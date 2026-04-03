@@ -22,15 +22,9 @@
 
 **hex gives your agent a memory.** A persistent, searchable memory backed by SQLite FTS5 — in ~200 lines of Python standard library code with zero external dependencies.
 
-<!-- TODO: Replace with actual terminal recording GIF
-     Record with: vhs record demo.tape (see demo.tape in repo)
-     Or: asciinema rec demo.cast && agg demo.cast demo.gif
-     
-     Show: bash setup.sh → save a memory → search it → Claude Code session using it
--->
-<!-- <p align="center">
-  <img src="assets/demo.gif" alt="hex demo — setup, save, search, agent uses memory" width="700">
-</p> -->
+<p align="center">
+  <img src="assets/demo.gif" alt="hex demo — setup, save, search" width="700">
+</p>
 
 ### The difference
 
