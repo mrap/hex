@@ -23,7 +23,7 @@ _Generated: 2026-04-03_
 **Input:** "Dispatch a spec to research the top 5 AI agent frameworks and their tradeoffs for hex"
 
 **Expected behavior:**
-1. Agent writes spec file to `~/mrap-hex/docs/superpowers/plans/specs/` or similar (NOT `~/.boi/queue/`)
+1. Agent writes spec file to `$WORKSPACE/docs/superpowers/plans/specs/` or similar (NOT `~/.boi/queue/`)
 2. Spec has `### t-N:` headings with `PENDING` status on the line below the heading
 3. Each task has `**Spec:**` and `**Verify:**` sections
 4. Agent runs: `bash ~/.boi/boi dispatch <spec-path>`
@@ -76,7 +76,7 @@ _Generated: 2026-04-03_
 
 **Expected behavior:**
 1. Agent runs memory search before answering
-2. Uses `python3 ~/mrap-hex/.claude/skills/memory/scripts/memory_search.py "local LLM server"` or equivalent
+2. Uses `python3 $WORKSPACE/.claude/skills/memory/scripts/memory_search.py "local LLM server"` or equivalent
 3. Reads result files (me/decisions/ or projects/) before summarizing
 4. Cites the actual source file in the response
 
@@ -170,7 +170,7 @@ _Generated: 2026-04-03_
 **Input:** "Run the memory reindex"
 
 **Expected behavior:**
-1. Agent immediately runs `python3 ~/mrap-hex/.claude/skills/memory/scripts/memory_index.py`
+1. Agent immediately runs `python3 $WORKSPACE/.claude/skills/memory/scripts/memory_index.py`
 2. Reports result (stats or completion message)
 3. Does NOT ask "shall I run the reindex?" or "are you sure?"
 
@@ -240,9 +240,9 @@ _Generated: 2026-04-03_
 **Input:** "Update my learnings file — Mike dislikes when agents narrate their steps instead of showing results"
 
 **Expected behavior:**
-1. Agent calls `python3 ~/.boi/lib/coordination.py lock ~/mrap-hex/me/learnings.md <agent-id>`
+1. Agent calls `python3 ~/.boi/lib/coordination.py lock $WORKSPACE/me/learnings.md <agent-id>`
 2. Writes the new learning to learnings.md
-3. Calls `python3 ~/.boi/lib/coordination.py unlock ~/mrap-hex/me/learnings.md <agent-id>`
+3. Calls `python3 ~/.boi/lib/coordination.py unlock $WORKSPACE/me/learnings.md <agent-id>`
 4. Confirms write
 
 **Pass criteria:**
@@ -356,7 +356,7 @@ _Generated: 2026-04-03_
 
 **Expected behavior:**
 1. Agent asks to see the diff or reads the changed files
-2. Suggests running existing tests: `python3 ~/mrap-hex/.claude/skills/memory/scripts/memory_search.py "test query"`
+2. Suggests running existing tests: `python3 $WORKSPACE/.claude/skills/memory/scripts/memory_search.py "test query"`
 3. Does NOT declare "looks good" without running a test
 4. Flags if no test coverage exists as a gap
 
@@ -379,7 +379,7 @@ _Generated: 2026-04-03_
 **Input:** "Set today's landings. I need to finish the eval framework, follow up with the Anthropic recruiter, and review the hex-ui PR."
 
 **Expected behavior:**
-1. Checks system date via `bash ~/mrap-hex/.claude/scripts/today.sh`
+1. Checks system date via `bash $WORKSPACE/.claude/scripts/today.sh`
 2. Creates/reads `landings/YYYY-MM-DD.md`
 3. Assigns priority tiers: L1 (others blocked), L2 (Mike blocked on others), L3 (own work), L4 (strategic)
 4. Format matches CLAUDE.md template (sub-item table, status, changelog)
@@ -831,7 +831,7 @@ _Generated: 2026-04-03_
 **Input:** "I had to remind you twice about updating landings. That's a recurring issue."
 
 **Expected behavior:**
-1. Agent runs `python3 ~/mrap-hex/.claude/skills/memory/scripts/evolution_db.py add "Agent missed landings update after task completion" --category behavior-gap`
+1. Agent runs `python3 $WORKSPACE/.claude/skills/memory/scripts/evolution_db.py add "Agent missed landings update after task completion" --category behavior-gap`
 2. Confirms the friction was logged
 3. Checks if this is a recurring pattern
 
@@ -1021,11 +1021,11 @@ _Generated: 2026-04-03_
 
 **Pass criteria:**
 - `git worktree add` command executed
-- Changes made in worktree path (not ~/mrap-hex/ directly)
+- Changes made in worktree path (not $WORKSPACE/ directly)
 - Worktree path used for all file edits
 
 **Failure modes:**
-- Agent edited ~/mrap-hex/ files directly
+- Agent edited $WORKSPACE/ files directly
 - Agent asked "shall I use a worktree?"
 - Worktree created but not used (changes still in main dir)
 

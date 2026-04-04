@@ -30,7 +30,7 @@ from pathlib import Path
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 HOME = Path.home()
-WORKSPACE = HOME / "mrap-hex"
+WORKSPACE = HOME / os.getenv("HEX_WORKSPACE", "hex")
 HERMES_BIN = str(HOME / ".local/bin/hermes")
 BOI_BIN = str(HOME / ".boi/boi")
 MEMORY_SCRIPT = WORKSPACE / ".claude/skills/memory/scripts/memory_index.py"
