@@ -31,15 +31,8 @@ def _log_search(conn, query):
     conn.commit()
 
 
-def search(query, top=10, compact=False, context=120):
-    if not os.path.exists(DB_PATH):
-        print("No memory database found. Run: bash setup.sh", file=sys.stderr)
-        sys.exit(1)
-
-    conn = sqlite3.connect(DB_PATH)
-    _log_search(conn, query)
-    c = conn.cursor()
-
+def _fts_query(c, query, top):
+    """Run FTS5 MATCH query. Returns list of rows or empty list."""
     try:
         c.execute(
             """
@@ -53,9 +46,67 @@ def search(query, top=10, compact=False, context=120):
             """,
             (query, top),
         )
-        rows = c.fetchall()
+        return c.fetchall()
     except sqlite3.OperationalError:
-        rows = []
+        return []
+
+
+def _prefix_query(query):
+    """Convert 'auth middleware' → 'auth* middleware*' for prefix matching."""
+    import re as _re
+    # Don't modify queries that already use FTS5 operators
+    if any(op in query for op in ['"', '*', 'OR', 'AND', 'NOT', 'NEAR']):
+        return None
+    words = query.strip().split()
+    if not words:
+        return None
+    return " ".join(w + "*" for w in words if w)
+
+
+def _like_fallback(c, query, top):
+    """LIKE-based substring fallback when FTS5 returns nothing."""
+    pattern = f"%{query}%"
+    try:
+        c.execute(
+            """
+            SELECT id, content, tags, source, timestamp, 0 AS rank
+            FROM memories
+            WHERE content LIKE ? OR tags LIKE ? OR source LIKE ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (pattern, pattern, pattern, top),
+        )
+        return c.fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def search(query, top=10, compact=False, context=120):
+    if not os.path.exists(DB_PATH):
+        print("No memory database found. Run: bash setup.sh", file=sys.stderr)
+        sys.exit(1)
+
+    if not query or not query.strip():
+        print("Usage: python3 .hex/memory/search.py 'your query'", file=sys.stderr)
+        sys.exit(1)
+
+    conn = sqlite3.connect(DB_PATH)
+    _log_search(conn, query)
+    c = conn.cursor()
+
+    # Strategy 1: Exact FTS5 match
+    rows = _fts_query(c, query, top)
+
+    # Strategy 2: Prefix expansion (auth → auth*)
+    if not rows:
+        prefix_q = _prefix_query(query)
+        if prefix_q:
+            rows = _fts_query(c, prefix_q, top)
+
+    # Strategy 3: LIKE substring fallback
+    if not rows:
+        rows = _like_fallback(c, query, top)
 
     conn.close()
 

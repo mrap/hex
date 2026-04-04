@@ -16,6 +16,10 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory.db")
 
 
 def save(content, tags="", source=""):
+    if not content or not content.strip():
+        print("Error: memory content cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+
     if not os.path.exists(DB_PATH):
         print("No memory database found. Run: bash setup.sh", file=sys.stderr)
         sys.exit(1)

@@ -50,8 +50,8 @@ That's it. Start your agent. It reads `CLAUDE.md` / `AGENTS.md` and knows how to
 python3 .hex/memory/save.py 'Project uses Express with JWT auth, refresh tokens in httpOnly cookies' \
   --tags 'auth,architecture' --source 'initial-setup'
 
-# Search it back
-python3 .hex/memory/search.py 'authentication'
+# Search it back (FTS5 full-text search with prefix matching)
+python3 .hex/memory/search.py 'auth'
 # → Project uses Express with JWT auth, refresh tokens in httpOnly cookies
 ```
 
@@ -137,8 +137,8 @@ Any agent that can read markdown files and run `python3` commands will work.
 ## Commands
 
 ```bash
-# Search memories (FTS5 full-text search with BM25 ranking)
-python3 .hex/memory/search.py 'authentication middleware'
+# Search memories (FTS5 full-text search with BM25 ranking + prefix matching)
+python3 .hex/memory/search.py 'auth middleware'
 python3 .hex/memory/search.py 'auth' --top 5 --compact
 
 # Save a memory
