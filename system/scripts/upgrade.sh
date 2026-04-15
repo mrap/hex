@@ -17,7 +17,7 @@ for arg in "$@"; do
 done
 
 CURRENT_VERSION=$(cat "$HEX_DIR/.hex/version.txt" 2>/dev/null || echo "unknown")
-REPO_URL="https://github.com/mrap/hex-foundation.git"
+REPO_URL="${HEX_REPO_URL:-https://github.com/mrap/hex-foundation.git}"
 TMPDIR=$(mktemp -d)
 
 cleanup() {

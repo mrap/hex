@@ -196,11 +196,16 @@ text = text.replace(
 open('CLAUDE.md', 'w').write(text)
 "
 
-# Simulate upgrade: bump version in the 'repo'
-echo "0.2.0" > /tmp/hex-setup/system/version.txt
+# Create a local git repo to serve as the upgrade source
+mkdir -p /tmp/hex-upgrade-repo
+cp -r /tmp/hex-setup/* /tmp/hex-upgrade-repo/ 2>/dev/null || true
+cp -r /tmp/hex-setup/.gitignore /tmp/hex-upgrade-repo/ 2>/dev/null || true
+echo "0.2.0" > /tmp/hex-upgrade-repo/system/version.txt
+cd /tmp/hex-upgrade-repo && git init -q && git add -A && git commit -q -m "v0.2.0"
+cd /tmp/test-hex
 
-# Run upgrade
-HEX_DIR=/tmp/test-hex TMPDIR=/tmp bash /tmp/test-hex/.hex/scripts/upgrade.sh 2>&1 || true
+# Run upgrade pointing to local repo
+HEX_DIR=/tmp/test-hex HEX_REPO_URL=/tmp/hex-upgrade-repo bash /tmp/test-hex/.hex/scripts/upgrade.sh 2>&1 || true
 
 # Verify user zone preserved
 if grep -q "MY_CUSTOM_RULE_12345" /tmp/test-hex/CLAUDE.md; then
@@ -222,9 +227,6 @@ else
     FAIL=$((FAIL + 1))
 fi
 TOTAL=$((TOTAL + 1))
-
-# Restore version for consistency
-echo "0.1.0" > /tmp/hex-setup/system/version.txt
 
 # ── Test 17: Unit tests ───────────────────────────────────────────
 echo "[17] Unit tests"
