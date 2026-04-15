@@ -1,1 +1,0 @@
-End AI Groundhog Day. Persistent memory + planning + rules for any coding agent. Zero dependencies, 60-second setup. Open source.
