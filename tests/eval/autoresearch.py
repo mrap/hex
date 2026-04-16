@@ -16,6 +16,9 @@ Usage:
     python3 autoresearch.py --budget 10.0        # Cost cap in dollars
     python3 autoresearch.py --model haiku         # Cheaper model for mutations
     python3 autoresearch.py --dry-run             # Show what would happen, no Claude calls
+    python3 autoresearch.py --focus events        # Only target hex-events routing failures
+    python3 autoresearch.py --candidates 3        # Tournament: try 3 mutations, keep best
+    python3 autoresearch.py --focus boi --candidates 3  # Focused tournament
 """
 
 import argparse
@@ -43,6 +46,20 @@ RESULTS_LOG = SCRIPT_DIR / "autoresearch-log.jsonl"
 COST_PER_EVAL = 0.50
 # Cost per mutation generation call
 COST_PER_MUTATION = 0.05
+
+# Focus categories: map --focus flag to specific eval case names
+FOCUS_CATEGORIES = {
+    "events": [
+        "route_schedule_to_events", "route_monitoring_to_events",
+        "route_reactive_to_events", "hex_events_routing",
+    ],
+    "boi": [
+        "delegation", "route_research_to_boi", "route_build_to_boi",
+    ],
+    "core": [
+        "persistence", "onboarding", "memory_search", "startup_loads_context",
+    ],
+}
 
 MODEL_ALIASES = {
     "sonnet": "claude-sonnet-4-5",
@@ -130,11 +147,13 @@ def parse_eval_output(output: str) -> EvalResult:
 
 # ── Failure analysis ──────────────────────────────────────────────────────────
 
-def analyze_failures(result: EvalResult, claude_md_text: str) -> str:
+def analyze_failures(result: EvalResult, claude_md_text: str, focus_cases: Optional[list] = None) -> str:
     """Build a failure analysis prompt for Claude."""
     failing = []
     for name, data in result.per_case.items():
         if not data["passed"]:
+            if focus_cases and name not in focus_cases:
+                continue
             failing.append(f"- {name}: {data['checks']} checks passed")
 
     if not failing:
@@ -324,13 +343,107 @@ def should_keep(baseline: EvalResult, current: EvalResult) -> tuple[bool, str]:
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
+def run_tournament(
+    candidates_count: int,
+    best_result: EvalResult,
+    claude_md_path: Path,
+    model: str,
+    eval_timeout: int,
+    focus_cases: Optional[list] = None,
+    dry_run: bool = False,
+) -> tuple[Optional[dict], Optional[EvalResult], float]:
+    """Generate N mutation candidates, eval each, return the best.
+
+    Returns (best_mutation, best_eval_result, cost) or (None, None, cost) if none improved.
+    """
+    claude_md_text = claude_md_path.read_text()
+    original_text = claude_md_text  # Save for restoration
+
+    analysis = analyze_failures(best_result, claude_md_text, focus_cases)
+    if not analysis:
+        return None, None, 0.0
+
+    cost = 0.0
+    candidates = []
+
+    # Generate N different mutations
+    for c in range(candidates_count):
+        if dry_run:
+            mutation = {
+                "rule_number": f"S{c+1}",
+                "original": "example",
+                "replacement": f"candidate {c+1} replacement",
+                "reasoning": f"dry-run candidate {c+1}",
+                "raw_response": "",
+            }
+        else:
+            # Vary the analysis prompt slightly for diversity
+            varied_analysis = analysis
+            if c > 0:
+                varied_analysis += f"\n\nIMPORTANT: Propose a DIFFERENT mutation than: {candidates[-1]['reasoning'] if candidates else 'N/A'}. Try a different rule or a different approach."
+            mutation = generate_mutation(varied_analysis, model=model)
+            cost += COST_PER_MUTATION
+
+        candidates.append(mutation)
+        print(f"    Candidate {c+1}: Rule {mutation.get('rule_number', '?')} — {mutation.get('reasoning', '')[:80]}")
+
+    # Eval each candidate
+    best_mutation = None
+    best_eval = None
+    best_delta = 0
+
+    for c, mutation in enumerate(candidates):
+        print(f"    Evaluating candidate {c+1}/{len(candidates)}...")
+
+        if dry_run:
+            # Simulate improvement for first candidate only
+            sim_passed = best_result.passed + (1 if c == 0 else 0)
+            eval_result = EvalResult(total_cases=best_result.total_cases, passed=sim_passed, failed=best_result.total_cases - sim_passed, per_case=best_result.per_case)
+        else:
+            # Apply mutation temporarily
+            applied = apply_mutation(claude_md_path, mutation)
+            if not applied:
+                print(f"    Candidate {c+1}: could not apply, skipping")
+                continue
+
+            # Run eval
+            eval_result = run_eval(model=model, timeout=eval_timeout)
+            cost += COST_PER_EVAL
+
+            # Restore original CLAUDE.md for next candidate
+            claude_md_path.write_text(original_text)
+
+        delta = eval_result.passed - best_result.passed
+
+        # Check for regressions
+        regressions = []
+        for name, data in best_result.per_case.items():
+            if data["passed"] and name in eval_result.per_case and not eval_result.per_case[name]["passed"]:
+                regressions.append(name)
+
+        if delta > best_delta and not regressions:
+            best_delta = delta
+            best_mutation = mutation
+            best_eval = eval_result
+
+        status = f"+{delta}" if delta > 0 else str(delta)
+        regr = f" (regressions: {', '.join(regressions)})" if regressions else ""
+        print(f"    Candidate {c+1}: {eval_result.score_str} ({status}){regr}")
+
+    return best_mutation, best_eval, cost
+
+
 def run_loop(
     max_iterations: int = 10,
     budget: float = 50.0,
     model: str = "claude-sonnet-4-5",
     eval_timeout: int = 180,
     dry_run: bool = False,
+    focus: Optional[str] = None,
+    candidates: int = 1,
 ):
+    focus_cases = FOCUS_CATEGORIES.get(focus) if focus else None
+
     print("=" * 60)
     print(" hex autoresearch — CLAUDE.md optimization loop")
     print("=" * 60)
@@ -338,6 +451,8 @@ def run_loop(
     print(f"  Max iterations : {max_iterations}")
     print(f"  Budget         : ${budget:.2f}")
     print(f"  Eval timeout   : {eval_timeout}s per case")
+    print(f"  Focus          : {focus or 'all'}{f' ({len(focus_cases)} cases)' if focus_cases else ''}")
+    print(f"  Candidates     : {candidates} per iteration {'(tournament)' if candidates > 1 else '(single)'}")
     print(f"  CLAUDE.md      : {CLAUDE_MD}")
     print(f"  Log            : {RESULTS_LOG}")
     print()
@@ -413,102 +528,124 @@ def run_loop(
             print(f"  STOP: Perfect score ({best_result.score_str}). Nothing left to improve.")
             break
 
-        # Step 1: Analyze failures
-        print(f"\n  [1/4] Analyzing failures...")
-        claude_md_text = CLAUDE_MD.read_text()
-        analysis = analyze_failures(best_result, claude_md_text)
-        if not analysis:
-            print("  No failures to analyze. Done!")
+        # Identify failures
+        failing_cases = [n for n, d in best_result.per_case.items() if not d["passed"]]
+        if focus_cases:
+            failing_cases = [n for n in failing_cases if n in focus_cases]
+
+        if not failing_cases:
+            print(f"\n  No {'focused ' if focus else ''}failures to fix. Done!")
             break
 
-        failing_cases = [n for n, d in best_result.per_case.items() if not d["passed"]]
-        print(f"  Failing: {', '.join(failing_cases)}")
+        print(f"\n  Targeting: {', '.join(failing_cases)}")
 
-        # Step 2: Generate mutation
-        print(f"  [2/4] Generating mutation...")
-        if dry_run:
-            mutation = {
-                "rule_number": "S4",
-                "original": "example original",
-                "replacement": "example replacement",
-                "reasoning": "dry-run placeholder",
-                "raw_response": "",
-            }
-            print(f"  [dry-run] Would call Claude for mutation suggestion")
-        else:
-            mutation = generate_mutation(analysis, model=model)
-            cumulative_cost += COST_PER_MUTATION
+        if candidates > 1:
+            # Tournament mode: generate N candidates, eval each, keep best
+            print(f"\n  [Tournament] Generating {candidates} candidates...")
+            winner_mutation, winner_result, tournament_cost = run_tournament(
+                candidates_count=candidates,
+                best_result=best_result,
+                claude_md_path=CLAUDE_MD,
+                model=model,
+                eval_timeout=eval_timeout,
+                focus_cases=focus_cases,
+                dry_run=dry_run,
+            )
+            cumulative_cost += tournament_cost
 
-        print(f"  Target: Rule {mutation.get('rule_number', '?')}")
-        print(f"  Reasoning: {mutation.get('reasoning', 'none')[:100]}")
+            if winner_mutation and winner_result:
+                # Apply winning mutation and commit
+                apply_mutation(CLAUDE_MD, winner_mutation)
+                commit_hash = git_commit(
+                    f"autoresearch: {winner_mutation.get('reasoning', 'mutation')[:72]}"
+                ) if not dry_run else "dry-run"
 
-        # Step 3: Apply mutation
-        print(f"  [3/4] Applying mutation...")
-        if dry_run:
-            print(f"  [dry-run] Would edit CLAUDE.md and commit")
-            commit_hash = "dry-run"
-        else:
-            applied = apply_mutation(CLAUDE_MD, mutation)
-            if not applied:
-                print(f"  SKIP: Could not apply mutation (text not found)")
+                delta = winner_result.passed - best_result.passed
+                print(f"\n  Tournament winner: {winner_result.score_str} (+{delta})")
+                print(f"  ✓ KEEP — {winner_mutation.get('reasoning', '')[:100]}")
+                best_result = copy.deepcopy(winner_result)
+                consecutive_reverts = 0
+
+                log_iteration(Iteration(
+                    number=i, timestamp=datetime.now().isoformat(),
+                    hypothesis=winner_mutation.get("reasoning", ""),
+                    mutation=winner_mutation.get("replacement", "")[:200],
+                    baseline_score=f"{best_result.passed - delta}/{best_result.total_cases}",
+                    new_score=winner_result.score_str,
+                    delta=delta, decision="KEEP", reason=f"Tournament winner (+{delta})",
+                    commit_hash=commit_hash, cost=cumulative_cost,
+                ))
+            else:
+                print(f"\n  ✗ No candidate improved. Reverting all.")
                 consecutive_reverts += 1
                 log_iteration(Iteration(
-                    number=i,
-                    timestamp=datetime.now().isoformat(),
-                    hypothesis=mutation.get("reasoning", ""),
-                    mutation=mutation.get("replacement", "")[:200],
-                    baseline_score=best_result.score_str,
-                    new_score="N/A",
-                    delta=0,
-                    decision="SKIP",
-                    reason="Could not apply mutation",
+                    number=i, timestamp=datetime.now().isoformat(),
+                    hypothesis="tournament", mutation="none improved",
+                    baseline_score=best_result.score_str, new_score=best_result.score_str,
+                    delta=0, decision="REVERT", reason="No tournament candidate improved",
                     cost=cumulative_cost,
                 ))
-                continue
-
-            commit_hash = git_commit(
-                f"autoresearch: {mutation.get('reasoning', 'mutation')[:72]}"
-            )
-            print(f"  Committed: {commit_hash}")
-
-        # Step 4: Re-eval
-        print(f"  [4/4] Running eval...")
-        if dry_run:
-            new_result = EvalResult(total_cases=11, passed=5, failed=6)
-            print(f"  [dry-run] Simulated result: {new_result.score_str}")
         else:
-            new_result = run_eval(model=model, timeout=eval_timeout)
-            cumulative_cost += COST_PER_EVAL
+            # Single mutation mode (original behavior)
+            print(f"\n  [1/4] Analyzing failures...")
+            claude_md_text = CLAUDE_MD.read_text()
+            analysis = analyze_failures(best_result, claude_md_text, focus_cases)
+            if not analysis:
+                print("  No failures to analyze. Done!")
+                break
 
-        print(f"  Result: {new_result.score_str} (was {best_result.score_str})")
+            print(f"  [2/4] Generating mutation...")
+            if dry_run:
+                mutation = {
+                    "rule_number": "S4", "original": "example",
+                    "replacement": "example replacement", "reasoning": "dry-run",
+                    "raw_response": "",
+                }
+            else:
+                mutation = generate_mutation(analysis, model=model)
+                cumulative_cost += COST_PER_MUTATION
 
-        # Step 5: Keep or revert
-        keep, reason = should_keep(best_result, new_result)
-        delta = new_result.passed - best_result.passed
+            print(f"  Target: Rule {mutation.get('rule_number', '?')}")
+            print(f"  [3/4] Applying mutation...")
+            if dry_run:
+                commit_hash = "dry-run"
+            else:
+                applied = apply_mutation(CLAUDE_MD, mutation)
+                if not applied:
+                    print(f"  SKIP: Could not apply")
+                    consecutive_reverts += 1
+                    continue
+                commit_hash = git_commit(f"autoresearch: {mutation.get('reasoning', '')[:72]}")
 
-        if keep:
-            print(f"  ✓ KEEP — {reason}")
-            best_result = copy.deepcopy(new_result)
-            consecutive_reverts = 0
-        else:
-            print(f"  ✗ REVERT — {reason}")
-            if not dry_run:
-                git_revert()
-            consecutive_reverts += 1
+            print(f"  [4/4] Running eval...")
+            if dry_run:
+                new_result = EvalResult(total_cases=11, passed=best_result.passed + 1, failed=best_result.failed - 1, per_case=best_result.per_case)
+            else:
+                new_result = run_eval(model=model, timeout=eval_timeout)
+                cumulative_cost += COST_PER_EVAL
 
-        log_iteration(Iteration(
-            number=i,
-            timestamp=datetime.now().isoformat(),
-            hypothesis=mutation.get("reasoning", ""),
-            mutation=mutation.get("replacement", "")[:200],
-            baseline_score=best_result.score_str if not keep else f"{best_result.passed - delta}/{best_result.total_cases}",
-            new_score=new_result.score_str,
-            delta=delta,
-            decision="KEEP" if keep else "REVERT",
-            reason=reason,
-            commit_hash=commit_hash,
-            cost=cumulative_cost,
-        ))
+            keep, reason = should_keep(best_result, new_result)
+            delta = new_result.passed - best_result.passed
+
+            if keep:
+                print(f"  ✓ KEEP — {reason}")
+                best_result = copy.deepcopy(new_result)
+                consecutive_reverts = 0
+            else:
+                print(f"  ✗ REVERT — {reason}")
+                if not dry_run:
+                    git_revert()
+                consecutive_reverts += 1
+
+            log_iteration(Iteration(
+                number=i, timestamp=datetime.now().isoformat(),
+                hypothesis=mutation.get("reasoning", ""),
+                mutation=mutation.get("replacement", "")[:200],
+                baseline_score=best_result.score_str if not keep else f"{best_result.passed - delta}/{best_result.total_cases}",
+                new_score=new_result.score_str, delta=delta,
+                decision="KEEP" if keep else "REVERT", reason=reason,
+                commit_hash=commit_hash, cost=cumulative_cost,
+            ))
 
         print(f"  Cost so far: ${cumulative_cost:.2f}")
         print()
@@ -541,15 +678,26 @@ def main():
     parser.add_argument("--model", default="sonnet", help="Model for eval + mutations (default: sonnet)")
     parser.add_argument("--timeout", type=int, default=180, help="Eval timeout per case in seconds")
     parser.add_argument("--dry-run", action="store_true", help="Simulate without Claude calls")
+    parser.add_argument("--focus", default=None, help="Focus category: events, boi, core (or comma-separated case names)")
+    parser.add_argument("--candidates", type=int, default=1, help="Tournament size per iteration (default: 1)")
     args = parser.parse_args()
 
     model = MODEL_ALIASES.get(args.model, args.model)
+
+    # Parse focus: could be a category name or comma-separated case names
+    focus = args.focus
+    if focus and "," in focus:
+        # Raw case names passed (from parallel launcher)
+        FOCUS_CATEGORIES[focus] = focus.split(",")
+
     sys.exit(run_loop(
         max_iterations=args.iterations,
         budget=args.budget,
         model=model,
         eval_timeout=args.timeout,
         dry_run=args.dry_run,
+        focus=focus,
+        candidates=args.candidates,
     ))
 
 
