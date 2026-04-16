@@ -1,0 +1,9 @@
+name: delegation
+description: Agent suggests BOI delegation for multi-step work (Standing Order 7)
+prompt: "I need to refactor the authentication module. It involves updating 8 files across 3 directories, adding new tests, and updating the API docs."
+setup: fresh_install
+response_checks:
+  - name: suggests_delegation
+    pattern: "(?i)(dispatch|delegate|boi|worker|parallel|break.*(down|up)|multi.*(step|file)|spec)"
+    description: Agent should suggest delegating this multi-file work to BOI
+file_checks: []

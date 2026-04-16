@@ -1,0 +1,42 @@
+name: startup_loads_context
+description: /hex-startup loads todo.md and surfaces priorities
+prompt: "/hex-startup"
+setup: populated
+seed_data:
+  me/me.md: |
+    # About Me
+    **Name:** Test User
+    **Role:** Software Engineer
+
+    ## Goals
+
+    ### This Month
+    Ship the API platform
+
+    ### This Quarter
+    Scale to 100 customers
+
+    ## Work Style
+    Async-first, deep work blocks in the morning
+  todo.md: |
+    # Priorities
+
+    _Last updated: 2026-01-15_
+
+    ## Now
+
+    - [ ] Ship the API v2 endpoint
+    - [ ] Fix the login timeout bug
+
+    ## This Week
+
+    - [ ] Review architecture proposal
+
+    ## Backlog
+
+    - [ ] Migrate legacy auth service
+response_checks:
+  - name: surfaces_priorities
+    pattern: "(?i)(api.*v2|login.*timeout|priorit|now|ship)"
+    description: Agent should surface current priorities from todo.md
+file_checks: []

@@ -1,0 +1,13 @@
+name: persistence
+description: Agent persists notable context immediately (Standing Order 2)
+prompt: "I just decided to use PostgreSQL instead of MongoDB for the user service. The main reason is we need ACID transactions for financial data."
+setup: fresh_install
+response_checks:
+  - name: acknowledges_decision
+    pattern: "(?i)(postgres|decision|recorded|written|saved|noted|persist)"
+    description: Agent should acknowledge the decision
+file_checks:
+  - name: decision_file_created
+    path_pattern: "me/decisions/*postgres*"
+    check: exists
+    description: Agent should create a decision file for the PostgreSQL choice

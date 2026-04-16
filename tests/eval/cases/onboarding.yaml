@@ -1,0 +1,9 @@
+name: onboarding
+description: Fresh install triggers onboarding when agent reads me/me.md placeholder
+prompt: "Hi, I just installed hex. What do I do?"
+setup: fresh_install
+response_checks:
+  - name: detects_placeholder
+    pattern: "(?i)(what.*name|who are you|name|your name|call you)"
+    description: Agent should ask for the user's name (detects placeholder in me/me.md)
+file_checks: []

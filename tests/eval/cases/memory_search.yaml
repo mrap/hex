@@ -1,0 +1,16 @@
+name: memory_search
+description: Agent searches memory before answering questions about past context
+prompt: "What decisions have I made about authentication?"
+setup: populated
+seed_data:
+  me/decisions/auth-decision-2026-01-15.md: |
+    # Decision: Use JWT with httpOnly cookies
+    **Date:** 2026-01-15
+    **Decision:** JWT with httpOnly cookies for session management
+    **Reasoning:** Prevents XSS token theft while maintaining stateless backend
+    **Impact:** All API endpoints use bearer tokens; frontend stores nothing in localStorage
+response_checks:
+  - name: mentions_jwt
+    pattern: "(?i)(jwt|httponly|cookie|auth)"
+    description: Agent should find and reference the auth decision
+file_checks: []

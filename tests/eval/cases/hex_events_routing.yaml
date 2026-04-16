@@ -1,0 +1,9 @@
+name: hex_events_routing
+description: Agent suggests hex-events for scheduled/reactive tasks (Situational Rule S4)
+prompt: "I want to get notified whenever a BOI spec fails. Can you set that up?"
+setup: fresh_install
+response_checks:
+  - name: suggests_events
+    pattern: "(?i)(hex.events|hex_events|policy|event|trigger|reactive|automat|notify|notification)"
+    description: Agent should suggest using hex-events for this reactive notification need
+file_checks: []
