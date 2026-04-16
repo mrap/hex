@@ -162,15 +162,24 @@ def analyze_failures(result: EvalResult, claude_md_text: str, focus_cases: Optio
     # Build a focused prompt — only include rules relevant to the failures
     relevant_rules = _extract_relevant_rules(claude_md_text, failing)
 
+    # Load past mutations to prevent repeats
+    past_mutations = _load_past_mutations()
+    dedup_section = ""
+    if past_mutations:
+        dedup_section = "\n\nALREADY TRIED (do NOT repeat these):\n" + "\n".join(
+            f"- {m}" for m in past_mutations
+        )
+
     return f"""hex eval score: {result.score_str}. Failing: {', '.join(f[2:] for f in failing)}
 
 The agent defaults to Claude Code built-in features (CronCreate, hooks, inline coding)
 instead of hex systems (hex-events for automation, BOI for multi-step delegation).
 
 RELEVANT RULES (edit one of these):
-{relevant_rules}
+{relevant_rules}{dedup_section}
 
-Propose ONE surgical edit. Use NEVER/ALWAYS, name the Claude Code feature to avoid,
+Propose ONE surgical edit that is DIFFERENT from any previous attempt.
+Use NEVER/ALWAYS, name the Claude Code feature to avoid,
 name the hex system to use instead. 2-3 sentences max.
 
 Output EXACTLY this format:
@@ -178,6 +187,24 @@ RULE_NUMBER: <number or NEW>
 ORIGINAL: <current text or N/A>
 REPLACEMENT: <new text>
 REASONING: <one sentence>"""
+
+
+def _load_past_mutations() -> list[str]:
+    """Load past mutation descriptions from the log to prevent repeats."""
+    if not RESULTS_LOG.exists():
+        return []
+    mutations = []
+    for line in RESULTS_LOG.read_text().strip().split("\n"):
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+            desc = d.get("hypothesis", "") or d.get("mutation", "")
+            if desc and desc != "tournament" and desc != "none improved":
+                mutations.append(desc[:120])
+        except json.JSONDecodeError:
+            continue
+    return mutations
 
 
 def _extract_relevant_rules(text: str, failing_cases: list) -> str:
@@ -238,7 +265,7 @@ def extract_standing_orders(text: str) -> str:
 # ── Mutation generation ───────────────────────────────────────────────────────
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:26b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 
 
 def generate_mutation(failure_analysis: str, model: str = "claude-sonnet-4-5") -> dict:
@@ -449,7 +476,8 @@ def run_tournament(
             # Vary the analysis prompt slightly for diversity
             varied_analysis = analysis
             if c > 0:
-                varied_analysis += f"\n\nIMPORTANT: Propose a DIFFERENT mutation than: {candidates[-1]['reasoning'] if candidates else 'N/A'}. Try a different rule or a different approach."
+                prev = [cand['reasoning'] for cand in candidates if cand.get('reasoning')]
+                varied_analysis += f"\n\nIMPORTANT: Propose a DIFFERENT mutation than these:\n" + "\n".join(f"- {p}" for p in prev) + "\nTry a different rule number or a completely different approach."
             mutation = generate_mutation(varied_analysis, model=model)
             cost += COST_PER_MUTATION
 

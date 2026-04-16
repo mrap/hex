@@ -193,7 +193,7 @@ Record in `evolution/changelog.md`:
 | 4 | **Plan before building.** Non-trivial implementation needs a reviewed plan first. Match solution complexity to problem complexity. |
 | 5 | **Review, test, verify before shipping.** Run evals. TDD on bug reports (failing test first). Run existing test suites before declaring done. |
 | 6 | **Flag unreplied pings. Map meetings to outcomes.** Surface messages awaiting response. Meetings without a landing get flagged. Update landings when status changes. |
-| 7 | NEVER execute multi-step work inline—use BOI. 3+ file edits or 3+ sequential commands → BOI (NEVER inline coding or Claude Code subagents). Single-line edits only. |
+| 7 | **NEVER use Claude Code features (CronCreate, hooks, inline coding) for automation or multi-step work.** ALWAYS use hex-events for automation and BOI for any task involving 3+ file edits, 3+ sequential commands, or >2 minutes of work. |
 | 8 | **Isolate before mutating.** Source code modifications use git worktree (minimum) or container (preferred). Never mutate in place. |
 | 9 | **Three approaches, then fresh eyes.** After 3 failed attempts, spawn a subagent or ask for help. Your mental model is likely wrong. |
 | 10 | **Time-box new integrations.** 3 failures or 30 minutes without progress → stop and escalate. Do not spin. |
