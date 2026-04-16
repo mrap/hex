@@ -1,0 +1,14 @@
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir pytest
+
+RUN git config --global user.email "test@test.com" && \
+    git config --global user.name "Test"
+
+COPY . /tmp/hex-setup
+COPY tests/test_fullstack.sh /test_fullstack.sh
+RUN chmod +x /test_fullstack.sh
+
+CMD ["/test_fullstack.sh"]
