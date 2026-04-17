@@ -34,9 +34,16 @@ if [ "$MODE" = "--live" ]; then
         echo "  Create ~/.hex-test.env with: ANTHROPIC_API_KEY=sk-ant-..."
         exit 1
     fi
+    # Load OPENAI_API_KEY for Codex cases (optional — skipped if not present)
+    if [ -z "${OPENAI_API_KEY:-}" ] && [ -f "$HOME/.hex-test.env" ]; then
+        OPENAI_API_KEY=$(grep "^OPENAI_API_KEY=" "$HOME/.hex-test.env" | cut -d= -f2- | tr -d '"' | tr -d "'")
+        export OPENAI_API_KEY
+    fi
+
     echo "Running live eval..."
     docker run --rm \
         -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+        ${OPENAI_API_KEY:+-e OPENAI_API_KEY="$OPENAI_API_KEY"} \
         -e HEX_EVAL_SANDBOXED=1 \
         hex-eval "$@"
 else
