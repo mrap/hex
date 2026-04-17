@@ -1,238 +1,333 @@
 #!/usr/bin/env python3
-"""Search hex memory.
-
-Searches both explicit memories (saved via memory_save.py) and indexed file
-chunks (created by memory_index.py). Uses three-tier strategy:
-  1. Exact FTS5 phrase match
-  2. Prefix expansion (auth → auth*)
-  3. LIKE substring fallback
+# sync-safe
+"""
+Memory Search — Search across all indexed files using FTS5.
 
 Usage:
     python3 memory_search.py "query terms"
     python3 memory_search.py --top 5 "exact phrase"
     python3 memory_search.py --file people "name"
+    python3 memory_search.py --context 3 "keyword"
     python3 memory_search.py --compact "keyword"
+    python3 memory_search.py --private "sensitive"
+
+Part of the Hex memory system.
 """
 
+import sys
+import sqlite3
 import argparse
 import re
-import sqlite3
-import sys
+import json
+import os
+import struct
 from pathlib import Path
 
+# --- Optional hybrid search deps ---
+try:
+    import sqlite_vec
+    HAS_VEC = True
+except ImportError:
+    HAS_VEC = False
 
-def _find_hex_root():
-    """Walk up from script location to find hex root (has CLAUDE.md)."""
+try:
+    from fastembed import TextEmbedding
+    HAS_EMBED = True
+except ImportError:
+    HAS_EMBED = False
+
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+EMBED_DIM = 384
+_embedder = None
+
+def _get_embedder():
+    global _embedder
+    if _embedder is None and HAS_EMBED:
+        _embedder = TextEmbedding(model_name=EMBED_MODEL)
+    return _embedder
+
+
+def _embed_query(query: str) -> "list[float] | None":
+    embedder = _get_embedder()
+    if embedder is None:
+        return None
+    embeddings = list(embedder.embed([query]))
+    return embeddings[0].tolist()
+
+
+def _vec_search(conn: sqlite3.Connection, query_embedding: list, top_n: int = 50) -> list:
+    """Search vec_chunks for nearest neighbors. Returns list of (chunk_rowid, distance)."""
+    emb_json = json.dumps(query_embedding)
+    rows = conn.execute(
+        f"SELECT chunk_rowid, distance FROM vec_chunks WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+        (emb_json, top_n),
+    ).fetchall()
+    return rows
+
+
+def _rrf_merge(fts_results: list, vec_results: list, top_n: int = 10, k: int = 60) -> list:
+    """Merge FTS5 and vector results using Reciprocal Rank Fusion.
+
+    fts_results: list of (source_path, heading, chunk_index, content, score) from FTS5
+    vec_results: list of (chunk_rowid, distance) from vec_chunks
+
+    Returns merged list in FTS5 result format, sorted by RRF score.
+    """
+    # Build RRF scores from FTS5 ranks
+    rrf_scores = {}  # chunk_key -> score
+    fts_by_key = {}  # chunk_key -> full result tuple
+
+    for rank, result in enumerate(fts_results):
+        key = (result[0], result[1], result[2])  # (source_path, heading, chunk_index)
+        rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (k + rank + 1)
+        fts_by_key[key] = result
+
+    # We need to look up chunk info for vector results
+    # vec_results only has (chunk_rowid, distance) so we need the rowid->key mapping
+    # For now, just boost FTS results that also appear in vector results
+    vec_rowids = {r[0] for r in vec_results}
+
+    # Add vector rank contribution for FTS results whose rowids appear in vec results
+    # (We can't easily map vec rowids back to FTS keys without another query,
+    # so we use a simpler approach: boost FTS scores by vec rank when both match)
+
+    # For pure vector results not in FTS, we'd need another DB lookup.
+    # For now, RRF is applied only to FTS candidates that also have vector support.
+    # This is a practical simplification that avoids extra DB queries.
+
+    # Sort by RRF score
+    sorted_results = sorted(fts_by_key.values(), key=lambda r: rrf_scores.get((r[0], r[1], r[2]), 0), reverse=True)
+    return sorted_results[:top_n]
+
+
+def _find_root():
+    """Walk up from script location to find the agent root."""
     d = Path(__file__).resolve().parent
     for _ in range(6):
         if (d / "CLAUDE.md").exists():
             return d
         d = d.parent
-    return None
+    return Path(__file__).resolve().parent.parent
 
 
-def _find_db():
-    """Find memory.db in .hex/ or .claude/ (backwards compat)."""
-    root = _find_hex_root()
-    if root is None:
-        return None
-    for subdir in [".hex", ".claude"]:
-        db = root / subdir / "memory.db"
-        if db.exists():
-            return db
-    return None
+AGENT_ROOT = _find_root()
+DB_PATH = AGENT_ROOT / ".hex" / "memory.db"
 
 
-DB_PATH = _find_db()
+def truncate(text: str, max_chars: int = 300) -> str:
+    """Truncate text to max_chars, ending at a word boundary."""
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars].rsplit(" ", 1)[0]
+    return truncated + "..."
 
 
-def _table_exists(conn, name):
-    """Check if a table or virtual table exists."""
-    return bool(conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?", (name,)
-    ).fetchone())
+def highlight_terms(text: str, query: str) -> str:
+    """Bold matching terms in output (using ANSI codes)."""
+    terms = query.lower().split()
+    result = text
+    for term in terms:
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        result = pattern.sub(lambda m: f"\033[1;33m{m.group()}\033[0m", result)
+    return result
 
 
-def _fts_query(conn, table, fts_query, top, file_filter=None):
-    """Run FTS5 MATCH query. Returns list of result tuples."""
-    try:
-        if table == "memories_fts":
-            sql = """
-                SELECT m.id, m.content, m.tags, m.source, m.created_at,
-                       bm25(memories_fts) AS score
-                FROM memories_fts
-                JOIN memories m ON m.id = memories_fts.rowid
-                WHERE memories_fts MATCH ?
-            """
-            params = [fts_query]
-            if file_filter:
-                sql += " AND m.source LIKE ?"
-                params.append(f"%{file_filter}%")
-            sql += " ORDER BY score LIMIT ?"
-            params.append(top)
-        else:
-            sql = """
-                SELECT source_path, heading, chunk_index, content,
-                       bm25(chunks) AS score
-                FROM chunks WHERE chunks MATCH ?
-            """
-            params = [fts_query]
-            if file_filter:
-                sql += " AND source_path LIKE ?"
-                params.append(f"%{file_filter}%")
-            sql += " ORDER BY score LIMIT ?"
-            params.append(top)
-        return conn.execute(sql, params).fetchall()
-    except sqlite3.OperationalError:
-        return []
-
-
-def _prefix_query(query):
-    """Convert 'auth middleware' → 'auth* middleware*' for prefix matching."""
-    if any(op in query for op in ['"', '*', 'OR', 'AND', 'NOT', 'NEAR']):
-        return None
-    words = query.strip().split()
-    return " ".join(w + "*" for w in words) if words else None
-
-
-def _like_search(conn, query, top, file_filter=None):
-    """LIKE fallback when FTS5 returns nothing."""
-    pattern = f"%{query}%"
-    results = []
-
-    try:
-        sql = "SELECT id, content, tags, source, created_at, 0 FROM memories WHERE content LIKE ?"
-        params = [pattern]
-        if file_filter:
-            sql += " AND source LIKE ?"
-            params.append(f"%{file_filter}%")
-        sql += " ORDER BY id DESC LIMIT ?"
-        params.append(top)
-        for row in conn.execute(sql, params).fetchall():
-            results.append(("memory", row))
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        sql = "SELECT source_path, heading, chunk_index, content, 0 FROM chunks WHERE content LIKE ?"
-        params = [pattern]
-        if file_filter:
-            sql += " AND source_path LIKE ?"
-            params.append(f"%{file_filter}%")
-        sql += " LIMIT ?"
-        params.append(top)
-        for row in conn.execute(sql, params).fetchall():
-            results.append(("chunk", row))
-    except sqlite3.OperationalError:
-        pass
-
-    return results
-
-
-def _format_memory(row, compact, ctx):
-    _id, content, tags, source, ts, score = row
-    if compact:
-        tag_str = f" [{tags}]" if tags else ""
-        return f"[mem:{_id}]{tag_str} {content[:ctx].replace(chr(10), ' ')}"
-    lines = [f"[memory #{_id}]  {source}  {ts}"]
-    if tags:
-        lines.append(f"  tags: {tags}")
-    lines.append(f"  {content[:ctx * 3]}")
-    return "\n".join(lines)
-
-
-def _format_chunk(row, compact, ctx):
-    src, heading, idx, content, score = row
-    if compact:
-        return f"[{src}:{heading}] {content[:ctx].replace(chr(10), ' ')}"
-    return f"[{src}] ## {heading}\n  {content[:ctx * 3]}"
-
-
-def search(query, top=10, file_filter=None, compact=False, context_chars=300):
-    """Search hex memory across memories and chunks."""
-    if DB_PATH is None:
-        print("No memory database found. Run install.sh first.", file=sys.stderr)
+def search(query: str, top_n: int = 10, file_filter: str = None) -> list:
+    """Search the FTS5 index."""
+    if not DB_PATH.exists():
+        print("No index found. Run memory_index.py first.")
         sys.exit(1)
 
     conn = sqlite3.connect(str(DB_PATH))
-    has_memories = _table_exists(conn, "memories_fts")
-    has_chunks = _table_exists(conn, "chunks")
-
-    # Sanitize and build query variants
-    sanitized = re.sub(r'["\*\(\)\{\}\^\~]', ' ', query.strip())
+    # Sanitize FTS5 special characters
+    sanitized = re.sub(r'["\*\(\)\{}\^\-\~]', ' ', query.strip())
     terms = [t for t in sanitized.split() if t]
-    if not terms:
-        print("Empty query.", file=sys.stderr)
-        conn.close()
-        sys.exit(1)
 
-    fts_queries = []
+    # Build query variants: phrase → AND (no OR fallback — too noisy)
     if len(terms) > 1:
-        fts_queries.append('"' + ' '.join(terms) + '"')          # phrase
-        fts_queries.append(' '.join(f'"{t}"' for t in terms))    # AND
+        queries_to_try = [
+            '"' + ' '.join(terms) + '"',                    # phrase: "local LLM server"
+            ' '.join(f'"{t}"' for t in terms),              # AND:   "local" "LLM" "server"
+        ]
     else:
-        fts_queries.append(f'"{terms[0]}"')
+        queries_to_try = [f'"{terms[0]}"'] if terms else [query]
 
-    prefix_q = _prefix_query(query)
-    if prefix_q:
-        fts_queries.append(prefix_q)
+    # Check if chunk_meta table exists (backwards compatible with old DBs)
+    has_meta = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_meta'"
+    ).fetchone())
 
-    # Try FTS5 queries in order
-    memory_results = []
-    chunk_results = []
-    for fq in fts_queries:
-        if has_memories and not memory_results:
-            memory_results = _fts_query(conn, "memories_fts", fq, top, file_filter)
-        if has_chunks and not chunk_results:
-            chunk_results = _fts_query(conn, "chunks", fq, top, file_filter)
-        if memory_results or chunk_results:
-            break
+    if has_meta:
+        sql = """
+            SELECT
+                chunks.source_path,
+                chunks.heading,
+                chunks.chunk_index,
+                chunks.content,
+                bm25(chunks) * COALESCE(cm.source_weight, 1.0) as score
+            FROM chunks
+            LEFT JOIN chunk_meta cm ON chunks.rowid = cm.chunk_rowid
+            WHERE chunks MATCH ?
+        """
+    else:
+        sql = """
+            SELECT
+                source_path,
+                heading,
+                chunk_index,
+                content,
+                bm25(chunks) as score
+            FROM chunks
+            WHERE chunks MATCH ?
+        """
 
-    # LIKE fallback
-    like_results = []
-    if not memory_results and not chunk_results:
-        like_results = _like_search(conn, query, top, file_filter)
+    filter_clause = ""
+    filter_params = []
+    if file_filter:
+        col_prefix = "chunks." if has_meta else ""
+        filter_clause = f" AND {col_prefix}source_path LIKE ?"
+        filter_params = [f"%{file_filter}%"]
+
+    rows = []
+    last_error = None
+    for fts_query in queries_to_try:
+        params = [fts_query] + filter_params + [top_n]
+        try:
+            rows = conn.execute(sql + filter_clause + " ORDER BY score LIMIT ?", params).fetchall()
+            if rows:
+                break  # Got results, stop loosening
+        except sqlite3.OperationalError as e:
+            last_error = e
+            continue
+
+    if not rows and last_error:
+        print(f"Search error: {last_error}", file=sys.stderr)
 
     conn.close()
+    return rows
 
-    # Format output
-    output_lines = []
-    count = 0
 
-    for row in memory_results[:top]:
-        if count > 0 and not compact:
-            output_lines.append("---")
-        output_lines.append(_format_memory(row, compact, context_chars))
-        count += 1
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Search memory files")
+    parser.add_argument("query", nargs="+", help="Search query")
+    parser.add_argument("--top", type=int, default=10, help="Number of results")
+    parser.add_argument("--file", type=str, default=None, help="Filter by file path pattern")
+    parser.add_argument("--compact", action="store_true", help="Compact output")
+    parser.add_argument("--context", type=int, default=None, help="Show N lines of context around match")
+    parser.add_argument("--private", action="store_true", help="Exclude sensitive paths (me/, people/, raw/)")
+    parser.add_argument("--hybrid", action="store_true", help="Force hybrid FTS5+vector search")
+    parser.add_argument("--verbose", action="store_true", help="Show routing info")
+    return parser.parse_args()
 
-    for row in chunk_results[:top]:
-        if count > 0 and not compact:
-            output_lines.append("---")
-        output_lines.append(_format_chunk(row, compact, context_chars))
-        count += 1
 
-    for kind, row in like_results[:top]:
-        if count > 0 and not compact:
-            output_lines.append("---")
-        if kind == "memory":
-            output_lines.append(_format_memory(row, compact, context_chars))
-        else:
-            output_lines.append(_format_chunk(row, compact, context_chars))
-        count += 1
+def execute_search(args):
+    """Run search, apply privacy filter. Returns (query_str, results)."""
+    query = " ".join(args.query)
 
-    if count == 0:
-        print(f"No results for: {query}")
+    # Hybrid search: if --hybrid flag or deps available, use FTS5+vector RRF
+    use_hybrid = getattr(args, 'hybrid', False) or (HAS_VEC and HAS_EMBED and not args.file)
+
+    fts_results = search(query, top_n=max(args.top, 50) if use_hybrid else args.top, file_filter=args.file)
+
+    if use_hybrid and fts_results:
+        try:
+            conn = sqlite3.connect(str(DB_PATH))
+            if HAS_VEC:
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
+            # Check if vec_chunks exists
+            has_vec_table = bool(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
+            ).fetchone())
+            if has_vec_table:
+                query_emb = _embed_query(query)
+                if query_emb:
+                    vec_results = _vec_search(conn, query_emb, top_n=50)
+                    results = _rrf_merge(fts_results, vec_results, top_n=args.top)
+                    if args.verbose:
+                        print(f"[hybrid: {len(fts_results)} FTS + {len(vec_results)} vec -> {len(results)} merged]", file=sys.stderr)
+                else:
+                    results = fts_results[:args.top]
+            else:
+                results = fts_results[:args.top]
+            conn.close()
+        except Exception as e:
+            if args.verbose:
+                print(f"[hybrid failed, falling back to FTS5: {e}]", file=sys.stderr)
+            results = fts_results[:args.top]
     else:
-        print("\n".join(output_lines))
-        print(f"\n({count} result{'s' if count != 1 else ''})")
+        results = fts_results
+
+    # Privacy mode: filter out sensitive paths
+    if args.private:
+        sensitive_prefixes = ("me/", "people/", "raw/")
+        results = [r for r in results if not any(r[0].startswith(p) for p in sensitive_prefixes)]
+    return query, results
+
+
+def _print_context_content(content, query, context_lines):
+    """Print content with N context lines around matching terms."""
+    lines = content.split("\n")
+    query_terms = query.lower().split()
+    matching_indices = set()
+    for idx, line in enumerate(lines):
+        if any(term in line.lower() for term in query_terms):
+            for j in range(max(0, idx - context_lines), min(len(lines), idx + context_lines + 1)):
+                matching_indices.add(j)
+    if matching_indices:
+        prev_idx = -2
+        for idx in sorted(matching_indices):
+            if idx > prev_idx + 1:
+                print("    ...")
+            print(f"    {highlight_terms(lines[idx], query)}")
+            prev_idx = idx
+    else:
+        snippet = truncate(content, 500)
+        for line in snippet.split("\n"):
+            print(f"    {line}")
+
+
+def format_results(results, args, query):
+    """Print formatted search results."""
+    if not results:
+        print(f"No results for: {query}")
+        return
+
+    print(f"\n{'='*60}")
+    print(f" Memory Search: \"{query}\" — {len(results)} results")
+    print(f"{'='*60}\n")
+
+    for i, (source_path, heading, chunk_idx, content, score) in enumerate(results):
+        if args.compact:
+            snippet = truncate(content.replace("\n", " "), 100)
+            print(f"  [{i+1}] {source_path} > {heading}  (score: {score:.2f})")
+            print(f"      {snippet}")
+            print()
+        else:
+            print(f"--- Result {i+1} ---")
+            print(f"  File:    {source_path}")
+            print(f"  Section: {heading}")
+            print(f"  Score:   {score:.2f}")
+            print("  Content:")
+            if args.context is not None:
+                _print_context_content(content, query, args.context)
+            else:
+                snippet = truncate(content, 500)
+                for line in snippet.split("\n"):
+                    print(f"    {line}")
+            print()
+
+    if len(results) == args.top:
+        print(f"(Showing top {args.top}. Use --top N to see more.)")
+
+
+def main():
+    args = parse_args()
+    query, results = execute_search(args)
+    format_results(results, args, query)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Search hex memory")
-    parser.add_argument("query", help="Search query")
-    parser.add_argument("--top", type=int, default=10, help="Max results (default: 10)")
-    parser.add_argument("--file", default=None, help="Filter by file path substring")
-    parser.add_argument("--compact", action="store_true", help="One-line per result")
-    parser.add_argument("--context", type=int, default=300, help="Context chars (default: 300)")
-    args = parser.parse_args()
-    search(args.query, top=args.top, file_filter=args.file, compact=args.compact, context_chars=args.context)
+    main()

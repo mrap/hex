@@ -1,0 +1,5 @@
+# hex memory — optional hybrid search dependencies
+# If installation fails, memory_index.py degrades gracefully to FTS5-only mode.
+# Install with: pip install -r requirements.txt
+sqlite-vec>=0.1.6
+fastembed>=0.4.2

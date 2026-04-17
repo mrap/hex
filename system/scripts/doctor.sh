@@ -1,131 +1,664 @@
-#!/usr/bin/env bash
-# hex doctor — Validate hex installation health.
-set -euo pipefail
+#!/bin/bash
+# sync-safe
+# doctor.sh — Scriptable health checks for hex agent installation
+#
+# Usage:
+#   doctor.sh              # Run all checks, report results
+#   doctor.sh --fix        # Auto-fix safe issues
+#   doctor.sh --json       # Output full results as JSON
+#   doctor.sh --quiet      # Only show errors and warnings (no PASS lines)
+#
+# Exit codes:
+#   0 = all pass
+#   1 = errors found
+#   2 = warnings only (no errors)
 
-HEX_DIR="${HEX_DIR:-$(pwd)}"
-PASS=0
-FAIL=0
-WARN=0
+set -uo pipefail
 
-check() {
-    local name="$1"; shift
-    if "$@" >/dev/null 2>&1; then
-        echo "  ✓ $name"
-        PASS=$((PASS + 1))
-    else
-        echo "  ✗ $name"
-        FAIL=$((FAIL + 1))
-    fi
-}
+# ─── Resolve HEX_DIR ─────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# HEX_DIR may be injected by the caller (e.g. in tests); fall back to the
+# directory two levels above this script (.hex/scripts/ → .hex/ → HEX_DIR/).
+HEX_DIR="${HEX_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+HEX_SYSTEM_DIR="$HEX_DIR/.hex"
+SCRIPTS_DIR="$HEX_SYSTEM_DIR/scripts"
 
-warn_check() {
-    local name="$1"; shift
-    if "$@" >/dev/null 2>&1; then
-        echo "  ✓ $name"
-        PASS=$((PASS + 1))
-    else
-        echo "  ⚠ $name"
-        WARN=$((WARN + 1))
-    fi
-}
+# Colors
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
 
-echo "hex doctor"
-echo "=========="
-echo ""
+# ─── Flags ────────────────────────────────────────────────────────────────────
+FIX=false
+JSON_MODE=false
+QUIET=false
 
-# Core files
-echo "Core files:"
-check "CLAUDE.md exists" test -f "$HEX_DIR/CLAUDE.md"
-check "AGENTS.md exists" test -f "$HEX_DIR/AGENTS.md"
-check "todo.md exists" test -f "$HEX_DIR/todo.md"
-check "me/me.md exists" test -f "$HEX_DIR/me/me.md"
-check "me/learnings.md exists" test -f "$HEX_DIR/me/learnings.md"
-echo ""
-
-# System files
-echo "System files:"
-check ".hex/ exists" test -d "$HEX_DIR/.hex"
-check "memory.db exists" test -f "$HEX_DIR/.hex/memory.db"
-check "version.txt exists" test -f "$HEX_DIR/.hex/version.txt"
-check "memory_search.py exists" test -f "$HEX_DIR/.hex/skills/memory/scripts/memory_search.py"
-check "memory_save.py exists" test -f "$HEX_DIR/.hex/skills/memory/scripts/memory_save.py"
-check "memory_index.py exists" test -f "$HEX_DIR/.hex/skills/memory/scripts/memory_index.py"
-check "startup.sh exists" test -f "$HEX_DIR/.hex/scripts/startup.sh"
-echo ""
-
-# Directory structure
-echo "Directories:"
-for dir in me me/decisions projects people evolution landings raw raw/transcripts raw/handoffs specs; do
-    check "$dir/" test -d "$HEX_DIR/$dir"
+for arg in "$@"; do
+  case "$arg" in
+    --fix)   FIX=true ;;
+    --json)  JSON_MODE=true ;;
+    --quiet) QUIET=true ;;
+    --help|-h)
+      echo "Usage: doctor.sh [--fix] [--json] [--quiet]"
+      echo ""
+      echo "  --fix    Auto-fix safe issues (checks 1,2,5,8,10,11,12,13,14,15)"
+      echo "  --json   Output full results as JSON (always includes all checks)"
+      echo "  --quiet  Only show errors and warnings (skip passing checks)"
+      exit 0
+      ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
 done
-echo ""
 
-# Commands (in .claude/commands/)
-echo "Commands:"
-warn_check "hex-startup command" test -f "$HEX_DIR/.claude/commands/hex-startup.md"
-warn_check "hex-checkpoint command" test -f "$HEX_DIR/.claude/commands/hex-checkpoint.md"
-warn_check "hex-shutdown command" test -f "$HEX_DIR/.claude/commands/hex-shutdown.md"
-echo ""
+# ─── State ────────────────────────────────────────────────────────────────────
+PASS_COUNT=0
+WARN_COUNT=0
+ERROR_COUNT=0
+FIXED_COUNT=0
+HAS_ERRORS=false
+HAS_WARNINGS=false
 
-# Memory database health
-echo "Memory database:"
-if [ -f "$HEX_DIR/.hex/memory.db" ]; then
-    TABLES=$(python3 -c "
-import sqlite3
-conn = sqlite3.connect('$HEX_DIR/.hex/memory.db')
-tables = {r[0] for r in conn.execute(\"SELECT name FROM sqlite_master WHERE type IN ('table','view')\").fetchall()}
-for t in ['memories', 'memories_fts', 'chunks', 'files', 'metadata']:
-    if t in tables:
-        print(f'OK:{t}')
-    else:
-        print(f'MISSING:{t}')
-conn.close()
-" 2>/dev/null)
-    while IFS= read -r line; do
-        if [[ "$line" == OK:* ]]; then
-            TABLE="${line#OK:}"
-            echo "  ✓ table: $TABLE"
-            PASS=$((PASS + 1))
-        elif [[ "$line" == MISSING:* ]]; then
-            TABLE="${line#MISSING:}"
-            echo "  ✗ table: $TABLE"
-            FAIL=$((FAIL + 1))
-        fi
-    done <<< "$TABLES"
+# Temp file for check records (tab-separated: id<TAB>name<TAB>status<TAB>message)
+CHECKS_FILE=$(mktemp /tmp/doctor-checks.XXXXXX)
+trap 'rm -f "$CHECKS_FILE"' EXIT
+
+# ─── Output helpers ───────────────────────────────────────────────────────────
+_pass() {
+  PASS_COUNT=$((PASS_COUNT + 1))
+  if ! $JSON_MODE && ! $QUIET; then
+    echo -e "  [${GREEN}PASS${RESET}] $1"
+  fi
+}
+
+_warn() {
+  WARN_COUNT=$((WARN_COUNT + 1))
+  HAS_WARNINGS=true
+  if ! $JSON_MODE; then
+    echo -e "  [${YELLOW}WARN${RESET}] $1"
+  fi
+}
+
+_error() {
+  ERROR_COUNT=$((ERROR_COUNT + 1))
+  HAS_ERRORS=true
+  if ! $JSON_MODE; then
+    echo -e "  [${RED}ERROR${RESET}] $1"
+  fi
+}
+
+_fixed() {
+  FIXED_COUNT=$((FIXED_COUNT + 1))
+  if ! $JSON_MODE; then
+    echo -e "  [${GREEN}FIXED${RESET}] $1"
+  fi
+}
+
+_info() {
+  if ! $JSON_MODE && ! $QUIET; then
+    echo -e "  ${DIM}→${RESET} $1"
+  fi
+}
+
+# Record a check result: id, name, status (pass|warn|error|fixed), message
+# Note: no tab characters allowed in name or message fields
+_rec() {
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$CHECKS_FILE"
+}
+
+# ─── Checks ───────────────────────────────────────────────────────────────────
+
+# 1: .hex/ exists (error, fix: mkdir)
+check_1() {
+  if [ -d "$HEX_SYSTEM_DIR" ]; then
+    _pass ".hex/ exists"
+    _rec 1 ".hex exists" "pass" ".hex/ directory found"
+    return
+  fi
+  if $FIX; then
+    mkdir -p "$HEX_SYSTEM_DIR"
+    _fixed ".hex/ created"
+    _rec 1 ".hex exists" "fixed" ".hex/ created"
+    return
+  fi
+  _error ".hex/ missing"
+  _rec 1 ".hex exists" "error" ".hex/ directory not found"
+}
+
+# 2: .git/ initialized (error, fix: git init + initial commit)
+check_2() {
+  if [ -d "$HEX_DIR/.git" ]; then
+    _pass ".git/ initialized"
+    _rec 2 ".git initialized" "pass" "git repository found"
+    return
+  fi
+  if $FIX; then
+    (cd "$HEX_DIR" && git init -q && git commit --allow-empty -q -m "Initial commit") 2>/dev/null || true
+    if [ -d "$HEX_DIR/.git" ]; then
+      _fixed ".git/ initialized"
+      _rec 2 ".git initialized" "fixed" "git init + initial commit"
+      return
+    fi
+    _error ".git/ init failed"
+    _rec 2 ".git initialized" "error" "git init failed"
+    return
+  fi
+  _error ".git/ not initialized"
+  _rec 2 ".git initialized" "error" "git repository not found"
+}
+
+# 3: .hex/ directory structure — skills subdirectory (error, no fix)
+check_3() {
+  if [ -d "$HEX_SYSTEM_DIR/skills" ]; then
+    _pass ".hex/skills/ exists"
+    _rec 3 ".hex/skills/ exists" "pass" ".hex/skills/ directory found"
+    return
+  fi
+  _error ".hex/skills/ missing — re-run bootstrap to fix"
+  _rec 3 ".hex/skills/ exists" "error" ".hex/skills/ not found — re-run bootstrap"
+}
+
+# 4: .hex/skills/ has skill dirs (error, no fix)
+check_4() {
+  if [ -d "$HEX_SYSTEM_DIR/skills" ]; then
+    local count
+    count=$(ls -d "$HEX_SYSTEM_DIR/skills"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${count:-0}" -gt 0 ]; then
+      _pass ".hex/skills/ has ${count} skill directories"
+      _rec 4 ".hex/skills/ has skills" "pass" "${count} skill directories found"
+      return
+    fi
+  fi
+  _error ".hex/skills/ empty or missing — re-run bootstrap"
+  _rec 4 ".hex/skills/ has skills" "error" "no skill directories found — re-run bootstrap"
+}
+
+# 5: .agents/skills/ linked to .hex/skills/ (error, fix: create symlink)
+check_5() {
+  local agents_skills="$HEX_DIR/.agents/skills"
+  local hex_skills="$HEX_SYSTEM_DIR/skills"
+
+  if [ -L "$agents_skills" ]; then
+    _pass ".agents/skills/ linked to .hex/skills/"
+    _rec 5 ".agents/skills/ symlinked" "pass" "symlink exists"
+    return
+  fi
+
+  if [ -d "$agents_skills" ]; then
+    local count
+    count=$(ls "$agents_skills" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${count:-0}" -gt 0 ]; then
+      _warn ".agents/skills/ is a real non-empty directory — skipping symlink creation"
+      _rec 5 ".agents/skills/ symlinked" "warn" ".agents/skills/ is a non-empty real directory"
+      return
+    fi
+    if $FIX; then
+      rm -rf "$agents_skills"
+      mkdir -p "$HEX_DIR/.agents"
+      ln -s "$hex_skills" "$agents_skills"
+      _fixed ".agents/skills/ replaced with symlink to .hex/skills/"
+      _rec 5 ".agents/skills/ symlinked" "fixed" "replaced empty directory with symlink"
+      return
+    fi
+  fi
+
+  if $FIX; then
+    mkdir -p "$HEX_DIR/.agents"
+    ln -s "$hex_skills" "$agents_skills"
+    _fixed ".agents/skills/ symlinked to .hex/skills/"
+    _rec 5 ".agents/skills/ symlinked" "fixed" "created symlink"
+    return
+  fi
+
+  _error ".agents/skills/ not linked to .hex/skills/"
+  _rec 5 ".agents/skills/ symlinked" "error" ".agents/skills/ not found or not a symlink"
+}
+
+# 6: CLAUDE.md exists and >1000 bytes (error, no fix)
+check_6() {
+  if [ -f "$HEX_DIR/CLAUDE.md" ]; then
+    local size
+    size=$(wc -c < "$HEX_DIR/CLAUDE.md" | tr -d ' ')
+    if [ "${size:-0}" -gt 1000 ]; then
+      _pass "CLAUDE.md exists (${size} bytes)"
+      _rec 6 "CLAUDE.md exists and >1000 bytes" "pass" "CLAUDE.md found (${size} bytes)"
+      return
+    fi
+    _error "CLAUDE.md exists but only ${size} bytes (expected >1000)"
+    _rec 6 "CLAUDE.md exists and >1000 bytes" "error" "CLAUDE.md is ${size} bytes"
+    return
+  fi
+  _error "CLAUDE.md missing"
+  _rec 6 "CLAUDE.md exists and >1000 bytes" "error" "CLAUDE.md not found"
+}
+
+# 7: AGENTS.md exists (warning, no fix — LLM handles generation)
+check_7() {
+  if [ -f "$HEX_DIR/AGENTS.md" ]; then
+    _pass "AGENTS.md exists"
+    _rec 7 "AGENTS.md exists" "pass" "AGENTS.md found"
+    return
+  fi
+  _warn "AGENTS.md missing — run /hex-doctor to generate"
+  _rec 7 "AGENTS.md exists" "warn" "AGENTS.md not found"
+}
+
+# 8: .codex/config.toml exists (warning, fix: create with CLAUDE.md fallback)
+check_8() {
+  if [ -f "$HEX_DIR/.codex/config.toml" ]; then
+    _pass ".codex/config.toml exists"
+    _rec 8 ".codex/config.toml exists" "pass" ".codex/config.toml found"
+    return
+  fi
+  if $FIX; then
+    mkdir -p "$HEX_DIR/.codex"
+    {
+      echo "# codex config — generated by hex doctor"
+      echo "[profile]"
+      echo 'model = "codex-mini-latest"'
+      echo ""
+      echo "# Uses AGENTS.md or CLAUDE.md as system prompt"
+    } > "$HEX_DIR/.codex/config.toml"
+    _fixed ".codex/config.toml created"
+    _rec 8 ".codex/config.toml exists" "fixed" ".codex/config.toml created"
+    return
+  fi
+  _warn ".codex/config.toml missing"
+  _rec 8 ".codex/config.toml exists" "warn" ".codex/config.toml not found"
+}
+
+# 9: me/me.md exists with content (info, report only — no fix, no counter increment)
+check_9() {
+  if [ -f "$HEX_DIR/me/me.md" ]; then
+    local size
+    size=$(wc -c < "$HEX_DIR/me/me.md" | tr -d ' ')
+    _pass "me/me.md exists (${size} bytes)"
+    _rec 9 "me/me.md has content" "pass" "me/me.md found (${size} bytes)"
+    return
+  fi
+  # Severity is info — do NOT increment WARN_COUNT or set HAS_WARNINGS
+  _info "me/me.md not found (not critical — create to personalize your agent)"
+  _rec 9 "me/me.md has content" "warn" "me/me.md not found"
+}
+
+# 10: todo.md exists (warning, fix: create skeleton)
+check_10() {
+  if [ -f "$HEX_DIR/todo.md" ]; then
+    _pass "todo.md exists"
+    _rec 10 "todo.md exists" "pass" "todo.md found"
+    return
+  fi
+  if $FIX; then
+    cat > "$HEX_DIR/todo.md" << 'SKELETON'
+# Todo
+
+## Now
+<!-- Active tasks -->
+
+## Next
+<!-- Upcoming tasks -->
+
+## Later
+<!-- Backlog -->
+SKELETON
+    _fixed "todo.md created (skeleton)"
+    _rec 10 "todo.md exists" "fixed" "todo.md skeleton created"
+    return
+  fi
+  _warn "todo.md missing"
+  _rec 10 "todo.md exists" "warn" "todo.md not found"
+}
+
+# 11: memory.db exists (warning, fix: rebuild index)
+check_11() {
+  local memory_db="$HEX_SYSTEM_DIR/memory.db"
+  if [ -f "$memory_db" ]; then
+    _pass "memory.db exists"
+    _rec 11 "memory.db exists" "pass" "memory.db found"
+    return
+  fi
+  if $FIX; then
+    local indexer="$HEX_SYSTEM_DIR/skills/memory/scripts/memory_index.py"
+    if [ -f "$indexer" ]; then
+      python3 "$indexer" --full 2>/dev/null || true
+      if [ -f "$memory_db" ]; then
+        _fixed "memory.db rebuilt via memory_index.py"
+        _rec 11 "memory.db exists" "fixed" "memory.db rebuilt"
+        return
+      fi
+    fi
+    _warn "memory.db missing — memory_index.py not found or rebuild failed"
+    _rec 11 "memory.db exists" "warn" "memory.db rebuild failed"
+    return
+  fi
+  _warn "memory.db missing — run: python3 .hex/skills/memory/scripts/memory_index.py --full"
+  _rec 11 "memory.db exists" "warn" "memory.db not found"
+}
+
+# 12: No broken symlinks in .hex/ and .agents/ (error, fix: remove)
+check_12() {
+  local broken=()
+  local base
+  for base in "$HEX_SYSTEM_DIR" "$HEX_DIR/.agents"; do
+    [ -d "$base" ] || continue
+    while IFS= read -r link; do
+      case "$link" in
+        */raw/*) continue ;;
+      esac
+      broken+=("$link")
+    done < <(find "$base" -maxdepth 3 -type l ! -e 2>/dev/null || true)
+  done
+
+  if [ ${#broken[@]} -eq 0 ]; then
+    _pass "No broken symlinks in .hex/ or .agents/"
+    _rec 12 "No broken symlinks" "pass" "no broken symlinks found"
+    return
+  fi
+
+  if $FIX; then
+    local link
+    for link in "${broken[@]}"; do
+      rm -f "$link"
+    done
+    _fixed "Removed ${#broken[@]} broken symlink(s)"
+    _rec 12 "No broken symlinks" "fixed" "removed ${#broken[@]} broken symlink(s)"
+    return
+  fi
+
+  _error "${#broken[@]} broken symlink(s) in .hex/ or .agents/"
+  local link
+  for link in "${broken[@]}"; do
+    _info "  broken: $link"
+  done
+  _rec 12 "No broken symlinks" "error" "${#broken[@]} broken symlinks found"
+}
+
+# 13: .sh scripts in .hex/scripts/ are executable (warning, fix: chmod +x)
+check_13() {
+  if [ ! -d "$SCRIPTS_DIR" ]; then
+    _warn ".hex/scripts/ directory not found"
+    _rec 13 ".sh scripts are executable" "warn" ".hex/scripts/ directory not found"
+    return
+  fi
+
+  local not_exec=()
+  while IFS= read -r script; do
+    [ -x "$script" ] || not_exec+=("$script")
+  done < <(find "$SCRIPTS_DIR" -maxdepth 1 -name "*.sh" -type f 2>/dev/null || true)
+
+  if [ ${#not_exec[@]} -eq 0 ]; then
+    _pass ".sh scripts in .hex/scripts/ are executable"
+    _rec 13 ".sh scripts are executable" "pass" "all scripts are executable"
+    return
+  fi
+
+  if $FIX; then
+    local script
+    for script in "${not_exec[@]}"; do
+      chmod +x "$script"
+    done
+    _fixed "chmod +x on ${#not_exec[@]} script(s)"
+    _rec 13 ".sh scripts are executable" "fixed" "chmod +x applied to ${#not_exec[@]} scripts"
+    return
+  fi
+
+  _warn "${#not_exec[@]} script(s) not executable in .hex/scripts/"
+  _rec 13 ".sh scripts are executable" "warn" "${#not_exec[@]} scripts not executable"
+}
+
+# 14: .hex/llm-preference exists (warning, fix: detect cli and create)
+check_14() {
+  if [ -f "$HEX_SYSTEM_DIR/llm-preference" ]; then
+    local pref
+    pref=$(cat "$HEX_SYSTEM_DIR/llm-preference" | tr -d '[:space:]')
+    _pass ".hex/llm-preference = $pref"
+    _rec 14 ".hex/llm-preference exists" "pass" "llm-preference = $pref"
+    return
+  fi
+
+  if $FIX; then
+    mkdir -p "$HEX_SYSTEM_DIR"
+    local detected=""
+    if command -v claude &>/dev/null; then
+      detected="claude"
+    elif command -v codex &>/dev/null; then
+      detected="codex"
+    fi
+    if [ -n "$detected" ]; then
+      echo "$detected" > "$HEX_SYSTEM_DIR/llm-preference"
+      _fixed ".hex/llm-preference = $detected (auto-detected)"
+      _rec 14 ".hex/llm-preference exists" "fixed" "detected $detected on PATH"
+      return
+    fi
+    _warn ".hex/llm-preference missing — could not detect claude or codex on PATH"
+    _rec 14 ".hex/llm-preference exists" "warn" "could not auto-detect LLM CLI"
+    return
+  fi
+
+  _warn ".hex/llm-preference missing"
+  _rec 14 ".hex/llm-preference exists" "warn" ".hex/llm-preference not found"
+}
+
+# 15: No stale .hex/llm-preference in wrong location (warning, fix: move to .hex/)
+check_15() {
+  # Check for legacy llm-preference at root level
+  local stale="$HEX_DIR/llm-preference"
+  if [ ! -f "$stale" ]; then
+    _pass "No stale root-level llm-preference"
+    _rec 15 "No stale root llm-preference" "pass" "no stale llm-preference"
+    return
+  fi
+  if $FIX; then
+    mkdir -p "$HEX_SYSTEM_DIR"
+    mv "$stale" "$HEX_SYSTEM_DIR/llm-preference"
+    _fixed "Moved root llm-preference → .hex/llm-preference"
+    _rec 15 "No stale root llm-preference" "fixed" "moved to .hex/llm-preference"
+    return
+  fi
+  _warn "Stale root llm-preference found (should be .hex/llm-preference)"
+  _rec 15 "No stale root llm-preference" "warn" "stale llm-preference at root level"
+}
+
+# 16: hex-events reachable (degrade gracefully if not installed)
+check_16() {
+  local hex_eventd="$HOME/.hex-events/hex_eventd.py"
+  if [ ! -f "$hex_eventd" ]; then
+    _info "hex-events not installed (~/.hex-events/hex_eventd.py not found)"
+    _rec 16 "hex-events reachable" "warn" "hex-events not installed"
+    return
+  fi
+
+  local venv_python="$HOME/.hex-events/venv/bin/python3"
+  if [ ! -f "$venv_python" ]; then
+    _warn "hex-events venv missing ($HOME/.hex-events/venv/bin/python3 not found)"
+    _rec 16 "hex-events reachable" "warn" "hex-events venv not found"
+    return
+  fi
+
+  local hex_events_cmd=""
+  if command -v hex-events &>/dev/null; then
+    hex_events_cmd="hex-events"
+  elif [ -f "$HOME/.hex-events/venv/bin/hex-events" ]; then
+    hex_events_cmd="$HOME/.hex-events/venv/bin/hex-events"
+  fi
+
+  if [ -n "$hex_events_cmd" ]; then
+    if "$hex_events_cmd" validate &>/dev/null 2>&1; then
+      _pass "hex-events reachable (validate OK)"
+      _rec 16 "hex-events reachable" "pass" "hex-events validate succeeded"
+      return
+    fi
+    _warn "hex-events validate failed"
+    _rec 16 "hex-events reachable" "warn" "hex-events validate returned non-zero"
+    return
+  fi
+
+  _pass "hex-events installed (hex_eventd.py + venv found)"
+  _rec 16 "hex-events reachable" "pass" "hex_eventd.py and venv found"
+}
+
+# 17: BOI reachable (degrade gracefully if not installed)
+check_17() {
+  local boi_sh="$HOME/.boi/src/boi.sh"
+  local boi_cmd="$HOME/.boi/boi"
+
+  if [ ! -f "$boi_sh" ]; then
+    _info "BOI not installed (~/.boi/src/boi.sh not found)"
+    _rec 17 "BOI reachable" "warn" "BOI not installed"
+    return
+  fi
+
+  if [ -f "$boi_cmd" ]; then
+    if bash "$boi_cmd" status &>/dev/null 2>&1; then
+      _pass "BOI reachable (status OK)"
+      _rec 17 "BOI reachable" "pass" "boi status succeeded"
+      return
+    fi
+    _warn "BOI status failed (daemon may not be running)"
+    _rec 17 "BOI reachable" "warn" "boi status returned non-zero"
+    return
+  fi
+
+  _pass "BOI installed (~/.boi/src/boi.sh found)"
+  _rec 17 "BOI reachable" "pass" "boi.sh found"
+}
+
+# 18: Python 3.10+ available (error)
+check_18() {
+  if python3 -c "import sys; assert sys.version_info >= (3,10)" 2>/dev/null; then
+    local ver
+    ver=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    _pass "Python $ver available"
+    _rec 18 "Python 3.10+ available" "pass" "Python $ver found"
+    return
+  fi
+  _error "Python 3.10+ not available"
+  _rec 18 "Python 3.10+ available" "error" "python3 not found or version < 3.10"
+}
+
+# 19: .hex/settings.json exists and is valid JSON (warning, no fix)
+check_19() {
+  local settings="$HEX_SYSTEM_DIR/settings.json"
+  if [ ! -f "$settings" ]; then
+    _warn ".hex/settings.json missing"
+    _rec 19 ".hex/settings.json valid" "warn" "settings.json not found"
+    return
+  fi
+  if python3 -m json.tool "$settings" > /dev/null 2>&1; then
+    _pass ".hex/settings.json is valid JSON"
+    _rec 19 ".hex/settings.json valid" "pass" "settings.json is valid JSON"
+    return
+  fi
+  _warn ".hex/settings.json exists but is invalid JSON"
+  _rec 19 ".hex/settings.json valid" "warn" "settings.json parse error"
+}
+
+# 20: .hex/timezone exists and contains valid TZ value (warning, report only)
+check_20() {
+  local tz_file="$HEX_SYSTEM_DIR/timezone"
+  if [ ! -f "$tz_file" ]; then
+    _warn ".hex/timezone missing"
+    _rec 20 ".hex/timezone valid" "warn" "timezone file not found"
+    return
+  fi
+  local tz_val
+  tz_val=$(cat "$tz_file" | tr -d '[:space:]')
+  if [ -z "$tz_val" ]; then
+    _warn ".hex/timezone is empty"
+    _rec 20 ".hex/timezone valid" "warn" "timezone file is empty"
+    return
+  fi
+  if TZ="$tz_val" date &>/dev/null 2>&1; then
+    _pass ".hex/timezone = $tz_val (valid)"
+    _rec 20 ".hex/timezone valid" "pass" "timezone = $tz_val"
+    return
+  fi
+  _warn ".hex/timezone = '$tz_val' (may not be a valid TZ identifier)"
+  _rec 20 ".hex/timezone valid" "warn" "timezone '$tz_val' may be invalid"
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+if ! $JSON_MODE; then
+  echo ""
+  echo -e "${BOLD}Hex Doctor — Health Check${RESET}"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo -e "${DIM}HEX_DIR=$HEX_DIR${RESET}"
+  echo ""
+fi
+
+check_1
+check_2
+check_3
+check_4
+check_5
+check_6
+check_7
+check_8
+check_9
+check_10
+check_11
+check_12
+check_13
+check_14
+check_15
+check_16
+check_17
+check_18
+check_19
+check_20
+
+# ─── Output ───────────────────────────────────────────────────────────────────
+if $JSON_MODE; then
+  OVERALL="pass"
+  if $HAS_ERRORS; then
+    OVERALL="error"
+  elif $HAS_WARNINGS; then
+    OVERALL="warning"
+  fi
+
+  python3 << PYEOF
+import json, sys
+
+checks = []
+try:
+    with open("$CHECKS_FILE") as f:
+        for line in f:
+            line = line.rstrip('\n')
+            parts = line.split('\t', 3)
+            if len(parts) == 4:
+                checks.append({
+                    'id': int(parts[0]),
+                    'name': parts[1],
+                    'status': parts[2],
+                    'message': parts[3]
+                })
+except Exception as e:
+    sys.stderr.write(f"error reading checks file: {e}\n")
+
+result = {
+    'status': '$OVERALL',
+    'checks': checks,
+    'summary': {
+        'pass': $PASS_COUNT,
+        'warn': $WARN_COUNT,
+        'error': $ERROR_COUNT,
+        'fixed': $FIXED_COUNT
+    }
+}
+print(json.dumps(result, indent=2))
+PYEOF
 else
-    echo "  ✗ memory.db not found"
-    FAIL=$((FAIL + 1))
+  echo ""
+  echo -e "  ${BOLD}Summary:${RESET} ${PASS_COUNT} passed, ${WARN_COUNT} warnings, ${ERROR_COUNT} errors, ${FIXED_COUNT} fixed"
+  echo ""
 fi
-echo ""
 
-# CLAUDE.md zone markers
-echo "CLAUDE.md zones:"
-if [ -f "$HEX_DIR/CLAUDE.md" ]; then
-    check "system-start marker" grep -q "hex:system-start" "$HEX_DIR/CLAUDE.md"
-    check "system-end marker" grep -q "hex:system-end" "$HEX_DIR/CLAUDE.md"
-    check "user-start marker" grep -q "hex:user-start" "$HEX_DIR/CLAUDE.md"
-    check "user-end marker" grep -q "hex:user-end" "$HEX_DIR/CLAUDE.md"
+# ─── Exit code ───────────────────────────────────────────────────────────────
+if $HAS_ERRORS; then
+  exit 1
+elif $HAS_WARNINGS; then
+  exit 2
 fi
-echo ""
-
-# Companions
-echo "Companions:"
-warn_check "BOI installed (~/.boi)" test -d "$HOME/.boi"
-warn_check "hex-events installed (~/.hex-events)" test -d "$HOME/.hex-events"
-echo ""
-
-# Install registry
-echo "Registry:"
-warn_check "~/.hex-install.json exists" test -f "$HOME/.hex-install.json"
-echo ""
-
-# Summary
-TOTAL=$((PASS + FAIL + WARN))
-echo "=========="
-echo "$PASS passed, $FAIL failed, $WARN warnings ($TOTAL checks)"
-if [ "$FAIL" -gt 0 ]; then
-    echo "Run install.sh to fix missing components."
-    exit 1
-else
-    echo "hex is healthy."
-fi
+exit 0

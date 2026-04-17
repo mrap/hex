@@ -1,0 +1,156 @@
+=== v0.2.0 fresh-install smoke test ===
+Date: Fri Apr 17 00:59:47 EDT 2026
+Install dir: /tmp/hex-v2-fresh-test-1776401927
+
+=== Step 1: install.sh ===
+hex v0.2.0 installer
+========================
+
+Checking prerequisites...
+  Python 3.14  ✓
+  git               ✓
+
+Creating hex instance at /tmp/hex-v2-fresh-test-1776401927-log...
+  Directory structure  ✓
+Initializing memory database...
+  Memory database     ✓
+  Standing orders     ✓
+Installing companions...
+  ⚠️  Memory hybrid deps skipped — memory will use FTS5-only mode
+  BOI already installed  ✓
+  hex-events already installed  ✓
+
+=========================================
+ hex installed at /tmp/hex-v2-fresh-test-1776401927-log
+=========================================
+
+Start your first session:
+  cd /tmp/hex-v2-fresh-test-1776401927-log && claude
+
+Your agent will walk you through setup.
+Install exit: 0
+
+=== Step 2: startup.sh ===
+
+============================================================
+ Hex Startup — 2026-04-17 00:59
+============================================================
+
+1. Environment Detection
+  [PASS] macOS
+  → HEX_DIR=/tmp/hex-v2-fresh-test-1776401927-log
+
+2. Session Management
+  → session.sh not found — multi-session tracking unavailable
+  → Install session.sh to /tmp/hex-v2-fresh-test-1776401927-log/.hex/scripts/ to enable this feature
+
+3. Parse Transcripts
+  → parse_transcripts.py not found — transcript parsing unavailable
+  → Install parse_transcripts.py to /tmp/hex-v2-fresh-test-1776401927-log/.hex/scripts/ to enable this feature
+
+4. Memory Index
+  → Done in 2.82s: 8 indexed, 0 unchanged (mtime), 0 unchanged (hash), 0 removed, 98 new chunks
+  [PASS] Memory index rebuilt
+
+5. Memory Health
+  → memory_health.py not found (optional)
+
+6. Integrations
+  → No integrations configured. The agent works without them.
+  → Create integrations.json to connect external tools (calendar, messaging, etc.)
+
+7. Improvement Engine
+  [PASS] No pending suggestions
+
+8. Priority Scoring
+  → priority-score.py not found (optional)
+
+9. Daemon Status
+  → hex-daemons.sh not found — install hex-daemons to enable daemon management
+  → Start daemons manually or run: hex-daemons setup
+
+10. hex-events Telemetry
+  → hex-events not installed (optional companion)
+  → Install hex-events to enable reactive automation policies
+
+────────────────────────────────────────────────────────────
+  Startup complete. All checks passed.
+Startup exit: 0
+
+=== Step 3: doctor.sh --quiet ===
+
+Hex Doctor — Health Check
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HEX_DIR=/tmp/hex-v2-fresh-test-1776401927-log
+
+  [ERROR] .git/ not initialized
+  [ERROR] .agents/skills/ not linked to .hex/skills/
+  [WARN] .codex/config.toml missing
+  [WARN] .hex/llm-preference missing
+  [WARN] .hex/settings.json missing
+  [WARN] .hex/timezone missing
+
+  Summary: 13 passed, 4 warnings, 2 errors, 0 fixed
+
+Doctor exit: 1
+
+=== Step 5: memory_index.py ===
+Incremental index...
+Found 8 files to check
+
+Done in 0.01s: 0 indexed, 8 unchanged (mtime), 0 unchanged (hash), 0 removed, 0 new chunks
+Index exit: 0
+
+=== Step 6: memory_search.py ===
+
+============================================================
+ Memory Search: "test" — 3 results
+============================================================
+
+--- Result 1 ---
+  File:    CLAUDE.md
+  Section: t-1: {First task} (PENDING)
+  Score:   -3.87
+  Content:
+    ### t-1: {First task} (PENDING)
+    
+    {What to do. Be specific about files, functions, acceptance criteria.}
+    
+    **Verify:** `test -f /expected/output.md`
+
+--- Result 2 ---
+  File:    CLAUDE.md
+  Section: Core Rules (20)
+  Score:   -2.60
+Search exit: 0
+
+=== Step 7: decision-template.md ===
+PRESENT
+
+=== Step 4: upgrade.sh --dry-run (cached) ===
+
+════════════════════════════════════════════════════
+ Hexagon Upgrade — 2026-04-17 00:59
+════════════════════════════════════════════════════
+  [DRY RUN] No changes will be made.
+
+
+1. Get Latest Source
+  → Cloning https://github.com/mrap/hex-foundation.git
+  → Cloning into '/tmp/hex-v2-fresh-test-1776401927-log/.hex/.upgrade-cache'...
+  [OK] Source ready
+  → Source layout: v2
+
+2. Core Components
+  → Python 3.14
+  → Updating hex-events at /Users/mrap/github.com/mrap/hex-events (snapshot: 3794aea9)
+Already up to date.
+  → [dry-run] Would re-run hex-events install.sh
+  → Updating BOI
+  → [dry-run] Would re-run BOI install-public.sh --update
+
+3. Detect Changes
+  → 12 changed, 0 new, 5 unchanged
+  ~ scripts/today.sh
+  ~ scripts/doctor.sh
+Upgrade exit: 0

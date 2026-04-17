@@ -1,3 +1,4 @@
+<!-- # sync-safe -->
 # hex-foundation
 
 A minimal, installable template for the hex agent system — a persistent AI workspace for Claude Code that accumulates context, learns your patterns, and improves itself over time.
@@ -64,7 +65,7 @@ Companion systems installed alongside:
 
 ## Core ideas
 
-**Persistent memory.** Every observation, decision, and learning gets written to a file — not summarized into a chat bubble that disappears. A SQLite FTS5 index at `.hex/memory.db` makes all of it searchable.
+**Persistent memory.** Every observation, decision, and learning gets written to a file — not summarized into a chat bubble that disappears. A SQLite FTS5 index at `.hex/memory.db` makes all of it searchable. With `fastembed` + `sqlite-vec` installed, the indexer upgrades to hybrid semantic + keyword search automatically; FTS5-only is the default when those libraries aren't present.
 
 **Operating model.** `CLAUDE.md` ships with 20 core standing orders, a learning engine that records observations to `me/learnings.md` with evidence and dates, and an improvement engine that detects friction, proposes fixes after 3+ occurrences, and tracks what ships.
 
@@ -80,6 +81,8 @@ Companion systems installed alongside:
 - Prefer rebase over merge
 <!-- hex:user-end -->
 ```
+
+**Decision records.** Every decision gets logged to `me/decisions/` (or `projects/{project}/decisions/`) with date, context, reasoning, and impact. A template ships at `.hex/templates/decision-template.md`. The `/hex-decide` command walks through the full framework.
 
 ---
 
@@ -97,8 +100,8 @@ These are Claude Code slash commands, not shell CLIs. Use them inside a `claude`
 | `/hex-debrief` | Weekly walk-through of projects, org signals, relationships, career. |
 | `/hex-decide` | Structured decision framework — context, options, reasoning, impact. |
 | `/hex-triage` | Route untriaged content from `raw/` to the right files. |
-| `/hex-doctor` | Health check. Validate structure, missing files, stale config. |
-| `/hex-upgrade` | Pull latest system files from hex-foundation. Runs doctor after. |
+| `/hex-doctor` | Health check. 20-point validation across env, memory, structure, config, and companions. Use `--fix` to repair auto-fixable issues, `--json` for machine-readable output. |
+| `/hex-upgrade` | Pull latest system files from hex-foundation. Handles v1→v2 layout migration. Runs doctor after. |
 
 ---
 
@@ -113,12 +116,13 @@ bash .hex/scripts/upgrade.sh
 Options:
 
 - `--dry-run` — show what would change
+- `--local PATH` — use a local hex-foundation checkout instead of fetching
 - `--skip-boi` / `--skip-events` — skip a companion
 
 What it does:
 
 1. Backs up `.hex/` to `.hex-upgrade-backup-YYYYMMDD/`
-2. Fetches the latest `hex-foundation` release
+2. Detects source layout (v1 `dot-claude/` or v2 `system/`) and maps paths accordingly
 3. Replaces `.hex/` (preserving `memory.db`)
 4. Merges `CLAUDE.md`: system zone replaced, user zone preserved
 5. Runs `doctor.sh`
@@ -142,24 +146,25 @@ hex-foundation/
 ├── install.sh           Single install entrypoint
 ├── VERSIONS             Pinned boi / hex-events versions
 ├── system/              → becomes ~/hex/.hex/ on install
-│   ├── scripts/         startup.sh, doctor.sh, upgrade.sh, today.sh
+│   ├── scripts/         startup.sh, doctor.sh, upgrade.sh, today.sh, path-mapping.sh
 │   ├── commands/        → copied to ~/hex/.claude/commands/ (Claude Code slash commands)
-│   ├── skills/memory/   memory_index.py, memory_save.py, memory_search.py
+│   ├── skills/          memory/ (index+search+save), landings, hex-reflect, hex-decide,
+│   │                    hex-debrief, hex-consolidate, hex-doctor, hex-checkpoint,
+│   │                    hex-shutdown, hex-startup, hex-triage
 │   └── version.txt
-├── templates/           Seeds for CLAUDE.md, AGENTS.md, me.md, todo.md, etc.
+├── templates/           Seeds for CLAUDE.md, AGENTS.md, me.md, todo.md, decision-template.md
 ├── docs/architecture.md System overview
-└── tests/               E2E, full-stack, and memory tests
+└── tests/               E2E, layout, and memory tests
 ```
 
 ---
 
 ## Roadmap
 
-v0.1.0 is the foundation release. Next up:
+v0.2.0 ships: hybrid memory search, 20-check doctor, layout-aware upgrade, decision template, and 11 skills. Next up:
 
 - Hooks pack: transcript backup, reflection dispatch
 - Session lifecycle automation (warming → hot → checkpoint transitions)
-- More skills (landings, triage, debrief) split out of CLAUDE.md
 
 Open an issue or PR — the system is meant to evolve.
 

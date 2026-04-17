@@ -180,6 +180,16 @@ echo "  Standing orders     ✓"
 
 echo "Installing companions..."
 
+# Memory hybrid-search deps (optional — FTS5-only mode if pip fails)
+MEMORY_REQS="$SCRIPT_DIR/system/skills/memory/requirements.txt"
+if [ -f "$MEMORY_REQS" ]; then
+    if python3 -m pip install -q -r "$MEMORY_REQS" 2>/dev/null; then
+        echo "  Memory hybrid deps  ✓"
+    else
+        echo "  ⚠️  Memory hybrid deps skipped — memory will use FTS5-only mode"
+    fi
+fi
+
 # Read pinned versions from VERSIONS file (keeps install.sh in lock-step with
 # tested boi/hex-events releases). Fork-friendly: HEX_BOI_REPO and
 # HEX_EVENTS_REPO env vars override the default source.

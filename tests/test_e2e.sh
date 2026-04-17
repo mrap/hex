@@ -172,7 +172,7 @@ TOTAL=$((TOTAL + 1))
 echo "[15] Startup script"
 cd /tmp/test-hex
 STARTUP_OUT=$(HEX_DIR=/tmp/test-hex bash .hex/scripts/startup.sh 2>&1)
-if echo "$STARTUP_OUT" | grep -q "Ready"; then
+if echo "$STARTUP_OUT" | grep -q "Startup complete"; then
     echo "  PASS: Startup script runs"
     PASS=$((PASS + 1))
 else

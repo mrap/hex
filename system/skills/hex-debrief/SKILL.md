@@ -26,7 +26,7 @@ For each project in todo.md "Now" section, ask:
 
 ### 3. Relationship updates
 - Any new observations about collaborators or stakeholders?
-- Any new people you are working with?
+- Any new people you're working with?
 - Any friction or wins worth noting?
 - Create new `people/*/profile.md` files for new contacts.
 
@@ -51,7 +51,7 @@ For each project in todo.md "Now" section, ask:
 - Write distilled notes to the appropriate files.
 - Rebuild memory index:
 ```bash
-python3 $AGENT_DIR/.hex/skills/memory/scripts/memory_index.py
+python3 $HEX_DIR/.hex/skills/memory/scripts/memory_index.py
 ```
 
 ### 8. Reminder

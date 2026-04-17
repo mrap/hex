@@ -1,3 +1,4 @@
+<!-- # sync-safe -->
 # /hex-startup — Start Your Session
 
 ## Step 1: Run Startup Script

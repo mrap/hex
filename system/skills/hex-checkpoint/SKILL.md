@@ -1,14 +1,14 @@
 ---
 name: hex-checkpoint
 description: >
-  Non-blocking checkpoint. Quick distill pass, handoff file, todo update, landings refresh. Suggest compact when done.
+  Non-blocking checkpoint. Quick distill pass, handoff file, todo update, then compact.
   Reflection runs in the background via session-reflect.sh — never blocks the session.
 ---
-<!-- # sync-safe -->
+# sync-safe
 
 # /hex-checkpoint — Checkpoint and Continue
 
-Persist context from the current conversation, then suggest compact if the user wants a fresh context window.
+Persist context from the current conversation, then compact for a fresh start.
 Heavy work (reflection, memory index rebuild) is dispatched to the background
 so the user can keep working immediately.
 
@@ -40,7 +40,7 @@ Task (run_in_background: true):
   subagent_type: general-purpose
   prompt: |
     Run the session reflection script. Execute:
-    bash $AGENT_DIR/.hex/scripts/session-reflect.sh
+    bash $HEX_DIR/.hex/scripts/session-reflect.sh
     This will process the current transcript and apply reflection fixes.
     Do not wait for or report the result.
 ```
@@ -78,28 +78,24 @@ Write a structured handoff to `raw/handoffs/YYYY-MM-DD-HHMMSS.md`:
 
 Make sure todo.md reflects current state. Move completed items, add new ones discovered during the session.
 
-## Step 5: Update daily landings
+## Step 5: Compact
 
-Get today's date: `bash $AGENT_DIR/.hex/scripts/today.sh`
+Tell the user: "Checkpointed. Reflection dispatched to background. Compacting now."
 
-Read today's landings file at `landings/YYYY-MM-DD.md`. If it exists, update it:
-- Mark any landing items completed during this session segment as Done
-- Update status of in-progress items
-- Update open threads with current state
-- Append a changelog entry: `- HH:MM — Checkpoint: [brief summary of what changed]`
-
-If no landings file exists for today, skip this step.
-
-## Step 6: Suggest compact (optional)
-
-Tell the user: "Checkpointed. Reflection dispatched to background."
-
-Then suggest: "If you want to compact for a fresh context window, run:"
-
-Provide the compact command with a focused summary:
+Then trigger compact with a focused summary. The summary should include:
 - The next focus area (from arguments or from the handoff)
 - A pointer to the handoff file
 - Key files to re-read after compact
 
-Example:
-> `/compact [Next focus]. Handoff at raw/handoffs/[filename]. Re-read: todo.md, landings/YYYY-MM-DD.md`
+Format the compact prompt as:
+```
+/compact [Next focus]. Handoff at raw/handoffs/[filename]. Re-read: todo.md, me/learnings.md, evolution/observations.md
+```
+
+## Step 6: After compact
+
+After compact completes, immediately:
+1. Read the handoff file
+2. Read todo.md
+3. Read me/learnings.md
+4. Say: "Context restored. Ready to work on [next focus]."
