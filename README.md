@@ -17,6 +17,16 @@ cd ~/hex && claude
 
 Your agent walks you through setup on first run. Three questions, then you're working.
 
+### Already running hex v1? Migrate to v2
+
+If your existing hex instance has `.claude/scripts/`, `.claude/skills/`, etc., you're on the v1 layout. `/hex-upgrade` won't cleanly pull foundation v0.2.1+ content until you migrate. One line from your hex dir:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/mrap/hex-foundation/v0.2.2/bootstrap-migrate.sh)
+```
+
+Full guide: [docs/migrate-v1-to-v2.md](./docs/migrate-v1-to-v2.md).
+
 ### Prerequisites
 
 - Python 3.9+
@@ -161,7 +171,13 @@ hex-foundation/
 
 ## Roadmap
 
-v0.2.0 ships: hybrid memory search, 20-check doctor, layout-aware upgrade, decision template, and 11 skills. Next up:
+v0.2.2 adds: `bootstrap-migrate.sh` one-liner for v1 → v2 layout migration, generic migrator with rollback + idempotency, synthetic v1 fixtures + test suite.
+
+v0.2.1 fixed: Hindsight removal, install.sh doctor-clean on fresh install, hidden sync-safe markers.
+
+v0.2.0 shipped: hybrid memory search, 20-check doctor, layout-aware upgrade, decision template, 11 skills.
+
+Next up:
 
 - Hooks pack: transcript backup, reflection dispatch
 - Session lifecycle automation (warming → hot → checkpoint transitions)
