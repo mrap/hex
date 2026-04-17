@@ -3,7 +3,7 @@ name: hex-debrief
 description: Debrief hex on what changed — projects, org signals, relationships, career. Run weekly or when hex prompts you.
 allowed-tools: ["Bash", "Read", "Write", "Edit"]
 ---
-# sync-safe
+<!-- # sync-safe -->
 
 # Weekly Context Sync
 
