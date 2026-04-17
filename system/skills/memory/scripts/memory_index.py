@@ -47,8 +47,6 @@ import re
 import time
 from pathlib import Path
 from datetime import datetime
-from urllib.request import Request, urlopen
-from urllib.error import URLError
 
 
 # --- Optional hybrid search deps ---
@@ -689,107 +687,6 @@ def run_index(full: bool = False):
     print(f"\nDone in {elapsed:.2f}s: {indexed} indexed, "
           f"{skipped_mtime} unchanged (mtime), {skipped_hash} unchanged (hash), "
           f"{removed} removed, {total_chunks} new chunks")
-
-
-# ---------------------------------------------------------------------------
-# Hindsight dual-write (optional — skipped if Hindsight is not reachable)
-# ---------------------------------------------------------------------------
-
-HINDSIGHT_URL = os.environ.get("HINDSIGHT_URL", "http://localhost:8888")
-HINDSIGHT_BANK = os.environ.get("HINDSIGHT_BANK", "hex-memory")
-
-BANK_MAP = {
-    "me/": "hex-memory",
-    "people/": "hex-memory",
-    "projects/": "hex-memory",
-    "evolution/": "hex-memory",
-    "landings/": "hex-memory",
-}
-
-# Paths excluded from Hindsight (raw input — too large, not structured knowledge)
-HINDSIGHT_SKIP_PREFIXES = [
-    "raw/",         # all raw input (transcripts, message dumps, calendar data)
-    ".hex/",        # scripts, hooks, skills — not knowledge
-]
-
-# Per-file size cap for Hindsight: skip files larger than this to avoid token bombs
-HINDSIGHT_MAX_BYTES = 50_000  # 50KB ≈ ~12k tokens
-
-
-def _infer_type(rel_path: str) -> str:
-    if rel_path.startswith("projects/"): return "project"
-    if rel_path.startswith("me/decisions/"): return "decision"
-    if rel_path.startswith("me/"): return "identity"
-    if rel_path.startswith("people/"): return "relationship"
-    if rel_path.startswith("raw/transcripts/"): return "transcript"
-    if rel_path.startswith("raw/"): return "raw"
-    if rel_path.startswith("evolution/"): return "evolution"
-    if rel_path.startswith("landings/"): return "landing"
-    return "general"
-
-
-def _hindsight_retain(rel_path: str, content: str) -> bool:
-    """Retain a single file to Hindsight. Returns True on success."""
-    url = f"{HINDSIGHT_URL}/v1/default/banks/{HINDSIGHT_BANK}/memories"
-    payload = json.dumps({
-        "items": [{
-            "content": content,
-            "context": _infer_type(rel_path),
-            "document_id": rel_path,
-        }],
-        "async": True,
-    }).encode("utf-8")
-    req = Request(url, data=payload, headers={"Content-Type": "application/json"})
-    try:
-        with urlopen(req, timeout=5) as resp:
-            return resp.status == 200
-    except (URLError, OSError):
-        return False
-
-
-def _hindsight_should_skip(rel_path: str, file_size: int) -> "str | None":
-    """Return skip reason string if file should be excluded from Hindsight, else None."""
-    for prefix in HINDSIGHT_SKIP_PREFIXES:
-        if rel_path.startswith(prefix):
-            return f"excluded path ({prefix})"
-    if file_size > HINDSIGHT_MAX_BYTES:
-        return f"too large ({file_size:,} bytes > {HINDSIGHT_MAX_BYTES:,} cap)"
-    return None
-
-
-def _hindsight_retain_batch(files: list, full: bool):
-    """Retain changed files to Hindsight (non-blocking best-effort)."""
-    # Quick health check
-    try:
-        req = Request(f"{HINDSIGHT_URL}/health")
-        with urlopen(req, timeout=2) as resp:
-            if resp.status != 200:
-                print("  Hindsight: not healthy, skipping retain")
-                return
-    except (URLError, OSError):
-        print("  Hindsight: not reachable, skipping retain")
-        return
-
-    retained = 0
-    failed = 0
-    skipped = 0
-    for filepath in files:
-        rel_path = str(filepath.relative_to(HEX_ROOT))
-        file_size = filepath.stat().st_size
-        skip_reason = _hindsight_should_skip(rel_path, file_size)
-        if skip_reason:
-            skipped += 1
-            continue
-        try:
-            content = filepath.read_text(encoding="utf-8", errors="replace")
-            if content.strip() and _hindsight_retain(rel_path, content):
-                retained += 1
-            else:
-                failed += 1
-        except Exception:
-            failed += 1
-
-    print(f"  Hindsight: {retained} retained, {failed} failed, {skipped} skipped")
 
 
 def show_stats():

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# sync-safe
 set -euo pipefail
 
 # hex install — Creates a hex instance on the user's machine.
@@ -106,6 +107,26 @@ if [ -d "$SCRIPT_DIR/system/commands" ]; then
     mkdir -p "$TARGET_DIR/.claude/commands"
     cp "$SCRIPT_DIR/system/commands/"*.md "$TARGET_DIR/.claude/commands/"
 fi
+
+# Symlink .agents/skills/ → .hex/skills/ so tools that look in .agents/ find the same skill set
+mkdir -p "$TARGET_DIR/.agents"
+ln -sfn ../.hex/skills "$TARGET_DIR/.agents/skills"
+
+# Seed optional configs doctor expects. Defaults are safe and overridable later.
+echo '{}' > "$TARGET_DIR/.hex/settings.json"
+if [ -L /etc/localtime ]; then
+    # /etc/localtime → /var/db/timezone/zoneinfo/America/Los_Angeles → America/Los_Angeles
+    readlink /etc/localtime 2>/dev/null | sed 's|.*zoneinfo/||' > "$TARGET_DIR/.hex/timezone"
+fi
+# If detection failed or produced empty, leave the file absent (doctor will warn but not error)
+if [ -f "$TARGET_DIR/.hex/timezone" ] && [ ! -s "$TARGET_DIR/.hex/timezone" ]; then
+    rm -f "$TARGET_DIR/.hex/timezone"
+fi
+
+# Initialize the instance as a git repo so decision logs, landings, and
+# me/ evolve with history. Quiet failure mode: skip if git init fails.
+( cd "$TARGET_DIR" && git init -q 2>/dev/null && git add -A 2>/dev/null && \
+    git -c user.email=hex@local -c user.name=hex commit -q -m "hex v${VERSION} initial install" 2>/dev/null ) || true
 
 echo "  Directory structure  ✓"
 
@@ -238,6 +259,11 @@ info = {
 with open(os.path.expanduser('~/.hex-install.json'), 'w') as f:
     json.dump(info, f, indent=2)
 "
+
+# Seed optional configs (llm-preference, codex config) via doctor's --fix path.
+# HEX_DIR must be set explicitly so doctor.sh doesn't auto-detect the caller's cwd.
+# Silent; any failure is non-fatal.
+HEX_DIR="$TARGET_DIR" bash "$TARGET_DIR/.hex/scripts/doctor.sh" --fix --quiet >/dev/null 2>&1 || true
 
 echo ""
 echo "========================================="

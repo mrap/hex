@@ -5,7 +5,7 @@ description: >
   files (todo.md, people profiles, project context, decisions, learnings).
   Runs automatically during /hex-startup or manually via /hex-triage.
 ---
-# sync-safe
+<!-- # sync-safe -->
 
 # /hex-triage — Triage Captured Context
 
