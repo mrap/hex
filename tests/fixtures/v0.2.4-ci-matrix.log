@@ -1,0 +1,168 @@
+=== hex-foundation v0.2.4 CI Matrix Log ===
+Date: 2026-04-17T19:33:25Z
+
+=== test_skill_frontmatter.sh ===
+  OK    hex-checkpoint/SKILL.md
+  OK    hex-consolidate/SKILL.md
+  OK    hex-debrief/SKILL.md
+  OK    hex-decide/SKILL.md
+  OK    hex-doctor/SKILL.md
+  OK    hex-reflect/SKILL.md
+  OK    hex-shutdown/SKILL.md
+  OK    hex-startup/SKILL.md
+  OK    hex-triage/SKILL.md
+  WARN  landings/SKILL.md: 'name' ('daily-landings') does not match directory name ('landings')
+  OK    landings/SKILL.md
+  WARN  memory/SKILL.md: file not present (skipping frontmatter check)
+
+Checked: 10 SKILL.md files  |  Errors: 0  |  Warnings: 2
+PASS: frontmatter validation succeeded
+
+=== test_skill_refs.sh ===
+Installing hex to /tmp/hex-skillref-test-55741 for reference audit...
+Install complete. Auditing path references...
+
+  OK    hex-checkpoint: me/decisions/
+  OK    hex-checkpoint: todo.md
+  OK    hex-checkpoint: evolution/observations.md
+  OK    hex-checkpoint: .hex/scripts/session-reflect.sh
+  OK    hex-consolidate: CLAUDE.md
+  OK    hex-consolidate: me/learnings.md
+  OK    hex-consolidate: evolution/observations.md
+  OK    hex-consolidate: evolution/suggestions.md
+  OK    hex-consolidate: evolution/changelog.md
+  OK    hex-consolidate: todo.md
+  OK    hex-debrief: todo.md
+  OK    hex-debrief: me/learnings.md
+  OK    hex-debrief: me/decisions/
+  OK    hex-debrief: landings/weekly/
+  OK    hex-debrief: .hex/skills/memory/scripts/memory_index.py
+  OK    hex-decide: projects/
+  OK    hex-decide: .hex/skills/memory/scripts/memory_search.py
+  OK    hex-doctor: .hex/scripts/doctor.sh
+  OK    hex-doctor: .agents/skills/
+  WARN  hex-doctor: .hex/migrate-from  [not found — may be runtime-created]
+  OK    hex-doctor: me/
+  OK    hex-doctor: raw/
+  OK    hex-doctor: evolution/
+  OK    hex-doctor: landings/
+  OK    hex-doctor: todo.md
+  OK    hex-doctor: .hex/memory.db
+  WARN  hex-doctor: .hex/settings.local.json  [not found — may be runtime-created]
+  OK    hex-doctor: .hex/
+  OK    hex-doctor: .hex/skills/
+  OK    hex-doctor: CLAUDE.md
+  OK    hex-doctor: AGENTS.md
+  OK    hex-doctor: me/me.md
+  OK    hex-doctor: .hex/scripts/
+  OK    hex-doctor: .hex/llm-preference
+  OK    hex-doctor: .hex/skills/memory/scripts/memory_index.py
+  WARN  hex-reflect: evolution/reflection-log.md  [not found — may be runtime-created]
+  OK    hex-reflect: CLAUDE.md
+  OK    hex-reflect: me/learnings.md
+  OK    hex-reflect: evolution/observations.md
+  OK    hex-reflect: evolution/changelog.md
+  OK    hex-reflect: evolution/suggestions.md
+  OK    hex-reflect: raw/transcripts/
+  OK    hex-reflect: .hex/scripts/session-reflect.sh
+  WARN  hex-reflect: evolution/reflect-config.yaml  [not found — may be runtime-created]
+  OK    hex-reflect: evolution/eval/session-delta.py
+  OK    hex-reflect: .hex/memory.db
+  OK    hex-reflect: .hex/skills/memory/scripts/memory_index.py
+  OK    hex-shutdown: .hex/scripts/session.sh
+  WARN  hex-startup: .hex/migrate-from  [not found — may be runtime-created]
+  OK    hex-startup: me/me.md
+  OK    hex-startup: todo.md
+  OK    hex-startup: me/learnings.md
+  OK    hex-startup: landings/
+  OK    hex-startup: evolution/suggestions.md
+  WARN  hex-startup: evolution/reflection-log.md  [not found — may be runtime-created]
+  WARN  hex-triage: raw/captures/  [not found — may be runtime-created]
+  OK    hex-triage: todo.md
+  OK    hex-triage: me/learnings.md
+  WARN  hex-triage: me/ideas.md  [not found — may be runtime-created]
+  OK    hex-triage: projects/
+  OK    hex-triage: people/
+  OK    landings: todo.md
+  WARN  landings: raw/calendar/  [not found — may be runtime-created]
+  WARN  landings: raw/messages/  [not found — may be runtime-created]
+  OK    landings: me/me.md
+
+Checked: 10 SKILL.md files  |  Errors: 0  |  Warnings: 10
+
+Missing optional paths (runtime-created or optional):
+  hex-doctor: .hex/migrate-from
+  hex-doctor: .hex/settings.local.json
+  hex-reflect: evolution/reflection-log.md
+  hex-reflect: evolution/reflect-config.yaml
+  hex-startup: .hex/migrate-from
+  hex-startup: evolution/reflection-log.md
+  hex-triage: raw/captures/
+  hex-triage: me/ideas.md
+  landings: raw/calendar/
+  landings: raw/messages/
+PASS: skill reference audit succeeded
+
+=== test_skill_discovery_codex.sh ===
+=== hex skill discovery test (Codex) ===
+
+NOTE: Codex reads AGENTS.md + .hex/skills/ directly; it does not use
+      Claude Code slash commands. Discovery is verified structurally
+      (disk) and via live Codex reasoning (when key + CLI available).
+
+[1] Fresh install
+  PASS: install succeeded
+
+[2] Skill directories on disk (structural)
+  PASS: skill dir present: landings
+  PASS: skill dir present: hex-reflect
+  PASS: skill dir present: hex-decide
+  PASS: skill dir present: hex-debrief
+  PASS: skill dir present: hex-consolidate
+  PASS: skill dir present: hex-doctor
+  PASS: skill dir present: hex-checkpoint
+  PASS: skill dir present: hex-shutdown
+  PASS: skill dir present: hex-triage
+  PASS: skill dir present: hex-startup
+  PASS: skill dir present: memory
+
+[3] AGENTS.md (Codex entry point)
+  PASS: AGENTS.md present and non-empty
+
+[4] .codex/config.toml
+  PASS: .codex/config.toml present
+  PASS: config uses codex-mini-latest model
+
+[5] Codex live skill discovery
+  SKIP: OPENAI_API_KEY not set — skipping live discovery
+        Set OPENAI_API_KEY or add to ~/.hex-test.env to enable.
+
+[6] Codex skill-equivalent invocation (3 skills)
+  SKIP: OPENAI_API_KEY not set — skipping invocation tests
+
+Results: 15/17 passed, 0 failed, 2 skipped
+
+Note: live Codex session skipped (key or CLI unavailable).
+      Structural checks (sections 1-4) validate install shape.
+      Codex skill model: procedures via AGENTS.md, not slash commands.
+      See docs/codex-integration.md for Codex support scope.
+
+PASS: skill-discovery-codex
+
+=== test_skill_discovery.sh (already run, exit 0) ===
+Results: 32/32 passed, 0 failed
+PASS: skill-discovery
+
+=== tests/migrate/test-migrate.sh ===
+  [[32mPASS[0m] rollback: dir exists: /tmp/hex-migrate-test.3Loqog/v1-minimal-rollback/.claude/scripts
+  [[32mPASS[0m] rollback: dir correctly absent: /tmp/hex-migrate-test.3Loqog/v1-minimal-rollback/.hex/scripts
+
+[1mSummary:[0m 48 passed, 0 failed
+[32mALL PASS[0m
+
+=== eval --dry-run ===
+
+16 case(s) validated, ready for live run.
+
+To run live:
+  python3 /private/tmp/hex-foundation-v024-wt/tests/eval/run_eval.py --live

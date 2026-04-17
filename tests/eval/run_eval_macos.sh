@@ -22,6 +22,17 @@ SSH_USER="admin"
 SSH_PASS="admin"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no"
 
+# ── Dry-run mode: run locally, no VM required ──────────────────────
+# Usage:  bash run_eval_macos.sh            (dry-run, no VM)
+#         bash run_eval_macos.sh --live     (live run inside Tart VM)
+#         bash run_eval_macos.sh --live --case skill-discovery
+if [ "$MODE" = "--dry-run" ]; then
+    echo "=== hex eval (macOS) — local dry-run ==="
+    echo ""
+    python3 "$SCRIPT_DIR/run_eval.py" --dry-run $EXTRA_ARGS
+    exit $?
+fi
+
 cleanup() {
     echo ""
     echo "Cleaning up VM: $VM_NAME"

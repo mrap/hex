@@ -1,0 +1,8 @@
+name: skill-discovery
+description: Verifies Claude Code discovers all 11 hex skills and invokes 3 smoke-test skills
+agent: shell
+script: tests/test_skill_discovery.sh
+response_checks:
+  - name: discovery_pass
+    pattern: "PASS: skill-discovery"
+    description: Claude Code skill discovery script should output PASS

@@ -277,14 +277,28 @@ def run_codex(prompt: str, hex_dir: Path, timeout: int) -> tuple[str, str]:
     return result.stdout, result.stderr
 
 
+def run_shell_script(script_path: Path, timeout: int) -> tuple[str, str]:
+    """Run a shell script from REPO_ROOT. Returns (stdout, stderr)."""
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=str(REPO_ROOT),
+    )
+    return result.stdout, result.stderr
+
+
 # ── YAML loader ────────────────────────────────────────────────────────────────
 
 def load_case(path: Path) -> dict:
     with open(path) as f:
         data = yaml.safe_load(f)
 
-    # Validate required fields
-    required = ["name", "description", "prompt"]
+    # Validate required fields (prompt is optional for shell agent cases)
+    required = ["name", "description"]
+    if data.get("agent", "claude") != "shell":
+        required.append("prompt")
     for field_name in required:
         if field_name not in data:
             raise ValueError(f"Case {path.name} missing required field: {field_name!r}")
@@ -293,6 +307,7 @@ def load_case(path: Path) -> dict:
     data.setdefault("agent", "claude")
     data.setdefault("setup", "fresh_install")
     data.setdefault("seed_data", {})
+    data.setdefault("prompt", "")
     data.setdefault("response_checks", [])
     data.setdefault("file_checks", [])
 
@@ -349,6 +364,14 @@ def dry_run(cases: list[dict]) -> int:
     for case in cases:
         name = case["name"]
         try:
+            # Validate shell agent cases
+            if case.get("agent") == "shell":
+                if "script" not in case:
+                    raise ValueError("shell agent case missing 'script' field")
+                script_path = REPO_ROOT / case["script"]
+                if not script_path.exists():
+                    raise ValueError(f"shell script not found: {script_path}")
+
             # Validate response_checks
             for rc in case["response_checks"]:
                 if "name" not in rc:
@@ -365,7 +388,7 @@ def dry_run(cases: list[dict]) -> int:
                 if check_type not in valid_checks:
                     raise ValueError(f"invalid check type: {check_type!r}")
 
-            print(f"  {name}: valid  ✓")
+            print(f"  {name} PASS (validated)")
         except Exception as e:
             print(f"  {name}: INVALID — {e}")
             errors.append(name)
@@ -448,7 +471,54 @@ def live_run(cases: list[dict], model: str, timeout: int, verbose: bool = False)
             agent = case.get("agent", "claude")
             print(f"[{i}/{len(cases)}] {name} [{agent}] — {case['description']}")
 
-            # Setup
+            # Shell agent cases run scripts directly — no hex install needed
+            if agent == "shell":
+                script_rel = case.get("script", "")
+                script_path = REPO_ROOT / script_rel
+                try:
+                    stdout, stderr = run_shell_script(script_path, timeout)
+                    response_text = (stdout + stderr).strip()
+                except subprocess.TimeoutExpired:
+                    result = CaseResult(
+                        case_name=name,
+                        prompt="",
+                        response_text="",
+                        error=f"Timed out after {timeout}s",
+                    )
+                    results.append(result)
+                    print(f"  ERROR (timeout): exceeded {timeout}s")
+                    continue
+                except Exception as e:
+                    result = CaseResult(
+                        case_name=name,
+                        prompt="",
+                        response_text="",
+                        error=str(e),
+                    )
+                    results.append(result)
+                    print(f"  ERROR (shell): {e}")
+                    continue
+
+                response_results = run_response_checks(response_text, case["response_checks"])
+                result = CaseResult(
+                    case_name=name,
+                    prompt="",
+                    response_text=response_text,
+                    checks=response_results,
+                )
+                results.append(result)
+                for cr in response_results:
+                    status = "PASS" if cr.passed else "FAIL"
+                    print(f"  [{status}] {cr.name}")
+                    if not cr.passed:
+                        for line in cr.evidence.splitlines():
+                            print(f"         {line}")
+                overall = "PASS" if result.passed else "FAIL"
+                print(f"  => {overall} ({result.check_summary} checks passed)")
+                print()
+                continue
+
+            # Setup hex install for Claude/Codex cases
             try:
                 hex_dir = setup_hex(case["setup"], case.get("seed_data", {}), tmp_path)
             except Exception as e:

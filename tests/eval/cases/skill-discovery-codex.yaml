@@ -1,0 +1,8 @@
+name: skill-discovery-codex
+description: Verifies Codex skill discovery (structural checks always run; live skipped without OPENAI_API_KEY)
+agent: shell
+script: tests/test_skill_discovery_codex.sh
+response_checks:
+  - name: codex_discovery_pass
+    pattern: "PASS: skill-discovery-codex"
+    description: Codex skill discovery script should output PASS

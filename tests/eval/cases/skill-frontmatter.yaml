@@ -1,0 +1,8 @@
+name: skill-frontmatter
+description: Validates YAML frontmatter in all system/skills/*/SKILL.md files (static, no LLM)
+agent: shell
+script: tests/test_skill_frontmatter.sh
+response_checks:
+  - name: frontmatter_pass
+    pattern: "PASS: frontmatter"
+    description: Frontmatter validation script should output PASS

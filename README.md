@@ -169,7 +169,40 @@ hex-foundation/
 
 ---
 
+## Testing
+
+The test suite verifies installation, migration, skill discovery, and Codex parity. See [`docs/testing.md`](./docs/testing.md) for the full matrix and how to run locally.
+
+Key test files:
+
+| Test | What it verifies |
+|------|-----------------|
+| `tests/test_skill_frontmatter.sh` | Every SKILL.md has valid YAML frontmatter (name + description) |
+| `tests/test_skill_refs.sh` | All paths referenced inside SKILL.md resolve after a fresh install |
+| `tests/test_skill_discovery.sh` | Claude Code discovers all 11 shipped skills and invokes at least 3 |
+| `tests/test_skill_discovery_codex.sh` | Codex equivalent of skill discovery test |
+| `tests/test_e2e.sh` | Full install + doctor + upgrade lifecycle |
+| `tests/migrate/test-migrate.sh` | v1 → v2 migration correctness |
+
+To run the full suite locally:
+
+```bash
+# Static tests (no API key needed)
+bash tests/test_skill_frontmatter.sh
+bash tests/test_skill_refs.sh
+
+# Live tests (requires ~/.hex-test.env with ANTHROPIC_API_KEY)
+bash tests/eval/run_eval_docker.sh --live    # Linux Docker
+bash tests/eval/run_eval_macos.sh            # macOS Tart
+```
+
+---
+
 ## Roadmap
+
+v0.2.4 adds: Containerized skill discovery tests — static frontmatter validation, internal reference audit, Claude Code skill discovery (all 11 skills), Codex parity test. Both Docker and macOS Tart eval harnesses wired up.
+
+v0.2.3 adds: Codex bake in Docker image + Codex onboarding eval case.
 
 v0.2.2 adds: `bootstrap-migrate.sh` one-liner for v1 → v2 layout migration, generic migrator with rollback + idempotency, synthetic v1 fixtures + test suite.
 

@@ -97,6 +97,10 @@ cp "$SCRIPT_DIR/templates/observations.md"  "$TARGET_DIR/evolution/observations.
 cp "$SCRIPT_DIR/templates/suggestions.md"   "$TARGET_DIR/evolution/suggestions.md"
 cp "$SCRIPT_DIR/templates/changelog.md"     "$TARGET_DIR/evolution/changelog.md"
 
+# Copy evolution/eval scripts
+mkdir -p "$TARGET_DIR/evolution/eval"
+cp "$SCRIPT_DIR/templates/eval/session-delta.py" "$TARGET_DIR/evolution/eval/session-delta.py"
+
 # Copy tests
 if [ -d "$SCRIPT_DIR/tests" ]; then
     cp -r "$SCRIPT_DIR/tests" "$TARGET_DIR/tests"

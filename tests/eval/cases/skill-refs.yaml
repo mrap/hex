@@ -1,0 +1,8 @@
+name: skill-refs
+description: Audits path references in all SKILL.md files against a fresh install (static, no LLM)
+agent: shell
+script: tests/test_skill_refs.sh
+response_checks:
+  - name: refs_pass
+    pattern: "PASS: skill reference"
+    description: Reference audit script should output PASS
