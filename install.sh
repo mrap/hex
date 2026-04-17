@@ -62,8 +62,8 @@ fi
 
 if [ -d "$TARGET_DIR" ]; then
     echo "ERROR: $TARGET_DIR already exists."
-    echo "  To upgrade: hex upgrade"
-    echo "  To reinstall: rm -rf $TARGET_DIR && bash install.sh"
+    echo "  To upgrade:   bash \"$TARGET_DIR/.hex/scripts/upgrade.sh\""
+    echo "  To reinstall: rm -rf \"$TARGET_DIR\" && bash install.sh"
     exit 1
 fi
 
