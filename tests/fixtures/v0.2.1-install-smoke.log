@@ -1,0 +1,129 @@
+=== v0.2.1 fresh-install smoke test ===
+Date: Fri Apr 17 01:15:31 EDT 2026
+Install dir: /tmp/hex-v021-smoke5-1776402917
+
+=== Step 1: install.sh ===
+hex v0.2.1 installer
+========================
+
+Checking prerequisites...
+  Python 3.14  ✓
+  git               ✓
+
+Creating hex instance at /tmp/hex-v021-smoke5-1776402917-log...
+  Directory structure  ✓
+Initializing memory database...
+  Memory database     ✓
+  Standing orders     ✓
+Installing companions...
+  ⚠️  Memory hybrid deps skipped — memory will use FTS5-only mode
+  BOI already installed  ✓
+  hex-events already installed  ✓
+
+=========================================
+ hex installed at /tmp/hex-v021-smoke5-1776402917-log
+=========================================
+
+Start your first session:
+  cd /tmp/hex-v021-smoke5-1776402917-log && claude
+
+Your agent will walk you through setup.
+Install exit: 0
+
+=== Step 2: startup.sh ===
+
+============================================================
+ Hex Startup — 2026-04-17 01:15
+============================================================
+
+[1m1. Environment Detection[0m
+  [[32mPASS[0m] macOS
+  [2m→[0m HEX_DIR=/tmp/hex-v021-smoke5-1776402917
+
+[1m2. Session Management[0m
+  [2m→[0m session.sh not found — multi-session tracking unavailable
+  [2m→[0m Install session.sh to /tmp/hex-v021-smoke5-1776402917/.hex/scripts/ to enable this feature
+
+[1m3. Parse Transcripts[0m
+  [2m→[0m parse_transcripts.py not found — transcript parsing unavailable
+  [2m→[0m Install parse_transcripts.py to /tmp/hex-v021-smoke5-1776402917/.hex/scripts/ to enable this feature
+
+[1m4. Memory Index[0m
+  [2m→[0m Done in 3.21s: 8 indexed, 0 unchanged (mtime), 0 unchanged (hash), 0 removed, 98 new chunks
+  [[32mPASS[0m] Memory index rebuilt
+
+[1m5. Memory Health[0m
+  [2m→[0m memory_health.py not found (optional)
+
+[1m6. Integrations[0m
+  [2m→[0m No integrations configured. The agent works without them.
+  [2m→[0m Create integrations.json to connect external tools (calendar, messaging, etc.)
+
+[1m7. Improvement Engine[0m
+  [[32mPASS[0m] No pending suggestions
+
+[1m8. Priority Scoring[0m
+  [2m→[0m priority-score.py not found (optional)
+
+[1m9. Daemon Status[0m
+  [2m→[0m hex-daemons.sh not found — install hex-daemons to enable daemon management
+  [2m→[0m Start daemons manually or run: hex-daemons setup
+
+[1m10. hex-events Telemetry[0m
+  [2m→[0m hex-events not installed (optional companion)
+  [2m→[0m Install hex-events to enable reactive automation policies
+
+────────────────────────────────────────────────────────────
+  [32mStartup complete. All checks passed.[0m
+Startup exit: 0
+
+=== Step 3: doctor.sh --quiet ===
+
+[1mHex Doctor — Health Check[0m
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[2mHEX_DIR=/tmp/hex-v021-smoke5-1776402917[0m
+
+
+  [1mSummary:[0m 19 passed, 0 warnings, 0 errors, 0 fixed
+
+Doctor exit: 0
+
+=== Step 4: upgrade.sh --dry-run ===
+
+[1m2. Core Components[0m
+  [2m→[0m Python 3.14
+  [2m→[0m Updating hex-events at /Users/mrap/github.com/mrap/hex-events (snapshot: 3794aea9)
+Already up to date.
+  [2m→[0m [dry-run] Would re-run hex-events install.sh
+  [2m→[0m Updating BOI
+  [2m→[0m [dry-run] Would re-run BOI install-public.sh --update
+
+[1m3. Detect Changes[0m
+  [2m→[0m 5 changed, 0 new, 25 unchanged
+  ~ skills/memory/scripts/memory_index.py
+  ~ skills/hex-startup/SKILL.md
+  ~ skills/hex-triage/SKILL.md
+  ~ skills/hex-checkpoint/SKILL.md
+  ~ skills/hex-shutdown/SKILL.md
+
+
+[1m4. Dry Run Complete[0m
+  [2m→[0m Run without --dry-run to apply changes.
+Upgrade exit: 0
+
+=== Step 5: memory_index.py ===
+Found 8 files to check
+
+Done in 0.00s: 0 indexed, 8 unchanged (mtime), 0 unchanged (hash), 0 removed, 0 new chunks
+Index exit: 0
+
+=== Step 6: memory_search.py ===
+    | P1 | **Product judgment before engineering.** Define minimum viable engagement loop, test with 1 user first. Simplest thing that works. |
+    | P2 | **3 features max for context-constrained apps.** Ruthless feature caps for event/party apps. |
+    | P3 | **Seed less, guide more.** Empty canvas + clear prompt. Pre-loading content removes the reason to contribute. |
+    | P4 | **Launch early for onboarding.** Onboarding window is before distraction, not...
+
+Search exit: 0
+
+=== Step 7: decision-template.md ===
+PRESENT

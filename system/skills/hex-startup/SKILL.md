@@ -4,7 +4,7 @@ description: >
   Full session initialization. First-time users get onboarding.
   Returning users get context loading, action items, and daily landings.
 ---
-# sync-safe
+<!-- # sync-safe -->
 
 # /hex-startup — Start Your Session
 

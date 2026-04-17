@@ -4,7 +4,7 @@ description: >
   Fire-and-forget session close. Quick distill pass, deregister session, done.
   Reflection and memory indexing run in the background via Stop hooks.
 ---
-# sync-safe
+<!-- # sync-safe -->
 
 # /hex-shutdown — Close Session
 
