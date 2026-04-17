@@ -1,0 +1,11 @@
+# Pinned companion versions.
+# install.sh reads this file and clones the corresponding tags.
+#
+# To override the source repo (e.g. for forks), set these env vars before install:
+#   HEX_BOI_REPO=https://github.com/youruser/boi.git
+#   HEX_EVENTS_REPO=https://github.com/youruser/hex-events.git
+#
+# To bump: tag new releases in boi/hex-events, then update these values.
+
+BOI_VERSION=v0.1.0
+HEX_EVENTS_VERSION=v0.1.0

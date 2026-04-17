@@ -180,14 +180,27 @@ echo "  Standing orders     ✓"
 
 echo "Installing companions..."
 
+# Read pinned versions from VERSIONS file (keeps install.sh in lock-step with
+# tested boi/hex-events releases). Fork-friendly: HEX_BOI_REPO and
+# HEX_EVENTS_REPO env vars override the default source.
+VERSIONS_FILE="$SCRIPT_DIR/VERSIONS"
+if [ ! -f "$VERSIONS_FILE" ]; then
+    echo "ERROR: $VERSIONS_FILE not found — this hex-foundation checkout is incomplete."
+    exit 1
+fi
+BOI_VERSION=$(grep "^BOI_VERSION=" "$VERSIONS_FILE" | cut -d= -f2)
+HEX_EVENTS_VERSION=$(grep "^HEX_EVENTS_VERSION=" "$VERSIONS_FILE" | cut -d= -f2)
+BOI_REPO="${HEX_BOI_REPO:-https://github.com/mrap/boi.git}"
+HEX_EVENTS_REPO="${HEX_EVENTS_REPO:-https://github.com/mrap/hex-events.git}"
+
 # BOI — parallel worker dispatch
 if [ -d "$HOME/.boi" ]; then
     echo "  BOI already installed  ✓"
 else
-    if git clone --depth 1 https://github.com/mrap/boi.git "$HOME/.boi" 2>/dev/null; then
-        echo "  BOI installed  ✓"
+    if git clone --depth 1 --branch "$BOI_VERSION" "$BOI_REPO" "$HOME/.boi" 2>/dev/null; then
+        echo "  BOI installed ($BOI_VERSION)  ✓"
     else
-        echo "  BOI: repo not yet available (will install on next upgrade)"
+        echo "  BOI: failed to clone $BOI_REPO @ $BOI_VERSION (will install on next upgrade)"
     fi
 fi
 
@@ -195,10 +208,10 @@ fi
 if [ -d "$HOME/.hex-events" ]; then
     echo "  hex-events already installed  ✓"
 else
-    if git clone --depth 1 https://github.com/mrap/hex-events.git "$HOME/.hex-events" 2>/dev/null; then
-        echo "  hex-events installed  ✓"
+    if git clone --depth 1 --branch "$HEX_EVENTS_VERSION" "$HEX_EVENTS_REPO" "$HOME/.hex-events" 2>/dev/null; then
+        echo "  hex-events installed ($HEX_EVENTS_VERSION)  ✓"
     else
-        echo "  hex-events: repo not yet available (will install on next upgrade)"
+        echo "  hex-events: failed to clone $HEX_EVENTS_REPO @ $HEX_EVENTS_VERSION (will install on next upgrade)"
     fi
 fi
 
