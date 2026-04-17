@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build hex-eval-vm — a Tart macOS VM image with Claude Code, Node, Python,
-# and pyyaml baked in. run_eval_macos.sh clones this image per run so the
-# live eval can run hermetically without re-installing deps each time.
+# Build hex-eval-vm — a Tart macOS VM image with Claude Code, Codex CLI, Node,
+# Python, and pyyaml baked in. run_eval_macos.sh clones this image per run so
+# the live eval can run hermetically without re-installing deps each time.
 #
 # Idempotent: if hex-eval-vm already exists, this script refuses to overwrite.
 # To rebuild, run: tart delete hex-eval-vm && bash tests/eval/build_tart_image.sh
 #
 # Prerequisites:
 #   brew install cirruslabs/cli/tart sshpass
+#   Node 18+ (installed inside VM via brew — required for Codex CLI)
+#   Codex CLI (@openai/codex npm package — installed inside VM)
+#
+# Auth at runtime:
+#   ANTHROPIC_API_KEY — for Claude Code eval cases
+#   OPENAI_API_KEY    — for Codex eval cases (passed by run_eval_macos.sh)
 #
 # Usage:
 #   bash tests/eval/build_tart_image.sh
@@ -48,10 +54,10 @@ else
     SRC="$BASE_OCI"
 fi
 
-echo "[1/6] Cloning $SRC -> $TARGET..."
+echo "[1/7] Cloning $SRC -> $TARGET..."
 tart clone "$SRC" "$TARGET"
 
-echo "[2/6] Booting $TARGET..."
+echo "[2/7] Booting $TARGET..."
 tart run --no-graphics "$TARGET" &
 TART_PID=$!
 
@@ -82,21 +88,24 @@ vm_run() {
 
 echo "  VM IP: $VM_IP"
 
-echo "[3/6] Installing Node.js via brew..."
+echo "[3/7] Installing Node.js via brew..."
 vm_run "export PATH=/opt/homebrew/bin:\$PATH && brew install node 2>&1 | tail -2"
 
-echo "[4/6] Installing Claude Code + pyyaml..."
+echo "[4/7] Installing Claude Code + pyyaml..."
 vm_run "export PATH=/opt/homebrew/bin:\$PATH && npm install -g @anthropic-ai/claude-code 2>&1 | tail -2 && /opt/homebrew/bin/pip3 install --break-system-packages pyyaml 2>&1 | tail -2"
 
-echo "[5/6] Configuring PATH for non-login shells..."
+echo "[5/7] Installing Codex CLI (idempotent)..."
+vm_run "export PATH=/opt/homebrew/bin:\$PATH && if ! command -v codex &>/dev/null; then npm install -g @openai/codex@0.121.0 2>&1 | tail -2; else echo 'codex already installed'; fi"
+
+echo "[6/7] Configuring PATH for non-login shells..."
 vm_run "sudo -n tee /etc/zshenv > /dev/null <<'EOF'
-# hex-eval-vm: brew/claude/node must be on PATH for non-login SSH shells
+# hex-eval-vm: brew/claude/codex/node must be on PATH for non-login SSH shells
 export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\"
 EOF"
 
-echo "[6/6] Verifying..."
-vm_run "claude --version 2>&1 && node --version && python3 --version && python3 -c 'import yaml; print(\"pyyaml\", yaml.__version__)'"
+echo "[7/7] Verifying..."
+vm_run "claude --version 2>&1 && codex --version 2>&1 && node --version && python3 --version && python3 -c 'import yaml; print(\"pyyaml\", yaml.__version__)'"
 
 echo ""
-echo "Image baked: $TARGET"
+echo "Image baked: $TARGET (Claude Code + Codex CLI)"
 echo "Next: bash tests/eval/run_eval_macos.sh --live"
