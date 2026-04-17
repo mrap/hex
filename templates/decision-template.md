@@ -1,5 +1,4 @@
-# sync-safe
-
+<!-- # sync-safe -->
 # Decision Record Template
 
 Copy this file into your hex instance at `me/decisions/{slug}-YYYY-MM-DD.md` (or
