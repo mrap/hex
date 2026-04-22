@@ -178,7 +178,7 @@ rules:
           HEX_DIR=$HEX_DIR
           $HEX_DIR/.hex/bin/hex-agent wake <agent-id>
           --trigger timer.tick.1h
-          --payload '{{ event.payload | tojson }}'
+          --payload '{{ event | tojson }}'
 ```
 
 ### Step 4: Verify
