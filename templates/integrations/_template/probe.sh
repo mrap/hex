@@ -4,7 +4,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HEX_ROOT="${HEX_ROOT:-/Users/mrap/mrap-hex}"
+# HEX_ROOT auto-derives from bundle location: integrations/<name>/probe.sh → instance root is ../../
+HEX_ROOT="${HEX_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SECRETS_FILE="$HEX_ROOT/.hex/secrets/REPLACE_ME.env"
 
 # ─── Load secrets ─────────────────────────────────────────────────────────────

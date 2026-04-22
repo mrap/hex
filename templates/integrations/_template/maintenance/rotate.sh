@@ -2,10 +2,11 @@
 # maintenance/rotate.sh — REPLACE_ME key/secret rotation skeleton
 set -uo pipefail
 
-HEX_ROOT="${HEX_ROOT:-/Users/mrap/mrap-hex}"
+BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# HEX_ROOT auto-derives from bundle location: integrations/<name>/maintenance/rotate.sh → instance root is ../../../
+HEX_ROOT="${HEX_ROOT:-$(cd "${BUNDLE_DIR}/.." && pwd)}"
 SECRETS_DIR="$HEX_ROOT/.hex/secrets"
 ENV_FILE="$SECRETS_DIR/REPLACE_ME.env"
-BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "[REPLACE_ME/rotate] TODO: implement rotation logic"
 

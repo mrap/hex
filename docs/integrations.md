@@ -80,4 +80,4 @@ When migrating a live refresh policy (Slack bot token, X OAuth2) into a bundle:
 
 - Harness: `system/scripts/hex-integration-check.sh` — single-probe runner with atomic state + locks + transition events.
 - Template: `templates/integrations/_template/` — copy for every new integration.
-- Reference instance: `mrap-hex` repo, `projects/integrations/modular-integration-architecture.md` — the design doc that led to this version.
+- Reference instance: the hex instance that develops the foundation. If you maintain a private hex instance alongside this foundation repo, its `projects/integrations/modular-integration-architecture.md` contains the design doc that led to this version.

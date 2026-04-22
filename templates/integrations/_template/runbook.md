@@ -54,7 +54,7 @@ hex-integration probe REPLACE_ME
 ## Last Known Good
 
 ```bash
-cat /Users/mrap/mrap-hex/projects/integrations/_state/REPLACE_ME.json
+cat "$HEX_ROOT/projects/integrations/_state/REPLACE_ME.json"
 ```
 
 ---
