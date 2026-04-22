@@ -1,0 +1,58 @@
+# ─── Identity ────────────────────────────────────────────────────────────────
+name: REPLACE_ME
+description: One-line description of this integration
+owner: mike
+tier: standard           # critical | standard | slow
+version: "1.0"
+
+# ─── Dependency graph ────────────────────────────────────────────────────────
+depends_on: []           # e.g. [slack-bot] if this integration needs slack-bot healthy
+provides:
+  - hex.integration.REPLACE_ME.probe_ok
+  - hex.integration.REPLACE_ME.probe_fail
+
+# ─── Probe ───────────────────────────────────────────────────────────────────
+probe:
+  script: probe.sh
+  timeout_seconds: 10
+
+# ─── Secrets schema ──────────────────────────────────────────────────────────
+# Actual values live in .hex/secrets/<name>.env (never committed).
+# Remove this section if the integration has no secrets.
+secrets:
+  required:
+    - name: REPLACE_ME_API_KEY
+      description: API key from provider dashboard
+      type: string
+  optional: []
+  expiry:
+    strategy: manual_rotation   # manual_rotation | oauth2_refresh | none
+    max_age_days: 365
+    warn_days_before: 30
+
+# ─── Maintenance ─────────────────────────────────────────────────────────────
+# Remove this section if the integration has no recurring maintenance.
+maintenance:
+  - type: key_rotation             # token_refresh | key_rotation | secret_sync | cache_warm
+    script: maintenance/rotate.sh
+    schedule: "0 0 * * 1"         # cron expression
+    auto: false
+    notify_on_failure: "#integrations"
+    timeout_seconds: 60
+
+# ─── hex-events policy templates ─────────────────────────────────────────────
+# Remove this section if the integration has no hex-events policies.
+events: []
+# events:
+#   - source: events/my-policy.yaml
+
+# ─── Runtime dependencies ────────────────────────────────────────────────────
+# Declare non-stdlib packages required by probe.sh or lib/ scripts.
+# Remove this section if no extra packages are needed.
+# dependencies:
+#   python_packages:
+#     - cryptography>=41.0    # example: pip install cryptography
+
+# ─── Testing ─────────────────────────────────────────────────────────────────
+tests:
+  entry: tests/run.sh

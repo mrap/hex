@@ -200,6 +200,8 @@ bash tests/eval/run_eval_macos.sh            # macOS Tart
 
 ## Roadmap
 
+v0.3.0 adds: **Modular integration bundles + `hex-integration` CLI.** Every external surface (API, MCP, system service, refresh flow) lives in one directory under `integrations/<name>/` — manifest, probe, runbook, secrets schema, maintenance scripts, event policies, tests. `hex-integration install/uninstall/update/list/validate/status/probe/rotate` manages the lifecycle. Compile-step policy coupling: bundle event YAMLs compile into `~/.hex-events/policies/<name>-<stem>.yaml` with `# generated_from:` audit headers. See `docs/integrations.md` and `templates/integrations/_template/`.
+
 v0.2.4 adds: Containerized skill discovery tests — static frontmatter validation, internal reference audit, Claude Code skill discovery (all 11 skills), Codex parity test. Both Docker and macOS Tart eval harnesses wired up.
 
 v0.2.3 adds: Codex bake in Docker image + Codex onboarding eval case.

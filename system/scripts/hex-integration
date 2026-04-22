@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# hex-integration — integration bundle lifecycle manager
+# Usage: hex-integration [--json|--dry-run|--no-telemetry|--quiet] <command> [args...]
+# Commands: install, uninstall, update, list, validate, status, probe, rotate
+
+set -uo pipefail
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+readonly HEX_ROOT="/Users/mrap/mrap-hex"
+readonly HEX_SECRETS="${HEX_ROOT}/.hex/secrets"
+readonly HEX_STATE="${HEX_ROOT}/projects/integrations/_state"
+readonly HEX_BUNDLES="${HEX_ROOT}/integrations"
+readonly HEX_EVENTS_POLICIES="${HOME}/.hex-events/policies"
+readonly HEX_LIB="${HEX_ROOT}/.hex/lib"
+export HEX_ROOT HEX_SECRETS HEX_STATE HEX_BUNDLES HEX_EVENTS_POLICIES HEX_LIB
+
+# ─── Logging helpers ─────────────────────────────────────────────────────────
+log_info() { [[ "${FLAG_QUIET}" == "true" ]] || echo "[INFO] $*" >&2; }
+log_warn() { echo "[WARN] $*" >&2; }
+log_err()  { echo "[ERR]  $*" >&2; }
+
+die() { log_err "$*"; exit 1; }
+die_usage() { log_err "$*"; echo "Usage: hex-integration [--json|--dry-run|--no-telemetry|--quiet] <command> [args...]" >&2; exit 2; }
+
+# ─── Global flag defaults ────────────────────────────────────────────────────
+FLAG_JSON="false"
+FLAG_DRY_RUN="false"
+FLAG_NO_TELEMETRY="false"
+FLAG_QUIET="false"
+export FLAG_JSON FLAG_DRY_RUN FLAG_NO_TELEMETRY FLAG_QUIET
+
+# ─── Parse global flags ──────────────────────────────────────────────────────
+# Global flags must appear before the command. Once the command (first non-flag
+# arg) is seen, remaining args are passed through to the command handler.
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  if [[ ${#ARGS[@]} -eq 0 ]]; then
+    case "$1" in
+      --json)           FLAG_JSON="true";         shift ;;
+      --dry-run)        FLAG_DRY_RUN="true";      shift ;;
+      --no-telemetry)   FLAG_NO_TELEMETRY="true"; shift ;;
+      --quiet)          FLAG_QUIET="true";        shift ;;
+      --*)              die_usage "Unknown global flag: $1" ;;
+      *)                ARGS+=("$1");             shift ;;
+    esac
+  else
+    ARGS+=("$1"); shift
+  fi
+done
+
+if [[ ${#ARGS[@]} -eq 0 ]]; then
+  die_usage "Missing command"
+fi
+
+CMD="${ARGS[0]}"
+CMD_ARGS=("${ARGS[@]:1}")
+
+# ─── Python helper runner ────────────────────────────────────────────────────
+run_py_cmd() {
+  local cmd_module="$1"; shift
+  python3 -c "
+import sys
+sys.path.insert(0, '${HEX_LIB}')
+sys.path.insert(0, '${HEX_LIB}/integration/commands')
+import ${cmd_module} as m
+sys.exit(m.main())
+" -- "$@"
+}
+
+# ─── Command dispatch ────────────────────────────────────────────────────────
+case "$CMD" in
+  install)
+    python3 "${HEX_LIB}/integration/commands/install.py" \
+      --hex-root "${HEX_ROOT}" \
+      --json "${FLAG_JSON}" \
+      --dry-run "${FLAG_DRY_RUN}" \
+      --no-telemetry "${FLAG_NO_TELEMETRY}" \
+      --quiet "${FLAG_QUIET}" \
+      "${CMD_ARGS[@]}"
+    ;;
+  uninstall)
+    python3 "${HEX_LIB}/integration/commands/uninstall.py" \
+      --hex-root "${HEX_ROOT}" \
+      --json "${FLAG_JSON}" \
+      --dry-run "${FLAG_DRY_RUN}" \
+      --no-telemetry "${FLAG_NO_TELEMETRY}" \
+      --quiet "${FLAG_QUIET}" \
+      "${CMD_ARGS[@]}"
+    ;;
+  update)
+    python3 "${HEX_LIB}/integration/commands/update.py" \
+      --hex-root "${HEX_ROOT}" \
+      --json "${FLAG_JSON}" \
+      --dry-run "${FLAG_DRY_RUN}" \
+      --no-telemetry "${FLAG_NO_TELEMETRY}" \
+      --quiet "${FLAG_QUIET}" \
+      "${CMD_ARGS[@]}"
+    ;;
+  list)
+    python3 "${HEX_LIB}/integration/commands/list_cmd.py" \
+      --hex-root "${HEX_ROOT}" \
+      --json "${FLAG_JSON}" \
+      --quiet "${FLAG_QUIET}" \
+      "${CMD_ARGS[@]}"
+    ;;
+  validate)
+    python3 "${HEX_LIB}/integration/commands/validate.py" \
+      --hex-root "${HEX_ROOT}" \
+      --json "${FLAG_JSON}" \
+      --quiet "${FLAG_QUIET}" \
+      "${CMD_ARGS[@]}"
+    ;;
+  status)
+    python3 "${HEX_LIB}/integration/commands/status.py" \
+      --hex-root "${HEX_ROOT}" \
+      --json "${FLAG_JSON}" \
+      --quiet "${FLAG_QUIET}" \
+      "${CMD_ARGS[@]}"
+    ;;
+  probe)
+    python3 "${HEX_LIB}/integration/commands/probe.py" \
+      --hex-root "${HEX_ROOT}" \
+      --json "${FLAG_JSON}" \
+      --no-telemetry "${FLAG_NO_TELEMETRY}" \
+      --quiet "${FLAG_QUIET}" \
+      "${CMD_ARGS[@]}"
+    ;;
+  rotate)
+    python3 "${HEX_LIB}/integration/commands/rotate.py" \
+      --hex-root "${HEX_ROOT}" \
+      --json "${FLAG_JSON}" \
+      --no-telemetry "${FLAG_NO_TELEMETRY}" \
+      --quiet "${FLAG_QUIET}" \
+      "${CMD_ARGS[@]}"
+    ;;
+  *)
+    die_usage "Unknown command: ${CMD}"
+    ;;
+esac
