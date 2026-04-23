@@ -6,7 +6,10 @@ use std::path::Path;
 pub fn append(audit_dir: &Path, agent_id: &str, action: &str, detail: &serde_json::Value) {
     let path = audit_dir.join("actions.jsonl");
     if let Err(e) = fs::create_dir_all(audit_dir) {
-        eprintln!("AUDIT WRITE FAILED: cannot create {}: {e}", audit_dir.display());
+        eprintln!(
+            "AUDIT WRITE FAILED: cannot create {}: {e}",
+            audit_dir.display()
+        );
         return;
     }
     let entry = serde_json::json!({
@@ -25,7 +28,10 @@ pub fn append(audit_dir: &Path, agent_id: &str, action: &str, detail: &serde_jso
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut file) => {
             if let Err(e) = writeln!(file, "{}", line) {
-                eprintln!("AUDIT WRITE FAILED: cannot write to {}: {e}", path.display());
+                eprintln!(
+                    "AUDIT WRITE FAILED: cannot write to {}: {e}",
+                    path.display()
+                );
             }
         }
         Err(e) => {

@@ -10,6 +10,8 @@ pub fn initialize(agent_id: &str, budget_usd: f64) -> AgentState {
         wake_count: 0,
         last_wake: None,
         queue: Queue {
+            // Queue starts empty. On first wake, wake.rs auto-promotes charter
+            // responsibilities to scheduled items. No manual seeding required.
             active: vec![],
             blocked: vec![],
             scheduled: vec![],
@@ -27,6 +29,8 @@ pub fn initialize(agent_id: &str, budget_usd: f64) -> AgentState {
             },
             last_wake_usd: 0.0,
         },
+        cadence_overrides: Default::default(),
+        last_assessment_wake: 0,
     }
 }
 

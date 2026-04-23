@@ -96,6 +96,10 @@ pub struct AgentState {
     pub inbox: Vec<Message>,
     pub memory: serde_json::Value,
     pub cost: Cost,
+    #[serde(default)]
+    pub cadence_overrides: HashMap<String, u64>,
+    #[serde(default)]
+    pub last_assessment_wake: u64,
 }
 
 // ── Claude Output ───────────────────────────────────────────────────────────
@@ -144,12 +148,33 @@ pub struct QueueUpdates {
     pub parked: Vec<BlockedItem>,
 }
 
+// ── Self-Assessment ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CadenceChange {
+    pub responsibility: String,
+    pub old_interval: u64,
+    pub new_interval: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssessmentResponse {
+    pub trail: Vec<TrailEntry>,
+    #[serde(default)]
+    pub cadence_overrides: Vec<CadenceChange>,
+    pub strategy_updates: Option<serde_json::Value>,
+    #[serde(default)]
+    pub recommendations: Vec<String>,
+}
+
 // ── Charter ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Responsibility {
     pub name: String,
-    pub interval: u64,
+    #[serde(default)]
+    pub interval: Option<u64>,
     pub description: String,
 }
 
@@ -187,6 +212,24 @@ pub struct AuthorityTiers {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssessmentConfig {
+    #[serde(default = "default_assess_interval")]
+    pub every_n_wakes: u64,
+}
+
+fn default_assess_interval() -> u64 {
+    10
+}
+
+impl Default for AssessmentConfig {
+    fn default() -> Self {
+        AssessmentConfig {
+            every_n_wakes: default_assess_interval(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Charter {
     pub id: String,
     pub name: String,
@@ -201,6 +244,7 @@ pub struct Charter {
     pub budget: Budget,
     pub memory: Option<MemoryConfig>,
     pub hooks: Option<HooksConfig>,
+    pub assessment: Option<AssessmentConfig>,
     pub escalation_channel: Option<String>,
     pub kill_switch: String,
     #[serde(default)]

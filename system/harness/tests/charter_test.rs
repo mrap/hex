@@ -14,16 +14,21 @@ fn test_load_valid_charter() {
 
 #[test]
 fn test_reject_charter_missing_id() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/missing-id-charter.yaml");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/missing-id-charter.yaml");
     let result = hex_agent::charter::load(&path);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("id") || err.contains("missing"), "Error should mention missing 'id': {err}");
+    assert!(
+        err.contains("id") || err.contains("missing"),
+        "Error should mention missing 'id': {err}"
+    );
 }
 
 #[test]
 fn test_reject_charter_negative_budget() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bad-budget-charter.yaml");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bad-budget-charter.yaml");
     let result = hex_agent::charter::load(&path);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -32,8 +37,10 @@ fn test_reject_charter_negative_budget() {
 
 #[test]
 fn test_zero_budget_is_unlimited() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zero-budget-charter.yaml");
-    let charter = hex_agent::charter::load(&path).expect("zero budget charter should load successfully");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zero-budget-charter.yaml");
+    let charter =
+        hex_agent::charter::load(&path).expect("zero budget charter should load successfully");
     assert_eq!(charter.id, "zero-budget");
     assert_eq!(charter.budget.usd_per_day, 0.0);
     assert_eq!(charter.budget.usd_per_shift, 0.0);
@@ -53,8 +60,15 @@ fn test_zero_shift_budget_skips_enforcement() {
     let remaining = hex_agent::cost::shift_budget_remaining(&cost, 0.0);
     // With budget=0, remaining is negative, but the wake loop checks
     // `shift_budget > 0.0` before enforcing — so this should never trigger a break.
-    assert!(remaining <= 0.0, "remaining should be <= 0 when budget is 0");
+    assert!(
+        remaining <= 0.0,
+        "remaining should be <= 0 when budget is 0"
+    );
     // The key invariant: budget=0 means the `if shift_budget > 0.0` guard in wake.rs
     // prevents enforcement. This test documents that 0.0 is the sentinel for unlimited.
-    assert_eq!(0.0_f64 > 0.0, false, "0.0 must not pass the enforcement guard");
+    assert_eq!(
+        0.0_f64 > 0.0,
+        false,
+        "0.0 must not pass the enforcement guard"
+    );
 }

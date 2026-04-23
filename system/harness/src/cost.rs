@@ -14,7 +14,10 @@ pub fn record_invocation(cost: &mut Cost, output: &ClaudeOutput) {
 pub fn append_ledger(ledger_dir: &Path, agent_id: &str, output: &ClaudeOutput) {
     let path = ledger_dir.join("ledger.jsonl");
     if let Err(e) = fs::create_dir_all(ledger_dir) {
-        eprintln!("COST LEDGER FAILED: cannot create {}: {e}", ledger_dir.display());
+        eprintln!(
+            "COST LEDGER FAILED: cannot create {}: {e}",
+            ledger_dir.display()
+        );
         return;
     }
     let entry = serde_json::json!({
@@ -37,7 +40,10 @@ pub fn append_ledger(ledger_dir: &Path, agent_id: &str, output: &ClaudeOutput) {
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut file) => {
             if let Err(e) = writeln!(file, "{}", line) {
-                eprintln!("COST LEDGER FAILED: cannot write to {}: {e}", path.display());
+                eprintln!(
+                    "COST LEDGER FAILED: cannot write to {}: {e}",
+                    path.display()
+                );
             }
         }
         Err(e) => {

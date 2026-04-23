@@ -21,9 +21,7 @@ enum Commands {
         payload: String,
     },
     /// Show agent status
-    Status {
-        agent_id: Option<String>,
-    },
+    Status { agent_id: Option<String> },
     /// Show fleet overview
     Fleet,
     /// Send async message to another agent
@@ -70,7 +68,10 @@ fn get_hex_dir() -> PathBuf {
     if let Ok(v) = std::env::var("HEX_DIR") {
         let p = PathBuf::from(&v);
         if !p.join("CLAUDE.md").exists() {
-            eprintln!("ERROR: HEX_DIR={} does not contain CLAUDE.md — not a valid hex workspace", v);
+            eprintln!(
+                "ERROR: HEX_DIR={} does not contain CLAUDE.md — not a valid hex workspace",
+                v
+            );
             std::process::exit(1);
         }
         return p;
@@ -81,7 +82,10 @@ fn get_hex_dir() -> PathBuf {
     });
     let p = PathBuf::from(&home).join("mrap-hex");
     if !p.join("CLAUDE.md").exists() {
-        eprintln!("ERROR: default hex dir {} does not contain CLAUDE.md — set HEX_DIR explicitly", p.display());
+        eprintln!(
+            "ERROR: default hex dir {} does not contain CLAUDE.md — set HEX_DIR explicitly",
+            p.display()
+        );
         std::process::exit(1);
     }
     p
@@ -95,7 +99,10 @@ fn discover_agents(hex_dir: &Path) -> Vec<String> {
     let entries = match std::fs::read_dir(&projects_dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("ERROR: cannot read projects directory {}: {e}", projects_dir.display());
+            eprintln!(
+                "ERROR: cannot read projects directory {}: {e}",
+                projects_dir.display()
+            );
             std::process::exit(1);
         }
     };
@@ -105,7 +112,10 @@ fn discover_agents(hex_dir: &Path) -> Vec<String> {
                 if e.path().join("charter.yaml").exists() {
                     let name = e.file_name().to_string_lossy().into_owned();
                     if !is_safe_agent_id(&name) {
-                        eprintln!("ERROR: agent directory '{}' contains unsafe characters — skipping", name);
+                        eprintln!(
+                            "ERROR: agent directory '{}' contains unsafe characters — skipping",
+                            name
+                        );
                         continue;
                     }
                     agents.push(name);
@@ -122,14 +132,20 @@ fn discover_agents(hex_dir: &Path) -> Vec<String> {
 
 fn is_safe_agent_id(id: &str) -> bool {
     !id.is_empty()
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         && !id.contains("..")
 }
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Wake { agent_id, trigger, payload } => {
+        Commands::Wake {
+            agent_id,
+            trigger,
+            payload,
+        } => {
             match wake::run(wake::WakeConfig {
                 hex_dir: get_hex_dir(),
                 agent_id,
@@ -151,14 +167,22 @@ fn main() {
                     Ok(s) => {
                         println!("Agent: {}", s.agent_id);
                         println!("Wakes: {}", s.wake_count);
-                        println!("Last wake: {}", s.last_wake.map(|t| t.to_rfc3339()).unwrap_or("never".into()));
+                        println!(
+                            "Last wake: {}",
+                            s.last_wake
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or("never".into())
+                        );
                         println!("Active queue: {} items", s.queue.active.len());
                         println!("Blocked: {} items", s.queue.blocked.len());
                         println!("Scheduled: {} items", s.queue.scheduled.len());
                         println!("Inbox: {} messages", s.inbox.len());
                         println!("Trail: {} entries", s.trail.len());
                         println!("Cost (lifetime): ${:.4}", s.cost.lifetime_usd);
-                        println!("Cost (period): ${:.4} / ${:.2}", s.cost.current_period.spent_usd, s.cost.current_period.budget_usd);
+                        println!(
+                            "Cost (period): ${:.4} / ${:.2}",
+                            s.cost.current_period.spent_usd, s.cost.current_period.budget_usd
+                        );
                     }
                     Err(e) => {
                         eprintln!("Cannot load state for '{}': {e}", id);
@@ -180,7 +204,8 @@ fn main() {
             }
 
             let mut errors: Vec<String> = Vec::new();
-            let mut charters: std::collections::HashMap<String, hex_agent::types::Charter> = std::collections::HashMap::new();
+            let mut charters: std::collections::HashMap<String, hex_agent::types::Charter> =
+                std::collections::HashMap::new();
 
             for id in &agents {
                 let charter_path = hex_dir.join(format!("projects/{}/charter.yaml", id));
@@ -207,35 +232,56 @@ fn main() {
                 std::process::exit(1);
             }
 
-            println!("{:<20} {:>4} {:>6} {:>12} {:>8} {:>8} {:>10}", "AGENT", "CORE", "WAKES", "LAST WAKE", "ACTIVE", "BLOCKED", "COST/DAY");
+            println!(
+                "{:<20} {:>4} {:>6} {:>12} {:>8} {:>8} {:>10}",
+                "AGENT", "CORE", "WAKES", "LAST WAKE", "ACTIVE", "BLOCKED", "COST/DAY"
+            );
             println!("{}", "-".repeat(74));
             for id in &agents {
                 let is_core = charters.get(id).map(|c| c.core).unwrap_or(false);
                 let core_flag = if is_core { "  ●" } else { "" };
                 let state_path = hex_dir.join(format!("projects/{}/state.json", id));
                 if let Ok(s) = state::load(&state_path) {
-                    let last = s.last_wake.map(|t| t.format("%H:%M:%S").to_string()).unwrap_or("never".into());
-                    println!("{:<20} {:>4} {:>6} {:>12} {:>8} {:>8} ${:>9.4}",
-                        id, core_flag, s.wake_count, last, s.queue.active.len(), s.queue.blocked.len(), s.cost.current_period.spent_usd);
+                    let last = s
+                        .last_wake
+                        .map(|t| t.format("%H:%M:%S").to_string())
+                        .unwrap_or("never".into());
+                    println!(
+                        "{:<20} {:>4} {:>6} {:>12} {:>8} {:>8} ${:>9.4}",
+                        id,
+                        core_flag,
+                        s.wake_count,
+                        last,
+                        s.queue.active.len(),
+                        s.queue.blocked.len(),
+                        s.cost.current_period.spent_usd
+                    );
                 } else {
-                    println!("{:<20} {:>4} {:>6} {:>12} {:>8} {:>8} {:>10}",
-                        id, core_flag, 0, "never", 0, 0, "new");
+                    println!(
+                        "{:<20} {:>4} {:>6} {:>12} {:>8} {:>8} {:>10}",
+                        id, core_flag, 0, "never", 0, 0, "new"
+                    );
                 }
             }
 
+            println!("\n{} agents", agents.len());
+
             // Check core agent health
-            let core_agents: Vec<&String> = agents.iter()
+            let core_agents: Vec<&String> = agents
+                .iter()
                 .filter(|id| charters.get(*id).map(|c| c.core).unwrap_or(false))
                 .collect();
             if !core_agents.is_empty() {
                 let mut core_warnings: Vec<String> = Vec::new();
                 for id in &core_agents {
-                    let kill_switch = charters.get(*id).map(|c| {
-                        shellexpand::tilde(&c.kill_switch).to_string()
-                    }).unwrap_or_default();
+                    let kill_switch = charters
+                        .get(*id)
+                        .map(|c| shellexpand::tilde(&c.kill_switch).to_string())
+                        .unwrap_or_default();
                     if !kill_switch.is_empty() && Path::new(&kill_switch).exists() {
                         core_warnings.push(format!(
-                            "WARN: core agent '{}' is HALTED — system self-healing may be degraded", id
+                            "WARN: core agent '{}' is HALTED — system self-healing may be degraded",
+                            id
                         ));
                     }
                 }
@@ -254,7 +300,9 @@ fn main() {
                 if core {
                     let charter_path = hex_dir.join(format!("projects/{}/charter.yaml", id));
                     if let Ok(c) = hex_agent::charter::load(&charter_path) {
-                        if !c.core { continue; }
+                        if !c.core {
+                            continue;
+                        }
                     } else {
                         continue;
                     }
@@ -275,7 +323,10 @@ fn main() {
             let entries = match std::fs::read_dir(&ref_dir) {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("ERROR: cannot read reference directory {}: {e}", ref_dir.display());
+                    eprintln!(
+                        "ERROR: cannot read reference directory {}: {e}",
+                        ref_dir.display()
+                    );
                     std::process::exit(1);
                 }
             };
@@ -289,7 +340,9 @@ fn main() {
                         }
                     };
                     let fname = entry.file_name().to_string_lossy().to_string();
-                    if !fname.ends_with(".yaml") { continue; }
+                    if !fname.ends_with(".yaml") {
+                        continue;
+                    }
                     let agent_id = fname.trim_end_matches(".yaml").to_string();
                     let charter_path = hex_dir.join(format!("projects/{}/charter.yaml", agent_id));
                     if !charter_path.exists() {
@@ -298,9 +351,15 @@ fn main() {
                         match hex_agent::charter::load(&charter_path) {
                             Ok(c) => {
                                 if !c.core {
-                                    broken.push(format!("{} (exists but core: false — should be core: true)", agent_id));
+                                    broken.push(format!(
+                                        "{} (exists but core: false — should be core: true)",
+                                        agent_id
+                                    ));
                                 } else if c.id != agent_id {
-                                    broken.push(format!("{} (charter.id '{}' doesn't match directory)", agent_id, c.id));
+                                    broken.push(format!(
+                                        "{} (charter.id '{}' doesn't match directory)",
+                                        agent_id, c.id
+                                    ));
                                 } else {
                                     ok.push(agent_id);
                                 }
@@ -348,7 +407,10 @@ fn main() {
             let entries = match std::fs::read_dir(&ref_dir) {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("ERROR: cannot read reference directory {}: {e}", ref_dir.display());
+                    eprintln!(
+                        "ERROR: cannot read reference directory {}: {e}",
+                        ref_dir.display()
+                    );
                     std::process::exit(1);
                 }
             };
@@ -362,12 +424,17 @@ fn main() {
                     }
                 };
                 let fname = entry.file_name().to_string_lossy().to_string();
-                if !fname.ends_with(".yaml") { continue; }
+                if !fname.ends_with(".yaml") {
+                    continue;
+                }
                 let agent_id = fname.trim_end_matches(".yaml").to_string();
                 let target_dir = hex_dir.join(format!("projects/{}", agent_id));
                 let target_charter = target_dir.join("charter.yaml");
                 if target_charter.exists() {
-                    println!("  SKIP: {} — charter already exists (not overwriting)", agent_id);
+                    println!(
+                        "  SKIP: {} — charter already exists (not overwriting)",
+                        agent_id
+                    );
                     skipped += 1;
                     continue;
                 }
@@ -389,7 +456,10 @@ fn main() {
             }
             println!();
             if restored > 0 {
-                println!("Restored {} core agent(s). Run 'hex-agent fleet' to verify.", restored);
+                println!(
+                    "Restored {} core agent(s). Run 'hex-agent fleet' to verify.",
+                    restored
+                );
             } else if skipped > 0 {
                 println!("All core agents already present ({} checked).", skipped);
             } else {
@@ -400,7 +470,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Message { from, to, subject, body, initiative, response_requested } => {
+        Commands::Message {
+            from,
+            to,
+            subject,
+            body,
+            initiative,
+            response_requested,
+        } => {
             let hex_dir = get_hex_dir();
             let msg_dir = hex_dir.join(".hex/messages");
             let msg = hex_agent::types::Message {

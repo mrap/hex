@@ -1,4 +1,4 @@
-use crate::types::{AgentResponse, ClaudeOutput};
+use crate::types::{AgentResponse, AssessmentResponse, ClaudeOutput};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -7,10 +7,19 @@ pub fn parse_output(raw: &str) -> Result<ClaudeOutput, Box<dyn std::error::Error
     Ok(output)
 }
 
-pub fn parse_agent_response(result_text: &str) -> Result<AgentResponse, Box<dyn std::error::Error>> {
-    // Claude often wraps JSON in markdown fences or adds prose. Extract the JSON object.
+pub fn parse_agent_response(
+    result_text: &str,
+) -> Result<AgentResponse, Box<dyn std::error::Error>> {
     let cleaned = extract_json(result_text);
     let response: AgentResponse = serde_json::from_str(&cleaned)?;
+    Ok(response)
+}
+
+pub fn parse_assessment_response(
+    result_text: &str,
+) -> Result<AssessmentResponse, Box<dyn std::error::Error>> {
+    let cleaned = extract_json(result_text);
+    let response: AssessmentResponse = serde_json::from_str(&cleaned)?;
     Ok(response)
 }
 
@@ -60,7 +69,11 @@ pub fn build_args(model: &str, allowed_tools: &[&str]) -> Vec<String> {
     ]
 }
 
-pub fn invoke(prompt: &str, model: &str, allowed_tools: &[&str]) -> Result<ClaudeOutput, Box<dyn std::error::Error>> {
+pub fn invoke(
+    prompt: &str,
+    model: &str,
+    allowed_tools: &[&str],
+) -> Result<ClaudeOutput, Box<dyn std::error::Error>> {
     let args = build_args(model, allowed_tools);
     let mut child = Command::new("claude")
         .args(&args)

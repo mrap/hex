@@ -1,5 +1,42 @@
 use crate::types::*;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+
+/// Seeds scheduled entries for charter responsibilities not yet in the queue.
+/// Returns the number of new entries added.
+/// On first wake (empty queue) all responsibilities are seeded as due-now.
+/// On subsequent wakes, only newly added responsibilities are seeded.
+pub fn auto_seed_from_charter(
+    queue: &mut Queue,
+    responsibilities: &[Responsibility],
+    cadence_overrides: &HashMap<String, u64>,
+    now: DateTime<Utc>,
+) -> usize {
+    let mut added = 0;
+    for responsibility in responsibilities {
+        // Skip event-triggered responsibilities (no interval); only seed timer-based ones.
+        let base_interval = match responsibility.interval {
+            Some(i) => i,
+            None => continue,
+        };
+        let scheduled_id = format!("s-{}", responsibility.name);
+        if !queue.scheduled.iter().any(|s| s.id == scheduled_id) {
+            let interval = cadence_overrides
+                .get(&responsibility.name)
+                .copied()
+                .unwrap_or(base_interval);
+            queue.scheduled.push(ScheduledItem {
+                id: scheduled_id,
+                summary: responsibility.description.clone(),
+                interval_seconds: interval,
+                last_run: None,
+                next_due: now,
+            });
+            added += 1;
+        }
+    }
+    added
+}
 
 pub fn promote_scheduled(queue: &mut Queue, now: DateTime<Utc>) -> usize {
     let mut promoted = 0;

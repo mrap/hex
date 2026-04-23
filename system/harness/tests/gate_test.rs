@@ -1,6 +1,6 @@
+use chrono::Utc;
 use hex_agent::gate;
 use hex_agent::types::TrailEntry;
-use chrono::Utc;
 
 fn make_entry(entry_type: &str, detail: serde_json::Value) -> TrailEntry {
     TrailEntry {
@@ -13,31 +13,46 @@ fn make_entry(entry_type: &str, detail: serde_json::Value) -> TrailEntry {
 
 #[test]
 fn test_valid_observe() {
-    let entry = make_entry("observe", serde_json::json!({"what": "log.jsonl", "noted": "healthy"}));
+    let entry = make_entry(
+        "observe",
+        serde_json::json!({"what": "log.jsonl", "noted": "healthy"}),
+    );
     assert!(gate::validate(&entry).is_ok());
 }
 
 #[test]
 fn test_valid_find() {
-    let entry = make_entry("find", serde_json::json!({"finding": "Path is wrong", "evidence": "log shows errors"}));
+    let entry = make_entry(
+        "find",
+        serde_json::json!({"finding": "Path is wrong", "evidence": "log shows errors"}),
+    );
     assert!(gate::validate(&entry).is_ok());
 }
 
 #[test]
 fn test_valid_decide() {
-    let entry = make_entry("decide", serde_json::json!({"decision": "Add breaker", "alternatives": ["alert"], "reasoning": "Need prevention"}));
+    let entry = make_entry(
+        "decide",
+        serde_json::json!({"decision": "Add breaker", "alternatives": ["alert"], "reasoning": "Need prevention"}),
+    );
     assert!(gate::validate(&entry).is_ok());
 }
 
 #[test]
 fn test_valid_act() {
-    let entry = make_entry("act", serde_json::json!({"action": "Wrote function", "result": "Test passes"}));
+    let entry = make_entry(
+        "act",
+        serde_json::json!({"action": "Wrote function", "result": "Test passes"}),
+    );
     assert!(gate::validate(&entry).is_ok());
 }
 
 #[test]
 fn test_valid_verify() {
-    let entry = make_entry("verify", serde_json::json!({"check": "infra test", "evidence": "35/35", "status": "unconfirmed"}));
+    let entry = make_entry(
+        "verify",
+        serde_json::json!({"check": "infra test", "evidence": "35/35", "status": "unconfirmed"}),
+    );
     assert!(gate::validate(&entry).is_ok());
 }
 
@@ -51,7 +66,10 @@ fn test_reject_find_missing_evidence() {
 
 #[test]
 fn test_reject_decide_missing_reasoning() {
-    let entry = make_entry("decide", serde_json::json!({"decision": "Do something", "alternatives": []}));
+    let entry = make_entry(
+        "decide",
+        serde_json::json!({"decision": "Do something", "alternatives": []}),
+    );
     let result = gate::validate(&entry);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("reasoning"));
@@ -67,7 +85,10 @@ fn test_reject_unknown_type() {
 
 #[test]
 fn test_reject_empty_required_field() {
-    let entry = make_entry("find", serde_json::json!({"finding": "", "evidence": "some evidence"}));
+    let entry = make_entry(
+        "find",
+        serde_json::json!({"finding": "", "evidence": "some evidence"}),
+    );
     let result = gate::validate(&entry);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("finding"));
