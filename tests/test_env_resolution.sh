@@ -208,13 +208,14 @@ if [ -f "$DOCTOR" ]; then
   fi
 fi
 
-# ── Test 9: Version bumped ──────────────────────────────────────────────────
+# ── Test 9: Version present ──────────────────────────────────────────────────
 bold "── version ──"
 VERSION=$(cat "$INSTALL_DIR/.hex/version.txt" 2>/dev/null || echo "MISSING")
-if [ "$VERSION" = "v0.4.0" ]; then
-  assert_pass "Version is v0.4.0"
+EXPECTED_VERSION=$(cat "$REPO_DIR/system/version.txt" 2>/dev/null || echo "v0.4.0")
+if [ "$VERSION" = "$EXPECTED_VERSION" ]; then
+  assert_pass "Version is $VERSION"
 else
-  assert_fail "Version is '$VERSION' (expected v0.4.0)"
+  assert_fail "Version is '$VERSION' (expected $EXPECTED_VERSION)"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────

@@ -442,32 +442,41 @@ _harness_download_prebuilt() {
     curl -fSL "$harness_url" -o "$TARGET_DIR/.hex/bin/hex-agent" && chmod +x "$TARGET_DIR/.hex/bin/hex-agent"
 }
 
-_harness_fatal() {
+_harness_warn_missing() {
     echo ""
-    echo "ERROR: hex-agent harness is REQUIRED but could not be built or downloaded."
-    echo "  Install Rust (https://rustup.rs) and re-run, or download the binary manually"
-    echo "  from https://github.com/mrap/hex-foundation/releases"
-    exit 1
+    echo "WARNING: hex-agent harness could not be built or downloaded."
+    echo "  Install Rust (https://rustup.rs) and re-run to enable the agent fleet."
+    echo "  Core hex functionality (BOI, hex-events, memory) still works without it."
+    echo ""
 }
 
 if command -v cargo &>/dev/null; then
     _harness_build_from_source || {
         echo "  Build failed — trying pre-built binary download..."
-        _harness_download_prebuilt || _harness_fatal
+        if command -v curl &>/dev/null; then
+            _harness_download_prebuilt || _harness_warn_missing
+        else
+            echo "  curl not found — skipping pre-built download"
+            _harness_warn_missing
+        fi
     }
-else
+elif command -v curl &>/dev/null; then
     echo "  cargo not found — trying pre-built binary download..."
-    _harness_download_prebuilt || _harness_fatal
+    _harness_download_prebuilt || _harness_warn_missing
+else
+    echo "  cargo and curl not found — skipping harness install"
+    _harness_warn_missing
 fi
 
-if ! "$TARGET_DIR/.hex/bin/hex-agent" --version &>/dev/null; then
-    echo ""
-    echo "ERROR: hex-agent binary installed but failed to execute."
-    echo "  The harness is required for hex to function. Check the binary and re-run."
-    exit 1
+if [ -f "$TARGET_DIR/.hex/bin/hex-agent" ]; then
+    if ! "$TARGET_DIR/.hex/bin/hex-agent" --version &>/dev/null; then
+        echo "WARNING: hex-agent binary installed but failed to execute. Re-run install to retry."
+    else
+        echo "  hex-agent harness   ✓"
+    fi
+else
+    echo "  hex-agent harness   ⚠ (install Rust to enable agent fleet)"
 fi
-
-echo "  hex-agent harness   ✓"
 
 echo ""
 echo "========================================="
