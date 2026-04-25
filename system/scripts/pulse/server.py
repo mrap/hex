@@ -351,9 +351,9 @@ def _push_response(response: dict):
 
 # ── Dashboard Context (Approach E: Dashboard-as-Memory) ───────────────────────
 
-_SYSTEM_PROMPT = (
-    'You are the hex pulse dashboard assistant. Respond ONLY with a JSON object '
-    '(no prose, no markdown, just raw JSON) with these keys: '
+_PULSE_ADDENDUM = (
+    '\n\nYou are responding via the Pulse dashboard surface. '
+    'Respond ONLY with a JSON object (no prose, no markdown, just raw JSON) with these keys: '
     '{"effect_type": "highlight|annotate|prose|action", '
     '"target": "metric-id or null", '
     '"text": "response text under 80 words", '
@@ -363,25 +363,38 @@ _SYSTEM_PROMPT = (
     'd-sa (session anomalies).'
 )
 
+# Persistent hex session for Pulse surface
+_hex_session_id = None
+
 
 class DashboardContext:
-    """Approach E: dashboard state + recent_effects IS the conversational memory.
+    """Pulse is a surface. Hex is the brain.
 
-    No explicit conversation history. The last 5 effects applied to the screen
-    carry enough context for dashboard-anchored interactions.
+    Messages route through claude -p with full CLAUDE.md context,
+    same as cc-connect does for Slack. Dashboard state is injected
+    as context alongside the user's message.
     """
 
     MAX_EFFECTS = 5
-    MODEL = "claude-haiku-4-5-20251001"
 
     def __init__(self):
-        self._recent_effects: list[dict] = []  # conversational context: last N screen effects
+        self._recent_effects: list[dict] = []
 
     def handle(self, text: str, dashboard_state: dict) -> dict:
-        enriched = dict(dashboard_state)
-        enriched["recent_effects"] = self._recent_effects  # inject context into state
-        system = self._build_system(enriched)
-        response = self._call_api(system, text)
+        global _hex_session_id
+        state_summary = self._summarize_state(dashboard_state)
+        recent = self._format_recent()
+
+        prompt_parts = [
+            f"[Pulse dashboard context]\n{state_summary}",
+        ]
+        if recent:
+            prompt_parts.append(f"[Recent interactions]\n{recent}")
+        prompt_parts.append(f"[User message]\n{text}")
+        prompt_parts.append(_PULSE_ADDENDUM)
+        full_prompt = "\n\n".join(prompt_parts)
+
+        response = self._call_hex(full_prompt)
         self._recent_effects.append({
             "query": text,
             "effect_type": response.get("effect_type"),
@@ -392,18 +405,31 @@ class DashboardContext:
             self._recent_effects.pop(0)
         return response
 
-    def _build_system(self, state: dict) -> str:
-        state_json = json.dumps(state, default=str)
-        recent = state.get("recent_effects", [])
-        if recent:
-            lines = "\n".join(
-                f"  - [{e.get('effect_type','?')}] {e.get('query','')} → {e.get('text','')}"
-                for e in recent
-            )
-            mem = f"\n\nRecent dashboard interactions (conversational memory):\n{lines}"
-        else:
-            mem = ""
-        return f"{_SYSTEM_PROMPT}\n\nCurrent dashboard state: {state_json}{mem}"
+    def _summarize_state(self, state: dict) -> str:
+        p = state.get("productivity", {})
+        sigs = p.get("signals", {})
+        ux = state.get("user_experience", {})
+        fleet = state.get("fleet", {})
+        lines = [
+            f"Productivity score: {state.get('productivity_score', '?')}/100",
+            f"Loop score: {state.get('loop_score', '?')}/100 (lower=better)",
+            f"Completion rate: {sigs.get('completion_rate', {}).get('value', '?')}",
+            f"Task throughput: {sigs.get('task_throughput', {}).get('value', '?')}",
+            f"Zero-task failures: {sigs.get('zero_task_failures', {}).get('value', '?')}",
+            f"Frustration signals: {ux.get('frustration', {}).get('count', '?')}",
+            f"Feedback recurrence (high): {ux.get('feedback_recurrence', {}).get('high_recurrence_count', '?')}",
+            f"Active loops: {ux.get('loops', {}).get('count', '?')}",
+            f"Fleet: {fleet.get('agent_count', '?')} agents, {fleet.get('total_wakes', '?')} wakes, ${fleet.get('total_cost', '?'):.2f}" if isinstance(fleet.get('total_cost'), (int, float)) else f"Fleet: {fleet.get('agent_count', '?')} agents",
+        ]
+        return "\n".join(lines)
+
+    def _format_recent(self) -> str:
+        if not self._recent_effects:
+            return ""
+        return "\n".join(
+            f"  - [{e.get('effect_type','?')}] {e.get('query','')} → {e.get('text','')}"
+            for e in self._recent_effects
+        )
 
     def _parse_raw(self, raw: str) -> dict:
         raw = raw.strip()
@@ -418,41 +444,54 @@ class DashboardContext:
                     pass
         return {"effect_type": "prose", "target": None, "text": raw[:200], "action": None}
 
-    def _call_api(self, system: str, text: str) -> dict:
-        if _HAS_SDK and os.environ.get("ANTHROPIC_API_KEY"):
-            return self._call_sdk(system, text)
-        if shutil.which("claude"):
-            return self._call_cli(system, text)
-        return {"effect_type": "prose", "text": "No AI backend available.", "target": None, "action": None}
+    def _call_hex(self, prompt: str) -> dict:
+        global _hex_session_id
+        claude_bin = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+        if not os.path.exists(claude_bin):
+            return {"effect_type": "prose", "text": "hex not available (claude not on PATH).", "target": None, "action": None}
 
-    def _call_sdk(self, system: str, text: str) -> dict:
-        client = _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        resp = client.messages.create(
-            model=self.MODEL, max_tokens=256,
-            system=system, messages=[{"role": "user", "content": text}]
-        )
-        return self._parse_raw(resp.content[0].text)
+        cmd = [claude_bin, '-p', prompt, '--output-format', 'json', '--dangerously-skip-permissions']
+        if _hex_session_id:
+            cmd.extend(['--resume', _hex_session_id])
 
-    def _call_cli(self, system: str, text: str) -> dict:
-        prompt = f"{system}\n\nUser message: {text}"
-        r = subprocess.run(
-            ['claude', '-p', prompt, '--output-format', 'json'],
-            capture_output=True, text=True, timeout=30
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            try:
-                outer = json.loads(r.stdout)
-                inner = outer.get('result') or outer.get('content') or ''
-                if isinstance(inner, str):
-                    return json.loads(inner)
-                elif isinstance(inner, dict):
-                    return inner
-            except (json.JSONDecodeError, AttributeError):
-                pass
-        return {"effect_type": "prose", "text": "Claude CLI error.", "target": None, "action": None}
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=HEX_ROOT)
+        except subprocess.TimeoutExpired:
+            return {"effect_type": "prose", "text": "Response timed out.", "target": None, "action": None}
+
+        import sys
+        if r.returncode != 0 or not r.stdout.strip():
+            print(f"[pulse] claude exit={r.returncode} stderr={r.stderr[:300]}", file=sys.stderr, flush=True)
+            return {"effect_type": "prose", "text": f"hex error (exit {r.returncode}): {r.stderr[:100]}", "target": None, "action": None}
+        try:
+            outer = json.loads(r.stdout)
+            if not _hex_session_id and outer.get("session_id"):
+                _hex_session_id = outer["session_id"]
+            inner = outer.get('result') or outer.get('content') or ''
+            if isinstance(inner, str):
+                return self._parse_raw(inner)
+            elif isinstance(inner, dict):
+                return inner
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"[pulse] parse error: {e}, stdout={r.stdout[:300]}", file=sys.stderr, flush=True)
+        return {"effect_type": "prose", "text": "Could not parse hex response.", "target": None, "action": None}
 
 
 _ctx = DashboardContext()
+
+
+def _prewarm_hex():
+    """Prime the CLAUDE.md cache on startup so first real message is fast."""
+    import sys
+    print("[pulse] pre-warming hex session...", file=sys.stderr, flush=True)
+    try:
+        response = _ctx._call_hex("Respond with exactly: {\"effect_type\":\"prose\",\"text\":\"ready\",\"target\":null,\"action\":null}")
+        print(f"[pulse] hex pre-warmed, session={_hex_session_id}, response={response.get('text','?')}", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[pulse] pre-warm failed: {e}", file=sys.stderr, flush=True)
+
+
+Thread(target=_prewarm_hex, daemon=True).start()
 
 
 def _handle_message(text: str):
