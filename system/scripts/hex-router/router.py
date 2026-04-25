@@ -31,6 +31,9 @@ ROUTES = [
     ("/ui/assets",  "127.0.0.1", 8889, "http",  False),  # static assets (preserve full path)
     ("/ui",         "127.0.0.1", 8889, "http",  True),   # hex-ui production build (strip prefix)
     ("/secrets", "127.0.0.1", 9877, "http",  True),
+    ("/pulse",   "127.0.0.1", 8896, "http",  True),
+    ("/compare", "127.0.0.1", 8895, "http",  True),
+    ("/artifacts", "127.0.0.1", 8897, "http",  True),
     ("/boi",     "127.0.0.1", 8891, "https", True),
     ("/visions", "127.0.0.1", 8890, "https", True),
 ]

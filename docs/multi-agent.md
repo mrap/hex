@@ -18,29 +18,13 @@ Agents are event-driven. hex-events fires a trigger (timer tick, BOI completion,
 1. Loads the agent's charter and validates `charter.id` matches the directory name
 2. Checks HALT file (kill switch) — if halted, audit and exit without touching state
 3. Loads or initializes persistent state (`projects/<agent-id>/state.json`)
-4. **Auto-promotes charter responsibilities** — any `wake.responsibilities` not yet in the scheduled queue are seeded with `next_due = now`, making them immediately actionable
-5. Promotes due scheduled items and unblocked items to the active queue
-6. Reads inbox (async messages from other agents)
-7. Invokes Claude with the charter + state as context
-8. Parses the agent's structured response
-9. Validates every trail entry through gates (required fields per action type)
-10. Persists state, delivers outbound messages, records cost
-11. Loops until the active queue is drained or shift budget is hit
-
-## Charter Auto-Promotion
-
-Agents derive work from their charter — no manual state.json seeding required.
-
-When an agent wakes, the harness compares `wake.responsibilities` in the charter against the scheduled queue. Any responsibility without a matching `s-<name>` entry is added immediately as a due scheduled item. On the first wake ever (fresh install, no state.json), all responsibilities seed and promote to active in the same wake — the agent is productive from day one.
-
-**Rules:**
-- First wake with a charter → all responsibilities seed, all due now, all promote to active
-- Subsequent wakes → `promote_scheduled` manages timing (interval elapsed = promote)
-- New responsibility added to charter → detected on next wake, auto-seeded
-- Responsibility removed from charter → orphaned scheduled entry stays; harness re-runs it, agent ignores it (harmless)
-- No state.json seeding scripts or manual queue population needed
-
-The scheduled item ID is `s-<responsibility.name>`. Interval comes from `responsibility.interval` (seconds).
+4. Promotes due scheduled items and unblocked items to the active queue
+5. Reads inbox (async messages from other agents)
+6. Invokes Claude with the charter + state as context
+7. Parses the agent's structured response
+8. Validates every trail entry through gates (required fields per action type)
+9. Persists state, delivers outbound messages, records cost
+10. Loops until the active queue is drained or shift budget is hit
 
 ## Core Agents
 
@@ -134,7 +118,6 @@ For the full decision framework (when to use agents vs BOI vs hex-events), see t
 ## Key Design Decisions
 
 - **Charter-driven discovery.** No hardcoded lists. Charter exists → agent is registered.
-- **Charter-driven initiative.** Agents derive work from `wake.responsibilities` — no manual state.json seeding. First wake = productive agent.
 - **Agents don't write their own state.** The harness owns state.json. Agents return structured output; the harness validates and persists.
 - **Loud errors, never quiet.** Every failure prints a specific error and exits non-zero. Audit and cost writes log to stderr on failure.
 - **Shift model.** Agents work until their active queue is empty or budget is hit (if set). They don't choose when to stop. Budget of 0 = unlimited.
@@ -149,6 +132,49 @@ E2E tests run in Docker to isolate from real fleet state:
 docker build -f tests/agent-harness/Dockerfile -t hex-agent-e2e .
 docker run --rm hex-agent-e2e
 ```
+
+## Agent Evolution Schema
+
+Charters support optional `evolution` fields for tracking self-improvement experiments and performance history. The `agent-evolution.sh` script reads and writes these fields daily.
+
+```yaml
+evolution:
+  baseline_date: YYYY-MM-DD          # Date when evolution tracking began for this agent
+  experiments:
+    - id: exp-001
+      hypothesis: "Increasing wake frequency improves blocker detection"
+      change: "wake interval 21600 → 14400"
+      started: YYYY-MM-DD
+      metric: "blocker-to-dispatch latency"
+      baseline: "2.3 wake cycles"
+      result: null                   # Filled in after experiment ends
+      verdict: null                  # "improved" | "no-change" | "regression"
+  performance_history:
+    - date: YYYY-MM-DD
+      kpi_achievement: 0.75          # Fraction of KPIs met (0.0–1.0)
+      cost_per_action: 0.12          # USD per productive trail entry
+      trail_quality: 0.85            # Blend of action diversity + productive ratio
+```
+
+### How Evolution Works
+
+1. **`agent-evolution.sh`** runs daily (triggered by `timer.tick.daily` via `~/.hex-events/policies/agent-evolution.yaml`)
+2. For each agent it calculates: KPI achievement rate, cost per productive action, finding-to-action ratio, trail quality score
+3. Identifies top performer, underperformer, and idle agents
+4. For underperformers: generates a data-backed evolution proposal with a proposed charter change and 7-day experiment
+5. Writes daily report to `projects/fleet-lead/evolution/YYYY-MM-DD.md`
+6. Updates the evolution scores table in `projects/fleet-lead/board.md`
+7. Emits `hex.agent.fleet-lead.evolution.complete` on success
+
+### Metrics Definitions
+
+| Metric | Definition |
+|--------|-----------|
+| `kpi_achievement` | Trail entries (7d) / (KPI count × 5 target entries). Capped at 1.0. |
+| `cost_per_action` | Total cost (7d) / productive trail entries (find + act + dispatch + verify) |
+| `f2a_ratio` | (act + dispatch entries) / find entries — how often findings become actions |
+| `trail_quality` | `productive_ratio × 0.6 + diversity_score × 0.4` |
+| `diversity_score` | Distinct action types used / 5 (full score = 5 types) |
 
 ## Source
 

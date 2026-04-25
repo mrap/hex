@@ -9,7 +9,7 @@ set -uo pipefail
 
 PASS=0
 FAIL=0
-HEX_DIR="/Users/mrap/mrap-hex"
+HEX_DIR="${AGENT_DIR:?AGENT_DIR not set}"
 ENV_SH="$HEX_DIR/.hex/env.sh"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -226,6 +226,23 @@ while IFS= read -r agent; do
     assert_fail "${agent}-agent.yaml missing"
   fi
 done < <(HEX_DIR="$HEX_DIR" "$HEX_DIR/.hex/bin/hex-agent" list 2>/dev/null)
+
+# ── 14. User-outcome metrics ─────────────────────────────────────────────────
+bold "14. User-outcome metrics"
+
+METRICS_SCRIPT="$HEX_DIR/.hex/scripts/metrics/run-all.sh"
+if [ -f "$METRICS_SCRIPT" ]; then
+  METRICS_OUT=$(bash "$METRICS_SCRIPT" 2>&1)
+  METRICS_RC=$?
+  if [ $METRICS_RC -eq 0 ]; then
+    assert_pass "user-outcome metrics all passed"
+  else
+    assert_fail "user-outcome metrics threshold breached — run $METRICS_SCRIPT for details"
+    echo "$METRICS_OUT" | sed 's/^/    /'
+  fi
+else
+  printf '\033[33m  WARN: User-outcome metrics not deployed.\033[0m\n'
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
