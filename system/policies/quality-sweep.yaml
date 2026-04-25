@@ -1,0 +1,21 @@
+name: quality-sweep
+version: "1.0"
+description: >
+  Periodic 6-hour sweep of all specs completed in the last 24h.
+  Detects system-level gaming trends: multiple workers gaming the same KR,
+  initiatives jumping 0→100% in a single day.
+
+trigger:
+  event: timer.tick.6h
+
+action:
+  type: script
+  command: "python3 ${HEX_SCRIPTS_DIR:-${HEX_ROOT}/system/scripts}/quality-check.py --sweep"
+  capture_output: true
+  emit_on_high_gaming_rate: hex.quality.gaming.detected
+  gaming_rate_alert_threshold_pct: 30
+  timeout_seconds: 300
+
+on_failure:
+  log: true
+  continue: true

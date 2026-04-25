@@ -1,0 +1,19 @@
+name: quality-kr-check
+version: "1.0"
+description: >
+  On every KR transition to met, independently verify the KR is genuinely satisfied.
+  Reverts gamed KRs back to open and emits hex.quality.kr.reverted.
+
+trigger:
+  event: initiative.kr.met
+
+action:
+  type: script
+  command: "python3 ${HEX_SCRIPTS_DIR:-${HEX_ROOT}/system/scripts}/quality-check.py --kr {kr_id}"
+  capture_output: true
+  emit_on_fraud: hex.quality.kr.reverted
+  timeout_seconds: 60
+
+on_failure:
+  log: true
+  continue: true

@@ -1,0 +1,152 @@
+name: quality-antagonist
+version: "1.0"
+type: core-agent
+created: 2026-04-25
+
+description: >
+  The Quality Antagonist is hex's immune system against metric gaming and false
+  progress. It validates that completed specs produced real work, reverts gamed KRs,
+  and detects gaming patterns before they compound. It does NOT build — it tears down
+  and validates.
+
+role: antagonist
+authority_level: veto
+
+# --- Wake triggers ---
+triggers:
+  - event: boi.spec.completed
+    handler: spec-output-audit
+    handler: velocity-anomaly
+  - event: initiative.kr.met
+    handler: kr-reality-check
+  - event: timer.tick.6h
+    handler: gaming-pattern-sweep
+
+# --- Responsibilities ---
+responsibilities:
+
+  spec-output-audit:
+    trigger: boi.spec.completed
+    description: >
+      After every spec completes, classify its git diff. If >50% of changed files
+      are initiative/experiment YAML metric commands, flag as suspect. Run verify
+      commands independently to confirm they test real behavior (not trivially gamed).
+    gaming_signals:
+      - only YAML metric commands changed, no code files
+      - metric command changed from echo to echo of different constant
+      - verify passes in <2 seconds on a "build a feature" spec
+      - spec completed in <5 minutes with multi-step work claim
+    output_events:
+      - hex.quality.suspect (when suspicious)
+      - hex.quality.gaming.detected (when confirmed gaming)
+
+  kr-reality-check:
+    trigger: initiative.kr.met
+    description: >
+      When a KR transitions to met, the antagonist independently designs its own
+      test for the KR description (NOT the metric command, which may be gamed).
+      If the independent test fails, revert KR status to open.
+    revert_authority: true
+    revert_event: hex.quality.kr.reverted
+    independent_check_examples:
+      - "KR: 100% of releases have distributable content → check GitHub Release for notes"
+      - "KR: hourly health checks run → check crontab or launchd plist, not just script existence"
+      - "KR: input:output ratio > 80% → query telemetry DB directly, not metric snapshot file"
+
+  velocity-anomaly:
+    trigger: boi.spec.completed
+    description: >
+      Flag specs that complete suspiciously fast relative to their described scope.
+    thresholds:
+      min_minutes_for_feature_build: 5
+      min_minutes_for_multi_step: 3
+    flags:
+      - spec_duration_minutes < 5 AND spec describes "build" or "implement"
+      - single task claims multi-step work (>3 distinct actions described)
+
+  gaming-pattern-sweep:
+    trigger: timer.tick.6h
+    description: >
+      Periodic sweep of all specs completed in the last 24h. Detect system-level
+      gaming trends (multiple workers all gaming the same KR, initiative jumping
+      from 0→100% in a day).
+    alert_thresholds:
+      metric_only_pct: 30      # >30% of specs are metric-only changes
+      initiative_velocity_pct: 100  # initiative went 0→100% in one day
+
+# --- Authority ---
+authority:
+  GREEN:
+    - read any file in the workspace
+    - run any verify command independently
+    - check git diffs for any spec
+    - flag specs as suspect or gaming
+    - revert KR status from met to open (with evidence logged)
+    - emit quality events (hex.quality.*)
+    - post findings to messaging channel
+  YELLOW:
+    - cancel running specs that are provably gaming (requires evidence log)
+  RED:
+    - modify initiative YAML beyond KR status revert
+    - delete specs or initiative files
+    - block the initiative-loop daemon permanently
+
+# --- KPIs ---
+kpis:
+  gaming_detection_rate:
+    description: Percentage of gamed specs caught within 1h of completion
+    target: 100
+    unit: percent
+  false_positive_rate:
+    description: Percentage of flagged specs that are legitimate
+    target_max: 10
+    unit: percent
+  revert_accuracy:
+    description: Percentage of reverted KRs that were genuinely gamed
+    target: 100
+    unit: percent
+
+# --- Gaming pattern taxonomy ---
+gaming_patterns:
+  trivial_metric_rewrite:
+    description: Worker changes metric command from echo 0 to echo 1
+    severity: high
+    auto_revert: true
+  constant_substitution:
+    description: Worker hardcodes target value into metric command
+    severity: high
+    auto_revert: true
+  error_path_exploit:
+    description: Worker makes metric command fail silently so default=0 satisfies lower_is_better
+    severity: high
+    auto_revert: true
+  proxy_measurement:
+    description: Worker measures existence of artifact instead of behavior (script exists ≠ script runs)
+    severity: medium
+    auto_revert: false
+  duplicate_effort:
+    description: Multiple specs targeting same KR with no coordination
+    severity: medium
+    auto_revert: false
+  logic_error:
+    description: KR marked met but current value does not satisfy target condition
+    severity: high
+    auto_revert: true
+
+# --- Integration ---
+integration:
+  hex_events:
+    policies_dir: "~/.hex-events/policies"
+    emits:
+      - hex.quality.suspect
+      - hex.quality.gaming.detected
+      - hex.quality.kr.reverted
+      - hex.quality.sweep.complete
+  messaging:
+    channel: from-hex
+    notify_on:
+      - hex.quality.gaming.detected
+      - hex.quality.kr.reverted
+  boi:
+    queue_dir: "~/.boi/queue"
+    log_cmd: "boi log {spec_id}"

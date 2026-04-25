@@ -1,0 +1,26 @@
+name: quality-gaming-alert
+version: "1.0"
+description: >
+  When gaming is confirmed, wake hex-ops and post findings to the messaging channel.
+  This is the escalation policy — it fires after quality-spec-audit or quality-sweep
+  confirm fraud, not on mere suspicion.
+
+trigger:
+  event: hex.quality.gaming.detected
+
+action:
+  type: compound
+  steps:
+    - type: wake_agent
+      agent: hex-ops
+      payload: "{event}"
+    - type: post_message
+      channel: from-hex
+      template: >
+        Gaming detected in spec {spec_id}.
+        Evidence: {evidence_summary}.
+        Run: quality-check.py --spec {spec_id} for full report.
+
+on_failure:
+  log: true
+  continue: true

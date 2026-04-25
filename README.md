@@ -201,6 +201,41 @@ be present. Run `hex-doctor` to verify harness status after install.
 
 ---
 
+## Quality assurance — gaming detection
+
+hex ships a Quality Antagonist: an adversarial checker that validates completed work is real, not gamed.
+
+**What it detects:**
+- Metric commands that are trivially rewritten (`echo 0` → `echo 1`) rather than measuring real behavior
+- KRs marked "met" where the independent measurement disagrees with the claimed value
+- Math errors (`lower_is_better` KRs where `current > target` yet `status = met`)
+- Specs that complete suspiciously fast relative to their described scope
+- File-existence proxies (script exists ≠ script runs)
+
+**How it works:**
+
+```
+boi.spec.completed → quality-spec-audit policy → quality-check.py --spec <id>
+initiative.kr.met  → quality-kr-check policy   → quality-check.py --kr <init>/<kr>
+timer.tick.6h      → quality-sweep policy       → quality-check.py --sweep
+                                                     ↓
+                                          hex.quality.gaming.detected
+                                          hex.quality.kr.reverted
+                                          hex.quality.suspect
+```
+
+The antagonist runs independently — it does not trust the metric command the worker used. It re-runs the metric, checks the math, and reverts KR status if fraud is confirmed. The charter lives at `system/reference/core-agents/quality-antagonist.yaml`.
+
+**CLI:**
+
+```bash
+python3 .hex/scripts/quality-check.py --spec q-123      # audit one spec
+python3 .hex/scripts/quality-check.py --kr init-foo/kr-1 # reality-check a KR
+python3 .hex/scripts/quality-check.py --sweep           # scan last 24h
+```
+
+---
+
 ## Project layout (this repo)
 
 ```
@@ -208,11 +243,14 @@ hex-foundation/
 ├── install.sh           Single install entrypoint
 ├── VERSIONS             Pinned boi / hex-events versions
 ├── system/              → becomes ~/hex/.hex/ on install
-│   ├── scripts/         startup.sh, doctor.sh, upgrade.sh, today.sh, path-mapping.sh
+│   ├── scripts/         startup.sh, doctor.sh, upgrade.sh, quality-check.py, ...
 │   ├── commands/        → copied to ~/hex/.claude/commands/ (Claude Code slash commands)
 │   ├── skills/          memory/ (index+search+save), landings, hex-reflect, hex-decide,
 │   │                    hex-debrief, hex-consolidate, hex-doctor, hex-checkpoint,
 │   │                    hex-shutdown, hex-startup, hex-triage
+│   ├── policies/        quality-spec-audit, quality-kr-check, quality-sweep,
+│   │                    quality-gaming-alert — event-driven quality gates
+│   ├── reference/       core-agents/ — quality-antagonist and fleet agent charters
 │   └── version.txt
 ├── templates/           Seeds for CLAUDE.md, AGENTS.md, me.md, todo.md, decision-template.md
 ├── docs/architecture.md System overview
