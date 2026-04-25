@@ -664,6 +664,49 @@ find "$HEX_DOTDIR" -name "*.sh" -type f -exec chmod +x {} +
 
 pass "Applied $((CHANGED + NEW)) file(s)"
 
+# ─── CLAUDE.md system zone replacement ───────────────────────────────────────
+# The system zone (between hex:system-start and hex:system-end markers) is
+# managed by hex. On upgrade, replace it wholesale with the new template content
+# while preserving everything in the user zone.
+CLAUDE_MD="$HEX_DIR/CLAUDE.md"
+TEMPLATE_CLAUDE_MD="$SOURCE_DIR/$SOURCE_CLAUDE_MD_PATH"
+if [ -f "$CLAUDE_MD" ] && [ -f "$TEMPLATE_CLAUDE_MD" ]; then
+  if grep -q 'hex:system-start' "$CLAUDE_MD" && grep -q 'hex:system-end' "$CLAUDE_MD"; then
+    if grep -q 'hex:system-start' "$TEMPLATE_CLAUDE_MD" && grep -q 'hex:system-end' "$TEMPLATE_CLAUDE_MD"; then
+      # Extract the new system zone from the template
+      NEW_SYSTEM=$(sed -n '/hex:system-start/,/hex:system-end/p' "$TEMPLATE_CLAUDE_MD")
+      # Extract user content (everything after hex:system-end)
+      USER_CONTENT=$(sed -n '/hex:system-end/,$ { /hex:system-end/d; p; }' "$CLAUDE_MD")
+      # Extract pre-system content (everything before hex:system-start)
+      PRE_CONTENT=$(sed -n '1,/hex:system-start/ { /hex:system-start/d; p; }' "$CLAUDE_MD")
+
+      # Rebuild CLAUDE.md: pre + system zone + user content
+      {
+        echo "$PRE_CONTENT"
+        echo "$NEW_SYSTEM"
+        echo "$USER_CONTENT"
+      } > "$CLAUDE_MD.tmp" && mv "$CLAUDE_MD.tmp" "$CLAUDE_MD"
+      pass "CLAUDE.md system zone updated (user content preserved)"
+    else
+      warn "Template CLAUDE.md missing zone markers — skipping zone replacement"
+    fi
+  else
+    warn "Local CLAUDE.md missing zone markers — skipping zone replacement"
+    info "Hint: add <!-- hex:system-start --> and <!-- hex:system-end --> markers to enable auto-updates"
+  fi
+fi
+
+# ─── Post-upgrade health check ──────────────────────────────────────────────
+# Run doctor in quiet mode to catch any issues introduced by the upgrade.
+if [ -f "$HEX_DOTDIR/scripts/doctor.sh" ]; then
+  header "4b. Post-Upgrade Health Check"
+  if HEX_DIR="$HEX_DIR" bash "$HEX_DOTDIR/scripts/doctor.sh" --quiet 2>/dev/null; then
+    pass "Doctor: all checks passed"
+  else
+    warn "Doctor found issues after upgrade — run 'bash $HEX_DOTDIR/scripts/doctor.sh' for details"
+  fi
+fi
+
 # ─── Record upgrade SHA (for update notifications) ───────────────────────────
 # Write last_remote_sha to upgrade.json so check-update.sh knows our baseline.
 # Works for both remote upgrades (CACHE_DIR) and --local upgrades (LOCAL_PATH).
