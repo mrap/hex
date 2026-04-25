@@ -30,7 +30,7 @@ except ImportError:
     print("ERROR: PyYAML not installed. Run: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-HEX_ROOT = os.environ["AGENT_DIR"]
+HEX_ROOT = os.environ.get("HEX_ROOT", os.path.expanduser("~/mrap-hex"))
 INITIATIVES_DIR = os.path.join(HEX_ROOT, "initiatives")
 EXPERIMENTS_DIR = os.path.join(HEX_ROOT, "experiments")
 SCRIPTS_DIR = os.path.join(HEX_ROOT, ".hex", "scripts")
@@ -397,7 +397,7 @@ def run_loop(agent_id, dry_run=False, filter_initiative=None):
                 })
                 _emit("initiative.at_risk", {
                     "initiative_id": init_id, "days_remaining": days_left,
-                    "unmet_krs": unmet, "channel": "the configured escalation channel",
+                    "unmet_krs": unmet, "channel": "#from-mrap-hex",
                 }, dry_run=dry_run)
 
     return summary

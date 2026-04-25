@@ -5,7 +5,6 @@ description: >
   files (todo.md, people profiles, project context, decisions, learnings).
   Runs automatically during /hex-startup or manually via /hex-triage.
 ---
-<!-- # sync-safe -->
 
 # /hex-triage — Triage Captured Context
 
@@ -64,7 +63,7 @@ For each processed capture, update its frontmatter to add:
 triaged: true
 routed_to:
   - todo.md
-  - people/alex/profile.md
+  - people/sarah/profile.md
 ```
 
 Use **Edit** to update the frontmatter in the original capture file. Replace the closing `---` of the frontmatter block with the new fields before `---`.
@@ -81,7 +80,7 @@ Be specific about what was routed where. Example:
 
 ```
 Triaged 3 captures:
-- 1 action item added to todo.md (follow up with Alex)
-- 1 person profile updated (people/alex/profile.md)
+- 1 action item added to todo.md (follow up with Sarah)
+- 1 person profile updated (people/jake/profile.md)
 - 1 project context updated (projects/roadmap/context.md)
 ```

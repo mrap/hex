@@ -482,7 +482,9 @@ print(json.dumps(obj))
 ROLLBACK_FILES+=("$AUDIT_FILE")  # not ideal (file may pre-exist), handled in rollback via line-count
 
 # ── step 10: write decision record ───────────────────────────────────────────
-python3 "$HOME/.boi/lib/coordination.py" lock "$DECISIONS_DIR/spawn-${AGENT_ID}-${TODAY}.md" "hex-agent-spawn" 2>/dev/null || true
+if ! python3 "$HOME/.boi/lib/coordination.py" lock "$DECISIONS_DIR/spawn-${AGENT_ID}-${TODAY}.md" "hex-agent-spawn" 2>&1; then
+  echo "[WARN] coordination lock failed for spawn-${AGENT_ID}-${TODAY}.md — possible duplicate spawn risk" >&2
+fi
 DECISION_FILE="$DECISIONS_DIR/spawn-${AGENT_ID}-${TODAY}.md"
 cat > "${DECISION_FILE}.tmp" <<DEC
 # Spawn Decision: $AGENT_NAME ($AGENT_ID)
@@ -508,7 +510,9 @@ $AGENT_REASON
 Agent starts **HALTED**. To activate: \`rm $HALT_FILE\`
 DEC
 mv "${DECISION_FILE}.tmp" "$DECISION_FILE"
-python3 "$HOME/.boi/lib/coordination.py" unlock "$DECISION_FILE" "hex-agent-spawn" 2>/dev/null || true
+if ! python3 "$HOME/.boi/lib/coordination.py" unlock "$DECISION_FILE" "hex-agent-spawn" 2>&1; then
+  echo "[WARN] coordination unlock failed for $DECISION_FILE" >&2
+fi
 ROLLBACK_FILES+=("$DECISION_FILE")
 
 # ── step 11: validate policy ──────────────────────────────────────────────────
@@ -540,6 +544,114 @@ if [[ $WAKE_ERRORS -gt 0 ]]; then
   echo "Wake script validation failed ($WAKE_ERRORS errors) — rolling back" >&2
   rollback
   exit 1
+fi
+
+# ── step 11c: create agent Slack channel and register binding ─────────────────
+AGENT_SECRETS_FILE="$HEX_DIR/secrets/slack-bot.env"
+if [[ -f "$AGENT_SECRETS_FILE" ]]; then
+  python3 - "$AGENT_ID" "$AGENT_NAME" "$AGENT_ROLE" "$AGENT_SECRETS_FILE" <<'PYEOF'
+import json, os, sys, urllib.request
+
+agent_id     = sys.argv[1]
+agent_name   = sys.argv[2]
+agent_role   = sys.argv[3]
+secrets_file = sys.argv[4]
+
+channel_name = f"hex-{agent_id}"
+agent_channels_yaml = os.path.expanduser("~/.cc-connect/agent-channels.yaml")
+
+# Load bot token
+token = None
+with open(secrets_file) as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith("MRAP_HEX_SLACK_BOT_TOKEN="):
+            token = line.split("=", 1)[1].strip()
+if not token:
+    print("[channel-setup] WARN: MRAP_HEX_SLACK_BOT_TOKEN not found — skipping", file=sys.stderr)
+    sys.exit(0)
+
+def slack_post(endpoint, payload):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://slack.com/api/{endpoint}",
+        data=data,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def slack_get(endpoint, params=""):
+    url = f"https://slack.com/api/{endpoint}"
+    if params:
+        url += "?" + params
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# Create channel (idempotent — skip if already exists)
+channel_id = None
+result = slack_post("conversations.create", {"name": channel_name, "is_private": False})
+if result.get("ok"):
+    channel_id = result["channel"]["id"]
+    print(f"[channel-setup] created #{channel_name} ({channel_id})")
+elif result.get("error") == "name_taken":
+    # Channel exists — look up its ID
+    data = slack_get("conversations.list", "types=public_channel&limit=200")
+    for ch in data.get("channels", []):
+        if ch["name"] == channel_name:
+            channel_id = ch["id"]
+            break
+    print(f"[channel-setup] #{channel_name} already exists ({channel_id or 'id unknown'}), skipping create")
+else:
+    print(f"[channel-setup] WARN: conversations.create failed: {result.get('error')} — skipping", file=sys.stderr)
+    sys.exit(0)
+
+if channel_id:
+    topic = (agent_role or f"{agent_name} agent")[:250]
+    slack_post("conversations.setTopic", {"channel": channel_id, "topic": topic})
+    purpose = f"Direct line to the {agent_name} agent. Messages here are routed to {agent_name} with full charter context."
+    slack_post("conversations.setPurpose", {"channel": channel_id, "purpose": purpose[:250]})
+    intro = (
+        f"*This channel is {agent_name}'s direct line.* "
+        f"Messages here go directly to the {agent_name} with full charter context loaded. "
+        f"You are talking to *{agent_name}*, not generic hex.\n\nRole: {agent_role}"
+    )
+    slack_post("chat.postMessage", {"channel": channel_id, "text": intro})
+
+# Register binding in agent-channels.yaml (append-safe, preserves comments)
+if os.path.exists(agent_channels_yaml):
+    with open(agent_channels_yaml) as f:
+        existing_content = f.read()
+else:
+    existing_content = ""
+
+if channel_name not in existing_content:
+    channel_id_line = f"    channel_id: {channel_id}\n" if channel_id else ""
+    entry = (
+        f"\n  {channel_name}:\n"
+        f"    agent_id: {agent_id}\n"
+        f"{channel_id_line}"
+        f"    charter: projects/{agent_id}/charter.yaml\n"
+        f"    state: projects/{agent_id}/state.json\n"
+        f"    initiatives: []\n"
+    )
+    tmp = agent_channels_yaml + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(existing_content + entry)
+    os.rename(tmp, agent_channels_yaml)
+    print(f"[channel-setup] added binding for #{channel_name} to agent-channels.yaml")
+else:
+    print(f"[channel-setup] #{channel_name} already in agent-channels.yaml, skipping")
+PYEOF
+else
+  echo "[channel-setup] WARNING: $AGENT_SECRETS_FILE not found — skipping Slack channel creation" >&2
 fi
 
 # ── step 12: print activation command ────────────────────────────────────────

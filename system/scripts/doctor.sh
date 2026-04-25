@@ -44,7 +44,7 @@ for arg in "$@"; do
     --help|-h)
       echo "Usage: doctor.sh [--fix] [--json] [--quiet]"
       echo ""
-      echo "  --fix    Auto-fix safe issues (checks 1,2,5,8,10,11,12,13,14,15,22)"
+      echo "  --fix    Auto-fix safe issues (checks 1,2,5,8,10,11,12,13,14,15)"
       echo "  --json   Output full results as JSON (always includes all checks)"
       echo "  --quiet  Only show errors and warnings (skip passing checks)"
       exit 0
@@ -375,7 +375,10 @@ check_11() {
   if $FIX; then
     local indexer="$HEX_SYSTEM_DIR/skills/memory/scripts/memory_index.py"
     if [ -f "$indexer" ]; then
-      python3 "$indexer" --full 2>/dev/null || true
+      if ! python3 "$indexer" --full 2>&1; then
+        _warn "memory_index.py --full failed — memory reindex error above"
+        WARNS=$((WARNS+1))
+      fi
       if [ -f "$memory_db" ]; then
         _fixed "memory.db rebuilt via memory_index.py"
         _rec 11 "memory.db exists" "fixed" "memory.db rebuilt"
@@ -694,170 +697,6 @@ check_21() {
   fi
 }
 
-# 22: Required hooks configured in .claude/settings.json
-check_22() {
-  local manifest="$HEX_SYSTEM_DIR/hooks/required-hooks.json"
-  local settings="$HEX_DIR/.claude/settings.json"
-
-  if [ ! -f "$manifest" ]; then
-    _warn "required-hooks.json not found at $HEX_SYSTEM_DIR/hooks/ — skipping hook validation"
-    _rec 22 "required hooks configured" "warn" "required-hooks.json not found"
-    return
-  fi
-
-  if [ ! -f "$settings" ] && ! $FIX; then
-    _error ".claude/settings.json missing — run: hex doctor --fix to install required hooks"
-    _rec 22 "required hooks configured" "error" ".claude/settings.json not found"
-    return
-  fi
-
-  local fix_flag="false"
-  $FIX && fix_flag="true"
-
-  local output
-  output=$(MANIFEST_PATH="$manifest" SETTINGS_PATH="$settings" FIX_MODE="$fix_flag" \
-    HEX_SYSTEM_DIR="$HEX_SYSTEM_DIR" HEX_DIR="$HEX_DIR" python3 << 'PYEOF'
-import json, sys, os, shutil
-
-manifest_path = os.environ['MANIFEST_PATH']
-settings_path = os.environ['SETTINGS_PATH']
-fix_mode = os.environ['FIX_MODE'] == 'true'
-hex_system_dir = os.environ['HEX_SYSTEM_DIR']
-hex_dir = os.environ['HEX_DIR']
-
-with open(manifest_path) as f:
-    manifest = json.load(f)
-
-if os.path.exists(settings_path):
-    with open(settings_path) as f:
-        try:
-            settings = json.load(f)
-        except json.JSONDecodeError:
-            print("ERROR:settings:settings.json exists but is invalid JSON")
-            sys.exit(0)
-else:
-    settings = {}
-
-hooks_section = settings.get('hooks', {})
-changed = False
-
-for event_type, hook_defs in manifest.items():
-    event_hooks = hooks_section.get(event_type, [])
-    for hook_def in hook_defs:
-        hook_id = hook_def['id']
-        required = hook_def.get('required', True)
-        matcher = hook_def.get('matcher', '')
-        description = hook_def.get('description', hook_id)
-
-        if 'command' in hook_def:
-            hook_command = hook_def['command']
-            is_present = any(
-                any(h.get('command', '') == hook_command for h in entry.get('hooks', []))
-                for entry in event_hooks
-            )
-            command_to_add = hook_command
-            script_rel = None
-        else:
-            script_rel = hook_def['script']
-            script_name = os.path.basename(script_rel)
-            is_present = any(
-                any(script_name in h.get('command', '') for h in entry.get('hooks', []))
-                for entry in event_hooks
-            )
-            command_to_add = f'bash "$CLAUDE_PROJECT_DIR/{script_rel}"'
-
-        if is_present:
-            if script_rel:
-                actual_script = os.path.join(hex_dir, script_rel)
-                if not os.path.exists(actual_script):
-                    sev = "WARN" if not required else "ERROR"
-                    print(f"{sev}:{hook_id}:hook configured but script missing at {actual_script}")
-                elif not os.access(actual_script, os.X_OK):
-                    if fix_mode:
-                        os.chmod(actual_script, 0o755)
-                        print(f"FIXED:{hook_id}:chmod +x {os.path.basename(actual_script)}")
-                    else:
-                        print(f"WARN:{hook_id}:script not executable — run: chmod +x {actual_script}")
-                else:
-                    print(f"PASS:{hook_id}:{description}")
-            else:
-                print(f"PASS:{hook_id}:{description}")
-        else:
-            if fix_mode:
-                if event_type not in hooks_section:
-                    hooks_section[event_type] = []
-                hooks_section[event_type].append({
-                    'matcher': matcher,
-                    'hooks': [{'type': 'command', 'command': command_to_add}]
-                })
-                changed = True
-
-                if script_rel:
-                    actual_script = os.path.join(hex_dir, script_rel)
-                    src_script = os.path.join(hex_system_dir, 'hooks', 'scripts', os.path.basename(script_rel))
-                    if not os.path.exists(actual_script) and os.path.exists(src_script):
-                        os.makedirs(os.path.dirname(actual_script), exist_ok=True)
-                        shutil.copy2(src_script, actual_script)
-                        os.chmod(actual_script, 0o755)
-                        print(f"FIXED:{hook_id}:installed script {os.path.basename(actual_script)}")
-                    elif os.path.exists(actual_script) and not os.access(actual_script, os.X_OK):
-                        os.chmod(actual_script, 0o755)
-
-                print(f"FIXED:{hook_id}:added {event_type} hook — {description}")
-            else:
-                sev = "ERROR" if required else "WARN"
-                print(f"{sev}:{hook_id}:missing {event_type} hook — run: hex doctor --fix")
-
-if changed:
-    settings['hooks'] = hooks_section
-    tmp = settings_path + '.tmp'
-    os.makedirs(os.path.dirname(tmp), exist_ok=True)
-    with open(tmp, 'w') as f:
-        json.dump(settings, f, indent=2)
-    os.replace(tmp, settings_path)
-    print("INFO:settings:Updated .claude/settings.json with missing hooks")
-
-PYEOF
-  )
-
-  if [ $? -ne 0 ]; then
-    _error "hook validation script failed"
-    _rec 22 "required hooks configured" "error" "validation script error"
-    return
-  fi
-
-  local has_hook_errors=false
-  local has_hook_warns=false
-  local has_hook_fixes=false
-  local hook_pass_count=0
-
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    local level="${line%%:*}"
-    local rest="${line#*:}"
-    local hook_id="${rest%%:*}"
-    local message="${rest#*:}"
-    case "$level" in
-      PASS)  hook_pass_count=$((hook_pass_count + 1)) ;;
-      WARN)  _warn "Hook $hook_id: $message"; has_hook_warns=true ;;
-      ERROR) _error "Hook $hook_id: $message"; has_hook_errors=true ;;
-      FIXED) _fixed "Hook $hook_id: $message"; has_hook_fixes=true ;;
-      INFO)  _info "$message" ;;
-    esac
-  done <<< "$output"
-
-  if $has_hook_errors; then
-    _rec 22 "required hooks configured" "error" "missing required hooks in .claude/settings.json"
-  elif $has_hook_fixes; then
-    _rec 22 "required hooks configured" "fixed" "installed missing hooks into .claude/settings.json"
-  elif $has_hook_warns; then
-    _rec 22 "required hooks configured" "warn" "optional hooks or scripts missing"
-  else
-    _pass "All required hooks configured ($hook_pass_count hooks)"
-    _rec 22 "required hooks configured" "pass" "$hook_pass_count hooks verified in .claude/settings.json"
-  fi
-}
-
 # ─── Main ─────────────────────────────────────────────────────────────────────
 if ! $JSON_MODE; then
   echo ""
@@ -888,7 +727,6 @@ check_18
 check_19
 check_20
 check_21
-check_22
 
 # ─── Output ───────────────────────────────────────────────────────────────────
 if $JSON_MODE; then

@@ -5,11 +5,6 @@ Usage:
   python3 quality-check.py --spec q-774
   python3 quality-check.py --sweep
   python3 quality-check.py --kr init-closed-loop-telemetry/kr-1
-
-Environment variables:
-  HEX_WORKSPACE   Path to the hex workspace directory (default: ~/hex)
-  BOI_QUEUE_DIR   Path to the BOI queue directory (default: ~/.boi/queue)
-  HEX_EVENTS_DIR  Path to hex-events directory (default: ~/.hex-events/events)
 """
 
 import argparse
@@ -23,10 +18,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-BOI_QUEUE = Path(os.environ.get("BOI_QUEUE_DIR", os.path.expanduser("~/.boi/queue")))
-WORKSPACE = Path(os.environ.get("HEX_WORKSPACE", os.path.expanduser("~/hex")))
+BOI_QUEUE = Path(os.path.expanduser("~/.boi/queue"))
+WORKSPACE = Path(os.path.expanduser("~/mrap-hex"))
 INITIATIVES_DIR = WORKSPACE / "initiatives"
-EVENTS_DIR = Path(os.environ.get("HEX_EVENTS_DIR", os.path.expanduser("~/.hex-events/events")))
+EVENTS_DIR = Path(os.path.expanduser("~/.hex-events/events"))
 
 # --- Gaming detection patterns ---
 
@@ -166,6 +161,7 @@ def get_spec_duration_seconds(spec_id: str) -> Optional[float]:
         total = tele.get("total_time_seconds")
         if total and total > 0:
             return total
+    # Fall back to mtime difference between prompt and exit
     prompt_path = BOI_QUEUE / f"{spec_id}.prompt.md"
     exit_path = BOI_QUEUE / f"{spec_id}.exit"
     if prompt_path.exists() and exit_path.exists():
@@ -177,12 +173,15 @@ def get_spec_duration_seconds(spec_id: str) -> Optional[float]:
 
 def read_initiative(init_id: str) -> Optional[dict]:
     """Read an initiative YAML file."""
+    # Normalize: strip 'init-' prefix if used as filename
     name = init_id.replace("init-", "")
     for candidate in [init_id, name, f"init-{name}"]:
         path = INITIATIVES_DIR / f"{candidate}.yaml"
         if path.exists():
             try:
+                import re as _re
                 content = path.read_text()
+                # Parse YAML manually (stdlib only)
                 return {"_raw": content, "_path": str(path), "_id": init_id}
             except Exception:
                 pass
@@ -192,6 +191,8 @@ def read_initiative(init_id: str) -> Optional[dict]:
 def parse_initiative_yaml(raw: str) -> dict:
     """Minimal YAML parser for initiative files (stdlib only)."""
     try:
+        # Try stdlib yaml-like parsing via json conversion hack
+        # Since we can't import yaml, use a line-based parser
         result = {}
         lines = raw.splitlines()
         current_kr = None
@@ -235,8 +236,10 @@ def parse_initiative_yaml(raw: str) -> dict:
                 metric_indent = indent
                 current_kr["metric"] = {}
             elif in_metric and stripped.startswith("command:"):
+                # Collect multi-line command
                 cmd_start = stripped[8:].strip()
                 if cmd_start.startswith("'") or cmd_start.startswith('"'):
+                    # Might be multi-line
                     cmd = cmd_start.lstrip("'\"")
                     current_kr["metric"]["command"] = cmd
                 else:
@@ -264,10 +267,13 @@ def find_kr(init_id: str, kr_id: str) -> Optional[dict]:
         if kr.get("id") == kr_id:
             kr["_initiative_id"] = init_id
             kr["_raw_command"] = ""
+            # Extract full metric command from raw YAML
             raw = init_data["_raw"]
+            # Find the command block for this KR
             kr_block_start = raw.find(f"id: {kr_id}")
             if kr_block_start >= 0:
                 block = raw[kr_block_start:]
+                # Find command field
                 cmd_match = re.search(r'command:\s*(.*?)(?:\n\s+direction:|\n\s*target:|\n\s*current:|\Z)', block, re.DOTALL)
                 if cmd_match:
                     cmd_raw = cmd_match.group(1).strip().strip("'\"")
@@ -316,6 +322,7 @@ def analyze_spec(spec_id: str) -> dict:
     # 3. Check the verify command — does it just re-run the metric?
     verify_cmd = get_verify_command(content)
     if verify_cmd and embedded_metric:
+        # If verify uses the same command as metric, it can be gamed by gaming the metric
         if embedded_metric.strip()[:30] in verify_cmd:
             evidence.append("verify command re-runs same metric — can be gamed by metric rewrite")
             gaming_signals += 1
@@ -347,6 +354,7 @@ def analyze_spec(spec_id: str) -> dict:
         )
         all_changed = [f.strip() for f in result.stdout.splitlines() if f.strip()]
 
+        # Filter to files likely changed during this spec's window
         exit_time = get_exit_time(spec_id)
         prompt_path = BOI_QUEUE / f"{spec_id}.prompt.md"
         start_time = prompt_path.stat().st_mtime if prompt_path.exists() else None
@@ -355,6 +363,7 @@ def analyze_spec(spec_id: str) -> dict:
             fpath = WORKSPACE / f
             if fpath.exists():
                 fmtime = fpath.stat().st_mtime
+                # Include if modified within spec window (±30min buffer)
                 if start_time and exit_time:
                     window_start = start_time - 60
                     window_end = exit_time + 1800
@@ -363,6 +372,7 @@ def analyze_spec(spec_id: str) -> dict:
                 else:
                     files_changed.append(f)
 
+        # Categorize changed files
         yaml_only = all([
             f.endswith('.yaml') or f.endswith('.json') or f.endswith('.toml')
             for f in files_changed
@@ -382,7 +392,7 @@ def analyze_spec(spec_id: str) -> dict:
             real_signals += len(code_files)
         elif doc_files:
             evidence.append(f"doc files changed: {doc_files}")
-            real_signals += 1
+            real_signals += 1  # docs are real work, not gaming
 
     except subprocess.TimeoutExpired:
         evidence.append("git diff timed out — could not check file changes")
@@ -553,7 +563,8 @@ def reality_check_kr(kr_ref: str) -> dict:
             if output:
                 try:
                     independent_check_value = float(output.split()[-1])
-                    tolerance = 0.05
+                    # Compare with claimed
+                    tolerance = 0.05  # 5% tolerance
                     if claimed_value is not None:
                         diff = abs(independent_check_value - float(claimed_value))
                         relative_diff = diff / max(abs(float(claimed_value)), 1)

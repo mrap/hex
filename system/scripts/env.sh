@@ -78,7 +78,7 @@ fi
 # --dangerously-skip-permissions so individual scripts don't need to.
 claude() {
   local claude_bin
-  claude_bin="$(command -v claude 2>/dev/null)" || {
+  claude_bin="$(type -P claude 2>/dev/null)" || {
     echo "ERROR: claude not found on PATH after sourcing env.sh" >&2
     echo "  PATH=$PATH" >&2
     return 127
@@ -86,3 +86,41 @@ claude() {
   "$claude_bin" --dangerously-skip-permissions "$@"
 }
 export -f claude
+
+# ── Circuit breaker ──────────────────────────────────────────────────────────
+# Halts an agent after N consecutive failed wake cycles. Call from wake scripts.
+# Usage: agent_check_circuit_breaker "agent-id" "/path/to/log.jsonl" 3
+# Returns: 0 = ok, 1 = circuit tripped (HALT file created, alert sent)
+agent_check_circuit_breaker() {
+  local agent_id="$1"
+  local log_file="$2"
+  local threshold="${3:-3}"
+  local halt_file="$HOME/.hex-${agent_id}-HALT"
+
+  [ -f "$log_file" ] || return 0
+
+  local fail_streak=0
+  while IFS= read -r line; do
+    if echo "$line" | grep -q '"status":"failed"'; then
+      fail_streak=$((fail_streak + 1))
+    else
+      fail_streak=0
+    fi
+  done < <(tail -"$threshold" "$log_file")
+
+  if [ "$fail_streak" -ge "$threshold" ]; then
+    touch "$halt_file"
+    local last_err=""
+    local err_file
+    err_file="$(dirname "$log_file")/last-error.txt"
+    [ -f "$err_file" ] && last_err=$(tail -1 "$err_file" 2>/dev/null | head -c 200)
+    local msg="Agent *${agent_id}* circuit-tripped: ${fail_streak} consecutive failures. Auto-halted. ${last_err:+Last error: \`$last_err\`}"
+    if ! cc-connect send --message "$msg" 2>/dev/null; then
+      echo "[WARN] cc-connect notification failed (cc-connect unavailable?)" >&2
+    fi
+    echo "$msg" >&2
+    return 1
+  fi
+  return 0
+}
+export -f agent_check_circuit_breaker

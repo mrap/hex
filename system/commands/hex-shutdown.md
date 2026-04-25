@@ -1,11 +1,8 @@
-# /hex-shutdown — Close Session
+---
+name: hex-shutdown
+description: >
+  Fire-and-forget session close. Quick distill pass, deregister session, done.
+  Heavy work (reflection, transcripts, memory) runs via Stop hooks in background.
+---
 
-Quick session close. Lighter than checkpoint — no handoff file, just final persistence.
-
-## Steps
-
-1. **Quick distill:** Scan the last few messages for anything not yet persisted. Write it now.
-
-2. **Update landings:** Update status on any landing items that changed during this session.
-
-3. **Report:** "Session closed."
+Invoke the hex-shutdown skill.

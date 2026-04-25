@@ -14,19 +14,9 @@ from glob import glob
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BOI_DB = os.path.expanduser("~/.boi/boi.db")
-_HEX_ROOT = os.environ.get("AGENT_DIR") or os.environ.get("HEX_DIR")
-if not _HEX_ROOT:
-    _HEX_ROOT = str(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
-_CLAUDE_PROJECT = os.environ.get("CLAUDE_PROJECT_MEMORY", "")
-if not _CLAUDE_PROJECT:
-    _CLAUDE_PROJECT = os.path.join(
-        os.path.expanduser("~/.claude/projects"),
-        "-" + _HEX_ROOT.replace("/", "-").lstrip("-"),
-        "memory"
-    )
-FEEDBACK_GLOB = os.path.join(_CLAUDE_PROJECT, "feedback_*.md")
+FEEDBACK_GLOB = os.path.expanduser(
+    "~/.claude/projects/-Users-mrap-mrap-hex/memory/feedback_*.md"
+)
 CACHE_FILE = "/tmp/hex-vitals-prev.json"
 
 # ── Thresholds (from t-2 analysis) ────────────────────────────────────────
@@ -299,8 +289,8 @@ def save_cache(data: dict) -> None:
 
 # ── Slack ──────────────────────────────────────────────────────────────────
 SLACK_SECRET_FILES = [
-    os.path.join(_HEX_ROOT, ".hex", "secrets", "slack-bot-token.env"),
-    os.path.join(_HEX_ROOT, ".hex", "secrets", "slack-bot.env"),
+    "/Users/mrap/mrap-hex/.hex/secrets/slack-bot-token.env",  # spec path
+    "/Users/mrap/mrap-hex/.hex/secrets/slack-bot.env",        # actual path
 ]
 SLACK_CHANNEL = "hex-vitals"
 

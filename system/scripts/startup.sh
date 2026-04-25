@@ -117,13 +117,18 @@ step_transcripts() {
     header "3. Parse Transcripts"
 
     PARSER="$SCRIPTS_DIR/parse_transcripts.py"
+    WRAPPER="$SCRIPTS_DIR/parse-transcripts-and-emit.sh"
     if [[ ! -f "$PARSER" ]]; then
         info "parse_transcripts.py not found — transcript parsing unavailable"
         info "Install parse_transcripts.py to $SCRIPTS_DIR/ to enable this feature"
         return
     fi
 
-    PARSE_OUT=$(python3 "$PARSER" 2>&1)
+    if [[ -x "$WRAPPER" ]]; then
+        PARSE_OUT=$(bash "$WRAPPER" 2>&1)
+    else
+        PARSE_OUT=$(python3 "$PARSER" 2>&1)
+    fi
     if echo "$PARSE_OUT" | grep -q "No new transcripts"; then
         pass "All transcripts already parsed"
     elif echo "$PARSE_OUT" | grep -q "No .jsonl files"; then

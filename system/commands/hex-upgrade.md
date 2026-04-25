@@ -1,22 +1,21 @@
 ---
 name: hex-upgrade
-description: Upgrade hex to the latest version from hex-foundation
+description: Upgrade hex to the latest version from hex
 ---
-<!-- # sync-safe -->
 
-# /hex-upgrade — Upgrade Hex
+# /hex-upgrade — Upgrade Hexagon
 
-Pull the latest scripts, skills, commands, and hooks from hex-foundation.
+Pull the latest scripts, skills, commands, and hooks from hex.
 
 ## Step 1: Run the upgrade script
 
 ```bash
-bash $HEX_DIR/.hex/scripts/upgrade.sh
+bash $AGENT_DIR/.hex/scripts/upgrade.sh
 ```
 
 If the user passed arguments (e.g., `--dry-run`, `--local PATH`), forward them:
 ```bash
-bash $HEX_DIR/.hex/scripts/upgrade.sh ARGUMENTS
+bash $AGENT_DIR/.hex/scripts/upgrade.sh ARGUMENTS
 ```
 
 ## Step 2: Handle CLAUDE.md template changes
@@ -25,13 +24,13 @@ If the upgrade script reports that the CLAUDE.md template has changed:
 
 1. Read the new template from the upgrade cache:
    ```
-   $HEX_DIR/.hex/.upgrade-cache/templates/CLAUDE.md.template
+   $AGENT_DIR/.claude/.upgrade-cache/templates/CLAUDE.md.template
    ```
 
-2. Read the current `$HEX_DIR/CLAUDE.md`
+2. Read the current `$AGENT_DIR/CLAUDE.md`
 
 3. Detect the user's `{{NAME}}` and `{{AGENT}}` values from the current CLAUDE.md:
-   - `{{NAME}}` = the name used throughout
+   - `{{NAME}}` = the name used throughout (e.g., "Mike Rapadas")
    - `{{AGENT}}` = the agent name from the file index section or title
 
 4. Merge intelligently:
@@ -46,7 +45,7 @@ If the upgrade script reports that the CLAUDE.md template has changed:
 
 After upgrade, rebuild the memory index to pick up any changes:
 ```bash
-python3 $HEX_DIR/.hex/skills/memory/scripts/memory_index.py
+python3 $AGENT_DIR/.hex/skills/memory/scripts/memory_index.py
 ```
 
 ## Step 4: Report
@@ -59,11 +58,11 @@ Show a concise summary:
 
 ## First-Time Setup
 
-If no `$HEX_DIR/.hex/upgrade.json` exists, create one:
+If no `$AGENT_DIR/.hex/upgrade.json` exists, create one:
 
 ```json
 {
-  "repo": "https://github.com/mrap/hex-foundation.git",
+  "repo": "https://github.com/mrap/hex.git",
   "last_upgrade": "YYYY-MM-DD"
 }
 ```

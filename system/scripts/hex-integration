@@ -6,28 +6,12 @@
 set -uo pipefail
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
-# HEX_ROOT derivation order:
-#   1. $HEX_ROOT env var (explicit override — dev / CI)
-#   2. Auto-detect from this script's location. When installed at
-#      <instance>/.hex/scripts/hex-integration, SCRIPT_DIR/../.. is the instance root.
-#   3. When running from a foundation checkout (system/scripts/hex-integration),
-#      auto-detect lands inside the foundation repo — set HEX_ROOT explicitly for dev.
-_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly HEX_ROOT="${HEX_ROOT:-$(cd "${_script_dir}/../.." && pwd)}"
+readonly HEX_ROOT="/Users/mrap/mrap-hex"
 readonly HEX_SECRETS="${HEX_ROOT}/.hex/secrets"
 readonly HEX_STATE="${HEX_ROOT}/projects/integrations/_state"
 readonly HEX_BUNDLES="${HEX_ROOT}/integrations"
 readonly HEX_EVENTS_POLICIES="${HOME}/.hex-events/policies"
-
-# HEX_LIB derivation: installed mode uses $HEX_ROOT/.hex/lib; foundation-dev
-# mode uses the lib dir next to this script. Prefer installed mode when both exist.
-if [[ -d "${HEX_ROOT}/.hex/lib/integration" ]]; then
-  readonly HEX_LIB="${HEX_ROOT}/.hex/lib"
-elif [[ -d "${_script_dir}/lib/integration" ]]; then
-  readonly HEX_LIB="${_script_dir}/lib"
-else
-  readonly HEX_LIB="${HEX_ROOT}/.hex/lib"   # fallback for error path
-fi
+readonly HEX_LIB="${HEX_ROOT}/.hex/lib"
 export HEX_ROOT HEX_SECRETS HEX_STATE HEX_BUNDLES HEX_EVENTS_POLICIES HEX_LIB
 
 # ─── Logging helpers ─────────────────────────────────────────────────────────

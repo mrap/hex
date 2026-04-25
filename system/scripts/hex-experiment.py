@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-HEX_ROOT = os.environ["AGENT_DIR"]
+HEX_ROOT = os.environ.get("HEX_ROOT", os.path.expanduser("~/mrap-hex"))
 EXPERIMENTS_DIR = os.path.join(HEX_ROOT, "experiments")
 
 # ── telemetry ─────────────────────────────────────────────────────────────────

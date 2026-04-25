@@ -3,7 +3,6 @@ name: hex-debrief
 description: Debrief hex on what changed — projects, org signals, relationships, career. Run weekly or when hex prompts you.
 allowed-tools: ["Bash", "Read", "Write", "Edit"]
 ---
-<!-- # sync-safe -->
 
 # Weekly Context Sync
 
@@ -26,7 +25,7 @@ For each project in todo.md "Now" section, ask:
 
 ### 3. Relationship updates
 - Any new observations about collaborators or stakeholders?
-- Any new people you are working with?
+- Any new people {{NAME}} is working with?
 - Any friction or wins worth noting?
 - Create new `people/*/profile.md` files for new contacts.
 
