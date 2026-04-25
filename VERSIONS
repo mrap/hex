@@ -7,5 +7,5 @@
 #
 # To bump: tag new releases in boi/hex-events, then update these values.
 
-BOI_VERSION=v0.1.0
+BOI_VERSION=v0.2.0
 HEX_EVENTS_VERSION=v0.2.0
