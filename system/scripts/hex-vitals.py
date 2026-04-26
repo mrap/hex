@@ -15,7 +15,7 @@ from glob import glob
 # ── Paths ──────────────────────────────────────────────────────────────────
 BOI_DB = os.path.expanduser("~/.boi/boi.db")
 FEEDBACK_GLOB = os.path.expanduser(
-    "~/.claude/projects/-Users-mrap-mrap-hex/memory/feedback_*.md"
+    os.path.join(_CLAUDE_PROJECT, "feedback_*.md")
 )
 CACHE_FILE = "/tmp/hex-vitals-prev.json"
 
@@ -289,8 +289,8 @@ def save_cache(data: dict) -> None:
 
 # ── Slack ──────────────────────────────────────────────────────────────────
 SLACK_SECRET_FILES = [
-    "/Users/mrap/mrap-hex/.hex/secrets/slack-bot-token.env",  # spec path
-    "/Users/mrap/mrap-hex/.hex/secrets/slack-bot.env",        # actual path
+    "/Users/mrap/hex/.hex/secrets/slack-bot-token.env",  # spec path
+    "/Users/mrap/hex/.hex/secrets/slack-bot.env",        # actual path
 ]
 SLACK_CHANNEL = "hex-vitals"
 

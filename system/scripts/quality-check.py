@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 BOI_QUEUE = Path(os.path.expanduser("~/.boi/queue"))
-WORKSPACE = Path(os.path.expanduser("~/mrap-hex"))
+WORKSPACE = Path(os.path.expanduser("${AGENT_DIR:-$HOME/hex}"))
 INITIATIVES_DIR = WORKSPACE / "initiatives"
 EVENTS_DIR = Path(os.path.expanduser("~/.hex-events/events"))
 

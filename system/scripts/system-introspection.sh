@@ -4,8 +4,8 @@
 
 set -uo pipefail
 
-CLAUDE_BIN="/Users/mrap/.local/bin/claude"
-AGENT_DIR="${AGENT_DIR:-$HOME/mrap-hex}"
+CLAUDE_BIN="$HOME/.local/bin/claude"
+AGENT_DIR="${AGENT_DIR:-${AGENT_DIR:-$HOME/hex}}"
 REPORT_DIR="$AGENT_DIR/raw/research/introspection"
 LOG_DIR="$AGENT_DIR/raw/research/introspection/logs"
 mkdir -p "$REPORT_DIR" "$LOG_DIR"

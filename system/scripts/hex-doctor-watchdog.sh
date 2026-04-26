@@ -13,7 +13,7 @@
 set -uo pipefail
 
 # Source shared environment so we have the same PATH/env as interactive shell
-HEX_ENV="${AGENT_DIR:-$HOME/mrap-hex}/.hex/scripts/env.sh"
+HEX_ENV="${AGENT_DIR:-${AGENT_DIR:-$HOME/hex}}/.hex/scripts/env.sh"
 [ -f "$HEX_ENV" ] && source "$HEX_ENV"
 
 # ─── Resolve AGENT_DIR ────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ if [ -z "$AGENT_DIR" ]; then
     fi
     candidate="$(dirname "$candidate")"
   done
-  AGENT_DIR="${AGENT_DIR:-$HOME/mrap-hex}"
+  AGENT_DIR="${AGENT_DIR:-${AGENT_DIR:-$HOME/hex}}"
 fi
 
 HEX_CHECKS_DIR="$AGENT_DIR/.hex/scripts"

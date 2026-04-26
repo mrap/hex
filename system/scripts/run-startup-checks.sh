@@ -28,7 +28,7 @@ for arg in "$@"; do
 done
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-# Derive AGENT_DIR from this script's location: scripts/ → mrap-hex/
+# Derive AGENT_DIR from this script's location: scripts/ → hex/
 AGENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLAUDE_DIR="$AGENT_DIR/.claude"
 

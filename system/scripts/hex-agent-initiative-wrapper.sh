@@ -21,7 +21,7 @@
 
 set -uo pipefail
 
-HEX_ROOT="${HEX_ROOT:-$HOME/mrap-hex}"
+HEX_ROOT="${HEX_ROOT:-${AGENT_DIR:-$HOME/hex}}"
 # Prefer the installed -bin alongside the wrapper; fall back to build output
 if [[ -f "$HEX_ROOT/.hex/bin/hex-agent-bin" ]]; then
     HEX_AGENT_BIN="$HEX_ROOT/.hex/bin/hex-agent-bin"

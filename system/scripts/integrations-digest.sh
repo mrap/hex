@@ -2,8 +2,8 @@
 # integrations-digest.sh — Post weekly integrations summary to #integrations
 set -uo pipefail
 
-STATE_DIR="/Users/mrap/mrap-hex/projects/integrations/_state"
-SLACK_SCRIPT="/Users/mrap/mrap-hex/.hex/scripts/slack-post.sh"
+STATE_DIR="${AGENT_DIR:-$HOME/hex}/projects/integrations/_state"
+SLACK_SCRIPT="${AGENT_DIR:-$HOME/hex}/.hex/scripts/slack-post.sh"
 CHANNEL="C0AUJJ63CG4"
 
 DIGEST=$(python3 - "$STATE_DIR" <<'PYEOF'

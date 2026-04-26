@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-AGENT_DIR="${AGENT_DIR:-$HOME/mrap-hex}"
+AGENT_DIR="${AGENT_DIR:-${AGENT_DIR:-$HOME/hex}}"
 ISSUES=0
 LOG=""
 
@@ -19,7 +19,7 @@ if [ -f "$AGENT_DIR/.hex/skills/memory/scripts/memory_index.py" ]; then
 fi
 
 # 2. Check MEMORY.md line count (cap at 200)
-MEMORY_MD="$HOME/.claude/projects/-Users-mrap-mrap-hex/memory/MEMORY.md"
+MEMORY_MD="$HOME/.claude/projects/-Users-mrap-hex/memory/MEMORY.md"
 if [ -f "$MEMORY_MD" ]; then
   LINE_COUNT=$(wc -l < "$MEMORY_MD" | tr -d ' ')
   if [ "$LINE_COUNT" -gt 180 ]; then
@@ -49,8 +49,8 @@ if [ -f "$AGENT_DIR/CLAUDE.md" ]; then
 fi
 
 # 4. Check for duplicate memory files
-if [ -d "$HOME/.claude/projects/-Users-mrap-mrap-hex/memory" ]; then
-  MEM_DIR="$HOME/.claude/projects/-Users-mrap-mrap-hex/memory"
+if [ -d "$HOME/.claude/projects/-Users-mrap-hex/memory" ]; then
+  MEM_DIR="$HOME/.claude/projects/-Users-mrap-hex/memory"
   DUPES=$(find "$MEM_DIR" -name "*.md" ! -name "MEMORY.md" -exec md5 -q {} + 2>/dev/null | sort | uniq -d | wc -l | tr -d ' ')
   if [ "$DUPES" -gt 0 ]; then
     log "ISSUE: $DUPES duplicate memory files detected"

@@ -17,7 +17,7 @@
 set -uo pipefail
 
 BINDINGS_FILE="$HOME/.cc-connect/agent-channels.yaml"
-HEX_DIR="/Users/mrap/mrap-hex"
+HEX_DIR="${AGENT_DIR:-$HOME/hex}"
 CHANNEL="${CC_CHAT_NAME:-}"
 
 # No channel name or no bindings file → generic hex behavior

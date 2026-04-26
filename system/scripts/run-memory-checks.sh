@@ -25,7 +25,7 @@ if [ -z "${AGENT_DIR:-}" ]; then
     fi
     candidate="$(dirname "$candidate")"
   done
-  AGENT_DIR="${AGENT_DIR:-$HOME/mrap-hex}"
+  AGENT_DIR="${AGENT_DIR:-${AGENT_DIR:-$HOME/hex}}"
 fi
 
 CLAUDE_DIR="$AGENT_DIR/.claude"

@@ -4,7 +4,7 @@ description: Friday weekly close — review lands, draft shareable post, log out
 
 # /hex-post-week
 
-Runs the Friday close cadence. Reviews the week's lands, produces a draft post for LinkedIn/X/mrap.me, and logs the outcome.
+Runs the Friday close cadence. Reviews the week's lands, produces a draft post for LinkedIn/X/personal site, and logs the outcome.
 
 ## When to run
 

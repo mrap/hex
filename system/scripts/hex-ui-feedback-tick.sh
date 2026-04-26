@@ -10,22 +10,22 @@
 
 set -uo pipefail
 
-PATH="/Users/mrap/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export PATH
-CLAUDE_BIN="/Users/mrap/.local/bin/claude"
+CLAUDE_BIN="$HOME/.local/bin/claude"
 
 # Load API key so headless `claude -p` can auth under cron (no interactive login available)
-if [ -f "/Users/mrap/.hex-test.env" ]; then
+if [ -f "$HOME/.hex-test.env" ]; then
   set -a
-  . "/Users/mrap/.hex-test.env"
+  . "$HOME/.hex-test.env"
   set +a
 fi
 
-API="https://mac-mini.tailbd5748.ts.net/visions/api/comments"
+API="${HEX_URL:-https://localhost}/visions/api/comments"
 LOG="/tmp/hex-ui-feedback-loop.log"
 LOCK="/tmp/hex-ui-feedback-loop.lock"
-PROMPT_FILE="/Users/mrap/mrap-hex/.hex/scripts/hex-ui-feedback-loop-prompt.txt"
-PROJECT_DIR="/Users/mrap/mrap-hex"
+PROMPT_FILE="${AGENT_DIR:-$HOME/hex}/.hex/scripts/hex-ui-feedback-loop-prompt.txt"
+PROJECT_DIR="${AGENT_DIR:-$HOME/hex}"
 
 # Simple lock so concurrent ticks don't race
 if [ -e "$LOCK" ]; then

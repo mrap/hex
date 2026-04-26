@@ -6,7 +6,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HEX_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TRANSCRIPTS_DIR="$HEX_ROOT/raw/transcripts"
-HEX_EMIT="python3 /Users/mrap/github.com/mrap/hex-events/hex_emit.py"
+HEX_EMIT="python3 $HOME/github.com/mrap/hex-events/hex_emit.py"
 
 PARSE_OUT=$(python3 "$SCRIPT_DIR/parse_transcripts.py" "$@" 2>&1)
 PARSE_EXIT=$?

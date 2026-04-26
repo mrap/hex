@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 # --- Paths ---
-HEX_ROOT = Path(os.environ.get("HEX_ROOT", Path.home() / "mrap-hex"))
+HEX_ROOT = Path(os.environ.get("HEX_ROOT", Path(os.environ.get("AGENT_DIR", str(Path.home() / "hex")))))
 INITIATIVES_DIR = HEX_ROOT / "initiatives"
 EXPERIMENTS_DIR = HEX_ROOT / "experiments"
 BOI_QUEUE_DIR = Path.home() / ".boi" / "queue"

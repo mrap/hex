@@ -3,8 +3,8 @@
 # Usage: hex-ui-build.sh [--skip-tests]
 set -uo pipefail
 
-FRONTEND_DIR="/Users/mrap/github.com/mrap/hex-ui/frontend"
-BACKEND_DIR="/Users/mrap/github.com/mrap/hex-ui/backend"
+FRONTEND_DIR="$HOME/github.com/mrap/hex-ui/frontend"
+BACKEND_DIR="$HOME/github.com/mrap/hex-ui/backend"
 BACKEND_PORT=8889
 ROUTER_PORT=8880
 BACKEND_LOG="/tmp/hex-ui-backend.log"
@@ -104,7 +104,7 @@ else
     echo "$OLD_ROUTER" | xargs kill -TERM 2>/dev/null || true
     sleep 1
   fi
-  ROUTER_DIR="/Users/mrap/mrap-hex/.hex/scripts/hex-router"
+  ROUTER_DIR="${AGENT_DIR:-$HOME/hex}/.hex/scripts/hex-router"
   if [ -d "$ROUTER_DIR" ]; then
     cd "$ROUTER_DIR"
     nohup python3 router.py > /tmp/hex-router.log 2>&1 &

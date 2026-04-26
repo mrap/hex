@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-AGENT_DIR="${AGENT_DIR:-/Users/mrap/mrap-hex}"
+AGENT_DIR="${AGENT_DIR:-${AGENT_DIR:-$HOME/hex}}"
 PROJECT_ID="${1:-}"
 CHANNEL_ID="${2:-}"
 

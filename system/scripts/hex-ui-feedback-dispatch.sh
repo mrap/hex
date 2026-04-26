@@ -10,14 +10,14 @@
 
 set -uo pipefail
 
-PATH="/Users/mrap/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export PATH
 
-API="https://mac-mini.tailbd5748.ts.net/visions/api/comments"
+API="${HEX_URL:-https://localhost}/visions/api/comments"
 LOG="/tmp/hex-ui-feedback-loop.log"
 LOCK="/tmp/hex-ui-feedback-loop.lock"
-SPEC_DIR="/Users/mrap/mrap-hex/specs/feedback-comments"
-PROJECT_DIR="/Users/mrap/mrap-hex"
+SPEC_DIR="${AGENT_DIR:-$HOME/hex}/specs/feedback-comments"
+PROJECT_DIR="${AGENT_DIR:-$HOME/hex}"
 
 mkdir -p "$SPEC_DIR"
 
@@ -63,11 +63,11 @@ import json, os, subprocess, re
 import urllib.request, ssl
 
 ctx = ssl._create_unverified_context()
-with urllib.request.urlopen('https://mac-mini.tailbd5748.ts.net/visions/api/comments', context=ctx, timeout=5) as r:
+with urllib.request.urlopen('${HEX_URL:-https://localhost}/visions/api/comments', context=ctx, timeout=5) as r:
     full = json.load(r)
 data = [c for c in full.get('comments', []) if c.get('status') == 'new']
 
-SPEC_DIR = "/Users/mrap/mrap-hex/specs/feedback-comments"
+SPEC_DIR = "${AGENT_DIR:-$HOME/hex}/specs/feedback-comments"
 DISPATCH_LIMIT = 3  # per tick
 
 def slug(s):
@@ -98,7 +98,7 @@ for c in data:
 ## Context
 
 This is a feedback comment left by Mike on the hex-ui pitch site at
-`https://mac-mini.tailbd5748.ts.net/demos`. Mark it building now, make the
+`${HEX_URL:-https://localhost}/demos`. Mark it building now, make the
 change he asked for, post an inline reply, mark built. All comments live
 in `projects/hex-ui/feedback/comments.json` and are served via the
 pitch-site API at `/visions/api/comments`.
@@ -107,7 +107,7 @@ pitch-site API at `/visions/api/comments`.
 
 - Only modify files under `projects/hex-ui/vision-pitch-site/`.
 - Respect `projects/hex-ui/design-principles-2026-04-21.md` and the
-  rejected-patterns memory (`~/.claude/projects/-Users-mrap-mrap-hex/memory/feedback_hex_ui_rejected_patterns.md`).
+  rejected-patterns memory (`~/.claude/projects/from the Claude project memory/memory/feedback_hex_ui_rejected_patterns.md`).
 - Light mode default. Tailscale URLs only.
 - Do NOT modify `projects/hex-ui/feedback/comments.json`.
 - If the comment is ambiguous, POST a clarifying reply and leave status as `new`.
@@ -116,16 +116,16 @@ pitch-site API at `/visions/api/comments`.
 PENDING
 
 **Spec:**
-1. `curl -sk -X POST -H "Content-Type: application/json" -d '{{\\"status\\":\\"building\\"}}' https://mac-mini.tailbd5748.ts.net/visions/api/comments/{cid}/status`
+1. `curl -sk -X POST -H "Content-Type: application/json" -d '{{\\"status\\":\\"building\\"}}' ${HEX_URL:-https://localhost}/visions/api/comments/{cid}/status`
 2. Read the comment text above. Identify the scope (demo `{demo_id}`).
 3. Edit the relevant files under `projects/hex-ui/vision-pitch-site/` to address the feedback.
 4. Verify the served HTML reflects the change (curl with a cache-bust query).
 5. POST a 1–3 sentence reply describing what changed:
-   `curl -sk -X POST -H "Content-Type: application/json" -d '{{"reply":"..."}}' https://mac-mini.tailbd5748.ts.net/visions/api/comments/{cid}/reply`
+   `curl -sk -X POST -H "Content-Type: application/json" -d '{{"reply":"..."}}' ${HEX_URL:-https://localhost}/visions/api/comments/{cid}/reply`
 6. POST `status=built`:
-   `curl -sk -X POST -H "Content-Type: application/json" -d '{{"status":"built"}}' https://mac-mini.tailbd5748.ts.net/visions/api/comments/{cid}/status`
+   `curl -sk -X POST -H "Content-Type: application/json" -d '{{"status":"built"}}' ${HEX_URL:-https://localhost}/visions/api/comments/{cid}/status`
 
-**Verify:** `curl -sk https://mac-mini.tailbd5748.ts.net/visions/api/comments | python3 -c "import sys,json; d=json.load(sys.stdin); c=[x for x in d['comments'] if x['id']=='{cid}'][0]; assert c['status']=='built', f'status still {{c[\\"status\\"]}}'"`
+**Verify:** `curl -sk ${HEX_URL:-https://localhost}/visions/api/comments | python3 -c "import sys,json; d=json.load(sys.stdin); c=[x for x in d['comments'] if x['id']=='{cid}'][0]; assert c['status']=='built', f'status still {{c[\\"status\\"]}}'"`
 """
 
     with open(sp, 'w') as f:
@@ -133,7 +133,7 @@ PENDING
 
     # dispatch
     r = subprocess.run(
-        ["bash", "/Users/mrap/.boi/boi", "dispatch", sp],
+        ["bash", "$HOME/.boi/boi", "dispatch", sp],
         capture_output=True, text=True, timeout=30
     )
     if r.returncode == 0:

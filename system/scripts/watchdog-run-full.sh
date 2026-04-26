@@ -4,7 +4,7 @@
 # Uses hour-of-day modulo to fire approximately every 12h (at 00:xx and 12:xx).
 set -uo pipefail
 
-HEX_ROOT="${HEX_ROOT:-$HOME/mrap-hex}"
+HEX_ROOT="${HEX_ROOT:-${AGENT_DIR:-$HOME/hex}}"
 CURRENT_HOUR=$(date +%H | sed 's/^0//')  # strip leading zero so 09 -> 9
 
 # Only run at hours 0 and 12 (approx every 12h)

@@ -5,7 +5,7 @@ set -uo pipefail
 
 PROJECTS_DIR="$HOME/.claude/projects"
 RETENTION_DAYS="${1:-30}"
-LOG_FILE="$HOME/mrap-hex/.hex/hooks/logs/cleanup-project-jsonl.log"
+LOG_FILE="${AGENT_DIR:-$HOME/hex}/.hex/hooks/logs/cleanup-project-jsonl.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 
 TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')

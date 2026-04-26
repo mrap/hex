@@ -6,7 +6,7 @@
 #   Revive candidates: Items with dates 14-21 days old that are still open
 #   Active:            Items under 14 days old (skipped)
 #
-# Usage: bash /Users/admin/mrap-hex/.hex/scripts/stale-reaper.sh
+# Usage: bash /Users/admin/hex/.hex/scripts/stale-reaper.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_DIR="${AGENT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"

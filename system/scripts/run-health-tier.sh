@@ -6,7 +6,7 @@
 set -uo pipefail
 
 TIER="${1:-}"
-HEALTH_DIR="/Users/mrap/mrap-hex/.hex/scripts/health"
+HEALTH_DIR="${AGENT_DIR:-$HOME/hex}/.hex/scripts/health"
 HEX_EMIT="python3 $HOME/.hex-events/hex_emit.py"
 
 case "$TIER" in
