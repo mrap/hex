@@ -25,6 +25,7 @@ if [[ -z "${HEX_DIR:-}" ]]; then
 fi
 export HEX_DIR
 export AGENT_DIR="$HEX_DIR"
+export HEX_ROOT="$HEX_DIR"
 
 # ── PATH: ensure user tools are reachable ────────────────────────────────────
 # Agents and workers run in clean environments (launchd, tmux, cron) where the

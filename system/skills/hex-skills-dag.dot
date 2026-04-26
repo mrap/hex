@@ -1,0 +1,88 @@
+digraph hex_skills {
+  rankdir=TB;
+  fontname="Helvetica";
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11];
+  edge [color="#666666"];
+  bgcolor="white";
+  pad=0.5;
+  nodesep=0.6;
+  ranksep=0.8;
+
+  // Session lifecycle
+  "hex-startup" [fillcolor="#b8e6c8"];
+  "hex-shutdown" [fillcolor="#b8e6c8"];
+  "hex-checkpoint" [fillcolor="#b8e6c8"];
+  "hex-reflect" [fillcolor="#b8e6c8"];
+  "hex-save" [fillcolor="#b8e6c8"];
+
+  // Core infrastructure
+  "memory" [fillcolor="#99ccff", penwidth=2];
+  "hex-doctor" [fillcolor="#99ccff"];
+  "hex-upgrade" [fillcolor="#99ccff"];
+  "hex-event" [fillcolor="#99ccff"];
+
+  // Teams cluster — MARKED FOR REMOVAL
+  "hex-sync" [fillcolor="#ff9999", fontcolor="#990000", label="hex-sync\n⛔ REMOVE"];
+  "hex-create-team" [fillcolor="#ff9999", fontcolor="#990000", label="hex-create-team\n⛔ REMOVE"];
+  "hex-connect-team" [fillcolor="#ff9999", fontcolor="#990000", label="hex-connect-team\n⛔ REMOVE"];
+
+  // Connected
+  "hex-triage" [fillcolor="#d4c5f9"];
+  "hex-decide" [fillcolor="#d4c5f9"];
+  "hex-context-sync" [fillcolor="#d4c5f9"];
+  "boi-delegation" [fillcolor="#d4c5f9"];
+  "landings" [fillcolor="#d4c5f9"];
+
+  // Standalone
+  "x-twitter" [fillcolor="#e8e8e8"];
+  "x-research" [fillcolor="#e8e8e8"];
+  "imessage" [fillcolor="#e8e8e8"];
+  "remodeling" [fillcolor="#e8e8e8"];
+  "vibe-to-prod" [fillcolor="#e8e8e8"];
+  "conjecture-criticism" [fillcolor="#e8e8e8"];
+  "hermes-memory-migration" [fillcolor="#e8e8e8"];
+  "hex-consolidate" [fillcolor="#e8e8e8"];
+  "context-save" [fillcolor="#e8e8e8"];
+  "hex-switch" [fillcolor="#e8e8e8"];
+  "hex-scout" [fillcolor="#e8e8e8"];
+  "hex-bookmarks" [fillcolor="#e8e8e8"];
+  "hex-ui" [fillcolor="#e8e8e8"];
+
+  // Edges — session lifecycle
+  "hex-startup" -> "hex-doctor";
+  "hex-startup" -> "hex-triage";
+  "hex-startup" -> "memory";
+  "hex-shutdown" -> "hex-checkpoint";
+  "hex-checkpoint" -> "memory";
+  "hex-checkpoint" -> "hex-reflect";
+  "hex-reflect" -> "memory";
+  "hex-save" -> "memory";
+
+  // Edges — connected
+  "hex-doctor" -> "memory";
+  "hex-decide" -> "memory";
+  "hex-upgrade" -> "memory";
+  "hex-context-sync" -> "memory";
+  "boi-delegation" -> "hex-event";
+
+  // Edges — teams (circular, removing)
+  "hex-sync" -> "hex-connect-team" [color="#cc0000", style=dashed];
+  "hex-sync" -> "hex-create-team" [color="#cc0000", style=dashed];
+  "hex-create-team" -> "hex-sync" [color="#cc0000", style=dashed];
+  "hex-connect-team" -> "hex-sync" [color="#cc0000", style=dashed];
+
+  // Legend
+  subgraph cluster_legend {
+    label="Legend";
+    fontsize=10;
+    style=rounded;
+    color="#cccccc";
+    node [shape=box, fontsize=9, width=1.8];
+    leg1 [label="Session lifecycle", fillcolor="#b8e6c8"];
+    leg2 [label="Core infrastructure", fillcolor="#99ccff"];
+    leg3 [label="Connected", fillcolor="#d4c5f9"];
+    leg4 [label="Standalone", fillcolor="#e8e8e8"];
+    leg5 [label="⛔ Marked for removal", fillcolor="#ff9999", fontcolor="#990000"];
+    leg1 -> leg2 -> leg3 -> leg4 -> leg5 [style=invis];
+  }
+}

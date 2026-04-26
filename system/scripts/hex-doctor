@@ -1,0 +1,286 @@
+#!/bin/bash
+# hex-doctor — Unified health check entry point for all hex modules
+#
+# Runs installation checks (via doctor.sh) + all 6 module checks:
+#   Memory → hex-events → BOI → startup → landings → workspace
+#
+# Usage:
+#   hex-doctor              # Check all modules, report results
+#   hex-doctor --fix        # Auto-fix issues where possible
+#   hex-doctor --smoke      # Also run smoke tests (slower, proves end-to-end)
+#   hex-doctor --quiet      # Only show errors and warnings
+#
+# Exit codes:
+#   0 = all pass
+#   1 = errors found
+#   2 = warnings only (no errors)
+
+set -uo pipefail
+
+# ─── Resolve AGENT_DIR ────────────────────────────────────────────────────────
+if [ -z "${AGENT_DIR:-}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  candidate="$SCRIPT_DIR"
+  while [ "$candidate" != "/" ]; do
+    if [ -f "$candidate/CLAUDE.md" ]; then
+      AGENT_DIR="$candidate"
+      break
+    fi
+    candidate="$(dirname "$candidate")"
+  done
+  AGENT_DIR="${AGENT_DIR:-$HOME/mrap-hex}"
+fi
+
+CLAUDE_DIR="$AGENT_DIR/.claude"
+SCRIPTS_DIR="$CLAUDE_DIR/scripts"
+HEX_CHECKS_DIR="$AGENT_DIR/scripts/doctor-checks"
+
+# ─── Flags ────────────────────────────────────────────────────────────────────
+FIX=false
+SMOKE=false
+QUIET=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --fix)   FIX=true ;;
+    --smoke) SMOKE=true ;;
+    --quiet) QUIET=true ;;
+    --help|-h)
+      echo "Usage: hex-doctor [--fix] [--smoke] [--quiet]"
+      echo ""
+      echo "  --fix    Auto-fix safe issues (restarts daemons, chmod, rebuilds indexes)"
+      echo "  --smoke  Run smoke tests proving end-to-end functionality (slower)"
+      echo "  --quiet  Only show errors and warnings (suppress PASS lines)"
+      exit 0
+      ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ─── State ────────────────────────────────────────────────────────────────────
+PASS_COUNT=0
+WARN_COUNT=0
+ERROR_COUNT=0
+FIXED_COUNT=0
+HAS_ERRORS=false
+HAS_WARNINGS=false
+
+CHECKS_FILE=$(mktemp /tmp/hex-doctor-checks.XXXXXX)
+trap 'rm -f "$CHECKS_FILE"' EXIT
+
+# ─── Output helpers ───────────────────────────────────────────────────────────
+_pass() {
+  PASS_COUNT=$((PASS_COUNT + 1))
+  if ! $QUIET; then
+    echo -e "  [${GREEN}PASS${RESET}] $1"
+  fi
+}
+
+_warn() {
+  WARN_COUNT=$((WARN_COUNT + 1))
+  HAS_WARNINGS=true
+  echo -e "  [${YELLOW}WARN${RESET}] $1"
+}
+
+_error() {
+  ERROR_COUNT=$((ERROR_COUNT + 1))
+  HAS_ERRORS=true
+  echo -e "  [${RED}ERROR${RESET}] $1"
+}
+
+_fixed() {
+  FIXED_COUNT=$((FIXED_COUNT + 1))
+  echo -e "  [${GREEN}FIXED${RESET}] $1"
+}
+
+_info() {
+  if ! $QUIET; then
+    echo -e "  ${DIM}→${RESET} $1"
+  fi
+}
+
+_rec() {
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$CHECKS_FILE"
+}
+
+# ─── Header ───────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}Hex Doctor — Full System Health Check${RESET}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${DIM}AGENT_DIR=$AGENT_DIR${RESET}"
+if $FIX;   then echo -e "${DIM}Mode: --fix enabled (auto-remediation on)${RESET}"; fi
+if $SMOKE; then echo -e "${DIM}Mode: --smoke enabled (end-to-end tests on)${RESET}"; fi
+
+# ─── Part 1: Installation checks (doctor.sh) ─────────────────────────────────
+DOCTOR_SH="$SCRIPTS_DIR/doctor.sh"
+INSTALL_ERRORS=0
+INSTALL_WARNINGS=0
+INSTALL_PASS=0
+INSTALL_FIXED=0
+
+if [ -f "$DOCTOR_SH" ]; then
+  echo ""
+  echo -e "${BOLD}Installation Checks${RESET}"
+  echo "  ─────────────────────────────────────────"
+
+  # Run doctor.sh and capture output (avoid empty array with -u)
+  if $FIX && $QUIET; then
+    doctor_output=$(bash "$DOCTOR_SH" --fix --quiet 2>&1) || true
+  elif $FIX; then
+    doctor_output=$(bash "$DOCTOR_SH" --fix 2>&1) || true
+  elif $QUIET; then
+    doctor_output=$(bash "$DOCTOR_SH" --quiet 2>&1) || true
+  else
+    doctor_output=$(bash "$DOCTOR_SH" 2>&1) || true
+  fi
+
+  # Print doctor.sh output (skip the header lines it already prints, show check results)
+  # Filter: remove the doctor.sh header (first 4 lines with title/separator/AGENT_DIR/blank)
+  echo "$doctor_output" | tail -n +5 | while IFS= read -r line; do
+    echo "$line"
+  done
+
+  # Parse summary from doctor.sh output: "  Summary: N passed, N warnings, N errors, N fixed"
+  summary_line=$(echo "$doctor_output" | grep "Summary:" | tail -1) || summary_line=""
+  if [ -n "$summary_line" ]; then
+    INSTALL_PASS=$(echo "$summary_line"   | grep -oE '[0-9]+ passed'   | grep -oE '[0-9]+' || echo 0)
+    INSTALL_WARNINGS=$(echo "$summary_line" | grep -oE '[0-9]+ warnings' | grep -oE '[0-9]+' || echo 0)
+    INSTALL_ERRORS=$(echo "$summary_line"   | grep -oE '[0-9]+ errors'   | grep -oE '[0-9]+' || echo 0)
+    INSTALL_FIXED=$(echo "$summary_line"    | grep -oE '[0-9]+ fixed'    | grep -oE '[0-9]+' || echo 0)
+    # Merge into global counts
+    PASS_COUNT=$((PASS_COUNT + ${INSTALL_PASS:-0}))
+    WARN_COUNT=$((WARN_COUNT + ${INSTALL_WARNINGS:-0}))
+    ERROR_COUNT=$((ERROR_COUNT + ${INSTALL_ERRORS:-0}))
+    FIXED_COUNT=$((FIXED_COUNT + ${INSTALL_FIXED:-0}))
+    [ "${INSTALL_ERRORS:-0}" -gt 0 ] && HAS_ERRORS=true
+    [ "${INSTALL_WARNINGS:-0}" -gt 0 ] && HAS_WARNINGS=true
+  fi
+else
+  _warn "Installation checks skipped: doctor.sh not found at $DOCTOR_SH"
+fi
+
+# ─── Part 2: Module checks ────────────────────────────────────────────────────
+MODULE_COUNT=0
+CHAIN_STOPPED=false
+
+if [ ! -d "$HEX_CHECKS_DIR" ]; then
+  echo ""
+  _warn "Module checks dir not found: $HEX_CHECKS_DIR"
+else
+
+  # ── Memory (critical) ────────────────────────────────────────────────────────
+  if [ -f "$HEX_CHECKS_DIR/memory.sh" ]; then
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "${BOLD}Memory Module${RESET}"
+    echo "  ─────────────────────────────────────────"
+    _ERRORS_BEFORE=$ERROR_COUNT
+    source "$HEX_CHECKS_DIR/memory.sh"
+    run_memory_checks
+    if [ "$ERROR_COUNT" -gt "$_ERRORS_BEFORE" ]; then
+      CHAIN_STOPPED=true
+    fi
+  fi
+
+  # ── hex-events ───────────────────────────────────────────────────────────────
+  if [ -f "$HEX_CHECKS_DIR/hex-events.sh" ] && ! $CHAIN_STOPPED; then
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "${BOLD}hex-events Module${RESET}"
+    echo "  ─────────────────────────────────────────"
+    source "$HEX_CHECKS_DIR/hex-events.sh"
+    run_hex_events_checks
+  elif [ -f "$HEX_CHECKS_DIR/hex-events.sh" ] && $CHAIN_STOPPED; then
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "  ${DIM}[SKIP] hex-events — blocked by memory errors${RESET}"
+  fi
+
+  # ── BOI ──────────────────────────────────────────────────────────────────────
+  if [ -f "$HEX_CHECKS_DIR/boi.sh" ] && ! $CHAIN_STOPPED; then
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "${BOLD}BOI Module${RESET}"
+    echo "  ─────────────────────────────────────────"
+    source "$HEX_CHECKS_DIR/boi.sh"
+    run_boi_checks
+  elif [ -f "$HEX_CHECKS_DIR/boi.sh" ] && $CHAIN_STOPPED; then
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "  ${DIM}[SKIP] BOI — blocked by memory errors${RESET}"
+  fi
+
+  # ── Startup ──────────────────────────────────────────────────────────────────
+  if [ -f "$HEX_CHECKS_DIR/startup.sh" ] && ! $CHAIN_STOPPED; then
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "${BOLD}Startup Module${RESET}"
+    echo "  ─────────────────────────────────────────"
+    source "$HEX_CHECKS_DIR/startup.sh"
+    run_startup_checks
+  elif [ -f "$HEX_CHECKS_DIR/startup.sh" ] && $CHAIN_STOPPED; then
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "  ${DIM}[SKIP] Startup — blocked by memory errors${RESET}"
+  fi
+
+  # ── Landings + Workspace (always run even if chain stopped) ──────────────────
+  if [ -f "$HEX_CHECKS_DIR/landings-workspace.sh" ]; then
+    source "$HEX_CHECKS_DIR/landings-workspace.sh"
+
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "${BOLD}Landings Module${RESET}"
+    echo "  ─────────────────────────────────────────"
+    check_61
+    check_62
+
+    MODULE_COUNT=$((MODULE_COUNT + 1))
+    echo ""
+    echo -e "${BOLD}Workspace Module${RESET}"
+    echo "  ─────────────────────────────────────────"
+    check_63
+    check_64
+    check_65
+  fi
+
+fi
+
+# ─── Summary ──────────────────────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if $CHAIN_STOPPED; then
+  echo -e "  ${YELLOW}⚠ Memory module had errors — dependent modules were skipped${RESET}"
+fi
+
+echo -e "  ${BOLD}Summary:${RESET} ${MODULE_COUNT} modules checked"
+echo -e "           ${PASS_COUNT} checks passed, ${WARN_COUNT} warnings, ${ERROR_COUNT} errors, ${FIXED_COUNT} auto-fixed"
+
+if $HAS_ERRORS; then
+  echo ""
+  echo -e "  ${RED}✗ System not healthy — run with --fix to attempt auto-remediation${RESET}"
+elif $HAS_WARNINGS; then
+  echo ""
+  echo -e "  ${YELLOW}⚠ Some warnings detected — run with --fix to resolve${RESET}"
+else
+  echo ""
+  echo -e "  ${GREEN}✓ All systems healthy${RESET}"
+fi
+echo ""
+
+# ─── Exit code ────────────────────────────────────────────────────────────────
+if $HAS_ERRORS; then
+  exit 1
+elif $HAS_WARNINGS; then
+  exit 2
+fi
+exit 0
