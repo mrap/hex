@@ -1,0 +1,32 @@
+name: boi-restart-on-pull
+description: >
+  Triggers the BOI safe restart pipeline when new code is pulled to the BOI
+  repo main branch. Fires on git.pull events emitted by the BOI post-merge
+  hook. Gates restart behind Docker tests — rolls back on failure.
+requires:
+  events:
+    - git.pull
+provides:
+  events:
+    - boi.upgrade.verified
+rate_limit:
+  max_fires: 3
+  window: 1h
+rules:
+  - name: restart-on-boi-pull
+    trigger:
+      event: git.pull
+    conditions:
+      - field: repo
+        op: contains
+        value: "/boi"
+    actions:
+      - type: shell
+        command: bash ~/.hex-events/scripts/boi-safe-restart.sh
+        timeout: 300
+        on_success:
+          - type: emit
+            event: boi.upgrade.verified
+            payload:
+              triggered_by: git.pull
+              repo: "{{ event.repo }}"

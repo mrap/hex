@@ -1,0 +1,47 @@
+name: boi-workspace-isolation
+description: >
+  Enforces BOI workspace isolation by detecting when workers write outside their
+  assigned worktree. Triggers on boi.workspace.leak events, emits policy.violation
+  for each leak, and emits a notification when 3+ leaks occur within 1 hour from
+  the same spec (suggesting a structural problem).
+standing_orders:
+  - "26"
+reflection_ids:
+  - R-047
+provides:
+  events:
+    - policy.violation
+    - boi.workspace.repeated-leak
+requires:
+  events:
+    - boi.workspace.leak
+rules:
+  - name: emit-violation-on-leak
+    trigger:
+      event: boi.workspace.leak
+    actions:
+      - type: emit
+        event: policy.violation
+        payload:
+          policy: boi-workspace-isolation
+          spec_id: "{{ event.spec_id or event.queue_id }}"
+          worker_id: "{{ event.worker_id }}"
+          leaked_files: "{{ event.leaked_files }}"
+          worktree_path: "{{ event.worktree_path }}"
+          message: "Worker wrote outside assigned worktree"
+
+  - name: notify-on-repeated-leaks
+    trigger:
+      event: boi.workspace.leak
+    conditions:
+      - field: "count(boi.workspace.leak, 1h)"
+        op: gte
+        value: 3
+    actions:
+      - type: emit
+        event: boi.workspace.repeated-leak
+        payload:
+          spec_id: "{{ event.spec_id or event.queue_id }}"
+          message: "3+ workspace leaks in 1h — spec may have structural isolation problem"
+      - type: notify
+        message: "BOI workspace leak alert: 3+ leaks in 1h from spec {{ event.spec_id or event.queue_id }} — structural isolation problem suspected"

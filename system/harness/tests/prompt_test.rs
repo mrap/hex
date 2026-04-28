@@ -1,9 +1,9 @@
-use hex_agent::prompt;
+use hex::prompt;
 
 #[test]
 fn test_prompt_contains_charter_and_state() {
     let charter_text = "id: test\nrole: Test Agent\nobjective: Be useful";
-    let state = hex_agent::state::initialize("test", 2.0);
+    let state = hex::state::initialize("test", 2.0);
     let p = prompt::build(charter_text, &state, "timer.tick.30m", "{}", None, None);
     assert!(
         p.contains("Test Agent"),
@@ -22,7 +22,7 @@ fn test_prompt_contains_charter_and_state() {
 
 #[test]
 fn test_prompt_includes_response_schema() {
-    let state = hex_agent::state::initialize("test", 2.0);
+    let state = hex::state::initialize("test", 2.0);
     let p = prompt::build("id: test", &state, "manual", "{}", None, None);
     assert!(p.contains("trail"), "must describe trail");
     assert!(p.contains("queue_updates"), "must describe queue_updates");
@@ -34,7 +34,7 @@ fn test_prompt_includes_response_schema() {
 
 #[test]
 fn test_prompt_includes_principles_when_provided() {
-    let state = hex_agent::state::initialize("test", 2.0);
+    let state = hex::state::initialize("test", 2.0);
     let p = prompt::build(
         "id: test",
         &state,
@@ -55,17 +55,17 @@ fn test_prompt_includes_principles_when_provided() {
 
 #[test]
 fn test_prompt_works_without_principles() {
-    let state = hex_agent::state::initialize("test", 2.0);
+    let state = hex::state::initialize("test", 2.0);
     let p = prompt::build("id: test", &state, "manual", "{}", None, None);
     assert!(!p.contains("Self-Tuning"), "no principles text when None");
 }
 
 #[test]
 fn test_assessment_prompt_structure() {
-    let charter = hex_agent::charter::load_from_str(
+    let charter = hex::charter::load_from_str(
         "id: test\nname: Test Bot\nrole: Test role\nobjective: Be effective\nkpis:\n  - 'metric >= 5'\nwake:\n  triggers: []\n  responsibilities:\n    - name: task-a\n      interval: 3600\n      description: Do task A\nauthority:\n  green: []\n  yellow: []\n  red: []\nbudget:\n  wakes_per_hour: 10\n  usd_per_day: 1\n  usd_per_shift: 0.5\nkill_switch: /tmp/test-halt"
     ).unwrap();
-    let state = hex_agent::state::initialize("test", 1.0);
+    let state = hex::state::initialize("test", 1.0);
     let p = prompt::build_assessment(&charter, &state, None);
     assert!(
         p.contains("Self-Assessment Phase"),
@@ -86,7 +86,7 @@ fn test_assessment_prompt_structure() {
 
 #[test]
 fn test_prompt_includes_live_messaging_guidance() {
-    let state = hex_agent::state::initialize("test", 2.0);
+    let state = hex::state::initialize("test", 2.0);
     let p = prompt::build("id: test", &state, "manual", "{}", None, None);
     assert!(
         p.contains("response_requested"),
@@ -104,7 +104,7 @@ fn test_prompt_includes_live_messaging_guidance() {
 
 #[test]
 fn test_prompt_message_schema_includes_response_requested() {
-    let state = hex_agent::state::initialize("test", 2.0);
+    let state = hex::state::initialize("test", 2.0);
     let p = prompt::build("id: test", &state, "manual", "{}", None, None);
     let msg_schema_region = p.find("outbound_messages").expect("must have outbound_messages in schema");
     let after_schema = &p[msg_schema_region..];
@@ -116,7 +116,7 @@ fn test_prompt_message_schema_includes_response_requested() {
 
 #[test]
 fn test_principles_live_collaboration_injected() {
-    let state = hex_agent::state::initialize("test", 2.0);
+    let state = hex::state::initialize("test", 2.0);
     let principles = "## Live Collaboration by Default\n\nWhen you send a message to another agent, default to response_requested: true.";
     let p = prompt::build("id: test", &state, "manual", "{}", Some(principles), None);
     assert!(
@@ -131,10 +131,10 @@ fn test_principles_live_collaboration_injected() {
 
 #[test]
 fn test_assessment_prompt_shows_cadence_overrides() {
-    let charter = hex_agent::charter::load_from_str(
+    let charter = hex::charter::load_from_str(
         "id: test\nname: Test Bot\nrole: Test role\nwake:\n  triggers: []\n  responsibilities:\n    - name: task-a\n      interval: 3600\n      description: Do task A\nauthority:\n  green: []\n  yellow: []\n  red: []\nbudget:\n  wakes_per_hour: 10\n  usd_per_day: 1\n  usd_per_shift: 0.5\nkill_switch: /tmp/test-halt"
     ).unwrap();
-    let mut state = hex_agent::state::initialize("test", 1.0);
+    let mut state = hex::state::initialize("test", 1.0);
     state.cadence_overrides.insert("task-a".to_string(), 7200);
     let p = prompt::build_assessment(&charter, &state, None);
     assert!(p.contains("7200s"), "must show overridden interval");

@@ -8,6 +8,8 @@ Runs the 8-step initiative execution loop for all initiatives owned by the agent
 Unlike v1, every step COMPLETES its action — no proposals that wait for someone else.
 
   1. Measure KRs — run metric commands, reload data.
+  1.5. Measure experiments — run hex-experiment.py measure on all ACTIVE experiments.
+     If ACTIVE > 48h: also run verdict immediately (pass/fail/inconclusive).
   2. Verdict — run verdict on ACTIVE/MEASURING experiments >= 48h old.
      PASS: activate/adopt. FAIL: log failure, dispatch new-approach spec.
   3. Activate — transition BASELINE experiments to ACTIVE immediately.
@@ -46,6 +48,9 @@ SCRIPTS_DIR = os.path.join(HEX_ROOT, ".hex", "scripts")
 TELEMETRY_PATH = os.path.join(HEX_ROOT, ".hex", "telemetry")
 AUDIT_DIR = os.path.expanduser("~/.hex/audit")
 LOOP_HISTORY = os.path.join(AUDIT_DIR, "initiative-loop-history.jsonl")
+SNAPSHOTS_LOG = os.path.join(AUDIT_DIR, "kr-snapshots.jsonl")
+PATTERN_LIBRARY = os.path.join(AUDIT_DIR, "patterns.jsonl")
+PIVOTS_LOG = os.path.join(AUDIT_DIR, "pivots.jsonl")
 
 
 # ── telemetry ─────────────────────────────────────────────────────────────────
@@ -328,6 +333,37 @@ def _build_kr_dispatch_spec(init_id, kr, initiative_data):
     return yaml.dump(spec_data, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
 
+# ── pivot tracking ────────────────────────────────────────────────────────────
+
+def _count_kr_pivots(kr_id, exp_lookup):
+    """Count total pivots recorded across all experiments for a given KR."""
+    count = 0
+    for _, (_, exp_data) in exp_lookup.items():
+        linked = exp_data.get("kr_id") or exp_data.get("linked_kr")
+        if linked == kr_id:
+            count += len(exp_data.get("pivots") or [])
+    return count
+
+
+def _record_pivot(exp_path, exp_data, reason, new_hypothesis, dry_run):
+    """Append a pivot entry to the failing experiment's YAML under `pivots:`.
+
+    Returns the new pivot count for this experiment.
+    """
+    if dry_run:
+        return len(exp_data.get("pivots") or []) + 1
+    pivots = list(exp_data.get("pivots") or [])
+    pivots.append({
+        "from": exp_data.get("id"),
+        "reason": reason,
+        "new_hypothesis": new_hypothesis,
+        "date": _now_iso()[:10],
+    })
+    exp_data["pivots"] = pivots
+    _save_yaml(exp_data, exp_path)
+    return len(pivots)
+
+
 def _build_pivot_spec(init_id, stalled_krs, initiative_data, run_count):
     """Build a spec to try a different approach when KRs haven't moved in 5 runs."""
     kr_list = ", ".join(k.get("id", "?") for k in stalled_krs)
@@ -410,6 +446,79 @@ ACTIVE_EXP_STATES = {"DRAFT", "BASELINE", "ACTIVE", "MEASURING"}
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 
+_behavioral_memory_initialized = False
+
+
+def _init_behavioral_memory():
+    """Ensure behavioral_patterns schema exists and is bootstrapped from feedback files.
+
+    Called once per process. Idempotent — bootstrap() uses INSERT OR IGNORE.
+    """
+    global _behavioral_memory_initialized
+    if _behavioral_memory_initialized:
+        return
+    try:
+        sys.path.insert(0, SCRIPTS_DIR)
+        from behavioral_memory import BehavioralMemory  # noqa: PLC0415
+        bm = BehavioralMemory()
+        bm.ensure_schema()
+        result = bm.load_feedback_from_files()
+        if result.get("imported", 0) > 0:
+            print(
+                f"[behavioral_memory] Bootstrapped {result['imported']} patterns "
+                f"(skipped={result.get('skipped', 0)}, errors={result.get('errors', 0)})",
+                file=sys.stderr,
+            )
+        bm.close()
+    except Exception as exc:
+        print(f"[behavioral_memory] init warn: {exc}", file=sys.stderr)
+    _behavioral_memory_initialized = True
+
+
+def _check_behavioral_patterns(agent_id: str, context: str) -> dict:
+    """Query behavioral_patterns before the loop runs — error-to-lesson loop hook.
+
+    Returns the check_behavior result so callers can log it or gate on risk_level.
+    HIGH risk patterns are logged to stderr so the agent can see them.
+    """
+    try:
+        sys.path.insert(0, SCRIPTS_DIR)
+        from behavioral_memory import check_behavior  # noqa: PLC0415
+        result = check_behavior(context)
+        if result.get("risk_level") in ("HIGH", "MEDIUM") and result.get("matches"):
+            top = result["matches"][0]
+            print(
+                f"[behavioral_pattern] {result['risk_level']} risk for '{context[:60]}': "
+                f"{top['pattern'][:80]} (×{top['correction_count']})",
+                file=sys.stderr,
+            )
+        return result
+    except Exception as exc:
+        return {"risk_level": "NONE", "matches": [], "error": str(exc)}
+
+
+def _store_frustration_corrections(agent_id: str, signals: list[dict]):
+    """Store detected frustration signals as behavioral corrections."""
+    try:
+        sys.path.insert(0, SCRIPTS_DIR)
+        from behavioral_memory import BehavioralMemory  # noqa: PLC0415
+        bm = BehavioralMemory()
+        for sig in signals:
+            pattern = sig.get("pattern", sig.get("signal", ""))
+            rule = sig.get("rule", sig.get("correction", pattern))
+            if pattern:
+                bm.store_correction(
+                    pattern_text=pattern,
+                    rule_text=rule,
+                    agent_id=agent_id,
+                    source_file=sig.get("source_file", ""),
+                    detection_type="transcript_scan",
+                )
+        bm.close()
+    except Exception as exc:
+        print(f"[behavioral_memory] store_frustration warn: {exc}", file=sys.stderr)
+
+
 def run_loop(agent_id, dry_run=False, filter_initiative=None):
     summary = {
         "agent": agent_id,
@@ -418,6 +527,24 @@ def run_loop(agent_id, dry_run=False, filter_initiative=None):
         "version": "v2",
         "initiatives_checked": 0,
         "actions": [],
+    }
+
+    # Ensure feedback loop data files exist (L1, L3, L4)
+    os.makedirs(AUDIT_DIR, exist_ok=True)
+    for _path in (SNAPSHOTS_LOG, PATTERN_LIBRARY, PIVOTS_LOG):
+        if not os.path.exists(_path):
+            open(_path, "a").close()
+
+    # Initialize behavioral memory (schema + bootstrap from feedback files) once per process
+    _init_behavioral_memory()
+
+    # Error-to-lesson loop: check behavioral_patterns before dispatching work
+    behavior_check = _check_behavioral_patterns(
+        agent_id, f"agent {agent_id} dispatching initiative specs"
+    )
+    summary["behavioral_check"] = {
+        "risk_level": behavior_check.get("risk_level", "NONE"),
+        "match_count": len(behavior_check.get("matches", [])),
     }
 
     initiatives = _load_initiatives_for_agent(agent_id, filter_id=filter_initiative)
@@ -471,6 +598,59 @@ def run_loop(agent_id, dry_run=False, filter_initiative=None):
                     "value": kr.get("current"), "target": kr.get("target"),
                 }, dry_run=dry_run)
 
+        # ── Step 1.5: Measure ACTIVE experiments ─────────────────────────────
+        for exp_ref in (init_data.get("experiments") or []):
+            exp_id = _exp_id_str(exp_ref)
+            if not exp_id:
+                continue
+            exp_path, exp_data = exp_lookup.get(exp_id, (None, None))
+            if exp_data is None:
+                continue
+            if exp_data.get("state") != "ACTIVE":
+                continue
+
+            ok, out = _run(
+                [sys.executable, os.path.join(SCRIPTS_DIR, "hex-experiment.py"), "measure", exp_id],
+                dry_run,
+            )
+            baseline_vals = (exp_data.get("baseline") or {}).get("values") or {}
+            primary_name = ((exp_data.get("metrics") or {}).get("primary") or {}).get("name", "primary")
+            summary["actions"].append({
+                "initiative": init_id, "step": "1.5", "action": "measure_experiment",
+                "experiment": exp_id, "title": exp_data.get("title", ""),
+                "baseline": baseline_vals.get(primary_name, "N/A"),
+                "success": ok, "output": out,
+            })
+            if ok and not dry_run:
+                try:
+                    exp_data = _load_yaml(exp_path)
+                    exp_lookup[exp_id] = (exp_path, exp_data)
+                except Exception:
+                    pass
+
+            # If ACTIVE >48h, run verdict immediately after measuring
+            activated_at = exp_data.get("activated_at", "")
+            if ok and _age_hours(activated_at) >= 48:
+                ok2, out2 = _run(
+                    [sys.executable, os.path.join(SCRIPTS_DIR, "hex-experiment.py"), "verdict", exp_id],
+                    dry_run,
+                )
+                verdict_result = "dry-run"
+                if ok2 and not dry_run:
+                    try:
+                        refreshed = _load_yaml(exp_path)
+                        vd = refreshed.get("verdict", {})
+                        verdict_result = vd.get("result", "unknown") if isinstance(vd, dict) else str(vd or "unknown")
+                        exp_lookup[exp_id] = (exp_path, refreshed)
+                    except Exception:
+                        pass
+                summary["actions"].append({
+                    "initiative": init_id, "step": "1.5", "action": "run_verdict",
+                    "experiment": exp_id, "verdict": verdict_result,
+                    "age_hours": round(_age_hours(activated_at), 1),
+                    "success": ok2, "output": out2,
+                })
+
         # ── Step 3: Verdicts on ACTIVE/MEASURING experiments >= 48h ──────────
         # On PASS: activate/adopt. On FAIL: dispatch a new-approach spec.
         for exp_ref in (init_data.get("experiments") or []):
@@ -492,10 +672,13 @@ def run_loop(agent_id, dry_run=False, filter_initiative=None):
                 dry_run,
             )
             verdict_result = "unknown"
+            refreshed_exp = None
             if ok and not dry_run:
                 try:
-                    refreshed = _load_yaml(exp_path)
-                    verdict_result = refreshed.get("verdict", "unknown")
+                    refreshed_exp = _load_yaml(exp_path)
+                    vd = refreshed_exp.get("verdict") or {}
+                    verdict_result = vd.get("result", "unknown") if isinstance(vd, dict) else str(vd or "unknown")
+                    exp_lookup[exp_id] = (exp_path, refreshed_exp)
                 except Exception:
                     pass
             else:
@@ -508,35 +691,88 @@ def run_loop(agent_id, dry_run=False, filter_initiative=None):
                 "success": ok, "output": out,
             }
 
-            if not ok or verdict_result == "FAIL":
+            if not ok or verdict_result == "fail":
                 # Dispatch a new-approach spec for the KR this experiment targeted
                 linked_kr_id = exp_data.get("kr_id") or exp_data.get("linked_kr")
                 kr_obj = next(
                     (k for k in (init_data.get("key_results") or []) if k.get("id") == linked_kr_id),
                     None,
                 )
-                if kr_obj:
+
+                # Extract failure details for pivot record
+                fresh = refreshed_exp or exp_data
+                vd = (fresh.get("verdict") or {}) if isinstance(fresh.get("verdict"), dict) else {}
+                delta_pct = vd.get("primary_delta_pct", "N/A")
+                fail_reason = (
+                    f"Experiment {exp_id} didn't move {linked_kr_id or 'KR'}: "
+                    f"achieved {delta_pct}% improvement. "
+                    f"Failed hypothesis: {str(exp_data.get('hypothesis', 'N/A'))[:120]}"
+                )
+                new_hypothesis = (
+                    f"Previous approach ({exp_id}) failed. "
+                    f"Need a fundamentally different mechanism to move {linked_kr_id or 'KR'}."
+                )
+
+                # Record pivot in experiment YAML under `pivots:` field
+                this_pivot_count = _record_pivot(
+                    exp_path, fresh, fail_reason, new_hypothesis, dry_run
+                )
+
+                # Count total pivots across all experiments for this KR
+                total_pivot_count = max(this_pivot_count, _count_kr_pivots(linked_kr_id or "", exp_lookup))
+
+                if total_pivot_count >= 3 and linked_kr_id:
+                    # 3+ pivots with no KR movement — escalate to Mike
+                    msg = (
+                        f"PIVOT ESCALATION: {init_id}/{linked_kr_id} has had {total_pivot_count} "
+                        f"pivot(s) across experiments with no movement. "
+                        f"Latest failed experiment: {exp_id}. "
+                        f"Full pivot history tracked in experiments/*.yaml under 'pivots:' field."
+                    )
+                    summary["actions"].append({
+                        "initiative": init_id, "step": 3, "action": "escalate_pivot",
+                        "experiment": exp_id, "kr_id": linked_kr_id,
+                        "pivot_count": total_pivot_count, "message": msg,
+                    })
+                    _emit("initiative.pivot.escalation", {
+                        "initiative_id": init_id, "kr_id": linked_kr_id,
+                        "experiment_id": exp_id, "pivot_count": total_pivot_count,
+                        "channel": "#from-hex", "message": msg,
+                    }, dry_run=dry_run)
+                elif kr_obj:
                     pivot_spec_data = {
                         "title": f"New Approach for {init_id}/{linked_kr_id} After Experiment {exp_id} Failed",
                         "mode": "execute",
                         "initiative": init_id,
                         "context": (
                             f"Experiment {exp_id} failed to move KR {linked_kr_id}.\n"
-                            f"Hypothesis that failed: {str(exp_data.get('hypothesis', 'N/A'))[:200]}"
+                            f"Failure reason: {fail_reason}\n"
+                            f"This is pivot #{total_pivot_count} for {linked_kr_id}. "
+                            f"3 pivots will trigger escalation to Mike."
                         ),
                         "tasks": [{
                             "id": "t-1",
-                            "title": f"Try a different approach for {linked_kr_id} (experiment {exp_id} failed)",
+                            "title": f"Create new experiment for {linked_kr_id} (pivot #{total_pivot_count})",
                             "status": "PENDING",
                             "spec": (
                                 f"Experiment {exp_id} (\"{exp_data.get('title', '')}\") failed to move KR {linked_kr_id}.\n\n"
-                                f"Hypothesis that failed: {str(exp_data.get('hypothesis', 'N/A'))[:200]}\n\n"
+                                f"Failure reason: {fail_reason}\n\n"
                                 f"KR: {kr_obj.get('description', '')}\n"
                                 f"Current: {kr_obj.get('current')}, Target: {kr_obj.get('target')}\n\n"
-                                f"Design and execute a DIFFERENT approach. Analyze why the failed experiment didn't work, "
-                                f"then take a fundamentally different action (different mechanism, different lever, different metric)."
+                                f"This is pivot #{total_pivot_count}. "
+                                f"Design a DIFFERENT approach (different mechanism, different lever, different metric).\n\n"
+                                f"Steps:\n"
+                                f"1. Analyze WHY {exp_id} failed — read experiments/{exp_id}-*.yaml for context\n"
+                                f"2. Write a new experiment YAML with a different hypothesis\n"
+                                f"3. Run: python3 .hex/scripts/hex-experiment.py create <new-exp.yaml>\n"
+                                f"4. Run: python3 .hex/scripts/hex-experiment.py baseline <new-exp-id>\n"
+                                f"5. Run: python3 .hex/scripts/hex-experiment.py activate <new-exp-id>\n"
+                                f"6. Add the new experiment ID to the initiative's experiments list"
                             ),
-                            "verify": "bash -c 'METRIC_CMD' | python3 -c \"import sys; v=float(sys.stdin.read().strip()); assert v > 0, f'KR still at {v}'; print(f'KR moved to {v}')\"",
+                            "verify": (
+                                f"python3 .hex/scripts/hex-experiment.py list 2>&1 | "
+                                f"grep -c ACTIVE | xargs test 1 -le"
+                            ),
                         }],
                     }
                     pivot_spec = yaml.dump(pivot_spec_data, default_flow_style=False, allow_unicode=True, sort_keys=False)
@@ -547,6 +783,7 @@ def run_loop(agent_id, dry_run=False, filter_initiative=None):
                         "initiative": init_id, "step": 3, "action": "dispatch_spec",
                         "spec_type": "pivot_after_verdict_fail", "format": "yaml",
                         "experiment": exp_id, "kr_id": linked_kr_id,
+                        "pivot_count": total_pivot_count,
                         "queue_id": qid or "[dry-run-q-XXX]", "success": ok2,
                     })
                     if not ok2 and out2.startswith("BUDGET_EXHAUSTED"):
@@ -708,15 +945,23 @@ def run_loop(agent_id, dry_run=False, filter_initiative=None):
     recent_runs = _load_recent_runs(agent_id, count=5)
     run_count = len(recent_runs) + 1
 
-    # Record this run's KR snapshot
+    # Record this run's KR snapshot (flat format matching kr-snapshots.jsonl)
     kr_snapshot_after = {}
-    for _, init_data in _load_initiatives_for_agent(agent_id) if not dry_run else []:
+    for _, init_data in (_load_initiatives_for_agent(agent_id) if not dry_run else []):
         init_id = init_data.get("id", "unknown")
         for kr in (init_data.get("key_results") or []):
             kr_snapshot_after[f"{init_id}/{kr.get('id')}"] = kr.get("current")
 
+    # Always write structured per-initiative KR snapshots (L1 feedback loop)
+    _write_kr_snapshots_per_initiative(agent_id, initiatives)
+
     if not dry_run:
         _record_run(agent_id, kr_snapshot_after)
+        # Also write flat snapshot to SNAPSHOTS_LOG for self_improvement stall detection
+        os.makedirs(AUDIT_DIR, exist_ok=True)
+        with open(SNAPSHOTS_LOG, "a", encoding="utf-8") as _fh:
+            _fh.write(json.dumps({"ts": _now_iso(), "agent": agent_id,
+                                   "snapshot": kr_snapshot_after}) + "\n")
 
     if run_count >= 5 and len(recent_runs) >= 4:
         oldest_snapshot = recent_runs[0].get("kr_snapshot", {})
@@ -724,42 +969,359 @@ def run_loop(agent_id, dry_run=False, filter_initiative=None):
             oldest_snapshot.get(k) != kr_snapshot_before.get(k)
             for k in kr_snapshot_before
         )
-        if not any_kr_moved:
-            # Collect still-stalled KRs
-            stalled_krs = []
-            for _, init_data in initiatives:
-                init_id = init_data.get("id", "unknown")
-                for kr in (init_data.get("key_results") or []):
-                    if kr.get("status") != "met":
-                        stalled_krs.append({**kr, "_init_id": init_id})
 
-            if stalled_krs:
-                # Group by initiative for one pivot spec per initiative
-                from collections import defaultdict
-                by_init = defaultdict(list)
-                for kr in stalled_krs:
-                    by_init[kr["_init_id"]].append(kr)
-
-                for init_id, krs in by_init.items():
-                    _, init_data = next(
-                        ((p, d) for p, d in initiatives if d.get("id") == init_id),
-                        (None, {})
-                    )
-                    pivot_spec = _build_pivot_spec(init_id, krs, init_data or {}, run_count)
-                    ok, qid, out = _write_and_dispatch_spec(
-                        pivot_spec, f"self-assess-pivot-{init_id}", dry_run
-                    )
+        if any_kr_moved:
+            # KRs moved — log successful approaches to pattern_library
+            if not dry_run:
+                _log_moved_krs_to_pattern_library(
+                    agent_id, initiatives, oldest_snapshot, kr_snapshot_before
+                )
+                # Cross-seed: apply successful patterns to stalled KRs in other initiatives
+                _cross_seed_successful_patterns(
+                    agent_id, initiatives, oldest_snapshot, kr_snapshot_before, summary
+                )
+        else:
+            # No KR moved — call self_assess via self_improvement module
+            try:
+                sys.path.insert(0, SCRIPTS_DIR)
+                from self_improvement import run_self_assess  # noqa: PLC0415
+                si_initiatives = [d for _, d in initiatives]
+                si_actions = run_self_assess(agent_id, si_initiatives, dry_run=dry_run)
+                for action in si_actions:
                     summary["actions"].append({
-                        "step": 9, "action": "dispatch_spec",
-                        "spec_type": "self_assess_pivot", "format": "yaml",
-                        "initiative": init_id,
-                        "reason": f"{run_count} consecutive runs with zero KR movement",
-                        "queue_id": qid or "[dry-run-q-XXX]",
-                        "success": ok,
+                        "step": 9, "action": action.get("action"),
+                        "spec_type": "self_assess_pivot",
+                        "initiative": action.get("initiative_id"),
+                        "kr_id": action.get("kr_id"),
+                        "stall_category": action.get("stall_category"),
+                        "pivot_num": action.get("pivot_num"),
+                        "queue_id": action.get("spec_id"),
+                        "dry_run": action.get("dry_run", dry_run),
                     })
+                    print(
+                        f"[self_assess] {action.get('action')}: "
+                        f"{action.get('initiative_id')}/{action.get('kr_id')} "
+                        f"pivot #{action.get('pivot_num', '?')} → {action.get('spec_id', 'escalated')}",
+                        file=sys.stderr,
+                    )
+            except ImportError:
+                # self_improvement.py not on path — fall back to basic pivot spec
+                stalled_krs = []
+                for _, init_data in initiatives:
+                    init_id = init_data.get("id", "unknown")
+                    for kr in (init_data.get("key_results") or []):
+                        if kr.get("status") != "met":
+                            stalled_krs.append({**kr, "_init_id": init_id})
+
+                if stalled_krs:
+                    from collections import defaultdict  # noqa: PLC0415
+                    by_init = defaultdict(list)
+                    for kr in stalled_krs:
+                        by_init[kr["_init_id"]].append(kr)
+
+                    for init_id, krs in by_init.items():
+                        _, init_data = next(
+                            ((p, d) for p, d in initiatives if d.get("id") == init_id),
+                            (None, {})
+                        )
+                        pivot_spec = _build_pivot_spec(init_id, krs, init_data or {}, run_count)
+                        ok, qid, out = _write_and_dispatch_spec(
+                            pivot_spec, f"self-assess-pivot-{init_id}", dry_run
+                        )
+                        summary["actions"].append({
+                            "step": 9, "action": "dispatch_spec",
+                            "spec_type": "self_assess_pivot", "format": "yaml",
+                            "initiative": init_id,
+                            "reason": f"{run_count} consecutive runs with zero KR movement",
+                            "queue_id": qid or "[dry-run-q-XXX]",
+                            "success": ok,
+                        })
 
     summary["runs_tracked"] = run_count
     return summary
+
+
+def _append_jsonl(path, entry):
+    """Append a single JSON object as a line to a .jsonl file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, default=str) + "\n")
+
+
+def _write_kr_snapshots_per_initiative(agent_id, initiatives):
+    """Write one structured snapshot line per initiative to kr-snapshots.jsonl.
+
+    Format: {"ts": ISO, "agent": "cos", "initiative": "init-xxx",
+             "krs": [{"id": "kr-1", "current": 0.5, "target": 1.0}, ...]}
+    """
+    ts = _now_iso()
+    for _, init_data in initiatives:
+        init_id = init_data.get("id", "unknown")
+        krs = []
+        for kr in (init_data.get("key_results") or []):
+            krs.append({
+                "id": kr.get("id"),
+                "current": kr.get("current"),
+                "target": kr.get("target"),
+            })
+        if krs:
+            _append_jsonl(SNAPSHOTS_LOG, {
+                "ts": ts,
+                "agent": agent_id,
+                "initiative": init_id,
+                "krs": krs,
+            })
+
+
+def _get_spec_modified_files(spec_id):
+    """Return a set of file paths modified by the given spec (via git log on the worktree)."""
+    if not spec_id:
+        return set()
+    try:
+        # BOI worktrees are named after the queue id; look for the worktree path
+        boi_root = os.path.expanduser("~/.boi")
+        worktrees_dir = os.path.join(boi_root, "worktrees")
+        # Try the canonical name pattern: <spec_id> maps to a worktree directory
+        candidate = os.path.join(worktrees_dir, spec_id)
+        if not os.path.isdir(candidate):
+            # Also try boi-worker-N pattern by looking for recent git commits
+            return set()
+        result = subprocess.run(
+            ["git", "-C", candidate, "diff", "--name-only", "HEAD~1", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def _verify_pattern_claim(kr, old_val, new_val, latest_spec):
+    """Re-measure the KR and assess causation confidence.
+
+    Returns (confirmed: bool, confidence: str, re_measure_val: float|None, notes: list[str]).
+    confirmed=False means skip logging entirely.
+    confidence is 'high' or 'low'.
+    """
+    notes = []
+    metric_cmd = (kr.get("metric") or {}).get("command", "")
+
+    # Step 1: re-measure the KR right now
+    re_measure_val = None
+    if metric_cmd:
+        ok, re_val, _ = _run_metric_command(metric_cmd, dry_run=False)
+        if ok and re_val is not None:
+            re_measure_val = re_val
+            try:
+                re_delta = float(re_val) - float(old_val)
+                if re_delta <= 0:
+                    notes.append(f"re-measure={re_val} did not confirm movement from {old_val}")
+                    return False, "low", re_measure_val, notes
+            except (TypeError, ValueError):
+                notes.append("re-measure value not numeric; skipping pattern log")
+                return False, "low", re_measure_val, notes
+        else:
+            notes.append("re-measure failed; skipping pattern log")
+            return False, "low", re_measure_val, notes
+
+    # Step 2: assess causation — do spec's modified files overlap with metric inputs?
+    confidence = "high"
+    if latest_spec and metric_cmd:
+        spec_files = _get_spec_modified_files(latest_spec)
+        if spec_files:
+            # Heuristic: extract path-like tokens from the metric command
+            metric_tokens = set()
+            for token in metric_cmd.split():
+                if "/" in token or token.endswith(".py") or token.endswith(".sh"):
+                    metric_tokens.add(token.lstrip("~").lstrip("/"))
+            overlap = any(
+                any(mtoken in sf or sf.endswith(mtoken) for mtoken in metric_tokens)
+                for sf in spec_files
+            ) if metric_tokens else False
+            if not overlap:
+                confidence = "low"
+                notes.append(
+                    f"spec {latest_spec} modified files {sorted(spec_files)[:5]} "
+                    f"have no overlap with metric command inputs — correlation may be coincidental"
+                )
+        else:
+            notes.append(f"could not retrieve modified files for spec {latest_spec}; defaulting confidence=low")
+            confidence = "low"
+
+    return True, confidence, re_measure_val, notes
+
+
+def _log_moved_krs_to_pattern_library(agent_id, initiatives, oldest_snapshot, current_snapshot):
+    """Write successful KR movements to the pattern_library (patterns.jsonl).
+
+    Before logging, re-measure the KR and verify causation. Patterns with
+    confidence:low are logged for reference but not auto-applied in cross-seeding.
+    """
+    os.makedirs(AUDIT_DIR, exist_ok=True)
+    ts = _now_iso()
+    for _, init_data in initiatives:
+        init_id = init_data.get("id", "unknown")
+        for kr in (init_data.get("key_results") or []):
+            key = f"{init_id}/{kr.get('id')}"
+            old_val = oldest_snapshot.get(key)
+            new_val = current_snapshot.get(key)
+            if old_val is None or new_val is None:
+                continue
+            try:
+                delta = float(new_val) - float(old_val)
+            except (TypeError, ValueError):
+                continue
+            if delta <= 0:
+                continue
+            desc = kr.get("description", "")
+            kr_type = _classify_kr_type(desc)
+            spec_ids = init_data.get("specs") or []
+            latest_spec = spec_ids[-1] if spec_ids else None
+
+            # Verify pattern claim before logging: re-measure and assess causation
+            confirmed, confidence, re_measure_val, verify_notes = _verify_pattern_claim(
+                kr, old_val, new_val, latest_spec
+            )
+            if not confirmed:
+                # Re-measurement didn't confirm movement — skip logging
+                print(
+                    f"[pattern-library] SKIP {key}: {'; '.join(verify_notes)}",
+                    file=sys.stderr,
+                )
+                continue
+
+            entry = {
+                "ts": ts,
+                "agent": agent_id,
+                "initiative": init_id,
+                "initiative_id": init_id,  # kept for backward compat
+                "kr_id": kr.get("id"),
+                "kr_type": kr_type,
+                "metric_command": (kr.get("metric") or {}).get("command", ""),
+                "outcome": "success",
+                "confidence": confidence,
+                "re_measure_val": re_measure_val,
+                "verify_notes": verify_notes,
+                "approach": (
+                    f"Spec {latest_spec} moved KR from {old_val} to {new_val}"
+                    if latest_spec else f"KR moved from {old_val} to {new_val}"
+                ),
+                "approach_type": "dispatch_spec",
+                "approach_summary": (
+                    f"Spec {latest_spec} moved KR from {old_val} to {new_val}"
+                    if latest_spec else f"KR moved from {old_val} to {new_val}"
+                ),
+                "spec_id": latest_spec,
+                "applied_from": key,
+                "delta": delta,
+            }
+            _append_jsonl(PATTERN_LIBRARY, entry)
+
+
+def _classify_kr_type(description):
+    """Map KR description to a type for pattern_library cross-matching."""
+    desc = description.lower()
+    if any(w in desc for w in ("publish", "post", "content", "piece")):
+        return "content_count"
+    if any(w in desc for w in ("ratio", "rate", "percentage", "%")):
+        return "ratio"
+    if any(w in desc for w in ("cover", "instrument", "track", "monitor")):
+        return "coverage"
+    if any(w in desc for w in ("latency", "speed", "time", "ms")):
+        return "performance"
+    if any(w in desc for w in ("user", "member", "follower", "subscriber")):
+        return "audience"
+    return "generic"
+
+
+def _cross_seed_successful_patterns(agent_id, initiatives, oldest_snapshot, current_snapshot, summary):
+    """After logging successful KR movements, seed the pattern to stalled KRs elsewhere.
+
+    For each KR that moved, build a pattern dict and call seed_cross_initiative()
+    from self_improvement.py. Any cross-seed proposals are logged to patterns.jsonl
+    and appended to the loop summary.
+    """
+    try:
+        sys.path.insert(0, SCRIPTS_DIR)
+        from self_improvement import seed_cross_initiative  # noqa: PLC0415
+    except ImportError:
+        return
+
+    all_init_dicts = [d for _, d in initiatives]
+    # Also load initiatives from other agents (cross-seeding is cross-initiative)
+    try:
+        all_yamls = []
+        if os.path.isdir(INITIATIVES_DIR):
+            for fname in sorted(os.listdir(INITIATIVES_DIR)):
+                if not fname.endswith(".yaml") or fname.endswith(".lock"):
+                    continue
+                path = os.path.join(INITIATIVES_DIR, fname)
+                try:
+                    data = _load_yaml(path)
+                    if data.get("status", "active") == "active":
+                        all_yamls.append(data)
+                except Exception:
+                    continue
+        if all_yamls:
+            all_init_dicts = all_yamls
+    except Exception:
+        pass
+
+    for _, init_data in initiatives:
+        init_id = init_data.get("id", "unknown")
+        for kr in (init_data.get("key_results") or []):
+            key = f"{init_id}/{kr.get('id')}"
+            old_val = oldest_snapshot.get(key)
+            new_val = current_snapshot.get(key)
+            if old_val is None or new_val is None:
+                continue
+            try:
+                delta = float(new_val) - float(old_val)
+            except (TypeError, ValueError):
+                continue
+            if delta <= 0:
+                continue
+
+            # Build successful pattern dict for cross-seeding
+            desc = kr.get("description", "")
+            kr_type = _classify_kr_type(desc)
+            spec_ids = init_data.get("specs") or []
+            latest_spec = spec_ids[-1] if spec_ids else None
+
+            # Skip cross-seeding patterns with confidence:low — they may be coincidental
+            _, confidence, _, _ = _verify_pattern_claim(kr, old_val, new_val, latest_spec)
+            if confidence == "low":
+                continue
+
+            pattern = {
+                "initiative_id": init_id,
+                "kr_id": kr.get("id"),
+                "kr_type": kr_type,
+                "kr_description": desc,
+                "approach": (
+                    f"Spec {latest_spec} moved KR from {old_val} to {new_val}"
+                    if latest_spec else f"KR moved from {old_val} to {new_val}"
+                ),
+                "approach_summary": (
+                    f"Spec {latest_spec} moved KR from {old_val} to {new_val}"
+                    if latest_spec else f"KR moved from {old_val} to {new_val}"
+                ),
+                "delta": delta,
+            }
+
+            seeds = seed_cross_initiative(pattern, all_init_dicts)
+            for seed in seeds:
+                summary["actions"].append({
+                    "step": 9,
+                    "action": "cross_seed",
+                    "from_initiative": seed.get("from_initiative"),
+                    "from_kr": seed.get("from_kr"),
+                    "to_initiative": seed.get("to_initiative"),
+                    "to_kr": seed.get("to_kr"),
+                    "kr_type": seed.get("kr_type"),
+                    "proposed_experiment": seed.get("proposed_experiment"),
+                })
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

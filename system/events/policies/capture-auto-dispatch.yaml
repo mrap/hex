@@ -1,0 +1,47 @@
+name: capture-auto-dispatch
+description: >
+  Automatically dispatch BOI specs from actionable captures every 6 hours.
+  Closes the "dispatch gap" where captures get triaged but never dispatched.
+
+standing_orders: ["15"]
+reflection_ids: []
+
+requires:
+  events:
+    - timer.tick.6h
+
+provides:
+  events:
+    - capture.dispatch.completed
+
+rate_limit:
+  max_fires: 5
+  window: 24h
+
+rules:
+  - name: auto-dispatch-captures
+    trigger:
+      event: timer.tick.6h
+    actions:
+      - type: shell
+        command: |
+          SCRIPT="$AGENT_DIR/.claude/scripts/capture-to-dispatch.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "capture-to-dispatch.sh not found at $SCRIPT — skipping"
+            exit 0
+          fi
+          bash "$SCRIPT" --max 3
+        timeout: 120
+        on_success:
+          - type: emit
+            event: capture.dispatch.completed
+            payload:
+              triggered_by: timer.tick.6h
+              status: success
+        on_failure:
+          - type: emit
+            event: capture.dispatch.completed
+            payload:
+              triggered_by: timer.tick.6h
+              status: failed
+              error: "capture-to-dispatch exited non-zero"

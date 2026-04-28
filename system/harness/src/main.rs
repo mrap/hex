@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use hex_agent::{state, wake};
+use hex::{state, wake};
 
 #[derive(Parser)]
-#[command(name = "hex-agent", about = "Hex multi-agent harness")]
+#[command(name = "hex", about = "Hex multi-agent harness")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -12,6 +12,63 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Agent fleet management
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommands,
+    },
+    /// HTTP/SSE server
+    Server {
+        #[command(subcommand)]
+        command: ServerCommands,
+    },
+    /// Asset registry
+    Asset {
+        #[command(subcommand)]
+        command: AssetCommands,
+    },
+    /// Unified messaging (comments, agent messages, notifications)
+    Message {
+        #[command(subcommand)]
+        command: MessageCommands,
+    },
+    /// Event engine
+    Events {
+        #[command(subcommand)]
+        command: EventsCommands,
+    },
+    /// SSE bus operations
+    Sse {
+        #[command(subcommand)]
+        command: SseCommands,
+    },
+    /// Integration bundle lifecycle management
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommands,
+    },
+    /// Behavioral and indexed memory operations
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+    /// System health check
+    Doctor {
+        #[arg(long)]
+        fix: bool,
+        #[arg(long)]
+        smoke: bool,
+        #[arg(long)]
+        quiet: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print version
+    Version,
+}
+
+#[derive(Subcommand)]
+enum AgentCommands {
     /// Run an agent wake cycle (shift)
     Wake {
         agent_id: String,
@@ -64,6 +121,155 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ServerCommands {
+    /// Start the HTTP/SSE server
+    Start {
+        #[arg(long, default_value = "8880")]
+        port: u16,
+    },
+    /// Check if the server is running
+    Health,
+}
+
+#[derive(Subcommand)]
+enum AssetCommands {
+    /// Resolve asset by type:local_id
+    Resolve { id: String },
+    /// List assets
+    List {
+        #[arg(long)]
+        r#type: Option<String>,
+    },
+    /// Search assets
+    Search { query: String },
+    /// Register an asset
+    Register {
+        #[arg(long)]
+        r#type: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// List asset types with counts
+    Types,
+}
+
+#[derive(Subcommand)]
+enum MessageCommands {
+    /// Send a message
+    Send {
+        from: String,
+        to: Vec<String>,
+        #[arg(long)]
+        content: String,
+        #[arg(long, default_value = "agent")]
+        msg_type: String,
+        #[arg(long)]
+        anchor: Option<String>,
+    },
+    /// List messages
+    List {
+        #[arg(long)]
+        msg_type: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        anchor: Option<String>,
+    },
+    /// Update message status / action log
+    Respond {
+        id: String,
+        status: String,
+        action: Option<String>,
+        #[arg(long)]
+        assets: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventsCommands {
+    /// Show event engine status
+    Status,
+    /// Emit an event
+    Emit {
+        event_type: String,
+        payload: String,
+    },
+    /// Show full action chain for an event
+    Trace {
+        event_id: i64,
+    },
+    /// List loaded policies
+    Policies,
+    /// Force policy reload
+    Reload,
+}
+
+#[derive(Subcommand)]
+enum SseCommands {
+    /// Publish an SSE event
+    Publish {
+        topic: String,
+        r#type: String,
+        payload: String,
+    },
+    /// List registered SSE topics
+    Topics,
+}
+
+#[derive(Subcommand)]
+enum IntegrationCommands {
+    /// Install an integration bundle
+    Install { name: String },
+    /// Uninstall an integration bundle
+    Uninstall { name: String },
+    /// Update an integration bundle
+    Update { name: String },
+    /// List installed integrations
+    List,
+    /// Validate an integration bundle
+    Validate { name: String },
+    /// Show integration status
+    Status { name: Option<String> },
+    /// Probe an integration's connectivity
+    Probe { name: String },
+    /// Rotate an integration's credentials
+    Rotate { name: String },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// Query behavioral memory for relevant corrections
+    CheckBehavior { query: String },
+    /// Store a behavioral correction
+    Store {
+        text: String,
+        #[arg(long)]
+        rule: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Bootstrap memory from feedback files
+    Bootstrap,
+    /// Show memory health stats
+    Health,
+    /// Search indexed memory files
+    Search {
+        query: String,
+        #[arg(long)]
+        top: Option<usize>,
+    },
+    /// Index memory files
+    Index {
+        #[arg(long)]
+        full: bool,
+    },
+}
+
 fn get_hex_dir() -> PathBuf {
     if let Ok(v) = std::env::var("HEX_DIR") {
         let p = PathBuf::from(&v);
@@ -80,7 +286,7 @@ fn get_hex_dir() -> PathBuf {
         eprintln!("ERROR: neither HEX_DIR nor HOME is set");
         std::process::exit(1);
     });
-    let p = PathBuf::from(&home).join("hex");
+    let p = PathBuf::from(&home).join("mrap-hex");
     if !p.join("CLAUDE.md").exists() {
         eprintln!(
             "ERROR: default hex dir {} does not contain CLAUDE.md — set HEX_DIR explicitly",
@@ -138,10 +344,9 @@ fn is_safe_agent_id(id: &str) -> bool {
         && !id.contains("..")
 }
 
-fn main() {
-    let cli = Cli::parse();
-    match cli.command {
-        Commands::Wake {
+fn run_agent_command(command: AgentCommands) {
+    match command {
+        AgentCommands::Wake {
             agent_id,
             trigger,
             payload,
@@ -154,7 +359,6 @@ fn main() {
                 payload,
             }) {
                 Ok(code) => {
-                    // Post-wake: surface loop.detected status if HALT-loop file was written
                     let home = std::env::var("HOME").unwrap_or_default();
                     let halt_path = format!("{}/.hex-{}-HALT-loop", home, agent_id);
                     if std::path::Path::new(&halt_path).exists() {
@@ -171,7 +375,7 @@ fn main() {
                 }
             }
         }
-        Commands::Status { agent_id } => {
+        AgentCommands::Status { agent_id } => {
             let hex_dir = get_hex_dir();
             if let Some(id) = agent_id {
                 let state_path = hex_dir.join(format!("projects/{}/state.json", id));
@@ -202,11 +406,11 @@ fn main() {
                     }
                 }
             } else {
-                eprintln!("Usage: hex-agent status <agent-id>");
+                eprintln!("Usage: hex agent status <agent-id>");
                 std::process::exit(1);
             }
         }
-        Commands::Fleet => {
+        AgentCommands::Fleet => {
             let hex_dir = get_hex_dir();
             let agents = discover_agents(&hex_dir);
 
@@ -216,12 +420,12 @@ fn main() {
             }
 
             let mut errors: Vec<String> = Vec::new();
-            let mut charters: std::collections::HashMap<String, hex_agent::types::Charter> =
+            let mut charters: std::collections::HashMap<String, hex::types::Charter> =
                 std::collections::HashMap::new();
 
             for id in &agents {
                 let charter_path = hex_dir.join(format!("projects/{}/charter.yaml", id));
-                match hex_agent::charter::load(&charter_path) {
+                match hex::charter::load(&charter_path) {
                     Ok(c) => {
                         if c.id != *id {
                             errors.push(format!(
@@ -278,7 +482,6 @@ fn main() {
 
             println!("\n{} agents", agents.len());
 
-            // Check core agent health
             let core_agents: Vec<&String> = agents
                 .iter()
                 .filter(|id| charters.get(*id).map(|c| c.core).unwrap_or(false))
@@ -305,13 +508,13 @@ fn main() {
                 }
             }
         }
-        Commands::List { core } => {
+        AgentCommands::List { core } => {
             let hex_dir = get_hex_dir();
             let agents = discover_agents(&hex_dir);
             for id in &agents {
                 if core {
                     let charter_path = hex_dir.join(format!("projects/{}/charter.yaml", id));
-                    if let Ok(c) = hex_agent::charter::load(&charter_path) {
+                    if let Ok(c) = hex::charter::load(&charter_path) {
                         if !c.core {
                             continue;
                         }
@@ -322,7 +525,7 @@ fn main() {
                 println!("{}", id);
             }
         }
-        Commands::CheckCore => {
+        AgentCommands::CheckCore => {
             let hex_dir = get_hex_dir();
             let ref_dir = hex_dir.join(".hex/reference/core-agents");
             if !ref_dir.exists() {
@@ -360,7 +563,7 @@ fn main() {
                     if !charter_path.exists() {
                         missing.push(agent_id);
                     } else {
-                        match hex_agent::charter::load(&charter_path) {
+                        match hex::charter::load(&charter_path) {
                             Ok(c) => {
                                 if !c.core {
                                     broken.push(format!(
@@ -402,11 +605,11 @@ fn main() {
             }
             if !missing.is_empty() || !broken.is_empty() {
                 println!();
-                println!("Run 'hex-agent restore-core' to fix missing core agents.");
+                println!("Run 'hex agent restore-core' to fix missing core agents.");
                 std::process::exit(1);
             }
         }
-        Commands::RestoreCore => {
+        AgentCommands::RestoreCore => {
             let hex_dir = get_hex_dir();
             let ref_dir = hex_dir.join(".hex/reference/core-agents");
             if !ref_dir.exists() {
@@ -469,7 +672,7 @@ fn main() {
             println!();
             if restored > 0 {
                 println!(
-                    "Restored {} core agent(s). Run 'hex-agent fleet' to verify.",
+                    "Restored {} core agent(s). Run 'hex agent fleet' to verify.",
                     restored
                 );
             } else if skipped > 0 {
@@ -482,7 +685,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Message {
+        AgentCommands::Message {
             from,
             to,
             subject,
@@ -491,40 +694,295 @@ fn main() {
             response_requested,
         } => {
             let hex_dir = get_hex_dir();
-            let msg_dir = hex_dir.join(".hex/messages");
-            let msg = hex_agent::types::Message {
-                id: uuid::Uuid::new_v4().to_string(),
-                from: from.clone(),
-                to: to.clone(),
-                subject: subject.clone(),
-                body,
-                initiative_id: initiative,
-                response_requested,
-                in_reply_to: None,
-                sent_at: chrono::Utc::now(),
-            };
-            match hex_agent::message::send(&msg_dir, &msg) {
-                Ok(()) => {
-                    println!("Sent message '{}' from {} to {}", subject, from, to);
-                    if response_requested {
-                        let audit_dir = hex_dir.join(".hex/audit");
-                        wake::auto_wake_target(&hex_dir, &to, &from, &audit_dir);
-                        println!("Auto-waking {} for live response", to);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to send message: {e}");
-                    std::process::exit(1);
-                }
+            let bus = hex::sse::SseBus::new();
+            let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
+            let handler = hex::messaging::MessagingHandler::new(&hex_dir, bus, telemetry);
+            let content = format!("[{}] {}", subject, body);
+            handler.cli_send(&from, vec![to.clone()], &content, "agent", initiative.as_deref());
+            if response_requested {
+                let audit_dir = hex_dir.join(".hex/audit");
+                wake::auto_wake_target(&hex_dir, &to, &from, &audit_dir);
+                println!("Auto-waking {} for live response", to);
             }
         }
-        Commands::Audit { agent, .. } => {
+        AgentCommands::Audit { agent, .. } => {
             eprintln!("audit: {:?} (not yet implemented)", agent);
             std::process::exit(1);
         }
-        Commands::Cost { agent, .. } => {
+        AgentCommands::Cost { agent, .. } => {
             eprintln!("cost: {:?} (not yet implemented)", agent);
             std::process::exit(1);
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let binary_name = Path::new(&args[0])
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let effective_args = if binary_name == "hex-agent" {
+        let mut new_args = vec![args[0].clone(), "agent".to_string()];
+        new_args.extend(args[1..].to_vec());
+        new_args
+    } else {
+        args
+    };
+    let cli = Cli::parse_from(effective_args);
+
+    match cli.command {
+        Commands::Agent { command } => run_agent_command(command),
+        Commands::Server { command } => match command {
+            ServerCommands::Start { port } => {
+                let hex_dir = get_hex_dir();
+                let bus = hex::sse::SseBus::new();
+                let topics_dir = hex_dir.join("system/sse/topics");
+                bus.load_manifests(&topics_dir);
+                let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
+                let events = hex::events::EventEngine::new(
+                    &hex_dir,
+                    std::sync::Arc::clone(&telemetry),
+                    std::sync::Arc::clone(&bus),
+                ).unwrap_or_else(|e| {
+                    eprintln!("hex server: events engine init failed: {e}");
+                    std::process::exit(1);
+                });
+                let messaging = hex::messaging::MessagingHandler::new(
+                    &hex_dir,
+                    std::sync::Arc::clone(&bus),
+                    std::sync::Arc::clone(&telemetry),
+                );
+                let assets = hex::assets::AssetsHandler::new(
+                    &hex_dir,
+                    std::sync::Arc::clone(&bus),
+                    std::sync::Arc::clone(&telemetry),
+                );
+                let server = hex::server::HexServer::new(port, hex_dir, bus, telemetry, events, messaging, assets);
+                server.start();
+            }
+            ServerCommands::Health => {
+                let port = 8880u16;
+                if hex::server::HexServer::check_health(port) {
+                    println!("hex server is running on port {}", port);
+                } else {
+                    eprintln!("hex server is not running on port {}", port);
+                    std::process::exit(1);
+                }
+            }
+        },
+        Commands::Asset { command } => {
+            let hex_dir = get_hex_dir();
+            let bus = hex::sse::SseBus::new();
+            let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
+            let handler = hex::assets::AssetsHandler::new(&hex_dir, bus, telemetry);
+            match command {
+                AssetCommands::Resolve { id } => handler.cli_resolve(&id),
+                AssetCommands::List { r#type } => handler.cli_list(r#type.as_deref()),
+                AssetCommands::Search { query } => handler.cli_search(&query),
+                AssetCommands::Register { r#type, id, title, path } => {
+                    handler.cli_register(&r#type, &id, &title, path.as_deref())
+                }
+                AssetCommands::Types => handler.cli_types(),
+            }
+        }
+        Commands::Message { command } => {
+            let hex_dir = get_hex_dir();
+            let bus = hex::sse::SseBus::new();
+            let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
+            let handler = hex::messaging::MessagingHandler::new(&hex_dir, bus, telemetry);
+            match command {
+                MessageCommands::Send { from, to, content, msg_type, anchor } => {
+                    handler.cli_send(&from, to, &content, &msg_type, anchor.as_deref());
+                }
+                MessageCommands::List { msg_type, status, anchor } => {
+                    handler.cli_list(msg_type.as_deref(), status.as_deref(), anchor.as_deref());
+                }
+                MessageCommands::Respond { id, status, action, assets } => {
+                    handler.cli_respond(&id, &status, action.as_deref(), assets);
+                }
+            }
+        }
+        Commands::Events { command } => {
+            let hex_dir = get_hex_dir();
+            let bus = hex::sse::SseBus::new();
+            let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
+            let engine = hex::events::EventEngine::new(&hex_dir, telemetry, bus)
+                .unwrap_or_else(|e| {
+                    eprintln!("events engine init failed: {e}");
+                    std::process::exit(1);
+                });
+            match command {
+                EventsCommands::Status => engine.cli_status(),
+                EventsCommands::Emit { event_type, payload } => engine.cli_emit(&event_type, &payload),
+                EventsCommands::Trace { event_id } => engine.cli_trace(event_id),
+                EventsCommands::Policies => engine.cli_policies(),
+                EventsCommands::Reload => engine.cli_reload(),
+            }
+        }
+        Commands::Sse { command } => match command {
+            SseCommands::Publish { topic, r#type, payload } => {
+                eprintln!(
+                    "hex sse publish {} {} {} (not yet implemented)",
+                    topic, r#type, payload
+                );
+                std::process::exit(1);
+            }
+            SseCommands::Topics => {
+                eprintln!("hex sse topics (not yet implemented)");
+                std::process::exit(1);
+            }
+        },
+        Commands::Integration { command } => {
+            let hex_dir = get_hex_dir();
+            let script = hex_dir.join("system/scripts/hex-integration");
+            let (subcmd, name_arg): (&str, Option<String>) = match &command {
+                IntegrationCommands::Install { name } => ("install", Some(name.clone())),
+                IntegrationCommands::Uninstall { name } => ("uninstall", Some(name.clone())),
+                IntegrationCommands::Update { name } => ("update", Some(name.clone())),
+                IntegrationCommands::List => ("list", None),
+                IntegrationCommands::Validate { name } => ("validate", Some(name.clone())),
+                IntegrationCommands::Status { name } => ("status", name.clone()),
+                IntegrationCommands::Probe { name } => ("probe", Some(name.clone())),
+                IntegrationCommands::Rotate { name } => ("rotate", Some(name.clone())),
+            };
+            let start = std::time::Instant::now();
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg(&script).arg(subcmd);
+            if let Some(n) = &name_arg {
+                cmd.arg(n);
+            }
+            cmd.env("HEX_DIR", &hex_dir);
+            let status = cmd.status().unwrap_or_else(|e| {
+                eprintln!("hex integration: failed to run script: {e}");
+                std::process::exit(1);
+            });
+            let exit_code = status.code().unwrap_or(1);
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
+            let integration_name = name_arg.as_deref().unwrap_or("(all)");
+            telemetry.emit(&format!("hex.integration.{}", subcmd), &serde_json::json!({
+                "integration": integration_name,
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+            }));
+            std::process::exit(exit_code);
+        }
+        Commands::Memory { command } => {
+            let hex_dir = get_hex_dir();
+            let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
+            let subcmd_name = match &command {
+                MemoryCommands::CheckBehavior { .. } => "check-behavior",
+                MemoryCommands::Store { .. } => "store",
+                MemoryCommands::Bootstrap => "bootstrap",
+                MemoryCommands::Health => "health",
+                MemoryCommands::Search { .. } => "search",
+                MemoryCommands::Index { .. } => "index",
+            };
+            let start = std::time::Instant::now();
+            let exit_code = match &command {
+                MemoryCommands::Search { query, top } => {
+                    let script = hex_dir.join("system/skills/memory/scripts/memory_search.py");
+                    let mut cmd = std::process::Command::new("python3");
+                    cmd.arg(&script).arg(query);
+                    if let Some(t) = top {
+                        cmd.arg("--top").arg(t.to_string());
+                    }
+                    cmd.env("HEX_DIR", &hex_dir);
+                    cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+                }
+                MemoryCommands::Index { full } => {
+                    let script = hex_dir.join("system/skills/memory/scripts/memory_index.py");
+                    let mut cmd = std::process::Command::new("python3");
+                    cmd.arg(&script);
+                    if *full {
+                        cmd.arg("--full");
+                    }
+                    cmd.env("HEX_DIR", &hex_dir);
+                    cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+                }
+                _ => {
+                    let hex_memory = hex_dir.join("system/scripts/bin/hex-memory");
+                    let mut cmd = std::process::Command::new("bash");
+                    cmd.arg(&hex_memory);
+                    match &command {
+                        MemoryCommands::CheckBehavior { query } => {
+                            cmd.arg("check-behavior").arg(query);
+                        }
+                        MemoryCommands::Store { text, rule, session } => {
+                            cmd.arg("store").arg(text);
+                            if let Some(r) = rule {
+                                cmd.arg("--rule").arg(r);
+                            }
+                            if let Some(s) = session {
+                                cmd.arg("--session").arg(s);
+                            }
+                        }
+                        MemoryCommands::Bootstrap => {
+                            cmd.arg("bootstrap");
+                        }
+                        MemoryCommands::Health => {
+                            cmd.arg("health");
+                        }
+                        _ => unreachable!(),
+                    }
+                    cmd.env("HEX_DIR", &hex_dir);
+                    cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+                }
+            };
+            let duration_ms = start.elapsed().as_millis() as u64;
+            telemetry.emit(
+                &format!("hex.memory.{}", subcmd_name),
+                &serde_json::json!({
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                }),
+            );
+            std::process::exit(exit_code);
+        }
+        Commands::Doctor { fix, smoke, quiet, json } => {
+            let hex_dir = get_hex_dir();
+            let script = hex_dir.join("system/scripts/hex-doctor");
+            let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
+            let start = std::time::Instant::now();
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg(&script);
+            if fix { cmd.arg("--fix"); }
+            if smoke { cmd.arg("--smoke"); }
+            if quiet { cmd.arg("--quiet"); }
+            if json { cmd.arg("--json"); }
+            cmd.env("HEX_DIR", &hex_dir);
+            let output = cmd.output().unwrap_or_else(|e| {
+                eprintln!("hex doctor: failed to run script: {e}");
+                std::process::exit(1);
+            });
+            let exit_code = output.status.code().unwrap_or(1);
+            let duration_ms = start.elapsed().as_millis() as u64;
+            // Forward stdout/stderr to terminal
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), &output.stdout);
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
+            telemetry.emit("hex.doctor.run", &serde_json::json!({
+                "fix": fix,
+                "smoke": smoke,
+                "quiet": quiet,
+                "json": json,
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+            }));
+            if exit_code != 0 {
+                let stderr_str = String::from_utf8_lossy(&output.stderr);
+                let stdout_str = String::from_utf8_lossy(&output.stdout);
+                telemetry.emit("hex.doctor.failed", &serde_json::json!({
+                    "exit_code": exit_code,
+                    "stdout": stdout_str.chars().take(2000).collect::<String>(),
+                    "stderr": stderr_str.chars().take(2000).collect::<String>(),
+                }));
+            }
+            std::process::exit(exit_code);
+        }
+        Commands::Version => {
+            println!("hex {} ({})", env!("HEX_VERSION"), env!("HEX_GIT_SHA"));
         }
     }
 }

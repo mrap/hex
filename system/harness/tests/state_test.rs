@@ -1,4 +1,4 @@
-use hex_agent::state;
+use hex::state;
 use std::path::PathBuf;
 
 #[test]

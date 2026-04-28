@@ -1,12 +1,12 @@
 """
 hex-router — tiny path-routing reverse proxy for named local services.
 
-Runs on 127.0.0.1:7000. Tailscale Serve (or any reverse proxy) fronts it on :443 so users get:
-  https://<your-host>/ui        → hex-ui MVP
-  https://<your-host>/boi       → BOI live status
-  https://<your-host>/visions   → UX vision pitch site
-  https://<your-host>/demos     → demos page
-  https://<your-host>/          → landing page
+Runs on 127.0.0.1:8880. Tailscale Serve fronts it on :443 so users get:
+  https://mac-mini.tailbd5748.ts.net/ui        → hex-ui MVP
+  https://mac-mini.tailbd5748.ts.net/boi       → BOI live status
+  https://mac-mini.tailbd5748.ts.net/visions   → UX vision pitch site
+  https://mac-mini.tailbd5748.ts.net/demos     → demos page
+  https://mac-mini.tailbd5748.ts.net/          → landing page
 
 To add a new named service, add an entry to ROUTES.
 """
@@ -36,6 +36,11 @@ ROUTES = [
     ("/artifacts", "127.0.0.1", 8897, "http",  True),
     ("/boi",     "127.0.0.1", 8891, "https", True),
     ("/visions", "127.0.0.1", 8890, "https", True),
+    ("/proposals","127.0.0.1", 8898, "http",  True),
+    ("/social",   "127.0.0.1", 8899, "http",  True),
+    ("/comments", "127.0.0.1", 8901, "http",  True),
+    ("/wit",      "127.0.0.1", 3457, "http",  True),
+    ("/cc",       "127.0.0.1", 3458, "http",  True),
 ]
 
 # Convenience redirects: /alias  →  /target
@@ -78,7 +83,7 @@ footer { margin-top: 1.5rem; font-family: "SF Mono", Menlo, Consolas, monospace;
 </head><body>
 <main>
   <h1><span>▶</span> hex — local services</h1>
-  <p>Named paths for the services running on this host. Add more by editing <code>hex-router/router.py</code>.</p>
+  <p>Named paths for the services running on the mac-mini. Add more by editing <code>hex-router/router.py</code>.</p>
   <div class="list">
     <a class="row" href="/ui/">        <span class="name">/ui</span>      <span class="desc">hex-ui MVP (Morning Anchor, conversation)</span> <span class="arrow">→</span></a>
     <a class="row" href="/boi">        <span class="name">/boi</span>     <span class="desc">BOI live status — running specs, progress, queue</span> <span class="arrow">→</span></a>
@@ -86,6 +91,9 @@ footer { margin-top: 1.5rem; font-family: "SF Mono", Menlo, Consolas, monospace;
     <a class="row" href="/demos">      <span class="name">/demos</span>   <span class="desc">Usability demos — interactable sketches</span> <span class="arrow">→</span></a>
     <a class="row" href="/secrets">    <span class="name">/secrets</span><span class="desc">Credential intake — API keys, tokens, PEM files</span> <span class="arrow">→</span></a>
     <a class="row" href="/fleet">      <span class="name">/fleet</span>  <span class="desc">Live agent fleet org chart</span> <span class="arrow">→</span></a>
+    <a class="row" href="/proposals">  <span class="name">/proposals</span><span class="desc">Brand strategy decks and proposals</span> <span class="arrow">→</span></a>
+    <a class="row" href="/social">    <span class="name">/social</span>  <span class="desc">Live social dashboard — posts, experiments, engagement</span> <span class="arrow">→</span></a>
+    <a class="row" href="/cc/">       <span class="name">/cc</span>     <span class="desc">CloudCLI — web UI for Claude Code</span> <span class="arrow">→</span></a>
   </div>
   <footer>hex-router · tailscale-served · light mode</footer>
 </main>

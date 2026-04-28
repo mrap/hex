@@ -1,0 +1,75 @@
+name: ops-completion-verify
+description: >
+  Checks that expected output files exist after a BOI spec completes.
+  Reads the spec file from ~/.boi/queue/<spec_id>.spec.md, extracts 'test -f <path>'
+  patterns from Verify sections, and confirms those files exist.
+  Emits ops.spec.verified on success or ops.spec.output-missing on failure.
+  Fixed 2026-04-02: event payload uses spec_id not queue_id; spec_path derived from spec_id.
+provides:
+  events:
+    - ops.spec.verified
+    - ops.spec.output-missing
+requires:
+  events:
+    - boi.spec.completed
+rate_limit:
+  max_fires: 30
+  window: 1h
+rules:
+  - name: verify-output-files-on-completion
+    trigger:
+      event: boi.spec.completed
+    actions:
+      - type: shell
+        command: |
+          python3 -c "
+          import re, os, sys
+
+          spec_id = '{{ event.spec_id }}'
+          spec_title = '{{ event.spec_title }}'
+
+          if not spec_id:
+              print('No spec_id in event, skipping verify')
+              sys.exit(0)
+
+          # Derive spec path from spec_id (BOI queue convention)
+          queue_dir = os.path.expanduser('~/.boi/queue')
+          spec_path = os.path.join(queue_dir, f'{spec_id}.spec.md')
+
+          if not os.path.exists(spec_path):
+              print(f'spec file not found at {spec_path}, skipping verify')
+              sys.exit(0)
+
+          with open(spec_path) as f:
+              content = f.read()
+
+          # Find all 'test -f <path>' patterns in Verify sections
+          paths = re.findall(r'test\s+-f\s+([^\s\)\'\"]+)', content)
+          paths = [os.path.expanduser(p) for p in paths]
+
+          if not paths:
+              print(f'No test -f paths found in {spec_id} spec, skipping verify')
+              sys.exit(0)
+
+          missing = [p for p in paths if not os.path.exists(p)]
+          if missing:
+              print(f'MISSING ({spec_id}): ' + ', '.join(missing), file=sys.stderr)
+              sys.exit(1)
+
+          print(f'All output files verified for {spec_id}: ' + ', '.join(paths))
+          "
+        on_success:
+          - type: emit
+            event: ops.spec.verified
+            payload:
+              spec_id: "{{ event.spec_id }}"
+              spec_title: "{{ event.spec_title }}"
+        on_failure:
+          - type: emit
+            event: ops.spec.output-missing
+            payload:
+              spec_id: "{{ event.spec_id }}"
+              spec_title: "{{ event.spec_title }}"
+              message: "{{ action.stderr }}"
+          - type: notify
+            message: "BOI spec {{ event.spec_id }} ({{ event.spec_title }}) output files missing after completion"

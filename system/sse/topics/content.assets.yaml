@@ -1,0 +1,16 @@
+topic: content.assets
+description: "Asset registry changes"
+bridge:
+  - hex.asset.registered
+  - hex.asset.removed
+events:
+  - type: registered
+    description: "New asset registered or updated"
+    payload:
+      id: {type: string, description: "Asset ID (type:local_id)"}
+      title: {type: string}
+      asset_type: {type: string}
+  - type: removed
+    description: "Asset removed from registry"
+    payload:
+      id: {type: string}

@@ -1,0 +1,36 @@
+name: score-after-reflection
+description: >
+  Re-score priorities after each session reflection completes.
+  Runs priority-score.py to update priority-ranked.yaml, then emits
+  improvement.scored so the auto-dispatch policy can act on the results.
+
+requires:
+  events:
+    - session.reflected
+
+provides:
+  events:
+    - improvement.scored
+
+rules:
+  - name: score-priorities-on-reflection
+    trigger:
+      event: session.reflected
+    actions:
+      - type: shell
+        command: |
+          python3 $AGENT_DIR/evolution/priority-score.py \
+            --top 5 \
+            --output $AGENT_DIR/evolution/priority-ranked.yaml
+        on_success:
+          - type: emit
+            event: improvement.scored
+            payload:
+              ranked_path: $AGENT_DIR/evolution/priority-ranked.yaml
+              session_id: "{{ event.session_id }}"
+        on_failure:
+          - type: emit
+            event: improvement.score-failed
+            payload:
+              session_id: "{{ event.session_id }}"
+              message: "priority-score.py failed after session reflection"

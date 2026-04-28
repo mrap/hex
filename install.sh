@@ -296,10 +296,8 @@ if [ ! -f "$VERSIONS_FILE" ]; then
     exit 1
 fi
 BOI_VERSION=$(grep "^BOI_VERSION=" "$VERSIONS_FILE" | cut -d= -f2)
-HEX_EVENTS_VERSION=$(grep "^HEX_EVENTS_VERSION=" "$VERSIONS_FILE" | cut -d= -f2)
 HARNESS_VERSION=$(grep "^HARNESS_VERSION=" "$VERSIONS_FILE" | cut -d= -f2 || true)
 BOI_REPO="${HEX_BOI_REPO:-https://github.com/mrap/boi.git}"
-HEX_EVENTS_REPO="${HEX_EVENTS_REPO:-https://github.com/mrap/hex-events.git}"
 
 # BOI — parallel worker dispatch
 # Fresh install: clone at pinned version, then run the project's own installer.
@@ -339,46 +337,24 @@ install_or_upgrade_boi() {
 }
 install_or_upgrade_boi
 
-# hex-events — reactive event system
-# Same pattern: fresh install or upgrade existing.
-install_or_upgrade_hex_events() {
-    if [ -d "$HOME/.hex-events" ]; then
-        echo "  hex-events exists — upgrading to $HEX_EVENTS_VERSION..."
-        local src_dir=""
-        if [ -d "$HOME/.hex-events/.git" ]; then
-            src_dir="$HOME/.hex-events"
-        fi
-        if [ -n "$src_dir" ]; then
-            ( cd "$src_dir" && git fetch --tags --depth 1 origin 2>/dev/null && \
-              git checkout "$HEX_EVENTS_VERSION" 2>/dev/null ) || true
-        fi
-        # Re-run hex-events' own installer for venv/LaunchAgent setup
-        if [ -f "$HOME/.hex-events/install.sh" ]; then
-            bash "$HOME/.hex-events/install.sh" 2>/dev/null || true
-        fi
-        echo "  hex-events upgraded ($HEX_EVENTS_VERSION)  ✓"
-    else
-        if git clone --depth 1 --branch "$HEX_EVENTS_VERSION" "$HEX_EVENTS_REPO" "$HOME/.hex-events" 2>/dev/null; then
-            # Run hex-events' own installer for venv/daemon setup
-            if [ -f "$HOME/.hex-events/install.sh" ]; then
-                bash "$HOME/.hex-events/install.sh" 2>/dev/null || true
-            fi
-            echo "  hex-events installed ($HEX_EVENTS_VERSION)  ✓"
-        else
-            echo "  hex-events: failed to clone $HEX_EVENTS_REPO @ $HEX_EVENTS_VERSION (will install on next upgrade)"
-        fi
-    fi
-
-    # Verify hex-events is on PATH
-    if ! command -v hex-events &>/dev/null; then
-        echo "  ⚠️  'hex-events' not found on PATH. It should be at ~/.hex-events/venv/bin/hex-events"
-    fi
+# hex-events — reactive event system (now inline at system/events/)
+install_hex_events_from_source() {
+    local src_dir="$SCRIPT_DIR/system/events"
+    local dst_dir="$HOME/.hex-events"
+    mkdir -p "$dst_dir"
+    # Copy core source files; policies are deployed separately below (non-overwriting)
+    for item in "$src_dir"/*; do
+        name="$(basename "$item")"
+        [ "$name" = "policies" ] && continue
+        cp -R "$item" "$dst_dir/"
+    done
+    echo "  hex-events installed from system/events/  ✓"
 }
-install_or_upgrade_hex_events
+install_hex_events_from_source
 
 # ── Phase 5b: Deploy default policies ─────────────────────────────
 
-POLICIES_SRC="$SCRIPT_DIR/system/policies"
+POLICIES_SRC="$SCRIPT_DIR/system/events/policies"
 if [ -d "$POLICIES_SRC" ] && ls "$POLICIES_SRC"/*.yaml &>/dev/null; then
     if [ -d "$HOME/.hex-events" ]; then
         POLICIES_DST="$HOME/.hex-events/policies"
@@ -420,32 +396,42 @@ with open(os.path.expanduser('~/.hex-install.json'), 'w') as f:
 # Silent; any failure is non-fatal.
 HEX_DIR="$TARGET_DIR" bash "$TARGET_DIR/.hex/scripts/doctor.sh" --fix --quiet >/dev/null 2>&1 || true
 
-# ── Phase 7: Install hex-agent harness ────────────────────────────
+# ── Phase 7: Install hex binary (unified harness + server) ────────
 
-echo "Installing hex-agent harness..."
+echo "Installing hex binary..."
 
 mkdir -p "$TARGET_DIR/.hex/bin"
+mkdir -p "$TARGET_DIR/.hex/data"
+mkdir -p "$TARGET_DIR/.hex/sse/topics"
+
+# Migration: remove old standalone hex-agent binary (replaced by symlink)
+if [ -f "$TARGET_DIR/.hex/bin/hex-agent" ] && [ ! -L "$TARGET_DIR/.hex/bin/hex-agent" ]; then
+    echo "  Migrating: replacing old hex-agent binary with hex + symlink..."
+    rm -f "$TARGET_DIR/.hex/bin/hex-agent"
+fi
 
 _harness_build_from_source() {
-    echo "  Building hex-agent from source..."
+    echo "  Building hex from source..."
     ( cd "$SCRIPT_DIR/system/harness" && cargo build --release 2>&1 ) || return 1
-    cp "$SCRIPT_DIR/system/harness/target/release/hex-agent" "$TARGET_DIR/.hex/bin/hex-agent"
-    chmod +x "$TARGET_DIR/.hex/bin/hex-agent"
+    cp "$SCRIPT_DIR/system/harness/target/release/hex" "$TARGET_DIR/.hex/bin/hex"
+    chmod +x "$TARGET_DIR/.hex/bin/hex"
+    ln -sf hex "$TARGET_DIR/.hex/bin/hex-agent"
 }
 
 _harness_download_prebuilt() {
     local arch os harness_url
     arch=$(uname -m)
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    harness_url="https://github.com/mrap/hex-foundation/releases/download/${HARNESS_VERSION}/hex-agent-${os}-${arch}"
-    echo "  Downloading hex-agent from ${harness_url}..."
-    curl -fSL "$harness_url" -o "$TARGET_DIR/.hex/bin/hex-agent" && chmod +x "$TARGET_DIR/.hex/bin/hex-agent"
+    harness_url="https://github.com/mrap/hex-foundation/releases/download/${HARNESS_VERSION}/hex-${os}-${arch}"
+    echo "  Downloading hex from ${harness_url}..."
+    curl -fSL "$harness_url" -o "$TARGET_DIR/.hex/bin/hex" && chmod +x "$TARGET_DIR/.hex/bin/hex"
+    ln -sf hex "$TARGET_DIR/.hex/bin/hex-agent"
 }
 
 _harness_warn_missing() {
     echo ""
-    echo "WARNING: hex-agent harness could not be built or downloaded."
-    echo "  Install Rust (https://rustup.rs) and re-run to enable the agent fleet."
+    echo "WARNING: hex binary could not be built or downloaded."
+    echo "  Install Rust (https://rustup.rs) and re-run to enable the agent fleet and server."
     echo "  Core hex functionality (BOI, hex-events, memory) still works without it."
     echo ""
 }
@@ -464,18 +450,40 @@ elif command -v curl &>/dev/null; then
     echo "  cargo not found — trying pre-built binary download..."
     _harness_download_prebuilt || _harness_warn_missing
 else
-    echo "  cargo and curl not found — skipping harness install"
+    echo "  cargo and curl not found — skipping binary install"
     _harness_warn_missing
 fi
 
-if [ -f "$TARGET_DIR/.hex/bin/hex-agent" ]; then
-    if ! "$TARGET_DIR/.hex/bin/hex-agent" --version &>/dev/null; then
-        echo "WARNING: hex-agent binary installed but failed to execute. Re-run install to retry."
+# Copy SSE topic manifests
+if [ -d "$SCRIPT_DIR/system/sse/topics" ]; then
+    cp -R "$SCRIPT_DIR/system/sse/topics/"*.yaml "$TARGET_DIR/.hex/sse/topics/" 2>/dev/null || true
+fi
+
+# Copy CLI helpers
+for helper in hex-asset hex-comment-respond.sh hex-sse-publish hex-sse-listen; do
+    if [ -f "$SCRIPT_DIR/system/scripts/bin/$helper" ]; then
+        cp "$SCRIPT_DIR/system/scripts/bin/$helper" "$TARGET_DIR/.hex/bin/$helper"
+        chmod +x "$TARGET_DIR/.hex/bin/$helper"
+    fi
+done
+
+if [ -x "$TARGET_DIR/.hex/bin/hex" ]; then
+    if ! "$TARGET_DIR/.hex/bin/hex" version &>/dev/null; then
+        echo "WARNING: hex binary installed but failed to execute. Re-run install to retry."
     else
-        echo "  hex-agent harness   ✓"
+        local hex_ver
+        hex_ver=$("$TARGET_DIR/.hex/bin/hex" version 2>/dev/null || echo "unknown")
+        echo "  hex binary          ✓ ($hex_ver)"
+        # Verify symlink works
+        if [ -L "$TARGET_DIR/.hex/bin/hex-agent" ]; then
+            echo "  hex-agent symlink   ✓"
+        else
+            echo "  hex-agent symlink   ⚠ (creating...)"
+            ln -sf hex "$TARGET_DIR/.hex/bin/hex-agent"
+        fi
     fi
 else
-    echo "  hex-agent harness   ⚠ (install Rust to enable agent fleet)"
+    echo "  hex binary          ⚠ (install Rust to enable agent fleet + server)"
 fi
 
 echo ""

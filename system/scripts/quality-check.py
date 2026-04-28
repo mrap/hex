@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Optional
 
 BOI_QUEUE = Path(os.path.expanduser("~/.boi/queue"))
-WORKSPACE = Path(os.path.expanduser("${AGENT_DIR:-$HOME/hex}"))
+WORKSPACE = Path(os.path.expanduser("~/hex"))
 INITIATIVES_DIR = WORKSPACE / "initiatives"
 EVENTS_DIR = Path(os.path.expanduser("~/.hex-events/events"))
+GITHUB_MRAP_BASE = Path(os.path.expanduser("~/github.com/mrap"))
 
 # --- Gaming detection patterns ---
 
@@ -37,6 +38,11 @@ TRIVIAL_METRIC_PATTERNS = [
 FILE_EXISTENCE_ONLY_PATTERN = re.compile(
     r'os\.path\.exists|test\s+-[ef]|if.*exists', re.I
 )
+
+ADMIN_TITLE_KEYWORDS = [
+    "close", "add closed_at", "update status", "mark complete",
+    "kr closure", "close kr", "initiative close", "admin", "housekeeping",
+]
 
 MANUAL_VERIFICATION_PATTERN = re.compile(
     r'manual.verif|manual.check|echo.*manual', re.I
@@ -104,8 +110,8 @@ def read_telemetry(spec_id: str) -> Optional[dict]:
     return None
 
 
-def spec_is_drive_kr(content: str) -> bool:
-    return bool(re.search(r'Drive KR to Non-Zero|drive.*kr.*non-zero|highest-leverage action for kr', content, re.I))
+def spec_is_drive_kr(title: str) -> bool:
+    return bool(re.search(r'Drive KR to Non-Zero|drive.*kr.*non-zero|highest-leverage action for kr', title, re.I))
 
 
 def extract_metric_command_from_spec(content: str) -> Optional[str]:
@@ -152,6 +158,163 @@ def get_exit_time(spec_id: str) -> Optional[float]:
     if exit_path.exists():
         return exit_path.stat().st_mtime
     return None
+
+
+def get_dispatch_commit(dispatch_time: float, repo_path: Path) -> Optional[str]:
+    """Return the git commit hash that was HEAD at dispatch_time (snapshot before spec ran)."""
+    try:
+        ts = datetime.fromtimestamp(dispatch_time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result = subprocess.run(
+            ["git", "log", f"--before={ts}", "-1", "--format=%H"],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=10
+        )
+        commit = result.stdout.strip()
+        return commit if commit else None
+    except Exception:
+        return None
+
+
+def get_untracked_files(repo_path: Path, start_time: Optional[float], exit_time: Optional[float]) -> list[dict]:
+    """Detect untracked files modified within the spec execution window (git status --short)."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=10
+        )
+        untracked = []
+        for line in result.stdout.splitlines():
+            if not line.startswith("?? "):
+                continue
+            rel_path = line[3:].strip()
+            fpath = repo_path / rel_path
+            if not fpath.exists() or fpath.is_dir():
+                continue
+            fmtime = fpath.stat().st_mtime
+            if start_time and exit_time:
+                window_start = start_time - 60
+                window_end = exit_time + 1800
+                if not (window_start <= fmtime <= window_end):
+                    continue
+            untracked.append({"type": "untracked", "file": rel_path, "source": "untracked"})
+        return untracked
+    except Exception:
+        return []
+
+
+def extract_repos_from_spec(content: str) -> list[Path]:
+    """Extract additional git repo paths referenced in spec content or workspace field."""
+    repos: list[Path] = []
+    seen: set[Path] = set()
+
+    # workspace: field
+    m = re.search(r'^workspace:\s*(.+)$', content, re.MULTILINE)
+    if m:
+        wp = Path(os.path.expanduser(m.group(1).strip()))
+        if wp != WORKSPACE and wp not in seen:
+            repos.append(wp)
+            seen.add(wp)
+
+    # github.com/mrap/<repo> paths anywhere in spec
+    for match in re.finditer(r'github\.com/mrap/([a-zA-Z0-9_.-]+)', content):
+        repo_name = match.group(1).rstrip('/.,:;')
+        rp = GITHUB_MRAP_BASE / repo_name
+        if rp not in seen:
+            repos.append(rp)
+            seen.add(rp)
+
+    # mrap/<repo-name> relative references
+    for match in re.finditer(r'\bmrap/([a-zA-Z0-9_-]+)', content):
+        rp = GITHUB_MRAP_BASE / match.group(1)
+        if rp not in seen:
+            repos.append(rp)
+            seen.add(rp)
+
+    return [r for r in repos if r.exists() and (r / '.git').exists()]
+
+
+def scan_github_mrap_repos_in_window(start_time: float, exit_time: Optional[float]) -> list[Path]:
+    """Return ~/github.com/mrap/ repos that had commits during the spec execution window."""
+    if not GITHUB_MRAP_BASE.exists():
+        return []
+    since_ts = datetime.fromtimestamp(start_time - 60, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_val = exit_time + 1800 if exit_time else start_time + 7200
+    until_ts = datetime.fromtimestamp(until_val, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    active: list[Path] = []
+    try:
+        for repo_dir in GITHUB_MRAP_BASE.iterdir():
+            if not repo_dir.is_dir() or not (repo_dir / '.git').exists():
+                continue
+            try:
+                r = subprocess.run(
+                    ["git", "log", f"--since={since_ts}", f"--until={until_ts}", "--oneline"],
+                    cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
+                )
+                if r.stdout.strip():
+                    active.append(repo_dir)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return active
+
+
+def scan_repo_for_changes(
+    repo_path: Path,
+    start_time: Optional[float],
+    exit_time: Optional[float],
+) -> dict:
+    """Scan a single repo for code/doc/untracked changes within the spec execution window.
+
+    Returns dict with keys: code_changes (list[dict]), evidence (list[str]).
+    """
+    label = repo_path.name
+    out: dict = {"code_changes": [], "evidence": []}
+    try:
+        dispatch_commit = get_dispatch_commit(start_time, repo_path) if start_time else None
+        git_diff_ref = f"{dispatch_commit}..HEAD" if dispatch_commit else "HEAD"
+        if not dispatch_commit:
+            out["evidence"].append(f"[{label}] dispatch-time commit unavailable, using HEAD diff")
+
+        diff_r = subprocess.run(
+            ["git", "diff", "--name-only", git_diff_ref],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=10,
+        )
+        all_changed = [f.strip() for f in diff_r.stdout.splitlines() if f.strip()]
+
+        files_in_window: list[str] = []
+        for f in all_changed:
+            fpath = repo_path / f
+            if not fpath.exists():
+                continue
+            fmtime = fpath.stat().st_mtime
+            if start_time and exit_time:
+                if (start_time - 60) <= fmtime <= (exit_time + 1800):
+                    files_in_window.append(f)
+            else:
+                files_in_window.append(f)
+
+        code_files = [f for f in files_in_window if f.endswith(('.py', '.rs', '.sh', '.js', '.ts'))]
+        doc_files = [f for f in files_in_window if f.endswith('.md')]
+
+        if code_files:
+            out["evidence"].append(f"[{label}] code files changed: {code_files}")
+            out["code_changes"].extend([{"type": "code", "file": f, "repo": label} for f in code_files])
+        if doc_files:
+            out["evidence"].append(f"[{label}] doc files changed: {doc_files}")
+            out["code_changes"].extend([{"type": "doc", "file": f, "repo": label} for f in doc_files])
+
+        untracked = get_untracked_files(repo_path, start_time, exit_time)
+        if untracked:
+            for u in untracked:
+                u["repo"] = label
+            out["evidence"].append(f"[{label}] untracked files: {[u['file'] for u in untracked]}")
+            out["code_changes"].extend(untracked)
+
+    except subprocess.TimeoutExpired:
+        out["evidence"].append(f"[{label}] git diff timed out")
+    except Exception as e:
+        out["evidence"].append(f"[{label}] scan error: {e}")
+    return out
 
 
 def get_spec_duration_seconds(spec_id: str) -> Optional[float]:
@@ -282,6 +445,73 @@ def find_kr(init_id: str, kr_id: str) -> Optional[dict]:
     return None
 
 
+# --- Admin spec classification ---
+
+def parse_spec_metadata(content: str) -> dict:
+    """Extract title, mode, and context from spec YAML frontmatter."""
+    meta = {"title": "", "mode": "", "context": ""}
+    lines = content.splitlines()
+    in_context = False
+    context_lines: list[str] = []
+    context_indent: Optional[int] = None
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("title:"):
+            meta["title"] = stripped[6:].strip().strip("\"'")
+            in_context = False
+        elif stripped.startswith("mode:"):
+            meta["mode"] = stripped[5:].strip().strip("\"'")
+            in_context = False
+        elif stripped.startswith("context:") and ("|" in stripped or stripped == "context:"):
+            in_context = True
+            context_lines = []
+            context_indent = None
+        elif in_context:
+            # Top-level key ends the context block
+            if line and not line[0].isspace() and stripped and ":" in stripped:
+                meta["context"] = "\n".join(context_lines)
+                in_context = False
+            else:
+                if context_indent is None and line.startswith(" "):
+                    context_indent = len(line) - len(line.lstrip())
+                if context_indent and line.startswith(" " * context_indent):
+                    context_lines.append(line[context_indent:])
+                elif not line.startswith(" ") and line.strip() == "":
+                    context_lines.append("")
+                else:
+                    context_lines.append(line)
+
+    if in_context and context_lines:
+        meta["context"] = "\n".join(context_lines)
+
+    return meta
+
+
+def classify_spec_type(spec_metadata: dict) -> tuple[str, str]:
+    """Classify spec as 'code', 'admin-closure', or 'unknown'. Returns (type, reason)."""
+    title = spec_metadata.get("title", "").lower()
+    mode = spec_metadata.get("mode", "").lower()
+
+    for kw in ADMIN_TITLE_KEYWORDS:
+        if kw in title:
+            return "admin-closure", f"title contains admin keyword: '{kw}'"
+
+    # mode=update/patch with metadata-only title signals
+    if mode in ("update", "patch"):
+        metadata_signals = ["status", "yaml", "config", "field", "closed_at", "initiative", "kr"]
+        for sig in metadata_signals:
+            if sig in title:
+                return "admin-closure", f"mode={mode!r} with metadata title signal: '{sig}'"
+
+    admin_title_patterns = ["adding closed_at", "updating initiative yaml"]
+    for pat in admin_title_patterns:
+        if pat in title:
+            return "admin-closure", f"title mentions: '{pat}'"
+
+    return "code", "no admin-closure indicators found"
+
+
 # --- Gaming analysis for a single spec ---
 
 def analyze_spec(spec_id: str) -> dict:
@@ -304,8 +534,29 @@ def analyze_spec(spec_id: str) -> dict:
     gaming_signals = 0
     real_signals = 0
 
+    # 0. Admin spec classification — must run before any gaming scoring
+    spec_metadata = parse_spec_metadata(content)
+    spec_type, classification_reason = classify_spec_type(spec_metadata)
+    evidence.append(f"spec classification: {spec_type} ({classification_reason})")
+
+    if spec_type == "admin-closure":
+        return {
+            "spec_id": spec_id,
+            "verdict": "ADMIN",
+            "spec_type": "admin-closure",
+            "classification_reason": classification_reason,
+            "gaming_signals": 0,
+            "real_signals": 0,
+            "evidence": evidence,
+            "files_changed": [],
+            "metric_changes": [],
+            "code_changes": [],
+            "is_drive_kr": False,
+            "duration_seconds": None,
+        }
+
     # 1. Is this a "drive KR to non-zero" initiative spec?
-    is_drive_kr = spec_is_drive_kr(content)
+    is_drive_kr = spec_is_drive_kr(spec_metadata.get("title", ""))
     if is_drive_kr:
         evidence.append("spec type: Drive KR to Non-Zero (high-risk template)")
         gaming_signals += 1
@@ -345,25 +596,31 @@ def analyze_spec(spec_id: str) -> dict:
             if duration > 600:
                 real_signals += 1
 
-    # 6. Look at what files changed (git diff HEAD for workspace)
+    # 6. Look at what files changed (git diff anchored to spec dispatch time, cross-repo)
     files_changed = []
     try:
+        prompt_path = BOI_QUEUE / f"{spec_id}.prompt.md"
+        start_time = prompt_path.stat().st_mtime if prompt_path.exists() else None
+        exit_time = get_exit_time(spec_id)
+
+        # --- Primary workspace scan (includes gaming-pattern detection) ---
+        dispatch_commit = get_dispatch_commit(start_time, WORKSPACE) if start_time else None
+        if dispatch_commit:
+            git_diff_ref = f"{dispatch_commit}..HEAD"
+        else:
+            git_diff_ref = "HEAD"
+            evidence.append("warning: dispatch-time commit unavailable, falling back to HEAD diff")
+
         result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
+            ["git", "diff", "--name-only", git_diff_ref],
             cwd=str(WORKSPACE), capture_output=True, text=True, timeout=10
         )
         all_changed = [f.strip() for f in result.stdout.splitlines() if f.strip()]
-
-        # Filter to files likely changed during this spec's window
-        exit_time = get_exit_time(spec_id)
-        prompt_path = BOI_QUEUE / f"{spec_id}.prompt.md"
-        start_time = prompt_path.stat().st_mtime if prompt_path.exists() else None
 
         for f in all_changed:
             fpath = WORKSPACE / f
             if fpath.exists():
                 fmtime = fpath.stat().st_mtime
-                # Include if modified within spec window (±30min buffer)
                 if start_time and exit_time:
                     window_start = start_time - 60
                     window_end = exit_time + 1800
@@ -371,12 +628,6 @@ def analyze_spec(spec_id: str) -> dict:
                         files_changed.append(f)
                 else:
                     files_changed.append(f)
-
-        # Categorize changed files
-        yaml_only = all([
-            f.endswith('.yaml') or f.endswith('.json') or f.endswith('.toml')
-            for f in files_changed
-        ]) if files_changed else False
 
         initiative_yaml_changes = [f for f in files_changed if f.startswith('initiatives/') or f.startswith('experiments/')]
         code_files = [f for f in files_changed if f.endswith(('.py', '.rs', '.sh', '.js', '.ts'))]
@@ -392,7 +643,41 @@ def analyze_spec(spec_id: str) -> dict:
             real_signals += len(code_files)
         elif doc_files:
             evidence.append(f"doc files changed: {doc_files}")
-            real_signals += 1  # docs are real work, not gaming
+            real_signals += 1
+
+        # Untracked files in primary workspace
+        untracked_changes = get_untracked_files(WORKSPACE, start_time, exit_time)
+        if untracked_changes:
+            untracked_paths = [u["file"] for u in untracked_changes]
+            evidence.append(f"untracked files modified during spec window: {untracked_paths}")
+            code_changes.extend(untracked_changes)
+            real_signals += len(untracked_changes)
+
+        # --- Cross-repo scanning ---
+        # Collect repos: from spec context + ~/github.com/mrap/ fallback sweep
+        context_repos = extract_repos_from_spec(content)
+        scanned: set[Path] = {WORKSPACE}
+
+        fallback_repos: list[Path] = []
+        if start_time:
+            fallback_repos = scan_github_mrap_repos_in_window(start_time, exit_time)
+
+        cross_repos: list[Path] = []
+        for r in context_repos + fallback_repos:
+            if r not in scanned:
+                cross_repos.append(r)
+                scanned.add(r)
+
+        for repo_path in cross_repos:
+            if not repo_path.exists():
+                evidence.append(f"cross-repo: {repo_path} not found on disk, skipping")
+                continue
+            repo_scan = scan_repo_for_changes(repo_path, start_time, exit_time)
+            evidence.extend(repo_scan["evidence"])
+            if repo_scan["code_changes"]:
+                evidence.append(f"cross-repo scan found changes in {repo_path.name}")
+                code_changes.extend(repo_scan["code_changes"])
+                real_signals += len(repo_scan["code_changes"])
 
     except subprocess.TimeoutExpired:
         evidence.append("git diff timed out — could not check file changes")

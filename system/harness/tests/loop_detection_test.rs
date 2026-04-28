@@ -1,7 +1,7 @@
 use chrono::Utc;
-use hex_agent::state;
-use hex_agent::types::TrailEntry;
-use hex_agent::wake::{check_and_handle_loop, compute_action_hash};
+use hex::state;
+use hex::types::TrailEntry;
+use hex::wake::{check_and_handle_loop, compute_action_hash};
 
 fn make_trail_entry(entry_type: &str, key: &str, val: &str) -> TrailEntry {
     TrailEntry {

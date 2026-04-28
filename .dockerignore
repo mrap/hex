@@ -1,0 +1,3 @@
+system/harness/target/
+.git/
+*.tmp

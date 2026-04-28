@@ -1,0 +1,78 @@
+name: ops-failure-pattern
+description: >
+  Detects recurring BOI spec failure patterns. On each boi.spec.failed event,
+  queries the hex-events SQLite DB for failures in the past 72 hours, groups
+  them by reason prefix (first 50 chars), and fires ops.pattern.detected when
+  3 or more failures share the same root cause prefix.
+provides:
+  events:
+    - ops.pattern.detected
+requires:
+  events:
+    - boi.spec.failed
+rate_limit:
+  max_fires: 10
+  window: 1h
+rules:
+  - name: detect-recurring-failure-pattern
+    trigger:
+      event: boi.spec.failed
+    actions:
+      - type: shell
+        command: |
+          python3 -c "
+          import sqlite3, json, os, sys
+
+          db_path = os.path.expanduser('~/.hex-events/events.db')
+          if not os.path.exists(db_path):
+              print('events.db not found, skipping pattern check')
+              sys.exit(0)
+
+          cutoff_hours = 72
+          with sqlite3.connect(db_path) as conn:
+              rows = conn.execute(
+                  '''SELECT payload FROM events
+                     WHERE event_type = 'boi.spec.failed'
+                     AND created_at >= datetime('now', '-' || ? || ' hours')''',
+                  (cutoff_hours,)
+              ).fetchall()
+
+          if len(rows) < 3:
+              print(f'Only {len(rows)} failures in 72h, no pattern threshold reached')
+              sys.exit(0)
+
+          # Group by reason prefix (first 50 chars)
+          from collections import Counter
+          reason_prefixes = []
+          for (payload_str,) in rows:
+              try:
+                  payload = json.loads(payload_str)
+                  reason = str(payload.get('reason', '')).strip()
+                  prefix = reason[:50]
+              except Exception:
+                  prefix = '(unparseable)'
+              reason_prefixes.append(prefix)
+
+          counts = Counter(reason_prefixes)
+          patterns = {k: v for k, v in counts.items() if v >= 3}
+
+          if not patterns:
+              print(f'{len(rows)} failures in 72h but no single reason pattern hit 3+ threshold')
+              sys.exit(0)
+
+          top_pattern = max(patterns, key=patterns.get)
+          top_count = patterns[top_pattern]
+          print(f'PATTERN DETECTED: {top_count}x in 72h — {top_pattern!r}')
+          # Write pattern details to stdout for downstream actions
+          details = json.dumps({'pattern': top_pattern, 'count': top_count, 'all_patterns': patterns})
+          print(details)
+          "
+        on_success:
+          - type: emit
+            event: ops.pattern.detected
+            payload:
+              trigger_spec_id: "{{ event.spec_id }}"
+              window_hours: 72
+              message: "Recurring BOI failure pattern detected (3+ occurrences in 72h)"
+          - type: notify
+            message: "BOI failure pattern detected: 3+ specs failed with same root cause in 72h (triggered by {{ event.spec_id }})"

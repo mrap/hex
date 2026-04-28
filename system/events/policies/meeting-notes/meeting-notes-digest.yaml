@@ -1,0 +1,124 @@
+name: meeting-notes-digest
+description: >
+  Digests a detected meeting notes Google Doc into hex's context system.
+  Reads the doc via Claude MCP, matches to a project, writes meeting summary,
+  updates people profiles, todo.md, and decision records.
+provides:
+  events:
+    - meeting.notes.digested
+requires:
+  events:
+    - meeting.notes.detected
+rate_limit:
+  max_fires: 10
+  window: 1h
+rules:
+  - name: digest-meeting-notes
+    trigger:
+      event: meeting.notes.detected
+    actions:
+      - type: shell
+        timeout: 300
+        retries: 2
+        command: |
+          cd ~/hex && claude --dangerously-skip-permissions --print --no-session-persistence -p "$(cat <<'PROMPT'
+          You are processing meeting notes from a Google Doc. Distill these notes into the hex framework's canonical file locations.
+
+          ## Meeting Info
+
+          - **Google Doc ID**: {{ event.doc_id }}
+          - **Meeting Title**: {{ event.title }}
+          - **Modified Time**: {{ event.modified_time }}
+
+          ## Instructions
+
+          ### Step 1: Read the Meeting Notes
+
+          Use the google_docs MCP tool to read the contents of the Google Doc with ID `{{ event.doc_id }}`.
+
+          **Important**: Some docs (especially Zoom AI meeting notes) are rolling docs that accumulate notes from multiple meetings. If the doc contains multiple dated sections, ONLY process the most recent one. Do not re-distill older sections.
+
+          **Important**: AI transcription frequently mangles names. Cross-check all names against known stakeholders in ~/hex/people/*/profile.md before writing.
+
+          ### Step 2: Match to a Project
+
+          Look at the existing projects in ~/hex/projects/ and read their context.md files. Determine which project this meeting belongs to based on the meeting title, attendees, and content.
+
+          If no project matches, save the meeting summary to ~/hex/raw/meetings/ and skip project-specific updates.
+
+          ### Step 3: Write Meeting Summary
+
+          Create a meeting summary file at:
+          ~/hex/projects/{project}/meetings/{meeting-title-slug}-YYYY-MM-DD.md
+
+          Use this format:
+
+          ```markdown
+          # {Meeting Title}
+
+          **Date**: YYYY-MM-DD
+          **Type**: {meeting type}
+          **Source**: AI meeting notes (doc ID: {{ event.doc_id }})
+          **Attendees**: [list key attendees]
+
+          ## Summary
+          [2-3 sentence summary]
+
+          ## Key Points
+          - [bullet points]
+
+          ## Decisions Made
+          - [decisions with who decided]
+
+          ## Action Items
+          - [ ] {action} - Owner: {name}
+
+          ## Open Questions
+          - [unresolved items]
+          ```
+
+          ### Step 4: Update Project Context
+
+          If the meeting matched a project, re-read ~/hex/projects/{project}/context.md immediately before editing, then use the Edit tool (NOT Write) to update with status changes, new blockers, timeline updates, or key decisions.
+
+          ### Step 5: Update Stakeholder Profiles
+
+          For any person who said or did something notable:
+          - Re-read ~/hex/people/{name}/profile.md before editing
+          - Use Edit tool to add new intel (positions taken, concerns raised, commitments made)
+          - Only create profiles for meaningful stakeholders
+
+          ### Step 6: Update Todo List
+
+          Re-read ~/hex/todo.md immediately before editing, then use Edit tool to:
+          - Add new action items from the meeting
+          - Update status on existing items if the meeting resolved or changed them
+
+          ### Step 7: Log Decisions
+
+          If decisions were made, create a decision file at:
+          ~/hex/projects/{project}/decisions/{topic-slug}-YYYY-MM-DD.md
+
+          ### Step 8: Rebuild Memory Index
+
+          After all writes are complete:
+          ```bash
+          python3 ~/hex/.claude/skills/memory/scripts/memory_index.py
+          ```
+
+          ## Rules
+
+          - Use Edit tool (surgical) for all modifications to existing files. Never Write to overwrite.
+          - Re-read files immediately before writing to avoid clobbering concurrent changes.
+          - Be concise. Capture signal, not noise.
+          - Attribute actions and decisions to specific people by name.
+          - If the notes are empty or contain no useful content, exit without writing anything.
+          - Do not create project folders for projects that do not already exist. Use raw/meetings/ for unmatched content.
+          PROMPT
+          )"
+        on_success:
+          - type: emit
+            event: meeting.notes.digested
+            payload:
+              doc_id: "{{ event.doc_id }}"
+              title: "{{ event.title }}"

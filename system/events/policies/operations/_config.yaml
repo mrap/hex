@@ -1,0 +1,8 @@
+name: operations
+description: BOI spec output verification, failure pattern detection, and completion digests
+enabled: true
+
+config:
+  boi_state_dir: ~/.boi
+  failure_window_hours: 72
+  failure_threshold: 3

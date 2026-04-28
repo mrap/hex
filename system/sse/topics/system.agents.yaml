@@ -1,0 +1,16 @@
+topic: system.agents
+description: "Agent lifecycle events"
+bridge:
+  - hex.agent.*.woke
+  - hex.agent.*.failed
+events:
+  - type: wake_started
+    description: "Agent began a wake cycle"
+    payload:
+      agent_id: {type: string}
+      trigger: {type: string}
+  - type: wake_failed
+    description: "Agent wake cycle failed"
+    payload:
+      agent_id: {type: string}
+      error: {type: string}

@@ -1,0 +1,22 @@
+name: generative-output-notify
+description: Notify on new generative layer outputs
+
+requires:
+  events:
+    - generative.output.created
+
+rules:
+  - name: notify-on-output
+    trigger:
+      event: generative.output.created
+    actions:
+      - type: shell
+        command: |
+          OUTPUT_TYPE="{{ event.output_type }}"
+          HEADLINE="{{ event.headline }}"
+          if [ -n "$OUTPUT_TYPE" ] && [ -n "$HEADLINE" ]; then
+            echo "[generative-layer] New output: $OUTPUT_TYPE — $HEADLINE"
+          else
+            echo "[generative-layer] New output generated"
+          fi
+        timeout: 10

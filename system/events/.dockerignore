@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+events.db
+events.db-wal
+events.db-shm
+daemon.log
+daemon.smoke.log
+fswatch.log
+.git/

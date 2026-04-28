@@ -1,0 +1,42 @@
+name: generative-loop-daily
+description: >
+  Run the generative layer daily light pass. Produces cross-source pattern
+  alerts, project momentum pulse, and research feed health checks.
+
+requires:
+  events:
+    - timer.tick.daily.6am
+
+provides:
+  events:
+    - generative.output.created
+
+rate_limit:
+  max_fires: 1
+  window: 12h
+
+rules:
+  - name: daily-generation
+    trigger:
+      event: timer.tick.daily.6am
+    actions:
+      - type: shell
+        command: |
+          SCRIPT="$AGENT_DIR/.claude/scripts/generative-loop.py"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "generative-loop.py not found at $SCRIPT — skipping"
+            exit 0
+          fi
+          cd "$AGENT_DIR" && AGENT_DIR=$(pwd) python3 "$SCRIPT" --cycle-type daily
+        timeout: 300
+        on_success:
+          - type: emit
+            event: generative.output.created
+            payload:
+              triggered_by: timer.tick.daily.6am
+        on_failure:
+          - type: emit
+            event: generative.output.created
+            payload:
+              triggered_by: timer.tick.daily.6am
+              error: "generative-loop exited non-zero"

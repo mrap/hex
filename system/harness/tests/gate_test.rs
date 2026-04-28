@@ -1,6 +1,6 @@
 use chrono::Utc;
-use hex_agent::gate;
-use hex_agent::types::TrailEntry;
+use hex::gate;
+use hex::types::TrailEntry;
 
 fn make_entry(entry_type: &str, detail: serde_json::Value) -> TrailEntry {
     TrailEntry {

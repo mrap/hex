@@ -1,0 +1,59 @@
+description: Auto-update landings file when BOI specs are dispatched, completed, or
+  failed
+enabled: true
+name: boi-landings-bridge
+provides:
+  events:
+  - landings.updated
+rate_limit:
+  max_fires: 30
+  window: 1h
+reflection_ids:
+- R-033
+requires:
+  events:
+  - boi.spec.dispatched
+  - boi.spec.completed
+  - boi.spec.failed
+rules:
+- actions:
+  - command: 'bash ~/.hex-events/scripts/update-landings-from-boi.sh dispatched "{{
+      event.spec_id or event.queue_id }}" "{{ event.spec_title }}" "0" "{{ event.tasks_total
+      }}"
+
+      '
+    on_success:
+    - event: landings.updated
+      type: emit
+    type: shell
+  name: update-landings-on-dispatch
+  trigger:
+    event: boi.spec.dispatched
+- actions:
+  - command: 'bash ~/.hex-events/scripts/update-landings-from-boi.sh completed "{{
+      event.spec_id or event.queue_id }}" "{{ event.spec_title }}" "{{ event.tasks_done
+      }}" "{{ event.tasks_total }}"
+
+      '
+    on_success:
+    - event: landings.updated
+      type: emit
+    type: shell
+  name: update-landings-on-completion
+  trigger:
+    event: boi.spec.completed
+- actions:
+  - command: 'bash ~/.hex-events/scripts/update-landings-from-boi.sh failed "{{ event.spec_id
+      or event.queue_id }}" "{{ event.spec_title }}" "{{ event.tasks_done }}" "{{
+      event.tasks_total }}"
+
+      '
+    on_success:
+    - event: landings.updated
+      type: emit
+    type: shell
+  name: update-landings-on-failure
+  trigger:
+    event: boi.spec.failed
+standing_orders:
+- '9'

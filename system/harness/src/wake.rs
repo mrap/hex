@@ -588,7 +588,7 @@ pub fn compute_action_hash(agent_id: &str, trail_type: &str, detail: &serde_json
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
-    hex::encode(result)[..16].to_string()
+    hex_bytes::encode(result)[..16].to_string()
 }
 
 pub fn check_and_handle_loop(

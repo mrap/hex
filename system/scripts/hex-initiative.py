@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-HEX_ROOT = os.environ.get("HEX_ROOT", os.path.expanduser("${AGENT_DIR:-$HOME/hex}"))
+HEX_ROOT = os.environ.get("HEX_ROOT", os.path.expanduser("~/hex"))
 INITIATIVES_DIR = os.path.join(HEX_ROOT, "initiatives")
 EXPERIMENTS_DIR = os.path.join(HEX_ROOT, "experiments")
 
@@ -90,7 +90,8 @@ def _find_init_file(init_id: str) -> str:
 def _run_metric(command: str) -> float:
     result = subprocess.run(
         ["bash", "-c", command],
-        capture_output=True, text=True, timeout=60
+        capture_output=True, text=True, timeout=60,
+        cwd=HEX_ROOT,
     )
     if result.returncode != 0:
         raise RuntimeError(f"command exited {result.returncode}: {result.stderr.strip()}")
@@ -126,6 +127,28 @@ def _list_init_files() -> list[str]:
 # ── validation ────────────────────────────────────────────────────────────────
 
 REQUIRED_FIELDS = ["id", "goal", "owner", "horizon"]
+
+# Near-miss field names that indicate typos in initiative YAML files.
+# e.g. 'krs' instead of 'key_results' → all KRs silently skipped.
+_INITIATIVE_NEAR_MISS_FIELDS: dict[str, str] = {
+    "krs": "key_results",
+    "key-results": "key_results",
+    "keyresults": "key_results",
+    "key_result": "key_results",
+}
+
+
+def _check_initiative_field_names(data: dict) -> None:
+    """Raise ValueError on near-miss field names that would silently corrupt KR state."""
+    for key in data:
+        if key in _INITIATIVE_NEAR_MISS_FIELDS:
+            correct = _INITIATIVE_NEAR_MISS_FIELDS[key]
+            raise ValueError(
+                f"Unknown field '{key}' in initiative YAML — "
+                f"did you mean '{correct}'? "
+                f"This typo would silently skip all KR measurements."
+            )
+
 
 def _validate(data: dict) -> list[str]:
     errors = []
@@ -194,6 +217,7 @@ def cmd_measure(args: list[str]) -> int:
     lock = _acquire_lock(init_id)
     try:
         data = _load(path)
+        _check_initiative_field_names(data)
         key_results = data.get("key_results") or []
         if not key_results:
             print("No key results defined.")
@@ -218,22 +242,26 @@ def cmd_measure(args: list[str]) -> int:
                         met = val <= float(target)
                     else:
                         met = val >= float(target)
-                    if met and kr.get("status") != "met":
-                        kr["status"] = "met"
+                    prev_status = kr.get("status", "open")
+                    kr["status"] = "met" if met else "open"
+                    if met and prev_status != "met":
                         any_met = True
                         print(f"  → {val} ✓ MET (target: {target})")
-                        _emit("initiative.kr_met", {
+                        _emit("initiative.kr.met", {
                             "initiative_id": init_id,
                             "kr_id": kr_id,
                             "value": val,
                             "target": target,
                         })
+                    elif met:
+                        print(f"  → {val} ✓ MET (target: {target})")
                     else:
                         print(f"  → {val} (target: {target}, {'↓' if direction == 'lower_is_better' else '↑'} {target})")
                 else:
                     print(f"  → {val}")
             except Exception as exc:
-                print(f"  ERROR: {exc}")
+                print(f"  ERROR measuring {kr_id}: {exc}", file=sys.stderr)
+                print(f"  FAIL: {kr_id} measurement failed — KR status unchanged")
         horizon = data.get("horizon")
         if horizon:
             days = _days_until(horizon)

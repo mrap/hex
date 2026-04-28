@@ -1,0 +1,30 @@
+topic: system.boi
+description: "BOI spec lifecycle events"
+bridge:
+  - boi.spec.dispatched
+  - boi.spec.completed
+  - boi.spec.failed
+  - boi.task.completed
+events:
+  - type: dispatched
+    description: "New spec queued"
+    payload:
+      queue_id: {type: string}
+      title: {type: string}
+      task_count: {type: integer}
+  - type: task_completed
+    description: "A task within a spec finished"
+    payload:
+      queue_id: {type: string}
+      task_id: {type: string}
+      title: {type: string}
+  - type: completed
+    description: "All tasks in a spec finished"
+    payload:
+      queue_id: {type: string}
+      title: {type: string}
+  - type: failed
+    description: "Spec failed"
+    payload:
+      queue_id: {type: string}
+      error: {type: string}

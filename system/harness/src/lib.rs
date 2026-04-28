@@ -1,11 +1,17 @@
+pub mod assets;
 pub mod audit;
 pub mod charter;
 pub mod claude;
 pub mod cost;
+pub mod events;
 pub mod gate;
 pub mod message;
+pub mod messaging;
 pub mod prompt;
 pub mod queue;
+pub mod server;
 pub mod state;
+pub mod sse;
+pub mod telemetry;
 pub mod types;
 pub mod wake;

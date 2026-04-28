@@ -1,0 +1,27 @@
+topic: content.messages
+description: "Message lifecycle — comments, agent messages, notifications"
+bridge:
+  - hex.message.created
+  - hex.message.updated
+events:
+  - type: created
+    description: "New message"
+    payload:
+      id: {type: string}
+      msg_type: {type: string, enum: [comment, agent, notification]}
+      from: {type: string}
+      to: {type: "string[]"}
+      content: {type: string}
+      anchor: {type: string, nullable: true}
+  - type: status_changed
+    description: "Message status updated"
+    payload:
+      id: {type: string}
+      status: {type: string, enum: [new, seen, acting, done, dismissed]}
+      action: {type: string}
+      related_assets: {type: "string[]"}
+  - type: routed
+    description: "Message routed to agents"
+    payload:
+      id: {type: string}
+      routed_to: {type: "string[]"}

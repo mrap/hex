@@ -1,0 +1,85 @@
+# Scheduler adapter configuration for hex-events
+# Each schedule emits a timer event on the specified cron expression.
+# Timer events use dedup_key to prevent double-firing within the same window.
+# See docs/design-v2.md for the timer model.
+
+schedules:
+  - name: 1m-tick
+    cron: "* * * * *"
+    event: timer.tick.1m
+
+  - name: 5m-tick
+    cron: "*/5 * * * *"
+    event: timer.tick.5m
+
+  - name: 15m-tick
+    cron: "*/15 * * * *"
+    event: timer.tick.15m
+
+  - name: 30m-tick
+    cron: "*/30 * * * *"
+    event: timer.tick.30m
+
+  - name: 1h-tick
+    cron: "0 * * * *"
+    event: timer.tick.1h
+
+  - name: 6h-tick
+    cron: "0 */6 * * *"
+    event: timer.tick.6h
+
+  - name: daily-tick
+    cron: "0 0 * * *"
+    event: timer.tick.daily
+
+  - name: 2h-tick
+    cron: "0 */2 * * *"
+    event: timer.tick.2h
+
+  - name: 4h-tick
+    cron: "0 */4 * * *"
+    event: timer.tick.4h
+
+  - name: daily-9am-tick
+    cron: "0 9 * * *"
+    event: timer.tick.daily.9am
+
+  - name: daily-6am-tick
+    cron: "0 6 * * *"
+    event: timer.tick.daily.6am
+
+  - name: weekly-tick
+    cron: "0 9 * * 0"
+    event: timer.tick.weekly
+
+  - name: hourly-tick
+    cron: "0 * * * *"
+    event: timer.tick.hourly
+
+  - name: minutely-tick
+    cron: "* * * * *"
+    event: timer.tick.minutely
+
+# External adapter events (fswatch, git hooks) — declared here for static
+# validation only; no cron is needed, they are emitted by external processes.
+  - name: external-file-created
+    event: file.created
+
+  - name: external-file-modified
+    event: file.modified
+
+  - name: external-git-push
+    event: git.push
+
+  - name: external-git-commit
+    event: git.commit
+
+  - name: external-landings-updated
+    event: landings.updated
+
+  - name: external-boi-iteration-done
+    event: boi.iteration.done
+
+  - name: external-boi-spec-completed
+    event: boi.spec.completed
+

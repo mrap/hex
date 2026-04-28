@@ -1,0 +1,48 @@
+name: ops-spec-digest
+description: >
+  Appends a one-line timestamped summary to ~/.boi/ops-digest.md whenever a BOI spec
+  completes. This file is read by hex startup to brief sessions on what BOI accomplished.
+  Fixed 2026-04-02: event payload uses spec_id not queue_id.
+provides:
+  events:
+    - ops.spec.digest.written
+requires:
+  events:
+    - boi.spec.completed
+rate_limit:
+  max_fires: 60
+  window: 1h
+rules:
+  - name: append-completion-digest
+    trigger:
+      event: boi.spec.completed
+    actions:
+      - type: shell
+        command: |
+          python3 -c "
+          import os, sys, datetime
+
+          spec_id = '{{ event.spec_id }}'
+          spec_title = '{{ event.spec_title }}'
+          tasks_done = '{{ event.tasks_done }}'
+          tasks_total = '{{ event.tasks_total }}'
+
+          digest_path = os.path.expanduser('~/.boi/ops-digest.md')
+          now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+          title_part = f' ({spec_title})' if spec_title and spec_title != 'None' else ''
+          line = f'- {now} — {spec_id}{title_part}: {tasks_done}/{tasks_total} tasks done\n'
+
+          try:
+              os.makedirs(os.path.dirname(digest_path), exist_ok=True)
+              with open(digest_path, 'a') as f:
+                  f.write(line)
+              print(f'Appended digest: {line.strip()}')
+          except OSError as e:
+              print(f'ERROR: Failed to write digest to {digest_path}: {e}', file=sys.stderr)
+              sys.exit(1)
+          "
+        on_success:
+          - type: emit
+            event: ops.spec.digest.written
+            payload:
+              spec_id: "{{ event.spec_id }}"

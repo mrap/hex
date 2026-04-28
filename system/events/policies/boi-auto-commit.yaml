@@ -1,0 +1,44 @@
+name: boi-auto-commit
+description: >
+  Unconditionally commit and push all code changes when a BOI spec completes.
+  This is a safety net: BOI output must never be lost. Commit happens regardless
+  of test status. Test verification is a separate concern (boi-completion-gate).
+standing_orders:
+  - "9"
+
+requires:
+  events:
+    - boi.spec.completed
+
+provides:
+  events:
+    - boi.output.committed
+    - boi.output.clean
+
+rules:
+  - name: commit-on-completion
+    trigger:
+      event: boi.spec.completed
+    actions:
+      - type: shell
+        command: >
+          bash ~/.hex-events/scripts/auto-commit-boi-output.sh
+          "{{ event.spec_id or event.queue_id }}"
+          "{{ event.target_repo }}"
+          "$HOME/.boi/queue/{{ event.spec_id or event.queue_id }}.changed-files"
+          "{{ event.spec_path }}"
+        on_success:
+          - type: emit
+            event: boi.output.committed
+            payload:
+              spec_id: "{{ event.spec_id or event.queue_id }}"
+              target_repo: "{{ event.target_repo }}"
+  - name: archive-on-commit
+    trigger:
+      event: boi.output.committed
+    actions:
+      - type: shell
+        command: >
+          bash ~/.boi/scripts/boi-completion-to-archive.sh
+          "{{ event.spec_id or event.queue_id }}"
+          "{{ event.target_repo }}"

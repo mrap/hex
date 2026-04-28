@@ -1,0 +1,42 @@
+name: system-introspection
+description: >
+  Nightly self-improvement loop. Audits system health, scans logs for errors,
+  checks repo hygiene, identifies friction patterns, and dispatches fixes.
+  This is hex watching itself and generating work.
+
+standing_orders:
+  - "13"
+
+requires:
+  events:
+    - timer.tick.daily
+
+provides:
+  events:
+    - introspection.completed
+    - introspection.issues-found
+
+rate_limit:
+  max_fires: 1
+  window: 20h
+
+rules:
+  - name: nightly-introspection
+    trigger:
+      event: timer.tick.daily
+    actions:
+      - type: shell
+        command: >
+          AGENT_DIR="$AGENT_DIR" bash "$AGENT_DIR/.claude/scripts/system-introspection.sh"
+        timeout: 600
+        on_success:
+          - type: emit
+            event: introspection.completed
+            payload:
+              date: "{{ now.strftime('%Y-%m-%d') }}"
+        on_failure:
+          - type: emit
+            event: introspection.completed
+            payload:
+              date: "{{ now.strftime('%Y-%m-%d') }}"
+              error: "introspection failed"

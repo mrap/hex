@@ -1,0 +1,45 @@
+name: bookmark-research
+description: >
+  Runs the bookmark watcher every 2 hours. Fetches new X bookmarks,
+  compares against already-processed IDs, and dispatches a research brief
+  for each new bookmark via claude -p. Results written to
+  ~/raw/research/bookmarks/ and surfaced via _pending.md on next hex session.
+
+requires:
+  events:
+    - timer.tick.2h
+
+provides:
+  events:
+    - bookmark.scan.completed
+    - bookmark.scan.skipped
+
+rate_limit:
+  max_fires: 1
+  window: 90m
+
+rules:
+  - name: run-bookmark-watcher
+    trigger:
+      event: timer.tick.2h
+    actions:
+      - type: shell
+        command: |
+          SCRIPT="$HOME/.boi/scripts/bookmark-watcher.py"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "bookmark-watcher.py not found at $SCRIPT — skipping"
+            exit 0
+          fi
+          python3 "$SCRIPT"
+        timeout: 600
+        on_success:
+          - type: emit
+            event: bookmark.scan.completed
+            payload:
+              triggered_by: timer.tick.2h
+        on_failure:
+          - type: emit
+            event: bookmark.scan.completed
+            payload:
+              triggered_by: timer.tick.2h
+              error: "watcher exited non-zero"

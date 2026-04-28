@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[test]
 fn test_load_valid_charter() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/valid-charter.yaml");
-    let charter = hex_agent::charter::load(&path).unwrap();
+    let charter = hex::charter::load(&path).unwrap();
     assert_eq!(charter.id, "test-agent");
     assert_eq!(charter.name, "Test Agent");
     assert_eq!(charter.budget.usd_per_day, 2.0);
@@ -16,7 +16,7 @@ fn test_load_valid_charter() {
 fn test_reject_charter_missing_id() {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/missing-id-charter.yaml");
-    let result = hex_agent::charter::load(&path);
+    let result = hex::charter::load(&path);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -29,7 +29,7 @@ fn test_reject_charter_missing_id() {
 fn test_reject_charter_negative_budget() {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bad-budget-charter.yaml");
-    let result = hex_agent::charter::load(&path);
+    let result = hex::charter::load(&path);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("budget"), "Error should mention budget: {err}");
@@ -40,7 +40,7 @@ fn test_zero_budget_is_unlimited() {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zero-budget-charter.yaml");
     let charter =
-        hex_agent::charter::load(&path).expect("zero budget charter should load successfully");
+        hex::charter::load(&path).expect("zero budget charter should load successfully");
     assert_eq!(charter.id, "zero-budget");
     assert_eq!(charter.budget.usd_per_day, 0.0);
     assert_eq!(charter.budget.usd_per_shift, 0.0);
@@ -48,16 +48,16 @@ fn test_zero_budget_is_unlimited() {
 
 #[test]
 fn test_zero_shift_budget_skips_enforcement() {
-    let cost = hex_agent::types::Cost {
+    let cost = hex::types::Cost {
         last_wake_usd: 5.0,
-        current_period: hex_agent::types::CostPeriod {
+        current_period: hex::types::CostPeriod {
             start: Utc::now(),
             spent_usd: 10.0,
             budget_usd: 0.0,
         },
         lifetime_usd: 50.0,
     };
-    let remaining = hex_agent::cost::shift_budget_remaining(&cost, 0.0);
+    let remaining = hex::cost::shift_budget_remaining(&cost, 0.0);
     // With budget=0, remaining is negative, but the wake loop checks
     // `shift_budget > 0.0` before enforcing — so this should never trigger a break.
     assert!(

@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY .hex/harness/ ./
+COPY system/harness/ ./
 RUN cargo build --release 2>&1
 
 FROM debian:trixie-slim
@@ -23,7 +23,8 @@ RUN mkdir -p $HOME/hex/projects $HOME/hex/.hex/bin $HOME/hex/.hex/audit \
     $HOME/hex/.hex/reference/core-agents
 RUN touch $HOME/hex/CLAUDE.md
 
-COPY --from=builder /build/target/release/hex-agent $HOME/hex/.hex/bin/hex-agent
+COPY --from=builder /build/target/release/hex $HOME/hex/.hex/bin/hex
+RUN ln -s $HOME/hex/.hex/bin/hex $HOME/hex/.hex/bin/hex-agent
 COPY tests/agent-harness/e2e-tests.sh $HOME/hex/e2e-tests.sh
 
 ENV HEX_DIR=$HOME/hex

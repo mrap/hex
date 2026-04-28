@@ -1,0 +1,43 @@
+name: tech-scout-daily
+description: >
+  Daily tech research scan at 6am. Runs the tech-scout script which
+  surfaces interesting tech developments, tools, and trends relevant
+  to current projects and interests.
+
+requires:
+  events:
+    - timer.tick.daily.6am
+
+provides:
+  events:
+    - tech-scout.scan.completed
+
+rate_limit:
+  max_fires: 1
+  window: 12h
+
+rules:
+  - name: run-tech-scout
+    trigger:
+      event: timer.tick.daily.6am
+    actions:
+      - type: shell
+        command: |
+          SCRIPT="$AGENT_DIR/.claude/scripts/tech-scout.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "tech-scout.sh not found at $SCRIPT — skipping"
+            exit 0
+          fi
+          bash "$SCRIPT"
+        timeout: 900
+        on_success:
+          - type: emit
+            event: tech-scout.scan.completed
+            payload:
+              triggered_by: timer.tick.daily.6am
+        on_failure:
+          - type: emit
+            event: tech-scout.scan.completed
+            payload:
+              triggered_by: timer.tick.daily.6am
+              error: "tech-scout exited non-zero"

@@ -1,0 +1,42 @@
+name: watchlist-scanner
+description: >
+  Weekly check of me/watchlist.md items for notable developments.
+  Monitors GitHub repos for star growth, new pushes, and activity spikes.
+  Notifies when something worth paying attention to changes.
+
+requires:
+  events:
+    - timer.tick.weekly
+
+provides:
+  events:
+    - watchlist.checked
+    - watchlist.development-detected
+
+rate_limit:
+  max_fires: 2
+  window: 168h
+
+rules:
+  - name: weekly-watchlist-scan
+    trigger:
+      event: timer.tick.weekly
+    actions:
+      - type: shell
+        command: |
+          AGENT_DIR="${AGENT_DIR:-$HOME/hex}" python3 ~/.hex-events/scripts/watchlist-check.py
+        timeout: 60
+        on_success:
+          - type: emit
+            event: watchlist.checked
+            source: "hex:watchlist"
+            payload:
+              status: no-changes
+        on_failure:
+          - type: notify
+            message: "{{ action.stdout }}"
+          - type: emit
+            event: watchlist.development-detected
+            source: "hex:watchlist"
+            payload:
+              details: "{{ action.stdout }}"

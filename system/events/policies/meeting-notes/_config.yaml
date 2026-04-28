@@ -1,0 +1,8 @@
+name: meeting-notes
+description: Poll for AI meeting notes and digest them into hex context system
+enabled: true
+
+config:
+  scripts_dir: ~/.hex-events/scripts
+  poll_interval: 15m
+  hex_dir: ~/hex

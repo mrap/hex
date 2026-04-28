@@ -1,0 +1,40 @@
+name: auto-dispatch-top-improvement
+description: >
+  Auto-dispatch the top-ranked improvement if it passes all safety gates.
+  Reads priority-ranked.yaml written by score-after-reflection policy.
+  Runs in --dry-run mode until pipeline is validated end-to-end.
+
+requires:
+  events:
+    - improvement.scored
+
+provides:
+  events:
+    - improvement.dispatch-attempted
+
+rules:
+  - name: dispatch-on-improvement-scored
+    trigger:
+      event: improvement.scored
+    actions:
+      - type: shell
+        command: |
+          python3 $AGENT_DIR/evolution/auto-dispatch.py \
+            --ranked $AGENT_DIR/evolution/priority-ranked.yaml \
+            --config $AGENT_DIR/evolution/engine-config.yaml \
+            --dry-run
+        on_success:
+          - type: emit
+            event: improvement.dispatch-attempted
+            payload:
+              ranked_path: $AGENT_DIR/evolution/priority-ranked.yaml
+              mode: dry-run
+              session_id: "{{ event.session_id }}"
+        on_failure:
+          - type: emit
+            event: improvement.dispatch-attempted
+            payload:
+              ranked_path: $AGENT_DIR/evolution/priority-ranked.yaml
+              mode: dry-run
+              error: "auto-dispatch.py exited non-zero"
+              session_id: "{{ event.session_id }}"

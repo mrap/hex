@@ -1,0 +1,20 @@
+name: commit-changelog
+description: Appends a changelog entry to the current landings doc on git push.
+standing_orders: []
+reflection_ids: []
+provides:
+  events: []           # shell action has no event output
+requires:
+  events:
+    - git.push
+rules:
+  - name: append-changelog
+    trigger:
+      event: git.push
+    actions:
+      - type: shell
+        command: >
+          cd ~/hex &&
+          LAST_COMMIT=$(git log -1 --format='%h %s') &&
+          LANDINGS=$(ls landings/ | sort | tail -1) &&
+          echo "- $(date +%H:%M) — Git push: $LAST_COMMIT" >> "landings/$LANDINGS"

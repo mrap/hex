@@ -6,6 +6,7 @@ set -uo pipefail
 PASS=0
 FAIL=0
 HEX_AGENT="$HEX_DIR/.hex/bin/hex-agent"
+HEX_BIN="$HEX_DIR/.hex/bin/hex"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -374,7 +375,7 @@ assert_contains "$out" "invalid charter" "error mentions invalid charter"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-bold "11. Message send/receive"
+bold "11. Message send/receive (unified store)"
 # ══════════════════════════════════════════════════════════════════════════════
 
 cleanup
@@ -384,12 +385,31 @@ create_charter "receiver"
 out=$("$HEX_AGENT" message sender receiver --subject "test msg" --body "hello" 2>&1); rc=$?
 assert_exit 0 $rc "message send exits 0"
 
-if [ -f "$HEX_DIR/.hex/messages/receiver.jsonl" ]; then
-  assert_pass "message file created in receiver inbox"
-  assert_contains "$(cat "$HEX_DIR/.hex/messages/receiver.jsonl")" "test msg" "message content is correct"
-else
-  assert_fail "no message file created"
-fi
+# Verify via hex message list (unified SQLite store) instead of legacy JSONL file
+out=$("$HEX_BIN" message list 2>&1); rc=$?
+assert_exit 0 $rc "message list exits 0 after send"
+assert_contains "$out" "test msg\|hello\|sender\|receiver" "message appears in unified store"
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "12. Messaging primitive"
+# ══════════════════════════════════════════════════════════════════════════════
+
+cleanup
+
+# Create a comment-type message
+out=$("$HEX_BIN" message send mike brand --content "test comment" --msg-type comment 2>&1); rc=$?
+assert_exit 0 $rc "message send (comment type) exits 0"
+
+# Create an agent-type message
+out=$("$HEX_BIN" message send brand cos --content "status update" 2>&1); rc=$?
+assert_exit 0 $rc "message send (agent type) exits 0"
+
+# List messages
+out=$("$HEX_BIN" message list 2>&1); rc=$?
+assert_exit 0 $rc "message list exits 0"
+assert_contains "$out" "test comment\|status update" "messages appear in list"
 
 echo ""
 

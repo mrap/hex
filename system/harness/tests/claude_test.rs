@@ -1,4 +1,4 @@
-use hex_agent::claude;
+use hex::claude;
 
 #[test]
 fn test_parse_claude_json_output() {

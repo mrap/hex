@@ -1,0 +1,20 @@
+name: file-triage
+description: Logs new raw capture files to daemon.log.
+standing_orders: []
+reflection_ids: []
+provides:
+  events: []
+requires:
+  events:
+    - file.created
+rules:
+  - name: log-new-capture
+    trigger:
+      event: file.created
+    conditions:
+      - field: path
+        op: contains
+        value: raw/captures/
+    actions:
+      - type: shell
+        command: 'echo "New capture: {{ event.path }}" >> ~/.hex-events/daemon.log'

@@ -1,0 +1,8 @@
+name: boi-lifecycle
+description: BOI spec completion, output persistence, and workspace cleanup
+enabled: true
+
+config:
+  boi_state_dir: ~/.boi
+  scripts_dir: ~/.hex-events/scripts
+  max_retries: 3

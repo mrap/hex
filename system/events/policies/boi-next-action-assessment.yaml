@@ -1,0 +1,26 @@
+name: boi-next-action-assessment
+description: >
+  After a spec completes, assess what needs to happen next.
+  Checks for dependent specs, next phases, and related pending work.
+  Writes a capture for the agent to surface on next session.
+  Action bias — don't wait for the user to ask.
+
+requires:
+  events:
+    - boi.spec.completed
+
+rules:
+  - name: assess-next-action
+    trigger:
+      event: boi.spec.completed
+    conditions:
+      - field: tasks_done
+        op: gt
+        value: 0
+    actions:
+      - type: shell
+        command: >
+          bash ~/.hex-events/scripts/assess-next-action.sh
+          "{{ event.spec_id or event.queue_id }}"
+          "{{ event.spec_title }}"
+          "{{ event.target_repo }}"

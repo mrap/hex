@@ -1,0 +1,39 @@
+name: self-audit
+description: "Weekly policy health check — runs audit script and alerts on degraded/dead policies"
+standing_orders: []
+reflection_ids: []
+provides:
+  events:
+    - ops.audit.completed
+    - ops.audit.issues-found
+requires:
+  events:
+    - timer.tick.weekly
+rate_limit:
+  max_fires: 2
+  window: 24h
+rules:
+  - name: weekly-audit
+    trigger:
+      event: timer.tick.weekly
+    actions:
+      - type: shell
+        command: |
+          python3 ~/.hex-events/scripts/audit-policies.py --json 2>/dev/null
+        on_success:
+          - type: shell
+            command: |
+              python3 -c "
+              import json, sys
+              report = json.loads(sys.stdin.read())
+              issues = report.get('degraded', 0) + report.get('silent', 0) + report.get('dead', 0)
+              if issues > 0:
+                  sys.exit(1)
+              "
+            on_failure:
+              - type: notify
+                message: "hex-events policy audit: issues found. Run 'python3 ~/.hex-events/scripts/audit-policies.py' for details."
+              - type: emit
+                event: ops.audit.issues-found
+          - type: emit
+            event: ops.audit.completed

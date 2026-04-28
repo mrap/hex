@@ -1,0 +1,63 @@
+name: boi-output-persistence
+description: >
+  Enforces R-047: BOI iteration outputs must persist after worktree cleanup.
+  Arms a delayed check after each completed iteration; fires policy.violation
+  if expected output files are missing after the cleanup window elapses.
+standing_orders:
+  - "26"
+reflection_ids:
+  - R-047
+provides:
+  events:
+    - boi.output.check-due
+    - policy.violation
+requires:
+  events:
+    - boi.iteration.done
+rate_limit:
+  max_fires: 60
+  window: 1h
+rules:
+  - name: arm-check-on-iteration-done
+    trigger:
+      event: boi.iteration.done
+    conditions:
+      - field: tasks_completed
+        op: gt
+        value: 0
+    actions:
+      - type: emit
+        event: boi.output.check-due
+        delay: 2m
+        cancel_group: "boi-output-check-{{ event.spec_id or event.queue_id }}"
+        payload:
+          spec_id: "{{ event.spec_id or event.queue_id }}"
+          output_paths: "{{ event.output_paths }}"
+
+  - name: check-output-files-exist
+    trigger:
+      event: boi.output.check-due
+    actions:
+      - type: shell
+        command: |
+          python3 -c '
+          import json, sys, os
+          raw = """{{ event.output_paths | default("", true) }}"""
+          if not raw.strip():
+              sys.exit(0)
+          try:
+              output_paths = json.loads(raw) if raw.strip().startswith("[") else [p.strip() for p in raw.split(",") if p.strip()]
+          except (json.JSONDecodeError, ValueError):
+              output_paths = [p.strip() for p in raw.split(",") if p.strip()]
+          missing = [p for p in output_paths if not os.path.exists(os.path.expanduser(p))]
+          if missing:
+              sys.exit(1)
+          '
+        on_failure:
+          - type: emit
+            event: policy.violation
+            payload:
+              policy: boi-output-persistence
+              rule: R-047
+              spec_id: "{{ event.spec_id or event.queue_id }}"
+              message: "BOI iteration output files missing after worktree cleanup"

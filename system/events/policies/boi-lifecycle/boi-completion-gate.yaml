@@ -1,0 +1,43 @@
+name: boi-completion-gate
+description: >
+  Verifies BOI spec output after auto-commit. Triggers on boi.output.committed
+  (not boi.spec.completed — auto-commit policy handles commit first).
+  Runs verify script (tests, push status). Emits boi.completion.verified on
+  success, policy.violation on failure. Does NOT auto-commit — that's
+  boi-auto-commit's job.
+standing_orders:
+  - "6"
+  - "12"
+reflection_ids:
+  - R-028
+  - R-047
+provides:
+  events:
+    - boi.completion.verified
+    - policy.violation
+requires:
+  events:
+    - boi.output.committed
+rules:
+  - name: verify-after-commit
+    trigger:
+      event: boi.output.committed
+    actions:
+      - type: shell
+        command: >
+          bash "${HEX_EVENTS_HOME:-$HOME/.hex-events}/scripts/verify-boi-completion.sh"
+          "{{ event.spec_id or event.queue_id }}"
+          "{{ event.target_repo }}"
+        on_success:
+          - type: emit
+            event: boi.completion.verified
+            payload:
+              spec_id: "{{ event.spec_id or event.queue_id }}"
+              target_repo: "{{ event.target_repo }}"
+        on_failure:
+          - type: emit
+            event: policy.violation
+            payload:
+              policy: boi-completion-gate
+              spec_id: "{{ event.spec_id or event.queue_id }}"
+              message: "Tests or push failed after commit. Code is committed but not verified."

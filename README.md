@@ -30,9 +30,9 @@ Full guide: [docs/migrate-v1-to-v2.md](./docs/migrate-v1-to-v2.md).
 - Python 3.9+
 - git
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code) (`claude`) — warning-only; install separately
-- Rust / cargo ([rustup.rs](https://rustup.rs)) — required to build the hex-agent harness from source; without it, install attempts a pre-built binary download (fails hard if neither works)
+- Rust / cargo ([rustup.rs](https://rustup.rs)) — required to build the `hex` binary from source; without it, install attempts a pre-built binary download
 
-The installer also clones two companion repos into `~/.boi` and `~/.hex-events`. Versions pinned in [`VERSIONS`](./VERSIONS).
+The installer sets up `~/.boi` (BOI worker fleet) and deploys hex-events from `system/events/` to `~/.hex-events`. BOI version pinned in [`VERSIONS`](./VERSIONS).
 
 ### Install options
 
@@ -41,7 +41,7 @@ bash install.sh              # installs to ~/hex
 bash install.sh ~/my-hex     # custom location
 ```
 
-To use a fork of the companions, set `HEX_BOI_REPO` and/or `HEX_EVENTS_REPO` before running install.
+To use a fork of BOI, set `HEX_BOI_REPO` before running install. hex-events ships inline at `system/events/` — no external repo needed.
 
 ---
 
@@ -68,7 +68,7 @@ After install, `~/hex/` contains:
 Companion systems installed alongside:
 
 - **[`~/.boi`](https://github.com/mrap/boi)** — parallel Claude Code worker dispatch
-- **[`~/.hex-events`](https://github.com/mrap/hex-events)** — reactive event policies
+- **`~/.hex-events`** — reactive event policies (deployed from `system/events/` — no external repo)
 
 ### Auto-configured by install.sh
 
@@ -186,18 +186,37 @@ You can also run the upgrade from inside Claude Code via `/hex-upgrade`.
 
 ## Architecture
 
-hex-agent (the multi-agent harness) is **core infrastructure**, not optional.
-It drives all agent wakes, fleet management, cost tracking, gate validation,
-and initiative execution. Without it, hex is a collection of scripts with
-no orchestration.
+`hex` is a unified Rust binary — **core infrastructure**, not optional. One binary handles:
 
-Requirements: Rust toolchain (for building from source) or a supported
-platform for pre-built binaries (macOS arm64/x86_64, Linux x86_64).
+- **Agent harness** (`hex agent`) — fleet management, wakes, cost tracking, gate validation, initiative execution
+- **HTTP/SSE server** (`hex server`) — serves all web surfaces, real-time event bus with namespaced topics
+- **Asset registry** (`hex asset`) — unified `{type}:{id}` namespace for all hex artifacts
+- **Comment system** (`hex comment`) — feedback on any asset, routed to agents via LLM classification
 
-The harness binary is built or downloaded automatically by `install.sh`. If the
-harness cannot be built or downloaded, install warns and continues — core
-scripting still works, but agent wakes and fleet management require the binary to
-be present. Run `hex-doctor` to verify harness status after install.
+Subcommands:
+
+```
+hex agent wake/fleet/status/message/list    — agent fleet management
+hex server start                            — HTTP server + SSE bus (port 8880)
+hex asset resolve/list/search/types         — asset registry
+hex comment respond/list                    — comment management
+hex sse publish/topics                      — SSE bus operations
+hex version                                 — print version
+```
+
+Backward compatibility: `hex-agent` is a symlink to `hex`. Existing scripts and policies that call `hex-agent` continue to work unchanged.
+
+Requirements: Rust toolchain (for building from source) or a supported platform for pre-built binaries (macOS arm64/x86_64, Linux x86_64).
+
+The binary is built or downloaded automatically by `install.sh`. If it cannot be built or downloaded, install warns and continues — core scripting still works, but agent wakes, the server, and fleet management require the binary. Run `hex-doctor` to verify status after install.
+
+### Version
+
+`version.txt` at the repo root is the single source of truth. `build.rs` injects it at compile time. Cargo.toml must match. Git tags must match. See [docs/versioning.md](./docs/versioning.md).
+
+### SSE bus
+
+The server includes a real-time event bus with namespaced topics (`content.comments`, `system.agents`, `system.boi`, `content.assets`). Clients subscribe via `GET /events/stream?topics=content.*`. Topic manifests at `.hex/sse/topics/*.yaml` define the contract — adding a topic means adding a YAML file, not editing bus code. hex-events are bridged to SSE via a policy, so any backend event becomes observable in real time.
 
 ---
 
@@ -241,9 +260,32 @@ python3 .hex/scripts/quality-check.py --sweep           # scan last 24h
 ```
 hex-foundation/
 ├── install.sh           Single install entrypoint
-├── VERSIONS             Pinned boi / hex-events versions
+├── version.txt          Repo-level version (read by Rust build.rs)
+├── VERSIONS             Pinned boi version (hex-events is now inline)
 ├── system/              → becomes ~/hex/.hex/ on install
-│   ├── scripts/         startup.sh, doctor.sh, upgrade.sh, quality-check.py, ...
+│   ├── harness/         ← hex binary Rust source (agent + server + SSE + assets + comments)
+│   │   ├── src/main.rs     unified CLI (hex agent/server/asset/comment/sse)
+│   │   ├── src/server.rs   HTTP server + reverse proxy
+│   │   ├── src/sse.rs      SSE bus (topics, subscriptions, publish)
+│   │   ├── src/comments.rs comment API handler
+│   │   ├── src/assets.rs   asset registry handler
+│   │   ├── src/telemetry.rs request + event telemetry (append-only JSONL)
+│   │   ├── src/wake.rs     agent wake cycle
+│   │   └── build.rs        reads version.txt at compile time
+│   ├── events/          ← hex-events daemon, emitter, CLI (merged from hex-events repo)
+│   │   ├── hex_eventd.py   main daemon
+│   │   ├── hex_emit.py     event emitter
+│   │   ├── hex_events_cli.py CLI
+│   │   ├── actions/        action handlers (shell, emit, notify, render, update_file)
+│   │   ├── adapters/       scheduler and timer adapters
+│   │   ├── policies/       built-in default policies (boi-lifecycle, capture, etc.)
+│   │   └── docs/           hex-events documentation
+│   ├── sse/
+│   │   └── topics/      ← SSE topic manifests (content.comments, system.agents, etc.)
+│   ├── scripts/         startup.sh, doctor.sh, upgrade.sh, quality-check.py,
+│   │                    route-comment.py, hex-asset.py, hex-asset-discover.py, ...
+│   │   ├── comments-service/  comment widget (widget.js) + Python fallback server
+│   │   └── sse-bus/           hex-events → SSE bridge script
 │   ├── commands/        → copied to ~/hex/.claude/commands/ (Claude Code slash commands)
 │   ├── skills/          memory/ (index+search+save), landings, hex-reflect, hex-decide,
 │   │                    hex-debrief, hex-consolidate, hex-doctor, hex-checkpoint,
@@ -254,7 +296,9 @@ hex-foundation/
 │   └── version.txt
 ├── templates/           Seeds for CLAUDE.md, AGENTS.md, me.md, todo.md, decision-template.md
 ├── docs/architecture.md System overview
-└── tests/               E2E, layout, and memory tests
+└── tests/
+    ├── events/          hex-events unit and integration tests
+    └── ...              E2E, layout, and memory tests
 ```
 
 ---
@@ -267,10 +311,14 @@ Key test files:
 
 | Test | What it verifies |
 |------|-----------------|
-| `tests/test_skill_frontmatter.sh` | Every SKILL.md has valid YAML frontmatter (name + description) |
-| `tests/test_skill_refs.sh` | All paths referenced inside SKILL.md resolve after a fresh install |
-| `tests/test_skill_discovery.sh` | Claude Code discovers all 11 shipped skills and invokes at least 3 |
-| `tests/test_skill_discovery_codex.sh` | Codex equivalent of skill discovery test |
+| `tests/agent-harness/Dockerfile` | Agent harness E2E — charter discovery, wake, fleet, core drift, messages (43 tests) |
+| `tests/agent-harness/Dockerfile.initiative` | Initiative E2E — auto-seeding, watchdog, scheduled promotion (10 tests) |
+| `tests/agent-harness/Dockerfile.migration` | v0.8.0 migration — binary rename, symlink, backward compat, version (17 tests) |
+| `tests/contract-verification/Dockerfile` | Schema contracts across hex components (22 tests) |
+| `tests/feedback-loops/Dockerfile` | All 4 feedback loops — pivots, escalation, redesign (30 tests) |
+| `tests/codex-parity/Dockerfile` | Codex runtime parity — hooks, skills, memory, agent wake |
+| `tests/test_skill_frontmatter.sh` | Every SKILL.md has valid YAML frontmatter |
+| `tests/test_skill_refs.sh` | All paths referenced inside SKILL.md resolve |
 | `tests/test_e2e.sh` | Full install + doctor + upgrade lifecycle |
 | `tests/migrate/test-migrate.sh` | v1 → v2 migration correctness |
 
@@ -289,6 +337,16 @@ bash tests/eval/run_eval_macos.sh            # macOS Tart
 ---
 
 ## Roadmap
+
+v0.8.0 adds: **Unified `hex` binary + 3 new primitives + hex-events merged inline.**
+- **Unified binary**: `hex-agent` replaced by `hex` — single Rust binary with subcommands for agent fleet, HTTP/SSE server, asset registry, and comment system. `hex-agent` preserved as symlink for backward compat.
+- **Asset registry**: unified `{type}:{id}` namespace for all hex artifacts (posts, proposals, specs, decisions, projects). Auto-discovery, periodic re-scan, CLI + HTTP API.
+- **Unified comments**: single comment store, embeddable widget, LLM-classified routing to agents, action log with related assets.
+- **SSE bus**: real-time event streaming with namespaced topics (`content.*`, `system.*`), wildcard subscriptions, topic manifests as self-documenting contract. hex-events bridged to SSE.
+- **Telemetry**: append-only JSONL for all server requests and events, same pattern as agent harness.
+- **hex-events merged**: standalone [hex-events](https://github.com/mrap/hex-events) repo (v0.2.0) merged into `system/events/`. hex-events repo archived.
+- **Version system**: `version.txt` is single source of truth, `build.rs` injects at compile time.
+- **Migration**: install.sh handles upgrading from pre-0.8.0 (standalone `hex-agent` → `hex` + symlink). 122/122 E2E tests pass in Docker.
 
 v0.3.0 adds: **Modular integration bundles + `hex-integration` CLI.** Every external surface (API, MCP, system service, refresh flow) lives in one directory under `integrations/<name>/` — manifest, probe, runbook, secrets schema, maintenance scripts, event policies, tests. `hex-integration install/uninstall/update/list/validate/status/probe/rotate` manages the lifecycle. Compile-step policy coupling: bundle event YAMLs compile into `~/.hex-events/policies/<name>-<stem>.yaml` with `# generated_from:` audit headers. See `docs/integrations.md` and `templates/integrations/_template/`.
 
