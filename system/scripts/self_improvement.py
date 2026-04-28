@@ -598,7 +598,7 @@ tasks:
         fh.write(spec_content)
 
     # Dispatch via BOI
-    boi_path = os.path.expanduser("~/.boi/boi")
+    boi_path = os.path.expanduser("~/.boi/src/boi.sh")
     try:
         result = subprocess.run(
             ["bash", boi_path, "dispatch", spec_path],
