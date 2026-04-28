@@ -1,0 +1,30 @@
+name: cc-connect-auto-deploy
+description: >
+  When fork/master diverges from the running cc-connect binary,
+  automatically pull, build, swap, and reload the daemon.
+  Polls on timer.tick.5m (spec called for timer.tick.5min — using
+  the actual scheduler event name instead).
+standing_orders:
+  - "S4"
+
+requires:
+  events:
+    - timer.tick.5m
+
+provides:
+  events:
+    - cc-connect.deployed
+
+rules:
+  - name: poll-and-deploy
+    trigger:
+      event: timer.tick.5m
+    actions:
+      - type: shell
+        command: bash ~/.hex-events/scripts/cc-connect-auto-deploy.sh
+        timeout: 300
+        on_success:
+          - type: emit
+            event: cc-connect.deployed
+            payload:
+              source: auto-deploy-policy
