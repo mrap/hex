@@ -20,3 +20,9 @@ Thumbs.db
 # Test artifacts
 /tmp/
 system/scripts/health/test*.txt
+
+# Local runtime artifacts
+.hex/
+.agents/
+.codex/
+todo.md
