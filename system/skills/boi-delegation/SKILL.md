@@ -52,18 +52,18 @@ If in doubt, BOI. The critic and self-evolution justify the async cost.
 
 BOI uses Claude Code as its worker runtime (`lib/runtime.py`).
 
-- **`claude`** (default) — `claude -p "$(cat prompt)" --model <model> --add-dir ${AGENT_DIR}`
+- **`claude`** (default) — `claude -p "$(cat prompt)" --model <model> --add-dir ${HEX_DIR}`
   Workers get CLAUDE.md, skills, commands, and memory search via the hex workspace.
 
 Config: `~/.boi/config.json` → `"runtime": {"default": "claude"}`
 
 ### Context Flow
 ```
-config.json: "context_root": "${AGENT_DIR}"
+config.json: "context_root": "${HEX_DIR}"
     ↓
 worker.py: load_context_root() → self.context_root
     ↓
-runtime.py: --add-dir ${AGENT_DIR} passed to Claude CLI
+runtime.py: --add-dir ${HEX_DIR} passed to Claude CLI
     ↓
 Worker gets CLAUDE.md, skills, commands, memory search
 ```
@@ -247,9 +247,9 @@ When writing BOI specs that involve web research (surveys, competitive analysis,
 Include this in research spec task blocks:
 ```
 For web research, use the token-efficient highlights wrapper:
-  python3 $AGENT_DIR/.hex/scripts/exa-highlights.py --search "query" --query "focus topic" --num N --compact
+  python3 $HEX_DIR/.hex/scripts/exa-highlights.py --search "query" --query "focus topic" --num N --compact
 For known URLs:
-  python3 $AGENT_DIR/.hex/scripts/exa-highlights.py <url> --query "what to extract" --compact
+  python3 $HEX_DIR/.hex/scripts/exa-highlights.py <url> --query "what to extract" --compact
 Only use web_fetch_exa (full page) when highlights are insufficient for deep single-page analysis.
 ```
 
@@ -343,7 +343,7 @@ When user leaves and BOI specs are running, NEVER say "I'll keep an eye on it." 
 This is SO #37 (mechanical action, not verbal) applied to BOI monitoring.
 1. **BOI repo is read-only from hex.** Never write to `~/github.com/mrap/boi/` directly.
    Changes go through worktrees.
-2. **context_root must exist on disk.** If `${AGENT_DIR}` doesn't exist,
+2. **context_root must exist on disk.** If `${HEX_DIR}` doesn't exist,
    `load_context_root()` silently returns None and the worker gets no hex context.
 3. **BOI's internal events (write_event) go to ~/.boi/events/ as JSON files.** These are
    separate from hex-events (SQLite). The bridge is `emit_hex_event()` in daemon.py which

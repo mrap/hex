@@ -124,7 +124,7 @@ SECRETS_VIOLATIONS=$(grep -rn "secrets/slack-bot-token\|\.hex/secrets/[a-zA-Z][a
     | grep -v "personalization-audit" \
     | grep -v "PATH=.*opt.homebrew" \
     | grep -v '<name>\|REPLACE_ME\|YOUR_' \
-    | grep -v 'AGENT_DIR.*secrets\|HEX_DIR.*secrets\|HEX_ROOT.*secrets' \
+    | grep -v 'HEX_DIR.*secrets\|HEX_ROOT.*secrets' \
     | grep -v 'hex-glance-post' \
     || true)
 if [ -n "$SECRETS_VIOLATIONS" ]; then

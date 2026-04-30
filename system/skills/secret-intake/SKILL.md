@@ -21,7 +21,7 @@ Reusable local web form for ingesting API keys, tokens, and key files into hex.
 ## How to Start
 
 ```bash
-bash $AGENT_DIR/.hex/skills/secret-intake/scripts/start.sh
+bash $HEX_DIR/.hex/skills/secret-intake/scripts/start.sh
 ```
 
 Then give the user the Tailscale URL: `https://<your-tailscale-hostname>/secrets`
@@ -31,7 +31,7 @@ The server runs on `:9877` locally. hex-router fronts it at `/secrets` with TLS 
 ## How to Stop
 
 ```bash
-bash $AGENT_DIR/.hex/skills/secret-intake/scripts/stop.sh
+bash $HEX_DIR/.hex/skills/secret-intake/scripts/stop.sh
 ```
 
 ## What Happens on Submit
@@ -85,4 +85,4 @@ Browser → https://<your-tailscale-hostname>/secrets
 | Env var | Default | What it does |
 |---------|---------|-------------|
 | `PORT` | `9877` | Server listen port |
-| `HEX_DIR` | `$AGENT_DIR` | Hex root directory |
+| `HEX_DIR` | `$HEX_DIR` | Hex root directory |

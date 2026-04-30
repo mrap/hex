@@ -192,7 +192,7 @@ fi
 
 # ── Sentinel notification ────────────────────────────────────────────────────
 bold "Notify: Sentinel"
-HEX_AGENT="${AGENT_DIR:-$HOME/hex}/.hex/bin/hex-agent"
+HEX_AGENT="${HEX_DIR:-$HOME/hex}/.hex/bin/hex-agent"
 if [ -x "$HEX_AGENT" ]; then
   "$HEX_AGENT" message hex-main sentinel \
     --subject "REVIEW REQUEST: hex-foundation $VERSION ($SHA)" \

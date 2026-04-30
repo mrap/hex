@@ -30,7 +30,7 @@ except ImportError:
     print("ERROR: PyYAML not installed. Run: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-HEX_ROOT = os.environ.get("HEX_ROOT", os.path.expanduser("${AGENT_DIR:-$HOME/hex}"))
+HEX_ROOT = os.environ.get("HEX_ROOT", os.path.expanduser("${HEX_DIR:-$HOME/hex}"))
 INITIATIVES_DIR = os.path.join(HEX_ROOT, "initiatives")
 EXPERIMENTS_DIR = os.path.join(HEX_ROOT, "experiments")
 SCRIPTS_DIR = os.path.join(HEX_ROOT, ".hex", "scripts")

@@ -1,0 +1,21 @@
+# Heavy directories that hang recursive grep searches.
+# Read by ugrep (Claude Code's grep wrapper) via --ignore-files.
+# Does NOT affect git tracking — only grep/search behavior.
+
+# Rust build artifacts
+target/
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+.venv/
+
+# BOI worktrees
+.boi/
+worktrees/
+
+# Eval data (large test corpora)
+eval/results/

@@ -10,7 +10,7 @@ import urllib.request
 from pathlib import Path
 
 PORT = 8896
-HEX_ROOT = Path(os.path.expanduser("${AGENT_DIR}"))
+HEX_ROOT = Path(os.path.expanduser("${HEX_DIR}"))
 BOI_DB = Path(os.path.expanduser("~/.boi/boi.db"))
 AUDIT_LOG = HEX_ROOT / ".hex" / "audit" / "actions.jsonl"
 TELEMETRY_DIR = HEX_ROOT / ".hex" / "telemetry"

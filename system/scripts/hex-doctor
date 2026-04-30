@@ -18,21 +18,21 @@
 set -uo pipefail
 
 # ─── Resolve AGENT_DIR ────────────────────────────────────────────────────────
-if [ -z "${AGENT_DIR:-}" ]; then
+if [ -z "${HEX_DIR:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   candidate="$SCRIPT_DIR"
   while [ "$candidate" != "/" ]; do
     if [ -f "$candidate/CLAUDE.md" ]; then
-      AGENT_DIR="$candidate"
+      HEX_DIR="$candidate"
       break
     fi
     candidate="$(dirname "$candidate")"
   done
-  AGENT_DIR="${AGENT_DIR:-$HOME/hex}"
+  HEX_DIR="${HEX_DIR:-$HOME/hex}"
 fi
 
-SCRIPTS_DIR="$AGENT_DIR/.hex/scripts"
-HEX_CHECKS_DIR="$AGENT_DIR/.hex/scripts/doctor-checks"
+SCRIPTS_DIR="$HEX_DIR/.hex/scripts"
+HEX_CHECKS_DIR="$HEX_DIR/.hex/scripts/doctor-checks"
 
 # ─── Flags ────────────────────────────────────────────────────────────────────
 FIX=false
@@ -114,7 +114,7 @@ _rec() {
 echo ""
 echo -e "${BOLD}Hex Doctor — Full System Health Check${RESET}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${DIM}AGENT_DIR=$AGENT_DIR${RESET}"
+echo -e "${DIM}HEX_DIR=$HEX_DIR${RESET}"
 if $FIX;   then echo -e "${DIM}Mode: --fix enabled (auto-remediation on)${RESET}"; fi
 if $SMOKE; then echo -e "${DIM}Mode: --smoke enabled (end-to-end tests on)${RESET}"; fi
 

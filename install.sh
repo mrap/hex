@@ -529,7 +529,7 @@ fi
 
 if [[ -n "$SHELL_RC" ]]; then
     NEEDS_WRITE=false
-    if ! grep -q 'export AGENT_DIR=' "$SHELL_RC" 2>/dev/null; then
+    if ! grep -q 'export HEX_DIR=' "$SHELL_RC" 2>/dev/null; then
         NEEDS_WRITE=true
     fi
 
@@ -541,19 +541,19 @@ if [[ -n "$SHELL_RC" ]]; then
 # Hex Agent
 # =====================
 export HEX_DIR="$TARGET_DIR"
-export AGENT_DIR="\$HEX_DIR"
+export AGENT_DIR="\$HEX_DIR"  # deprecated alias — use HEX_DIR
 export PATH="\$HEX_DIR/.hex/bin:\$PATH"
 RCEOF
-        echo "  AGENT_DIR, HEX_DIR, PATH added to $SHELL_RC ✓"
+        echo "  HEX_DIR, AGENT_DIR (deprecated alias), PATH added to $SHELL_RC ✓"
         echo "  Run 'source $SHELL_RC' or restart your terminal to activate."
     else
-        echo "  AGENT_DIR already in $SHELL_RC ✓"
+        echo "  HEX_DIR already in $SHELL_RC ✓"
     fi
 else
     echo ""
     echo "Add these to your shell rc file:"
     echo "  export HEX_DIR=\"$TARGET_DIR\""
-    echo "  export AGENT_DIR=\"\$HEX_DIR\""
+    echo "  export AGENT_DIR=\"\$HEX_DIR\"  # deprecated alias — use HEX_DIR"
     echo "  export PATH=\"\$HEX_DIR/.hex/bin:\$PATH\""
 fi
 

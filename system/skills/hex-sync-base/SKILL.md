@@ -66,8 +66,8 @@ Three layers prevent personal data from leaking:
 
 **Before copying any file**, run:
 ```bash
-bash $AGENT_DIR/.hex/scripts/sync-guard.sh check-path "dot-claude/scripts/foo.sh"
-bash $AGENT_DIR/.hex/scripts/sync-guard.sh scan-file /path/to/file
+bash $HEX_DIR/.hex/scripts/sync-guard.sh check-path "dot-claude/scripts/foo.sh"
+bash $HEX_DIR/.hex/scripts/sync-guard.sh scan-file /path/to/file
 ```
 
 If either check fails, DO NOT copy the file. Surface the issue to the user.

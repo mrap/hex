@@ -14,7 +14,8 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
 # ── Resolve HEX_DIR ─────────────────────────────────────────────────────────
-# Priority: AGENT_DIR env var > HEX_DIR env var > auto-detect from script location
+# Priority: HEX_DIR env var > AGENT_DIR env var (deprecated) > auto-detect from script location
+# DEPRECATED: AGENT_DIR is a legacy alias. Use HEX_DIR.
 if [[ -z "${HEX_DIR:-}" ]]; then
   if [[ -n "${AGENT_DIR:-}" ]]; then
     HEX_DIR="$AGENT_DIR"
@@ -24,7 +25,7 @@ if [[ -z "${HEX_DIR:-}" ]]; then
   fi
 fi
 export HEX_DIR
-export AGENT_DIR="$HEX_DIR"
+export AGENT_DIR="$HEX_DIR"  # deprecated alias — use HEX_DIR
 export HEX_ROOT="$HEX_DIR"
 
 # ── PATH: ensure user tools are reachable ────────────────────────────────────

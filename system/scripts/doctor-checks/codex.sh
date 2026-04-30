@@ -70,9 +70,9 @@ check_codex_3() {
   fi
 }
 
-# check_codex_4: AGENTS.md exists at $AGENT_DIR/AGENTS.md
+# check_codex_4: AGENTS.md exists at $HEX_DIR/AGENTS.md
 check_codex_4() {
-  local agent_dir="${AGENT_DIR:-$HEX_DIR}"
+  local agent_dir="${HEX_DIR:-$HEX_DIR}"
   local agents_md="$agent_dir/AGENTS.md"
 
   if [ -f "$agents_md" ]; then
@@ -89,7 +89,7 @@ check_codex_4() {
 
 # check_codex_5: AGENTS.md contains minimum required sections
 check_codex_5() {
-  local agent_dir="${AGENT_DIR:-$HEX_DIR}"
+  local agent_dir="${HEX_DIR:-$HEX_DIR}"
   local agents_md="$agent_dir/AGENTS.md"
 
   if [ ! -f "$agents_md" ]; then
