@@ -25,10 +25,10 @@ from lib.hex_utils import get_hex_root
 
 CC_SOCK = os.path.expanduser("~/.cc-connect/run/api.sock")
 CC_PROJECT = "hex"
-AGENT_DIR = str(get_hex_root())
-CHECKPOINT_DIR = os.path.join(AGENT_DIR, "projects/hex-e2e-test")
+HEX_DIR = str(get_hex_root())
+CHECKPOINT_DIR = os.path.join(HEX_DIR, "projects/hex-e2e-test")
 CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "checkpoint.md")
-RESET_SCRIPT = os.path.join(AGENT_DIR, ".hex/scripts/hex-session-reset.sh")
+RESET_SCRIPT = os.path.join(HEX_DIR, ".hex/scripts/hex-session-reset.sh")
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):

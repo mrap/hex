@@ -34,10 +34,10 @@ def _find_root():
     return Path(__file__).resolve().parent.parent
 
 
-AGENT_DIR = _find_root()
-TRANSCRIPTS_DIR = AGENT_DIR / "raw" / "transcripts"
+HEX_DIR = _find_root()
+TRANSCRIPTS_DIR = HEX_DIR / "raw" / "transcripts"
 PROCESSED_FILE = TRANSCRIPTS_DIR / ".parsed_transcripts"
-AGENT_NAME = AGENT_DIR.name.capitalize()
+AGENT_NAME = HEX_DIR.name.capitalize()
 
 
 def load_processed():

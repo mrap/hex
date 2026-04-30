@@ -24,10 +24,10 @@ from lib.hex_utils import get_hex_root
 
 HEX_ROOT = os.environ.get("HEX_ROOT", str(get_hex_root()))
 MEMORY_DB = os.path.join(HEX_ROOT, ".hex", "memory.db")
-_AGENT_DIR = os.environ.get("AGENT_DIR", str(get_hex_root()))
+_HEX_DIR = os.environ.get("HEX_DIR", str(get_hex_root()))
 FEEDBACK_DIR = Path(os.environ.get(
     "CLAUDE_PROJECT_MEMORY",
-    str(Path.home() / ".claude" / "projects" / ("-" + _AGENT_DIR.replace("/", "-").lstrip("-")) / "memory")
+    str(Path.home() / ".claude" / "projects" / ("-" + _HEX_DIR.replace("/", "-").lstrip("-")) / "memory")
 ))
 ESCALATIONS_FILE = os.path.join(HEX_ROOT, "evolution", "behavioral-escalations.md")
 

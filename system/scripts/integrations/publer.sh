@@ -2,7 +2,7 @@
 # probe.sh — Publer integration health check
 set -uo pipefail
 
-HEX_ROOT="${HEX_ROOT:-${AGENT_DIR}}"
+HEX_ROOT="${HEX_ROOT:-${HEX_DIR}}"
 SECRETS_FILE="$HEX_ROOT/.hex/secrets/publer.env"
 
 [[ -f "$SECRETS_FILE" ]] && source "$SECRETS_FILE"

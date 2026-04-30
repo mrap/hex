@@ -4,7 +4,7 @@ set -uo pipefail
 
 BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_JSON="$HOME/.claude.json"
-SECRETS_FILE="${AGENT_DIR}/.hex/secrets/excalidraw.env"
+SECRETS_FILE="${HEX_DIR}/.hex/secrets/excalidraw.env"
 RESULT=0
 
 emit_event() {

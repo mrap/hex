@@ -8,9 +8,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path.home() / "hex"))
-REGISTRY = AGENT_DIR / ".hex" / "data" / "assets.json"
-EVENTS_LOG = AGENT_DIR / ".hex" / "logs" / "hex-events.log"
+HEX_DIR = Path(os.environ.get("HEX_DIR", Path.home() / "hex"))
+REGISTRY = HEX_DIR / ".hex" / "data" / "assets.json"
+EVENTS_LOG = HEX_DIR / ".hex" / "logs" / "hex-events.log"
 
 VALID_TYPES = {"post", "proposal", "sample", "spec", "experiment", "decision", "demo", "project"}
 
@@ -105,7 +105,7 @@ def cmd_resolve(args):
         sys.exit(1)
     out = dict(asset)
     if out.get("path"):
-        out["path_absolute"] = str(AGENT_DIR / out["path"])
+        out["path_absolute"] = str(HEX_DIR / out["path"])
     print(json.dumps(out, indent=2))
 
 
@@ -165,7 +165,7 @@ def main():
     p_reg = sub.add_parser("register", help="Register or update an asset")
     p_reg.add_argument("id", help="type:local_id")
     p_reg.add_argument("--title", help="Asset title")
-    p_reg.add_argument("--path", help="Path relative to AGENT_DIR")
+    p_reg.add_argument("--path", help="Path relative to HEX_DIR")
     p_reg.add_argument("--url", help="Optional URL")
     p_reg.add_argument("--owner", help="Owner agent ID")
     p_reg.add_argument("--meta", nargs="*", metavar="key=value", help="Metadata key=value pairs")

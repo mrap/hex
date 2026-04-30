@@ -10,6 +10,7 @@ This document describes the test suite, what each test verifies, and how to run 
 | Core E2E (containerized) | `tests/core-e2e/run-all.sh` | BOI suites only |
 | Live eval — Claude Code | `test_skill_discovery.sh`, `test_e2e.sh`, `test_fullstack.sh` | Yes |
 | Live eval — Codex | `test_skill_discovery_codex.sh`, `test_codex_onboarding.sh` | Yes |
+| Codex parity (containerized) | `tests/codex-parity/run-all.sh` | No (structural); `OPENAI_API_KEY` for live |
 | Migration | `tests/migrate/test-migrate.sh` | No |
 | Memory | `test_memory.py` | No |
 
@@ -71,6 +72,26 @@ Requires `~/.hex-test.env` with `ANTHROPIC_API_KEY`.
 ### `tests/test_skill_discovery_codex.sh`
 
 Mirror of the above for Codex. Because Codex reads `AGENTS.md` rather than `SKILL.md` files directly, this test verifies that the 11 skill names surface via `AGENTS.md` context and that Codex can perform the same three invocations.
+
+## Codex parity suite (`tests/codex-parity/`)
+
+Seven tests that verify behavioral parity between the Claude Code and Codex runtimes. Runs inside a Docker container with Node.js + Codex CLI installed. Structural tests run without an API key; live-dispatch tests are skipped automatically when `OPENAI_API_KEY` is absent.
+
+```bash
+bash tests/codex-parity/run-all.sh
+```
+
+| Test | What it verifies | API key |
+|------|-----------------|:-------:|
+| `test-install-shape.sh` | Fresh hex install produces `.hex/scripts/`, `.hex/skills/`, `.hex/bin/`, `CLAUDE.md`, `AGENTS.md` | No |
+| `test-agents-md-complete.sh` | `AGENTS.md` covers all sections present in `CLAUDE.md` | No |
+| `test-skill-discovery.sh` | All skills are discoverable from `.hex/skills/*/SKILL.md` under Codex | No |
+| `test-doctor-codex.sh` | `doctor.sh` includes and passes the Codex CLI check | No |
+| `test-upgrade-codex.sh` | `upgrade.sh` preserves `AGENTS.md` user customizations | No |
+| `test-boi-dispatch-codex.sh` | Minimal spec with `runtime=codex` completes and produces output | Yes |
+| `test-memory-search.sh` | Memory search index and CLI work identically under the Codex runtime | No |
+
+Gate 5 in `system/scripts/release.sh` runs this suite and blocks on failure; structural tests always run, live tests are skipped when no key is present.
 
 ## Running locally
 

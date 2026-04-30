@@ -30,6 +30,14 @@ run_check() {
     local results
     results=$(grep -rn "$pattern" . \
         --exclude-dir=.git \
+        --exclude-dir=target \
+        --exclude-dir=node_modules \
+        --exclude-dir=.boi \
+        --exclude-dir=worktrees \
+        --exclude-dir=__pycache__ \
+        --exclude-dir=dist \
+        --exclude-dir=.hex \
+        --exclude-dir=.claude \
         "$@" 2>/dev/null \
         | grep -v "/${SELF}:" \
         | grep -v "personalization-audit" \
@@ -116,7 +124,7 @@ SECRETS_VIOLATIONS=$(grep -rn "secrets/slack-bot-token\|\.hex/secrets/[a-zA-Z][a
     | grep -v "personalization-audit" \
     | grep -v "PATH=.*opt.homebrew" \
     | grep -v '<name>\|REPLACE_ME\|YOUR_' \
-    | grep -v 'AGENT_DIR.*secrets\|HEX_DIR.*secrets\|HEX_ROOT.*secrets' \
+    | grep -v 'HEX_DIR.*secrets\|HEX_ROOT.*secrets' \
     | grep -v 'hex-glance-post' \
     || true)
 if [ -n "$SECRETS_VIOLATIONS" ]; then

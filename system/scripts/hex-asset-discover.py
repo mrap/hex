@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-AGENT_DIR = Path(os.environ.get("AGENT_DIR", Path.home() / "hex"))
+HEX_DIR = Path(os.environ.get("HEX_DIR", Path.home() / "hex"))
 
 # Import hex-asset module (filename has dash, so use importlib)
 _scripts_dir = Path(__file__).parent
@@ -40,7 +40,7 @@ def _make_asset(asset_id, title, path, url=None, owner="", metadata=None):
 
 def discover_posts():
     """Parse projects/brand/pipeline.md for P-NNN posts."""
-    pipeline = AGENT_DIR / "projects" / "brand" / "pipeline.md"
+    pipeline = HEX_DIR / "projects" / "brand" / "pipeline.md"
     if not pipeline.exists():
         return []
 
@@ -89,7 +89,7 @@ def discover_posts():
 
 def discover_proposals():
     """Scan projects/brand/proposals/*.html."""
-    proposals_dir = AGENT_DIR / "projects" / "brand" / "proposals"
+    proposals_dir = HEX_DIR / "projects" / "brand" / "proposals"
     if not proposals_dir.exists():
         return []
 
@@ -118,7 +118,7 @@ def discover_proposals():
 
 def discover_samples():
     """Scan projects/brand/proposals/samples/*.json."""
-    samples_dir = AGENT_DIR / "projects" / "brand" / "proposals" / "samples"
+    samples_dir = HEX_DIR / "projects" / "brand" / "proposals" / "samples"
     if not samples_dir.exists():
         return []
 
@@ -146,9 +146,9 @@ def discover_samples():
 def discover_decisions():
     """Scan me/decisions/*.md and projects/*/decisions/*.md."""
     assets = []
-    sources = [(AGENT_DIR / "me" / "decisions", "hex-ops")]
+    sources = [(HEX_DIR / "me" / "decisions", "hex-ops")]
 
-    projects_dir = AGENT_DIR / "projects"
+    projects_dir = HEX_DIR / "projects"
     if projects_dir.exists():
         for proj_dir in sorted(projects_dir.iterdir()):
             d = proj_dir / "decisions"
@@ -174,7 +174,7 @@ def discover_decisions():
                 pass
 
             try:
-                rel_path = str(f.relative_to(AGENT_DIR))
+                rel_path = str(f.relative_to(HEX_DIR))
             except ValueError:
                 rel_path = str(f)
 
@@ -190,7 +190,7 @@ def discover_decisions():
 
 def discover_projects():
     """Scan projects/*/context.md."""
-    projects_dir = AGENT_DIR / "projects"
+    projects_dir = HEX_DIR / "projects"
     if not projects_dir.exists():
         return []
 
@@ -224,7 +224,7 @@ def discover_projects():
 
 def discover_experiments():
     """Parse pipeline.md for **Experiment:** EXP-NNN references."""
-    pipeline = AGENT_DIR / "projects" / "brand" / "pipeline.md"
+    pipeline = HEX_DIR / "projects" / "brand" / "pipeline.md"
     if not pipeline.exists():
         return []
 

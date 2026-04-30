@@ -9,12 +9,12 @@ Usage:
     python3 stale_deps.py [--threshold DAYS] [--json]
 
 Reads from:
-    $AGENT_DIR/todo.md
-    $AGENT_DIR/landings/  (most recent .md file)
-    $AGENT_DIR/.hex/dependency-tracker.json  (state file)
+    $HEX_DIR/todo.md
+    $HEX_DIR/landings/  (most recent .md file)
+    $HEX_DIR/.hex/dependency-tracker.json  (state file)
 
 Writes to:
-    $AGENT_DIR/.hex/dependency-tracker.json  (updated state)
+    $HEX_DIR/.hex/dependency-tracker.json  (updated state)
     stdout (human-readable or JSON report)
 """
 
@@ -34,7 +34,7 @@ def find_agent_dir():
         check = check.parent
         if (check / "CLAUDE.md").exists():
             return check
-    return Path(os.environ.get("AGENT_DIR", "."))
+    return Path(os.environ.get("HEX_DIR", "."))
 
 
 def extract_dependency_items(text, source_file):

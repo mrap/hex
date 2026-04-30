@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-HEX_ROOT="${HEX_ROOT:-${AGENT_DIR}}"
+HEX_ROOT="${HEX_ROOT:-${HEX_DIR}}"
 SECRETS_DIR="$HEX_ROOT/.hex/secrets"
 
 REQUIRED_FILES=(

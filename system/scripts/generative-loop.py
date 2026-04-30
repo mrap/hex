@@ -25,7 +25,7 @@ from typing import Optional
 # Config
 # ---------------------------------------------------------------------------
 
-HEX_ROOT = Path(os.environ.get("AGENT_DIR", str(Path.home() / "hex")))
+HEX_ROOT = Path(os.environ.get("HEX_DIR", str(Path.home() / "hex")))
 OUTPUTS_DIR = HEX_ROOT / "raw" / "research" / "generative-layer" / "outputs"
 STATE_DIR = HEX_ROOT / "raw" / "research" / "generative-layer" / "state"
 BOOKMARKS_DIR = HEX_ROOT / "raw" / "research" / "bookmarks"
@@ -577,7 +577,7 @@ def generate_feed_health_report(health, dry_run):
                 elif fid == "scout":
                     lines.append(
                         f"{action_num}. **{feed['label']}:** Verify hex-events `tech-scout-daily` policy "
-                        f"is active. Script: `$AGENT_DIR/.hex/scripts/tech-scout.sh`"
+                        f"is active. Script: `$HEX_DIR/.hex/scripts/tech-scout.sh`"
                     )
                 action_num += 1
 
@@ -613,7 +613,7 @@ def main():
         log(f"cycle type '{args.cycle_type}' not yet implemented (Phase 1: daily only)")
         sys.exit(0)
 
-    log(f"Starting daily cycle | AGENT_DIR={HEX_ROOT} | dry_run={args.dry_run}")
+    log(f"Starting daily cycle | HEX_DIR={HEX_ROOT} | dry_run={args.dry_run}")
 
     context = load_context()
 

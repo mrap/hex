@@ -28,22 +28,22 @@ from lib.hex_utils import (
 
 
 def test_get_hex_root_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AGENT_DIR env var is used when set."""
-    monkeypatch.setenv("AGENT_DIR", "/tmp/test-hex-root")
+    """HEX_DIR env var is used when set."""
+    monkeypatch.setenv("HEX_DIR", "/tmp/test-hex-root")
     result = get_hex_root()
     assert result == Path("/tmp/test-hex-root")
 
 
 def test_get_hex_root_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Falls back to ~/hex when AGENT_DIR is absent."""
-    monkeypatch.delenv("AGENT_DIR", raising=False)
+    """Falls back to ~/hex when HEX_DIR is absent."""
+    monkeypatch.delenv("HEX_DIR", raising=False)
     result = get_hex_root()
     assert result == Path.home() / "hex"
 
 
 def test_get_hex_root_empty_env_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Empty AGENT_DIR string is treated the same as unset."""
-    monkeypatch.setenv("AGENT_DIR", "")
+    """Empty HEX_DIR string is treated the same as unset."""
+    monkeypatch.setenv("HEX_DIR", "")
     result = get_hex_root()
     assert result == Path.home() / "hex"
 

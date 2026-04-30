@@ -10,8 +10,8 @@ Compare local hex against hex and push improvements upstream.
 
 ## Steps
 
-1. **Detect AGENT_DIR and BASE_DIR**
-   - AGENT_DIR: walk up from script to find CLAUDE.md
+1. **Detect HEX_DIR and BASE_DIR**
+   - HEX_DIR: walk up from script to find CLAUDE.md
    - BASE_DIR: `~/github.com/mrap/hex`
 
 2. **Diff shared files**
@@ -66,8 +66,8 @@ Three layers prevent personal data from leaking:
 
 **Before copying any file**, run:
 ```bash
-bash $AGENT_DIR/.hex/scripts/sync-guard.sh check-path "dot-claude/scripts/foo.sh"
-bash $AGENT_DIR/.hex/scripts/sync-guard.sh scan-file /path/to/file
+bash $HEX_DIR/.hex/scripts/sync-guard.sh check-path "dot-claude/scripts/foo.sh"
+bash $HEX_DIR/.hex/scripts/sync-guard.sh scan-file /path/to/file
 ```
 
 If either check fails, DO NOT copy the file. Surface the issue to the user.

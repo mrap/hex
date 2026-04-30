@@ -38,15 +38,15 @@ log = logging.getLogger("promote")
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 if SCRIPT_DIR.name == "scripts" and SCRIPT_DIR.parent.name == ".claude":
-    AGENT_DIR = SCRIPT_DIR.parents[1]
+    HEX_DIR = SCRIPT_DIR.parents[1]
 else:
-    AGENT_DIR = Path(os.environ.get("AGENT_DIR", SCRIPT_DIR.parent))
+    HEX_DIR = Path(os.environ.get("HEX_DIR", SCRIPT_DIR.parent))
 
-LEARNINGS_FILE = AGENT_DIR / "me" / "learnings.md"
-REFLECTIONS_DIR = AGENT_DIR / "raw" / "reflections"
-SUGGESTIONS_FILE = AGENT_DIR / "evolution" / "suggestions.md"
-CLAUDE_MD = AGENT_DIR / "CLAUDE.md"
-PENDING_FILE = AGENT_DIR / "evolution" / ".pending-promotions.json"
+LEARNINGS_FILE = HEX_DIR / "me" / "learnings.md"
+REFLECTIONS_DIR = HEX_DIR / "raw" / "reflections"
+SUGGESTIONS_FILE = HEX_DIR / "evolution" / "suggestions.md"
+CLAUDE_MD = HEX_DIR / "CLAUDE.md"
+PENDING_FILE = HEX_DIR / "evolution" / ".pending-promotions.json"
 CONFIG_PATH = Path.home() / ".config" / "hex" / "telegram.yaml"
 
 # ---------------------------------------------------------------------------

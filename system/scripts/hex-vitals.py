@@ -297,7 +297,7 @@ SLACK_CHANNEL = "hex-vitals"
 
 def _load_slack_token() -> str:
     """Return Slack bot token from env or secrets file."""
-    for var in ("SLACK_BOT_TOKEN", "MRAP_HEX_SLACK_BOT_TOKEN"):
+    for var in ("SLACK_BOT_TOKEN", "HEX_SLACK_BOT_TOKEN"):
         val = os.environ.get(var, "")
         if val.startswith("xoxb-"):
             return val
@@ -311,13 +311,13 @@ def _load_slack_token() -> str:
                 if line.startswith("#") or "=" not in line:
                     continue
                 k, _, v = line.partition("=")
-                if k.strip() in ("SLACK_BOT_TOKEN", "MRAP_HEX_SLACK_BOT_TOKEN"):
+                if k.strip() in ("SLACK_BOT_TOKEN", "HEX_SLACK_BOT_TOKEN"):
                     v = v.strip().strip('"').strip("'")
                     if v.startswith("xoxb-"):
                         return v
 
     raise RuntimeError(
-        "No Slack bot token found. Set SLACK_BOT_TOKEN or MRAP_HEX_SLACK_BOT_TOKEN, "
+        "No Slack bot token found. Set SLACK_BOT_TOKEN or HEX_SLACK_BOT_TOKEN, "
         "or place the token in one of: " + ", ".join(SLACK_SECRET_FILES)
     )
 

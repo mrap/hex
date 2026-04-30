@@ -2,7 +2,7 @@
 """
 feedback-recurrence.py — measure whether feedback corrections recur in later sessions.
 
-Reads feedback memory files from the Claude project memory directory (derived from AGENT_DIR)
+Reads feedback memory files from the Claude project memory directory (derived from HEX_DIR)
 Scans session summaries written AFTER each feedback date.
 Writes ~/.hex/audit/memory-effectiveness.jsonl
 Exit 2 if any memory has recurrence_rate >= 0.20.
@@ -15,9 +15,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-_AGENT_DIR = os.environ.get("AGENT_DIR", os.environ.get("HEX_DIR", "."))
-MEMORY_DIR = Path(os.environ.get("CLAUDE_PROJECT_MEMORY", str(Path.home() / ".claude/projects" / ("-" + _AGENT_DIR.replace("/", "-").lstrip("-")) / "memory")))
-SUMMARIES_DIR = Path(_AGENT_DIR) / ".hex" / "sessions" / "summaries"
+_HEX_DIR = os.environ.get("HEX_DIR", os.environ.get("HEX_DIR", "."))
+MEMORY_DIR = Path(os.environ.get("CLAUDE_PROJECT_MEMORY", str(Path.home() / ".claude/projects" / ("-" + _HEX_DIR.replace("/", "-").lstrip("-")) / "memory")))
+SUMMARIES_DIR = Path(_HEX_DIR) / ".hex" / "sessions" / "summaries"
 AUDIT_DIR = Path.home() / ".hex/audit"
 OUTPUT_FILE = AUDIT_DIR / "memory-effectiveness.jsonl"
 

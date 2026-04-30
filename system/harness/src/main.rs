@@ -1110,7 +1110,7 @@ fn main() {
             let start = std::time::Instant::now();
             let exit_code = match &command {
                 MemoryCommands::Search { query, top } => {
-                    let script = hex_dir.join("system/skills/memory/scripts/memory_search.py");
+                    let script = hex_dir.join(".hex/skills/memory/scripts/memory_search.py");
                     let mut cmd = std::process::Command::new("python3");
                     cmd.arg(&script).arg(query);
                     if let Some(t) = top {
@@ -1120,7 +1120,7 @@ fn main() {
                     cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
                 }
                 MemoryCommands::Index { full } => {
-                    let script = hex_dir.join("system/skills/memory/scripts/memory_index.py");
+                    let script = hex_dir.join(".hex/skills/memory/scripts/memory_index.py");
                     let mut cmd = std::process::Command::new("python3");
                     cmd.arg(&script);
                     if *full {

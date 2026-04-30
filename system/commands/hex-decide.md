@@ -19,7 +19,7 @@ Keep the scope tight. If the topic is broad ("what to do about the project"), as
 Search memory and project files for relevant context:
 
 ```bash
-python3 $AGENT_DIR/.hex/skills/memory/scripts/memory_search.py "decision topic keywords"
+python3 $HEX_DIR/.hex/skills/memory/scripts/memory_search.py "decision topic keywords"
 ```
 
 Read any relevant project context files, people profiles, or past decisions.
@@ -66,8 +66,8 @@ If the user makes a choice, update Status to "Decided" and record which option w
 ## Step 5: Save the Decision Record
 
 Determine where the decision belongs:
-- If it relates to a known project in `$AGENT_DIR/projects/`, save to `$AGENT_DIR/projects/{project}/decisions/{date}_{slug}.md`
-- Otherwise, save to `$AGENT_DIR/me/decisions/{date}_{slug}.md`
+- If it relates to a known project in `$HEX_DIR/projects/`, save to `$HEX_DIR/projects/{project}/decisions/{date}_{slug}.md`
+- Otherwise, save to `$HEX_DIR/me/decisions/{date}_{slug}.md`
 
 Use today's date (YYYY-MM-DD) and a URL-safe slug of the topic.
 

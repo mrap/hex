@@ -21,10 +21,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from lib.hex_utils import get_hex_root
 
-AGENT_DIR = str(get_hex_root())
-LEDGER_PATH = os.path.join(AGENT_DIR, ".hex/cost/ledger.jsonl")
+HEX_DIR = str(get_hex_root())
+LEDGER_PATH = os.path.join(HEX_DIR, ".hex/cost/ledger.jsonl")
 KR_SNAPSHOTS_PATH = os.path.expanduser("~/.hex/audit/kr-snapshots.jsonl")
-INITIATIVES_DIR = os.path.join(AGENT_DIR, "initiatives")
+INITIATIVES_DIR = os.path.join(HEX_DIR, "initiatives")
 OUTPUT_PATH = os.path.expanduser("~/.hex/audit/tuning-recommendations.jsonl")
 
 

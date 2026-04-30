@@ -40,7 +40,7 @@ Task (run_in_background: true):
   subagent_type: general-purpose
   prompt: |
     Run the session reflection script. Execute:
-    bash $AGENT_DIR/.hex/scripts/session-reflect.sh
+    bash $HEX_DIR/.hex/scripts/session-reflect.sh
     This will process the current transcript and apply reflection fixes.
     Do not wait for or report the result.
 ```
@@ -80,7 +80,7 @@ Make sure todo.md reflects current state. Move completed items, add new ones dis
 
 ## Step 5: Update daily landings
 
-Get today's date: `bash $AGENT_DIR/.hex/scripts/today.sh`
+Get today's date: `bash $HEX_DIR/.hex/scripts/today.sh`
 
 Read today's landings file at `landings/YYYY-MM-DD.md`. If it exists, update it:
 - Mark any landing items completed during this session segment as Done

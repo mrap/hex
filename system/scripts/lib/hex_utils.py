@@ -17,13 +17,13 @@ from typing import Union
 def get_hex_root() -> Path:
     """Return the hex workspace root directory.
 
-    Reads the AGENT_DIR environment variable first; falls back to ~/hex
+    Reads the HEX_DIR environment variable first; falls back to ~/hex
     when the variable is absent or empty.
 
     Returns:
         Absolute Path to the hex root directory.
     """
-    agent_dir = os.environ.get("AGENT_DIR", "").strip()
+    agent_dir = os.environ.get("HEX_DIR", "").strip()
     if agent_dir:
         return Path(agent_dir)
     return Path.home() / "hex"
@@ -67,7 +67,7 @@ def load_yaml(path: Union[str, Path]) -> dict:
 def emit_event(event_type: str, payload: dict) -> None:
     """Emit a hex event via the hex-emit.sh shell script.
 
-    The script is resolved relative to AGENT_DIR so it works in any
+    The script is resolved relative to HEX_DIR so it works in any
     deployment without hardcoded paths.
 
     Args:

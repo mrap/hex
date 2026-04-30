@@ -5,7 +5,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS_FILE="${HEX_SECRETS_DIR:-.hex/secrets}/kalshi.env"
-HEX_ROOT="${HEX_ROOT:-${AGENT_DIR}}"
+HEX_ROOT="${HEX_ROOT:-${HEX_DIR}}"
 
 # ─── Load secrets ─────────────────────────────────────────────────────────────
 ENV_FILE="$HEX_ROOT/$SECRETS_FILE"
