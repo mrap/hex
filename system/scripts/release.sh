@@ -136,32 +136,19 @@ if $SKIP_PARITY; then
   red "  SKIPPED (--skip-parity) — emergency bypass"
 elif $SKIP_E2E; then
   red "  SKIPPED (--skip-e2e implies --skip-parity)"
-elif ! command -v docker >/dev/null 2>&1; then
-  echo "  Docker not available — skipping codex parity gate"
 else
-  HEX_WORKSPACE="${HEX_WORKSPACE:-$HOME/hex}"
-  PARITY_DIR="$HEX_WORKSPACE/tests/codex-parity"
+  PARITY_DIR="$REPO_DIR/tests/codex-parity"
   if [ ! -d "$PARITY_DIR" ]; then
-    echo "  Parity tests not found at $PARITY_DIR — skipping codex parity gate"
-    echo "  Set HEX_WORKSPACE to enable. Expected: \$HEX_WORKSPACE/tests/codex-parity"
+    echo "  WARNING: Codex parity tests not found at $PARITY_DIR — skipping"
+    echo "  Expected: tests/codex-parity/ in the repo root"
   else
-    echo "  Building codex parity image..."
-    if docker build -f "$PARITY_DIR/Dockerfile" -t hex-codex-parity "$HEX_WORKSPACE" >/dev/null 2>&1; then
-      PARITY_OUTPUT=$(docker run --rm hex-codex-parity 2>&1)
-      PARITY_FAIL=$(echo "$PARITY_OUTPUT" | grep -c '\[.*FAIL\]' || true)
-      PARITY_PARTIAL=$(echo "$PARITY_OUTPUT" | grep -c '\[.*PARTIAL\]' || true)
-      if [ "$PARITY_FAIL" -gt 0 ]; then
-        gate_fail "Codex parity failure: $PARITY_FAIL test(s) failed"
-        echo "$PARITY_OUTPUT" | grep 'FAIL\]' >&2
-      else
-        if [ "$PARITY_PARTIAL" -gt 0 ]; then
-          green "  Codex parity: PASS ($PARITY_PARTIAL PARTIAL — known differences) ✓"
-        else
-          green "  Codex parity: PASS ✓"
-        fi
-      fi
+    echo "  Running codex parity suite (tests/codex-parity/)..."
+    # Export API key so test scripts can decide whether to run live tests or SKIP.
+    export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+    if bash "$PARITY_DIR/run-all.sh" 2>&1; then
+      green "  Codex parity: PASS ✓"
     else
-      gate_fail "Failed to build codex parity Docker image (check $PARITY_DIR/Dockerfile)"
+      gate_fail "Codex parity failure"
     fi
   fi
 fi
