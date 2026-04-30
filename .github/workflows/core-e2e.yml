@@ -1,0 +1,58 @@
+# .github/workflows/core-e2e.yml
+#
+# Runs the hex core E2E suite on every PR and on main/tag pushes.
+# Blocks merges on failure (configure in Settings → Branches → Required status checks:
+#   "Hex core suites" and "BOI integration suites").
+#
+# Release gate: running on `v*.*.*` tag pushes ensures all tests pass before
+# a tagged release. Combine with a required status check on tag protection rules.
+#
+# Two jobs:
+#   hex-core       — non-BOI suites run inside the core-e2e Docker image
+#   boi-integration — BOI suites run on the GHA host (needs Docker access)
+name: core-e2e
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'
+  release:
+    types: [published]
+
+concurrency:
+  group: core-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  hex-core:
+    name: Hex core suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test image
+        run: |
+          docker build \
+            -t hex-core-e2e:${{ github.sha }} \
+            -f tests/core-e2e/Dockerfile \
+            .
+
+      - name: Run hex core suites (excluding BOI which need host Docker)
+        run: |
+          docker run --rm \
+            hex-core-e2e:${{ github.sha }} \
+            --exclude boi
+
+  boi-integration:
+    name: BOI integration suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run BOI suites (host runner has Docker access)
+        run: bash tests/core-e2e/run-all.sh --include boi
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

@@ -100,3 +100,50 @@ Based on this audit, the new `core-e2e` suite should:
 4. Asset registry (assets) — zero coverage
 5. SSE bus (sse) — zero coverage
 6. Telemetry verification (telemetry) — zero CLI coverage
+
+---
+
+## BOI Integration Gaps — CLOSED (2026-04-29)
+
+The following BOI-related gaps, identified during the 2026-04-29 audit, are now covered by
+containerized E2E suites in `tests/core-e2e/suites/`:
+
+| Gap | Status | Suite |
+|-----|--------|-------|
+| BOI install: no test asserted binary RUNS after install | **CLOSED** | `test-boi-install.sh` |
+| BOI install: wrapper chain `~/.boi/boi → boi.sh → ~/.boi/bin/boi` never exercised | **CLOSED** | `test-boi-install.sh` |
+| BOI install: `--help` subcommands (`dispatch`, `status`, `bench`, `cancel`) never verified | **CLOSED** | `test-boi-install.sh` |
+| BOI install: `--version` never compared against VERSIONS BOI_VERSION | **CLOSED** | `test-boi-install.sh` |
+| BOI upgrade: no test rebuilds binary on version bump (caused stale `bench` subcommand) | **CLOSED** | `test-boi-upgrade.sh` |
+| BOI upgrade: symlink mtime staleness never detected | **CLOSED** | `test-boi-upgrade.sh` |
+| BOI upgrade: doctor only checks file existence, not runtime health | **CLOSED** | `test-boi-upgrade.sh` §6 (bad-case) |
+| BOI smoke dispatch: never exercised in CI | **CLOSED** | `test-boi-install.sh` §4–7 (with API key) |
+
+### What the suites verify
+
+**`test-boi-install.sh`** — Fresh-container install:
+- `~/.boi/bin/boi` is a real executable (symlink target also verified)
+- `boi --help` exits 0 and lists `dispatch`, `status`, `bench`, `cancel`
+- `boi version` output matches VERSIONS `BOI_VERSION`
+- Wrapper chain `boi.sh --help` exits 0
+- (With `ANTHROPIC_API_KEY`) full smoke dispatch completes and marker file exists
+
+**`test-boi-upgrade.sh`** — Upgrade from prior release:
+- Baseline install captures version + binary mtime
+- After checkout-HEAD + `install.sh` re-run: version bumped, binary mtime newer
+- `boi --help` lists all subcommands from new version (dynamically checked)
+- Smoke dispatch works after upgrade
+- BAD case: corrupted symlink is caught by `doctor.sh` runtime check
+
+### How to run
+
+```bash
+# All BOI suites only (host with Docker)
+bash tests/core-e2e/run-all.sh --include boi
+
+# Single suite
+bash tests/core-e2e/suites/test-boi-install.sh
+
+# With smoke dispatch
+ANTHROPIC_API_KEY=<key> bash tests/core-e2e/suites/test-boi-install.sh
+```

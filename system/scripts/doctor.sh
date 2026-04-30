@@ -36,22 +36,24 @@ FIX=false
 JSON_MODE=false
 QUIET=false
 
-for arg in "$@"; do
-  case "$arg" in
-    --fix)   FIX=true ;;
-    --json)  JSON_MODE=true ;;
-    --quiet) QUIET=true ;;
-    --help|-h)
-      echo "Usage: doctor.sh [--fix] [--json] [--quiet]"
-      echo ""
-      echo "  --fix    Auto-fix safe issues (checks 1,2,5,8,10,11,12,13,14,15)"
-      echo "  --json   Output full results as JSON (always includes all checks)"
-      echo "  --quiet  Only show errors and warnings (skip passing checks)"
-      exit 0
-      ;;
-    *) echo "Unknown option: $arg" >&2; exit 1 ;;
-  esac
-done
+if [[ "${DOCTOR_SOURCE_ONLY:-}" != "1" ]]; then
+  for arg in "$@"; do
+    case "$arg" in
+      --fix)   FIX=true ;;
+      --json)  JSON_MODE=true ;;
+      --quiet) QUIET=true ;;
+      --help|-h)
+        echo "Usage: doctor.sh [--fix] [--json] [--quiet]"
+        echo ""
+        echo "  --fix    Auto-fix safe issues (checks 1,2,5,8,10,11,12,13,14,15)"
+        echo "  --json   Output full results as JSON (always includes all checks)"
+        echo "  --quiet  Only show errors and warnings (skip passing checks)"
+        exit 0
+        ;;
+      *) echo "Unknown option: $arg" >&2; exit 1 ;;
+    esac
+  done
+fi
 
 # ─── State ────────────────────────────────────────────────────────────────────
 PASS_COUNT=0
@@ -561,30 +563,88 @@ check_16() {
   _rec 16 "hex-events reachable" "pass" "hex_eventd.py and venv found"
 }
 
-# 17: BOI reachable (degrade gracefully if not installed)
+# 17: BOI health — runtime checks, not just file-existence
 check_17() {
-  local boi_sh="$HOME/.boi/src/boi.sh"
-  local boi_cmd="$HOME/.boi/boi"
+  local boi_bin="$HOME/.boi/bin/boi"
+  local boi_wrapper="$HOME/.boi/boi"
+  local versions_file="$HEX_DIR/VERSIONS"
+  local expected_ver=""
 
-  if [ ! -f "$boi_sh" ]; then
-    _info "BOI not installed (~/.boi/src/boi.sh not found)"
-    _rec 17 "BOI reachable" "warn" "BOI not installed"
+  if [ -f "$versions_file" ]; then
+    expected_ver=$(grep "^BOI_VERSION=" "$versions_file" | cut -d= -f2 | tr -d '[:space:]')
+  fi
+
+  # Check: symlink not dangling (must test -L before -e; -e follows symlinks)
+  if [ -L "$boi_bin" ] && [ ! -f "$boi_bin" ]; then
+    _error "BOI: $boi_bin is a dangling symlink — run install.sh or rebuild: cd ~/github.com/mrap/boi && cargo build --release"
+    _rec 17 "BOI symlink" "error" "dangling symlink at $boi_bin"
     return
   fi
 
-  if [ -f "$boi_cmd" ]; then
-    if bash "$boi_cmd" status &>/dev/null 2>&1; then
-      _pass "BOI reachable (status OK)"
-      _rec 17 "BOI reachable" "pass" "boi status succeeded"
-      return
+  # Check: binary exists (graceful degrade if BOI not installed)
+  if [ ! -e "$boi_bin" ]; then
+    _info "BOI not installed ($boi_bin not found) — run install.sh to install BOI"
+    _rec 17 "BOI installed" "warn" "binary not found — not installed"
+    return
+  fi
+
+  # Check: boi --help exits 0
+  local help_rc=0
+  "$boi_bin" --help >/dev/null 2>&1 || help_rc=$?
+  if [ $help_rc -ne 0 ]; then
+    _error "boi --help returned exit $help_rc — binary may be corrupt; run install.sh to rebuild BOI"
+    _rec 17 "BOI --help" "error" "boi --help failed (exit $help_rc)"
+  else
+    _pass "boi --help exits 0"
+    _rec 17 "BOI --help" "pass" "boi --help OK"
+  fi
+
+  # Check: boi --version exits 0 and matches VERSIONS BOI_VERSION
+  local ver_out ver_rc=0
+  ver_out=$("$boi_bin" --version 2>&1) || ver_rc=$?
+  if [ $ver_rc -ne 0 ]; then
+    _error "boi --version returned exit $ver_rc — run install.sh to rebuild BOI"
+    _rec 17 "BOI --version" "error" "boi --version failed (exit $ver_rc)"
+  elif [ -n "$expected_ver" ]; then
+    local clean_ver="${expected_ver#v}"
+    if echo "$ver_out" | grep -qF "$clean_ver"; then
+      _pass "boi --version matches VERSIONS ($expected_ver)"
+      _rec 17 "BOI --version" "pass" "version $expected_ver OK"
+    else
+      _error "boi --version '$ver_out' does not match VERSIONS $expected_ver — run install.sh to upgrade BOI"
+      _rec 17 "BOI --version" "error" "version mismatch: got '$ver_out', want $expected_ver"
     fi
-    _warn "BOI status failed (daemon may not be running)"
-    _rec 17 "BOI reachable" "warn" "boi status returned non-zero"
-    return
+  else
+    _pass "boi --version exits 0"
+    _rec 17 "BOI --version" "pass" "boi --version OK"
   fi
 
-  _pass "BOI installed (~/.boi/src/boi.sh found)"
-  _rec 17 "BOI reachable" "pass" "boi.sh found"
+  # Check: boi status exits 0 (DB queryable)
+  local status_rc=0
+  "$boi_bin" status >/dev/null 2>&1 || status_rc=$?
+  if [ $status_rc -ne 0 ]; then
+    _warn "boi status returned exit $status_rc — daemon may not be running; start with: boi start"
+    _rec 17 "BOI status" "warn" "boi status failed (exit $status_rc)"
+  else
+    _pass "boi status exits 0 (DB queryable)"
+    _rec 17 "BOI status" "pass" "boi status OK"
+  fi
+
+  # Check: wrapper chain ~/.boi/boi --help exits 0
+  if [ ! -e "$boi_wrapper" ]; then
+    _warn "BOI wrapper missing at $boi_wrapper — run install.sh to restore"
+    _rec 17 "BOI wrapper" "warn" "wrapper not found at $boi_wrapper"
+  else
+    local wrapper_rc=0
+    "$boi_wrapper" --help >/dev/null 2>&1 || wrapper_rc=$?
+    if [ $wrapper_rc -ne 0 ]; then
+      _error "BOI wrapper chain broken: $boi_wrapper --help failed (exit $wrapper_rc) — run install.sh"
+      _rec 17 "BOI wrapper" "error" "wrapper chain broken (exit $wrapper_rc)"
+    else
+      _pass "BOI wrapper chain OK ($boi_wrapper --help exits 0)"
+      _rec 17 "BOI wrapper" "pass" "wrapper chain OK"
+    fi
+  fi
 }
 
 # 18: Python 3.10+ available (error)
@@ -735,6 +795,9 @@ check_22() {
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
+# When sourced for unit testing, all functions above are now defined; stop here.
+[[ "${DOCTOR_SOURCE_ONLY:-}" == "1" ]] && return 0
+
 if ! $JSON_MODE; then
   echo ""
   echo -e "${BOLD}Hex Doctor — Health Check${RESET}"

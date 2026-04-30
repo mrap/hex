@@ -7,10 +7,40 @@ This document describes the test suite, what each test verifies, and how to run 
 | Category | Files | Needs API key |
 |----------|-------|:-------------:|
 | Static / unit | `test_skill_frontmatter.sh`, `test_skill_refs.sh`, `test_path_mapping.bats` | No |
+| Core E2E (containerized) | `tests/core-e2e/run-all.sh` | BOI suites only |
 | Live eval — Claude Code | `test_skill_discovery.sh`, `test_e2e.sh`, `test_fullstack.sh` | Yes |
 | Live eval — Codex | `test_skill_discovery_codex.sh`, `test_codex_onboarding.sh` | Yes |
 | Migration | `tests/migrate/test-migrate.sh` | No |
 | Memory | `test_memory.py` | No |
+
+## Core E2E suite (`tests/core-e2e/`)
+
+Auto-discovers all `tests/core-e2e/suites/*.sh` files and runs them. Non-BOI suites run inside the `tests/core-e2e/Dockerfile` container; BOI integration suites run on the host (they need Docker access to spin up their own containers).
+
+CI runs both jobs on every PR and blocks merges on failure (see `.github/workflows/core-e2e.yml`).
+
+```bash
+# All suites (host must have Docker)
+bash tests/core-e2e/run-all.sh
+
+# Filter by pattern — useful when iterating on a specific suite
+bash tests/core-e2e/run-all.sh --include boi          # BOI suites only
+bash tests/core-e2e/run-all.sh --exclude boi          # skip BOI (e.g. inside Docker)
+bash tests/core-e2e/run-all.sh --include 'install|upgrade'  # regex match on suite name
+```
+
+Current suites:
+
+| Suite | What it verifies |
+|-------|-----------------|
+| `test-boi-install` | Fresh BOI install: binary builds, `--help`/`--version`, smoke dispatch |
+| `test-boi-upgrade` | Upgrade path: version bump, stale-symlink detection, doctor catches dangling link |
+| `test-assets` | Asset registry CRUD via `hex asset` subcommands |
+| `test-cli` | All `hex` subcommands reachable; version matches `version.txt` |
+| `test-events` | Event emit, policy firing, trace via `hex events` |
+| `test-messaging` | Message send/receive/filter with SQLite verification |
+| `test-sse` | SSE subscribe/publish, topic filtering, heartbeat |
+| `test-telemetry` | Telemetry JSONL written to `.hex/telemetry/` |
 
 ## Tests added in v0.2.4
 

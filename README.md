@@ -321,6 +321,7 @@ Key test files:
 | `tests/test_skill_refs.sh` | All paths referenced inside SKILL.md resolve |
 | `tests/test_e2e.sh` | Full install + doctor + upgrade lifecycle |
 | `tests/migrate/test-migrate.sh` | v1 → v2 migration correctness |
+| `tests/core-e2e/run-all.sh` | Hex primitives + BOI integration (containerized; CI-gated) |
 
 To run the full suite locally:
 
@@ -329,7 +330,12 @@ To run the full suite locally:
 bash tests/test_skill_frontmatter.sh
 bash tests/test_skill_refs.sh
 
-# Live tests (requires ~/.hex-test.env with ANTHROPIC_API_KEY)
+# Core E2E (requires Docker; ANTHROPIC_API_KEY for BOI suites)
+bash tests/core-e2e/run-all.sh                    # all suites
+bash tests/core-e2e/run-all.sh --exclude boi       # skip BOI (no Docker-in-Docker)
+bash tests/core-e2e/run-all.sh --include boi       # BOI suites only (host runner)
+
+# Live eval tests (requires ~/.hex-test.env with ANTHROPIC_API_KEY)
 bash tests/eval/run_eval_docker.sh --live    # Linux Docker
 bash tests/eval/run_eval_macos.sh            # macOS Tart
 ```
@@ -337,6 +343,11 @@ bash tests/eval/run_eval_macos.sh            # macOS Tart
 ---
 
 ## Roadmap
+
+v0.9.0 adds: **BOI v1.0.0 Rust binary + doctor runtime checks.**
+- **BOI rewrite**: BOI is now a compiled Rust binary at `~/.boi/bin/boi`. Install clones and builds from source; `VERSIONS` pins `BOI_VERSION`.
+- **Doctor runtime checks**: `check_17` now validates `boi --help`, `boi --version` (against `VERSIONS`), `boi status` (DB queryable), dangling-symlink detection, and the full wrapper chain (`~/.boi/boi --help`). Each failure includes a repair hint.
+- **Doctor unit tests**: `tests/test_doctor.bats` covers all new BOI checks (missing binary, dangling symlink, broken wrapper, version mismatch, status failure).
 
 v0.8.0 adds: **Unified `hex` binary + 3 new primitives + hex-events merged inline.**
 - **Unified binary**: `hex-agent` replaced by `hex` — single Rust binary with subcommands for agent fleet, HTTP/SSE server, asset registry, and comment system. `hex-agent` preserved as symlink for backward compat.
