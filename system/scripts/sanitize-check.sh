@@ -193,6 +193,7 @@ CLAUDE_PATH_FILES=$(grep -rln '\.claude/' . \
     | grep -v '/backup_session\.sh$' \
     | grep -v '/consolidate\.sh$' \
     | grep -v '/cleanup-project-jsonl\.sh$' \
+    | grep -v '/test_upgrade_prune\.sh$' \
     | grep -v "personalization-audit" \
     | grep -v "PATH=.*opt.homebrew" \
     || true)
