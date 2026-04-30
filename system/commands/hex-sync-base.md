@@ -12,8 +12,8 @@ Compare local hex against hex and push improvements upstream.
 
 **Before starting:** determine which upstream is authoritative for this sync. If `BASE_DIR` points at `mrap/hex-foundation` → use v2 path mapping. If `mrap/hex` → v1. Ask the user if ambiguous.
 
-1. **Detect AGENT_DIR and BASE_DIR**
-   - AGENT_DIR: walk up from script to find CLAUDE.md
+1. **Detect HEX_DIR and BASE_DIR**
+   - HEX_DIR: walk up from script to find CLAUDE.md
    - BASE_DIR: `~/github.com/mrap/hex-foundation` (v2, current default) or `~/github.com/mrap/hex` (v1, legacy)
    - Auto-detect via `detect_layout` to choose sync direction.
 
@@ -65,11 +65,11 @@ Path map by layout:
 | `.hex/hooks/` | `dot-claude/hooks/` | `system/hooks/` (if present) |
 | `CLAUDE.md` | `CLAUDE.md` | `templates/CLAUDE.md` |
 
-Use `bash $AGENT_DIR/.hex/scripts/path-mapping.sh` sourced for programmatic access — the `v1_to_v2` and `v2_to_v1` functions handle this mapping exactly.
+Use `bash $HEX_DIR/.hex/scripts/path-mapping.sh` sourced for programmatic access — the `v1_to_v2` and `v2_to_v1` functions handle this mapping exactly.
 
 Run layout detection first:
 ```bash
-source $AGENT_DIR/.hex/scripts/path-mapping.sh
+source $HEX_DIR/.hex/scripts/path-mapping.sh
 detect_layout "$BASE_DIR"
 ```
 
@@ -83,8 +83,8 @@ Three layers prevent personal data from leaking:
 
 **Before copying any file**, run:
 ```bash
-bash $AGENT_DIR/.hex/scripts/sync-guard.sh check-path "dot-claude/scripts/foo.sh"
-bash $AGENT_DIR/.hex/scripts/sync-guard.sh scan-file /path/to/file
+bash $HEX_DIR/.hex/scripts/sync-guard.sh check-path "dot-claude/scripts/foo.sh"
+bash $HEX_DIR/.hex/scripts/sync-guard.sh scan-file /path/to/file
 ```
 
 If either check fails, DO NOT copy the file. Surface the issue to the user.

@@ -352,7 +352,7 @@ v0.10.0 adds: **BOI v1.1.0 integration + containerized BOI E2E.**
 v0.10.1 fixes: **Releaser auto-unblock regression.**
 - **Harness queue.rs**: `check_unblock_condition` now handles `message_reply` blocks — previously only `telemetry` and `timer` arms existed, so releaser blocks were silently permanent.
 - **Harness wake.rs**: `blocked_since` is now stamped with the server clock on apply, preventing LLM-hallucinated future timestamps from corrupting SLA math.
-- **Tests**: 4 new tests in `tests/queue_test.rs` covering the unblock path.
+- **Tests**: 4 new tests in `tests/queue_test.rs` covering the unblock path. Build break fixes: `hex_bytes::encode` alias and `hex_agent` → `hex` rename in integration tests.
 
 v0.9.0 adds: **BOI v1.0.0 Rust binary + doctor runtime checks.**
 - **BOI rewrite**: BOI is now a compiled Rust binary at `~/.boi/bin/boi`. Install clones and builds from source; `VERSIONS` pins `BOI_VERSION`.

@@ -7,7 +7,7 @@
 set -uo pipefail
 
 NAME="slack-bot"
-SECRETS_FILE="${AGENT_DIR}/.hex/secrets/slack-bot.env"
+SECRETS_FILE="${HEX_DIR}/.hex/secrets/slack-bot.env"
 
 # 1. Secrets file must exist and be non-empty.
 if [[ ! -s "$SECRETS_FILE" ]]; then
