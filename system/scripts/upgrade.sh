@@ -647,8 +647,11 @@ if [ -d "$SOURCE_DIR/$SOURCE_SUBDIR_SKILLS" ]; then
 fi
 if [ -d "$SOURCE_DIR/$SOURCE_SUBDIR_COMMANDS" ]; then
   rsync -a     --exclude='__pycache__'     "$SOURCE_DIR/$SOURCE_SUBDIR_COMMANDS/" "$HEX_DOTDIR/commands/"
-  mkdir -p "$HEX_DIR/.claude/commands"
-  rsync -a     --exclude='__pycache__'     "$SOURCE_DIR/$SOURCE_SUBDIR_COMMANDS/" "$HEX_DIR/.claude/commands/"
+  # Mirror to runtime-specific slash-command dir: .claude/commands (Claude Code) or .codex/commands (Codex)
+  RUNTIME_CMD_DIR="$HEX_DIR/.claude"
+  [[ "${HEX_RUNTIME:-}" == "codex" ]] && RUNTIME_CMD_DIR="$HEX_DIR/.codex"
+  mkdir -p "$RUNTIME_CMD_DIR/commands"
+  rsync -a     --exclude='__pycache__'     "$SOURCE_DIR/$SOURCE_SUBDIR_COMMANDS/" "$RUNTIME_CMD_DIR/commands/"
 fi
 
 # For v1 layout, also sync hooks and the ui directory (not present in v2).

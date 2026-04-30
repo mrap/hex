@@ -511,7 +511,6 @@ if [ -x "$TARGET_DIR/.hex/bin/hex" ]; then
     if ! "$TARGET_DIR/.hex/bin/hex" version &>/dev/null; then
         echo "WARNING: hex binary installed but failed to execute. Re-run install to retry."
     else
-        local hex_ver
         hex_ver=$("$TARGET_DIR/.hex/bin/hex" version 2>/dev/null || echo "unknown")
         echo "  hex binary          ✓ ($hex_ver)"
         # Verify symlink works
