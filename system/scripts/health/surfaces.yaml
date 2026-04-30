@@ -1,0 +1,61 @@
+# User-facing surfaces registry for proactive-breakage-detection (kr-1)
+# Each surface maps to one or more health check scripts in this directory.
+# A surface is "covered" if at least one check script exists and is executable.
+#
+# Target: 100% of surfaces covered by checks that run at least hourly.
+
+surfaces:
+  - id: slack-channels
+    description: Slack cc-connect bridge — messages in/out of #from-hex-instance
+    checks:
+      - check-cc-connect.sh
+      - check-slack-bot.sh
+
+  - id: hex-eventd
+    description: hex event daemon — backbone for all surface communication
+    checks:
+      - check-hex-eventd.sh
+
+  - id: mcp-servers
+    description: MCP server integrations (context7, playwright, github, etc.)
+    checks:
+      - check-mcp-servers.sh
+
+  - id: integrations-secrets
+    description: Secrets availability for all integrations
+    checks:
+      - check-secrets.sh
+
+  - id: network-tailscale
+    description: Tailscale VPN — required for internal service connectivity
+    checks:
+      - check-tailscale.sh
+
+  - id: kalshi-integration
+    description: Kalshi market data integration
+    checks:
+      - check-kalshi.sh
+
+  - id: hex-pulse-ui
+    description: Hex Pulse dashboard server — vitals, messages, agent activity (port 8896)
+    checks:
+      - check-pulse-server.sh
+
+  - id: boi-dispatch
+    description: BOI daemon liveness and dispatch readiness — workers idle and accepting work
+    checks:
+      - check-boi-dispatch.sh
+
+  - id: agent-memory
+    description: Agent file-based memory system — shared SHARED.md index and project memory dirs
+    checks:
+      - check-agent-memory.sh
+
+  - id: hex-compare-view
+    checks:
+      - check-hex-compare.sh
+
+  - id: hex-eventd-policies
+    description: hex-events policy execution — verifies policies are actually firing, not just daemon alive
+    checks:
+      - check-hex-eventd-policies.sh

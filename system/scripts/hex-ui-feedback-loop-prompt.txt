@@ -1,0 +1,27 @@
+Process new hex-ui feedback comments autonomously.
+
+Endpoint: https://${HEX_HOST:-localhost}/visions/api/comments
+
+Steps:
+1. curl GET /visions/api/comments. Find comments where status == "new". If none, exit with "no new comments" and STOP.
+2. For each new comment (oldest first):
+   a. POST status="building" to /visions/api/comments/<id>/status immediately.
+   b. Read the comment text carefully. Identify scope:
+      - demo_id starting with "demo-" → modify the relevant demo in projects/hex-ui/vision-pitch-site/demos.html
+      - demo_id == "general" → read the text carefully; could affect the page chrome, sidebar, FAB, or anything at page scope
+   c. Make the requested change(s) to the relevant files.
+   d. Verify served HTML reflects the change (curl the URL with a cache-bust query).
+   e. POST a concise reply to /visions/api/comments/<id>/reply describing exactly what changed (1-3 sentences).
+   f. POST status="built" to /visions/api/comments/<id>/status.
+
+Guardrails:
+- Only modify files under projects/hex-ui/vision-pitch-site/ unless the comment clearly points elsewhere.
+- Respect Mike's design principles in projects/hex-ui/design-principles-2026-04-21.md (read it first).
+- Respect rejected-patterns memory (do NOT reintroduce Mission Control terminal grid, cursor-anywhere, always-on multi-select, pin-as-primary, subtle UI responses, pointer icon CP-9, highlight+Cmd-K CP-10, or shift/cmd-click modifiers).
+- Light mode default; tailscale URLs only (never localhost in rendered copy).
+- If a comment is ambiguous, post a reply asking one specific clarifying question, and leave status as "new" (do not mark building).
+- Do NOT modify comments.json (that is Mike-authored feedback).
+- Keep edits small and focused on the comment text. Do not refactor adjacent code.
+
+Budget: process up to 3 new comments per tick, then exit. Tomorrow-you will pick up the rest.
+Exit cleanly whether queue is empty or worked.
