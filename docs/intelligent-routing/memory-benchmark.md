@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-27
 **Author:** BOI Worker q-919 (Iteration 2)
-**Corpus:** `$AGENT_DIR/.hex/memory.db`
+**Corpus:** `$HEX_DIR/.hex/memory.db`
 **Depends on:** `docs/intelligent-routing/memory-architectures.md` (t-1)
 
 ---

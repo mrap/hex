@@ -77,7 +77,7 @@ payload: { session_id, agent_dir, transcript_path, duration_seconds }
 # system/scripts/dream/distill_session.py
 """
 Triggered by: hex-events policy dream-distill-session.yaml
-Input env:    SESSION_ID, TRANSCRIPT_PATH, AGENT_DIR
+Input env:    SESSION_ID, TRANSCRIPT_PATH, HEX_DIR
 """
 import json, os, sys
 from pathlib import Path
@@ -119,7 +119,7 @@ rules:
     actions:
       - type: shell
         command: |
-          python3 $AGENT_DIR/system/scripts/dream/distill_session.py \
+          python3 $HEX_DIR/system/scripts/dream/distill_session.py \
             --session-id "{{ event.session_id }}" \
             --transcript "{{ event.transcript_path }}"
         timeout: 300
@@ -216,7 +216,7 @@ rules:
     actions:
       - type: shell
         command: |
-          python3 $AGENT_DIR/system/scripts/dream/compress_memory.py
+          python3 $HEX_DIR/system/scripts/dream/compress_memory.py
         timeout: 1800
         on_success:
           - type: emit
@@ -301,7 +301,7 @@ rules:
     actions:
       - type: shell
         command: |
-          python3 $AGENT_DIR/system/scripts/dream/detect_patterns.py
+          python3 $HEX_DIR/system/scripts/dream/detect_patterns.py
         timeout: 600
         on_success:
           - type: emit
@@ -464,7 +464,7 @@ rules:
     actions:
       - type: shell
         command: |
-          python3 $AGENT_DIR/system/scripts/dream/prune_memory.py
+          python3 $HEX_DIR/system/scripts/dream/prune_memory.py
         timeout: 600
         on_success:
           - type: emit
