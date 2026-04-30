@@ -30,6 +30,14 @@ run_check() {
     local results
     results=$(grep -rn "$pattern" . \
         --exclude-dir=.git \
+        --exclude-dir=target \
+        --exclude-dir=node_modules \
+        --exclude-dir=.boi \
+        --exclude-dir=worktrees \
+        --exclude-dir=__pycache__ \
+        --exclude-dir=dist \
+        --exclude-dir=.hex \
+        --exclude-dir=.claude \
         "$@" 2>/dev/null \
         | grep -v "/${SELF}:" \
         | grep -v "personalization-audit" \
