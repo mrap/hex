@@ -28,12 +28,12 @@ if [ -z "${AGENT_DIR:-}" ]; then
     fi
     candidate="$(dirname "$candidate")"
   done
-  AGENT_DIR="${AGENT_DIR:-$HOME/mrap-hex}"
+  AGENT_DIR="${HEX_DIR:-${AGENT_DIR:-$HOME/hex}}"
 fi
 
 CLAUDE_DIR="$AGENT_DIR/.claude"
-SCRIPTS_DIR="$CLAUDE_DIR/scripts"
-HEX_CHECKS_DIR="$AGENT_DIR/scripts/doctor-checks"
+SCRIPTS_DIR="$AGENT_DIR/.hex/scripts"
+HEX_CHECKS_DIR="$AGENT_DIR/.hex/scripts/doctor-checks"
 
 # ─── Flags ────────────────────────────────────────────────────────────────────
 FIX=false

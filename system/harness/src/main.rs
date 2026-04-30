@@ -358,7 +358,7 @@ fn run_extension_command(command: ExtensionCommands) {
         }
 
         ExtensionCommands::Validate { path } => {
-            let script = hex_dir.join("system/scripts/extension-validate.py");
+            let script = hex_dir.join(".hex/scripts/extension-validate.py");
             let status = std::process::Command::new("python3")
                 .arg(&script)
                 .arg(&path)
@@ -506,7 +506,7 @@ fn get_hex_dir() -> PathBuf {
         eprintln!("ERROR: neither HEX_DIR nor HOME is set");
         std::process::exit(1);
     });
-    let p = PathBuf::from(&home).join("mrap-hex");
+    let p = PathBuf::from(&home).join("hex");
     if !p.join("CLAUDE.md").exists() {
         eprintln!(
             "ERROR: default hex dir {} does not contain CLAUDE.md — set HEX_DIR explicitly",
@@ -1063,7 +1063,7 @@ fn main() {
         },
         Commands::Integration { command } => {
             let hex_dir = get_hex_dir();
-            let script = hex_dir.join("system/scripts/hex-integration");
+            let script = hex_dir.join(".hex/scripts/hex-integration");
             let (subcmd, name_arg): (&str, Option<String>) = match &command {
                 IntegrationCommands::Install { name } => ("install", Some(name.clone())),
                 IntegrationCommands::Uninstall { name } => ("uninstall", Some(name.clone())),
@@ -1130,7 +1130,7 @@ fn main() {
                     cmd.status().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
                 }
                 _ => {
-                    let hex_memory = hex_dir.join("system/scripts/bin/hex-memory");
+                    let hex_memory = hex_dir.join(".hex/scripts/bin/hex-memory");
                     let mut cmd = std::process::Command::new("bash");
                     cmd.arg(&hex_memory);
                     match &command {
@@ -1170,7 +1170,7 @@ fn main() {
         }
         Commands::Doctor { fix, smoke, quiet, json } => {
             let hex_dir = get_hex_dir();
-            let script = hex_dir.join("system/scripts/hex-doctor");
+            let script = hex_dir.join(".hex/scripts/hex-doctor");
             let telemetry = std::sync::Arc::new(hex::telemetry::Telemetry::new(&hex_dir));
             let start = std::time::Instant::now();
             let mut cmd = std::process::Command::new("bash");
