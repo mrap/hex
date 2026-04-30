@@ -105,6 +105,9 @@ cp -r "$SCRIPT_DIR/system" "$TARGET_DIR/.hex"
 # Create user-space extensions directory (never overwritten by hex upgrade)
 mkdir -p "$TARGET_DIR/.hex/extensions"
 
+# Create memory directory for markdown-format memories
+mkdir -p "$TARGET_DIR/.hex/memory"
+
 # Copy root templates
 cp "$SCRIPT_DIR/templates/CLAUDE.md"  "$TARGET_DIR/CLAUDE.md"
 cp "$SCRIPT_DIR/templates/AGENTS.md"  "$TARGET_DIR/AGENTS.md"
@@ -378,6 +381,9 @@ install_hex_events_from_source() {
     for item in "$src_dir"/*; do
         name="$(basename "$item")"
         [ "$name" = "policies" ] && continue
+        dst="$dst_dir/$name"
+        # Remove stale symlinks so cp writes a real file instead of following them
+        [ -L "$dst" ] && rm -f "$dst"
         cp -R "$item" "$dst_dir/"
     done
     echo "  hex-events installed from system/events/  ✓"
