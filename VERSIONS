@@ -7,5 +7,5 @@
 # To bump: tag new releases in boi, then update these values.
 # hex-events is now inline at system/events/ (merged v0.2.0 → v0.8.0)
 
-BOI_VERSION=v1.0.0
+BOI_VERSION=v1.1.0
 HARNESS_VERSION=v0.8.0
