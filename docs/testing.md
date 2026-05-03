@@ -42,6 +42,7 @@ Current suites:
 | `test-messaging` | Message send/receive/filter with SQLite verification |
 | `test-sse` | SSE subscribe/publish, topic filtering, heartbeat |
 | `test-telemetry` | Telemetry JSONL written to `.hex/telemetry/` |
+| `test-doctor-events-coverage` | `hex-doctor` fails loudly on broken policies (parse errors named), passes on valid policies |
 
 ## Tests added in v0.2.4
 
