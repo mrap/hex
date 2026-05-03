@@ -351,13 +351,13 @@ else
       return
     fi
 
-    local BIN_VER
-    BIN_VER=$("$hex_bin" --version 2>&1 | awk '{print $2}')
+    local hex_version
+    hex_version=$("$hex_bin" --version 2>&1 | awk '{print $2}')
 
-    if [ "$CARGO_VER" != "$BIN_VER" ]; then
-      _error "version-sync: Cargo.toml=$CARGO_VER but binary reports $BIN_VER — rebuild needed"
+    if [ "$CARGO_VER" != "$hex_version" ]; then
+      _error "version-sync: Cargo.toml=$CARGO_VER but binary reports $hex_version — rebuild needed"
       _info  "  Run: cd $HEX_DIR/.hex/harness && cargo build --release && cp target/release/hex $hex_bin"
-      _rec 67 "version-sync" "error" "Cargo.toml=$CARGO_VER binary=$BIN_VER"
+      _rec 67 "version-sync" "error" "Cargo.toml=$CARGO_VER binary=$hex_version"
       return
     fi
 

@@ -173,7 +173,7 @@ info "Source layout: $SOURCE_LAYOUT"
 header "2. Core Components"
 
 HEX_EVENTS_REPO="https://github.com/mrap/hex-events.git"
-HEX_EVENTS_DIR="$HOME/.hex-events"
+HEX_EVENTS_DIR="${HEX_EVENTS_DIR:-$HOME/.hex-events}"
 HEX_EVENTS_SRC="${HEX_EVENTS_SRC:-$HOME/github.com/mrap/hex-events}"
 BOI_INSTALLER_URL="https://raw.githubusercontent.com/mrap/boi/main/install-public.sh"
 
@@ -384,7 +384,7 @@ install_hex_events() {
         if $DRY_RUN; then
           info "[dry-run] Would re-run hex-events install.sh"
         else
-          bash "$src_dir/install.sh" 2>&1 | while read -r line; do info "  $line"; done
+          HEX_EVENTS_DIR="$HEX_EVENTS_DIR" bash "$src_dir/install.sh" 2>&1 | while read -r line; do info "  $line"; done
           pass "hex-events updated"
           if ! verify_hex_events; then
             # Verification failed — roll back to the pre-upgrade commit
@@ -393,7 +393,7 @@ install_hex_events() {
               git -C "$src_dir" reset --hard "$SAVED_SHA" 2>&1 | head -3 || true
               # Re-run install.sh to rebuild venv and LaunchAgents against the rolled-back code
               if [ -f "$src_dir/install.sh" ]; then
-                bash "$src_dir/install.sh" 2>&1 | while read -r line; do info "  $line"; done
+                HEX_EVENTS_DIR="$HEX_EVENTS_DIR" bash "$src_dir/install.sh" 2>&1 | while read -r line; do info "  $line"; done
               fi
               # On macOS: reload the LaunchAgent so the daemon restarts with rolled-back code
               if [[ "$(uname)" == "Darwin" ]]; then
@@ -422,7 +422,7 @@ install_hex_events() {
       mkdir -p "$(dirname "$HEX_EVENTS_SRC")"
       if git clone "$HEX_EVENTS_REPO" "$HEX_EVENTS_SRC" 2>&1 | while read -r line; do info "  $line"; done; then
         if [ -f "$HEX_EVENTS_SRC/install.sh" ]; then
-          bash "$HEX_EVENTS_SRC/install.sh" 2>&1 | while read -r line; do info "  $line"; done
+          HEX_EVENTS_DIR="$HEX_EVENTS_DIR" bash "$HEX_EVENTS_SRC/install.sh" 2>&1 | while read -r line; do info "  $line"; done
           pass "hex-events installed"
           verify_hex_events
         else
@@ -670,6 +670,48 @@ if [ "$SOURCE_LAYOUT" = "v1" ]; then
   fi
 fi
 
+# ─── Deletion pass — prune files no longer present in foundation ──────────────
+# Walk each tracked install dir; any file missing from the source is stale.
+# Back it up before deletion so it's recoverable. Loud logging — no silent deletes.
+_DELETION_BACKUP_DIR="${BACKUP_DIR:-$HEX_DOTDIR/.upgrade-backup-$(date +%Y%m%d-%H%M%S)}"
+_DELETED=0
+
+_prune_stale_files() {
+  local install_dir="$1" source_dir="$2"
+  [ -d "$install_dir" ] || return 0
+  [ -d "$source_dir" ]  || return 0
+  while IFS= read -r -d '' _install_file; do
+    _rel="${_install_file#"$install_dir"/}"
+    # skip pycache
+    [[ "$_rel" == *__pycache__* ]] && continue
+    if [ ! -e "$source_dir/$_rel" ]; then
+      _bak="$_DELETION_BACKUP_DIR/$_rel"
+      mkdir -p "$(dirname "$_bak")"
+      cp "$_install_file" "$_bak"
+      rm "$_install_file"
+      info "  rm (not in foundation): $_rel"
+      _DELETED=$((_DELETED + 1))
+    fi
+  done < <(find "$install_dir" -type f -print0 2>/dev/null)
+}
+
+info "Running deletion pass — pruning files removed from foundation..."
+_prune_stale_files "$HEX_DOTDIR/scripts"  "$SOURCE_DIR/$SOURCE_SUBDIR_SCRIPTS"
+_prune_stale_files "$HEX_DOTDIR/skills"   "$SOURCE_DIR/$SOURCE_SUBDIR_SKILLS"
+_prune_stale_files "$HEX_DOTDIR/commands" "$SOURCE_DIR/$SOURCE_SUBDIR_COMMANDS"
+if [ "$SOURCE_LAYOUT" = "v1" ] && [ -n "${SOURCE_SUBDIR_HOOKS:-}" ]; then
+  _prune_stale_files "$HEX_DOTDIR/hooks" "$SOURCE_DIR/$SOURCE_SUBDIR_HOOKS"
+fi
+# Mirror pruning to runtime slash-command dir (set above in commands block, default .claude)
+_runtime_cmd_dir="${RUNTIME_CMD_DIR:-$HEX_DIR/.claude}"
+_prune_stale_files "$_runtime_cmd_dir/commands" "$SOURCE_DIR/$SOURCE_SUBDIR_COMMANDS"
+
+if [ "$_DELETED" -gt 0 ]; then
+  pass "Deletion pass: removed $_DELETED stale file(s) — backed up to ${_DELETION_BACKUP_DIR##*/}"
+else
+  info "Deletion pass: nothing to prune"
+fi
+
 # Make scripts executable
 find "$HEX_DOTDIR" -name "*.sh" -type f -exec chmod +x {} +
 
@@ -783,6 +825,33 @@ if [ -f "$VERSIONS_FILE" ]; then
       } > "${VERSIONS_FILE}.tmp" && mv "${VERSIONS_FILE}.tmp" "$VERSIONS_FILE"
 
       pass "VERSIONS → HEX_FOUNDATION_VERSION=v${_cargo_ver}${_boi_ver:+, BOI_VERSION=v${_boi_ver}}"
+
+      # ── O1: Sync harness source + rebuild hex binary if version changed ──────
+      if [ -f "$SOURCE_DIR/system/harness/Cargo.toml" ]; then
+        mkdir -p "$HEX_DOTDIR/harness"
+        rsync -a --exclude='target/' "$SOURCE_DIR/system/harness/" "$HEX_DOTDIR/harness/"
+        _installed_bin="$HEX_DOTDIR/bin/hex"
+        _installed_ver=$("$_installed_bin" --version 2>/dev/null | awk '{print $2}' || echo "")
+        if [ "$_installed_ver" != "$_cargo_ver" ]; then
+          info "hex binary version mismatch (${_installed_ver:-none} → $_cargo_ver) — rebuilding..."
+          if ! command -v cargo &>/dev/null; then
+            fail "cargo not found — install Rust and rerun upgrade to rebuild hex binary"
+            exit 1
+          fi
+          (cd "$HEX_DOTDIR/harness" && cargo build --release)
+          cp "$HEX_DOTDIR/harness/target/release/hex" "$_installed_bin"
+          codesign --force --sign - "$_installed_bin" 2>/dev/null || true
+          chmod +x "$_installed_bin"
+          _new_ver=$("$_installed_bin" --version 2>/dev/null | awk '{print $2}' || echo "")
+          if [ "$_new_ver" != "$_cargo_ver" ]; then
+            fail "hex binary version mismatch after build: got '${_new_ver:-unknown}', expected '$_cargo_ver'"
+            exit 1
+          fi
+          pass "hex binary rebuilt and swapped: v$_cargo_ver"
+        else
+          pass "hex binary already at v$_cargo_ver — no rebuild needed"
+        fi
+      fi
     else
       warn "Could not read Cargo.toml version from source — VERSIONS not updated"
     fi
@@ -863,7 +932,7 @@ if [ -n "$RC_FILE" ]; then
   fi
 else
   warn "Could not detect shell rc file. Add manually:"
-  info "  $ALIAS_LINE"
+  info "  $HEX_PATH_LINE"
   info '  claude() { command claude --dangerously-skip-permissions "$@"; }'
 fi
 
