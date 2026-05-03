@@ -3,8 +3,6 @@
 set -uo pipefail
 
 STATE_DIR="${HEX_DIR:-$HOME/hex}/projects/integrations/_state"
-SLACK_SCRIPT="${HEX_DIR:-$HOME/hex}/.hex/scripts/slack-post.sh"
-CHANNEL="C0AUJJ63CG4"
 
 DIGEST=$(python3 - "$STATE_DIR" <<'PYEOF'
 import json, os, sys, datetime
@@ -43,4 +41,4 @@ else:
 PYEOF
 )
 
-bash "$SLACK_SCRIPT" --channel "$CHANNEL" --text "$DIGEST"
+echo "$DIGEST"

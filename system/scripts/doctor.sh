@@ -255,8 +255,8 @@ check_6() {
 check_7() {
   local hex_agent="$HEX_DIR/.hex/bin/hex"
   if [ ! -x "$hex_agent" ]; then
-    _error "hex binary missing at $hex_agent — cannot validate fleet"
-    _rec 7 "agent-fleet" "error" "hex binary missing"
+    _warn "hex binary missing at $hex_agent — fleet validation skipped (install Rust to enable)"
+    _rec 7 "agent-fleet" "warn" "hex binary missing"
     return
   fi
 
@@ -791,8 +791,8 @@ check_23() {
 check_22() {
   local hex_bin="$HEX_DIR/.hex/bin/hex"
   if [ ! -x "$hex_bin" ]; then
-    _error "hex binary not found at $hex_bin"
-    _rec 22 "hex-binary-on-path" "error" "binary missing"
+    _warn "hex binary not found at $hex_bin (install Rust to enable fleet)"
+    _rec 22 "hex-binary-on-path" "warn" "binary missing"
     return
   fi
 

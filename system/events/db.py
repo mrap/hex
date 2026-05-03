@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS action_log (
     action_detail TEXT,
     status TEXT NOT NULL,
     error_message TEXT,
-    executed_at TEXT DEFAULT (datetime('now'))
+    executed_at TEXT DEFAULT (datetime('now')),
+    action_result TEXT
 );
 CREATE TABLE IF NOT EXISTS deferred_events (
     id INTEGER PRIMARY KEY,
@@ -106,6 +107,10 @@ class EventsDB:
         if "workflow" not in pel_cols:
             self.conn.execute("ALTER TABLE policy_eval_log ADD COLUMN workflow TEXT")
             self.conn.commit()
+        al_cols = [r[1] for r in self.conn.execute("PRAGMA table_info(action_log)").fetchall()]
+        if "action_result" not in al_cols:
+            self.conn.execute("ALTER TABLE action_log ADD COLUMN action_result TEXT")
+            self.conn.commit()
 
     def close(self):
         self.conn.close()
@@ -147,11 +152,12 @@ class EventsDB:
         self.conn.commit()
 
     def log_action(self, event_id: int, recipe: str, action_type: str,
-                   action_detail: str, status: str, error_message: str | None = None):
+                   action_detail: str, status: str, error_message: str | None = None,
+                   action_result: str | None = None):
         self.conn.execute(
-            "INSERT INTO action_log (event_id, recipe, action_type, action_detail, status, error_message) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (event_id, recipe, action_type, action_detail, status, error_message),
+            "INSERT INTO action_log (event_id, recipe, action_type, action_detail, status, error_message, action_result) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event_id, recipe, action_type, action_detail, status, error_message, action_result),
         )
         self.conn.commit()
 

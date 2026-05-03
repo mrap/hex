@@ -5,12 +5,6 @@
 # Target: 100% of surfaces covered by checks that run at least hourly.
 
 surfaces:
-  - id: slack-channels
-    description: Slack cc-connect bridge — messages in/out of #from-hex-instance
-    checks:
-      - check-cc-connect.sh
-      - check-slack-bot.sh
-
   - id: hex-eventd
     description: hex event daemon — backbone for all surface communication
     checks:

@@ -18,9 +18,6 @@ RESEARCH_DIR="$WORKSPACE/raw/research"
 PROJECTS_DIR="$WORKSPACE/projects"
 LANDINGS_DIR="$WORKSPACE/landings/weekly"
 BOI_QUEUE="$HOME/.boi/queue"
-SLACK_SCRIPT="$SCRIPT_DIR/slack-post.sh"
-SLACK_CHANNEL="${HEX_MAIN_CHANNEL}"
-
 FORCE=false
 DRY_RUN=false
 
@@ -181,22 +178,6 @@ TMP_FILE="$(mktemp)"
 echo "$DIGEST" > "$TMP_FILE"
 mv "$TMP_FILE" "$DIGEST_FILE"
 echo "Digest written: $DIGEST_FILE"
-
-# ── 8. Slack summary ──────────────────────────────────────────────────────────
-SLACK_MSG="*Hex W${WEEK_NUM} Synthesis Digest*
-You fed hex ${captures_total} input(s) this week. ${captures_dispatched} triggered BOI specs. ${synthesis_count} led to synthesis outputs. ${open_count} open threads remain.
-Full digest: \`landings/weekly/synthesis-${YEAR}-W${WEEK_NUM}.md\`"
-
-if [ -f "$SLACK_SCRIPT" ]; then
-  echo "[weekly-synthesis-digest] Posting summary to Slack..."
-  if bash "$SLACK_SCRIPT" --channel "$SLACK_CHANNEL" --text "$SLACK_MSG" 2>&1; then
-    echo "[weekly-synthesis-digest] Slack post ok"
-  else
-    echo "[weekly-synthesis-digest] Slack post failed (non-fatal)"
-  fi
-else
-  echo "[weekly-synthesis-digest] slack-post.sh not found — skipping Slack"
-fi
 
 echo ""
 echo "=== Done ==="

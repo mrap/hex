@@ -120,9 +120,6 @@ agent_check_circuit_breaker() {
     err_file="$(dirname "$log_file")/last-error.txt"
     [ -f "$err_file" ] && last_err=$(tail -1 "$err_file" 2>/dev/null | head -c 200)
     local msg="Agent *${agent_id}* circuit-tripped: ${fail_streak} consecutive failures. Auto-halted. ${last_err:+Last error: \`$last_err\`}"
-    if ! cc-connect send --message "$msg" 2>/dev/null; then
-      echo "[WARN] cc-connect notification failed (cc-connect unavailable?)" >&2
-    fi
     echo "$msg" >&2
     return 1
   fi

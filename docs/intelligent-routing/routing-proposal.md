@@ -249,7 +249,7 @@ When `context_pct` reaches 0.85, the routing layer does a **hard compact before 
 ```
 1. Wait for any in-progress checkpoint to complete (max 30s timeout)
 2. Reset the session: clear agent_session_id in cc-connect session file
-   (same as hex-session-reset.sh)
+   (session reset now done via /hex-shutdown slash command)
 3. On next message delivery, context loader re-hydrates from checkpoint
 4. Update session_affinity: context_pct = estimated post-compact value
 ```

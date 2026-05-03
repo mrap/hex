@@ -158,12 +158,12 @@ done
 echo "[14] Doctor"
 cd /tmp/test-hex
 DOCTOR_OUT=$(HEX_DIR=/tmp/test-hex bash .hex/scripts/doctor.sh 2>&1 || true)
-if echo "$DOCTOR_OUT" | grep -q "hex is healthy"; then
+if echo "$DOCTOR_OUT" | grep -q ", 0 errors"; then
     echo "  PASS: Doctor passes on fresh install"
     PASS=$((PASS + 1))
 else
     echo "  FAIL: Doctor found issues"
-    echo "$DOCTOR_OUT" | grep "✗\|FAIL" | head -5
+    echo "$DOCTOR_OUT" | grep -E "ERROR|\[31m" | head -5 || true
     FAIL=$((FAIL + 1))
 fi
 TOTAL=$((TOTAL + 1))

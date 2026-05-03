@@ -10,7 +10,7 @@ HEALTH_DIR="${HEX_DIR:-$HOME/hex}/.hex/scripts/health"
 HEX_EMIT="python3 $HOME/.hex-events/hex_emit.py"
 
 case "$TIER" in
-  critical)  NAMES="check-cc-connect check-slack-bot check-hex-eventd" ;;
+  critical)  NAMES="check-hex-eventd" ;;
   important) NAMES="check-mcp-servers check-secrets check-tailscale" ;;
   standard)  NAMES="check-kalshi" ;;
   *)

@@ -64,7 +64,6 @@ while IFS= read -r _aid; do
     # Underlying issue is fixed — remove HALT so agent can retry
     rm -f "$_halt"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] auto-recovered agent $_aid (claude reachable, HALT removed)" >&2
-    cc-connect send --message "Agent *${_aid}* auto-recovered by watchdog (claude reachable). HALT removed." 2>/dev/null || true
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] agent $_aid halted — claude still not reachable, keeping HALT" >&2
   fi

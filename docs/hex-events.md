@@ -470,6 +470,7 @@ CREATE TABLE action_log (
     action_detail  TEXT,                -- JSON of action params
     status         TEXT NOT NULL,       -- success, error, rate_limited
     error_message  TEXT,
+    action_result  TEXT,                -- JSON; on success: {"retry_count": <int>, ...}
     executed_at    TEXT DEFAULT (datetime('now'))
 );
 ```

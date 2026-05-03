@@ -464,9 +464,11 @@ def run_action_with_retry(action, event_id: int, recipe_name: str, payload: dict
         status = result.get("status", "error")
 
         if status != "error":
+            action_result_json = json.dumps({"retry_count": attempt})
             db.log_action(event_id, recipe_name, action.type,
                           json.dumps(action.params), status,
-                          result.get("output", ""))
+                          result.get("output", ""),
+                          action_result=action_result_json)
             _dispatch_sub_actions(action.params.get("on_success"), payload,
                                   result, db, workflow_context=workflow_context)
             return result
