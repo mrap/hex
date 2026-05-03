@@ -2,7 +2,7 @@
 import re
 import yaml
 
-VALID_ACTION_TYPES = {"shell", "emit", "notify", "update-file", "noop"}
+VALID_ACTION_TYPES = {"shell", "emit", "notify", "update-file", "noop", "dagu"}
 VALID_CONDITION_OPS = {"eq", "neq", "contains", "gt", "lt", "gte", "lte", "glob", "regex"}
 _DURATION_RE = re.compile(r"^\d+[smhd]$")
 
