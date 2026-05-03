@@ -138,8 +138,10 @@ What it does:
 1. Backs up `.hex/` to `.hex-upgrade-backup-YYYYMMDD/`
 2. Detects source layout (v1 `dot-claude/` or v2 `system/`) and maps paths accordingly
 3. Replaces `.hex/` (preserving `memory.db`)
-4. Merges `CLAUDE.md`: system zone replaced, user zone preserved
-5. Runs `doctor.sh`
+4. Deletion pass: removes files no longer present in foundation (backed up before deletion)
+5. Rebuilds the `hex` binary if the Cargo.toml version changed; verifies the installed binary matches
+6. Merges `CLAUDE.md`: system zone replaced, user zone preserved
+7. Runs `doctor.sh`
 
 Your data (`me/`, `projects/`, `people/`, `evolution/`, `landings/`, `raw/`, `todo.md`) is never touched.
 
