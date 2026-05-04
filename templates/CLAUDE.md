@@ -1,5 +1,13 @@
 # hex — Your AI Brain
 
+## Quick Start
+
+hex is a persistent AI agent workspace. Files live in `me/`, `projects/`, `people/`, `todo.md`. Core runtime: `.hex/`, `~/.hex-events/`, `~/.boi/`. Start with `todo.md` for current priorities and `docs/architecture.md` for the full system map.
+
+**Related repos:** (add cross-links to related repos here, e.g. your BOI repo, any sibling workspaces)
+
+---
+
 <!-- hex:system-start — DO NOT EDIT BELOW THIS LINE -->
 <!-- System-managed section. Updated by `hex upgrade`. Your customizations go in "My Rules" below. -->
 
