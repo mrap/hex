@@ -8,6 +8,12 @@
 > Codex reads AGENTS.md directly — there are no slash commands or first-class
 > skills. Read this file and browse `.hex/skills/` to discover capabilities.
 
+## Quick Start
+
+hex-foundation is the versioned base for the hex agent system. It provides Standing Orders, skills, directory structure conventions, and upgrade tooling that agent instances inherit. To explore: `ls system/` for core hex files, `cat getting-started.md` for setup instructions. To upgrade an existing hex instance: run `hex upgrade` in the target workspace. See `architecture.md` for design rationale.
+
+---
+
 ## Core Philosophy
 
 You are a persistent AI agent that compounds over time.
@@ -523,6 +529,29 @@ Every status change gets a timestamped changelog entry at the bottom.
 - Produce artifacts, not just advice. Draft the email, write the doc, build the framework.
 - Own the reminder loop. If something is due, surface it.
 - Keep output concise. Show the result, not the process.
+
+---
+
+## Gotchas
+
+- **`<!-- hex:system-start -->` / `<!-- hex:system-end -->` markers** delimit the managed section. `hex upgrade` replaces everything between them. Never put custom rules between these markers — they will be overwritten on the next upgrade.
+- **`## My Rules` section is user-preserved.** All instance customization goes in the `## My Rules` block below `<!-- hex:user-end -->`. It survives upgrades.
+- **`GEMINI.md` is NOT a symlink in hex instances** — it has Gemini-specific runtime differences. Treat it separately from `AGENTS.md`/`CLAUDE.md`.
+- **`hex upgrade` pulls, never pushes.** Running `hex upgrade` in an instance overwrites the system section with the latest from hex-foundation. Changes to an instance don't flow back automatically.
+- **`CLAUDE.md` in this repo is a symlink to `AGENTS.md`.** If a git clone resolves it as a text file (Windows without `core.symlinks=true`), run `git checkout CLAUDE.md` to restore the symlink.
+- **Codex 32 KiB combined limit.** This file + any subdirectory AGENTS.md files must total < 32 KiB for Codex compatibility. Currently ~22 KB — keep additions modest.
+
+---
+
+## How to Modify hex-foundation
+
+1. **Edit `AGENTS.md`** (canonical). `CLAUDE.md` is a symlink — edits to `AGENTS.md` propagate automatically.
+2. **Standing Orders changes**: edit the relevant table row above; append new rules at the bottom with today's date in a note.
+3. **Add a new skill**: create `system/skills/<name>/SKILL.md` following the template in `system/templates/`.
+4. **Distribute to instances**: after editing AGENTS.md, copy the system block to any downstream hex instance's `AGENTS.md` via `hex upgrade` (or manually copy the system section between the markers).
+5. **Cut a version**: update `system/version.txt`, add an entry to `CHANGELOG.md`, commit locally.
+6. **Test before deploying**: run `bash tests/run.sh` if tests exist; then run `hex upgrade` in a test instance and verify it picks up the changes.
+7. **Per SO #5 (Communication gates)**: commit locally; never push without explicit approval.
 
 <!-- hex:system-end -->
 
