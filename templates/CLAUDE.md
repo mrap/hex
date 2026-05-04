@@ -227,39 +227,14 @@ To add a new rule: append a row with the next number, the rule, and today's date
 
 ### Layer 2 Mechanisms
 
-These are enforcement patterns that activate automatically. They have "teeth" — they're not suggestions, they're checkpoints.
+Enforcement checkpoints with "teeth" — they activate automatically, not on request.
 
-**BOI Delegation Check**
-Activates before executing: 3+ file edits, 3+ sequential commands, any task taking > 2 minutes inline.
-
-Decision tree:
-1. Is this a single-line edit? → Do it inline.
-2. Is this recurring, scheduled, or reactive (fires on an event)? → **Write a hex-events policy** (`~/.hex-events/policies/*.yaml`). NEVER use CronCreate, hooks, or cron.
-3. Is this multi-step work, research, or generation (3+ file edits, >2 min, or decomposable)? → **Write a YAML BOI spec and dispatch** (`boi dispatch <spec.yaml>`). YAML only — markdown specs are rejected. NEVER code inline for multi-file projects.
-4. Is it a one-time lookup or simple edit? → Do it inline.
-
-This is Core Rule #6 (BOI default) with teeth.
-
-**Pre-Output Critique Gate**
-Activates before presenting: recommendations, benchmark results, "done" claims, architecture proposals. Also activates when evaluating completion claims from any source (BOI reports, CI summaries, subagent results).
-
-Checklist (answer internally before responding):
-1. Weakest assumption? Name it.
-2. What follow-up will the user ask? Answer it preemptively.
-3. What's missing from the evidence? Say so upfront.
-4. Uniform results? Perfect scores = broken measurement (Core Rule #9).
-5. Did I actually verify? Evidence before assertions (Core Rule #1).
-6. Inbound claims challenged? If someone else claimed completion, request and review evidence before accepting.
-
-**Verbal-to-Mechanical Check**
-Activates after receiving: eval results showing a gap, a correction, a coaching moment, a self-identified pattern.
-
-Check: Does my response include a mechanical action (file write, config change)? If it's purely verbal ("Got it", "I'll remember"), STOP. Ask: what file makes this change permanent? Do it now. This is Core Rule #10 with teeth.
-
-**Post-Task Landings Update**
-Activates after completing work that maps to a landing item.
-
-Check: Did I just complete work tracked in today's landings? → Update the landings file NOW before responding.
+| Mechanism | Activates | Action |
+|-----------|-----------|--------|
+| **BOI Delegation** | Before: 3+ edits, 3+ commands, or >2 min inline | Single edit → inline. Recurring/event → hex-events policy. Multi-step/research → BOI spec. YAML only. (Rule #6) |
+| **Pre-Output Critique** | Before: recommendations, "done" claims, benchmarks, architecture | Name weakest assumption. Preempt follow-ups. Cite evidence. Question uniform/perfect results. Challenge inbound completion claims. (Rules #1, #9) |
+| **Verbal-to-Mechanical** | After: correction, coaching, or self-identified pattern | If response is purely verbal ("Got it"), STOP — write the file or config change NOW. (Rule #10) |
+| **Landings Update** | After: completing work mapped to a landing item | Update landings file before responding. (Rule #2) |
 
 ---
 
