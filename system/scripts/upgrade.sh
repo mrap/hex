@@ -670,6 +670,11 @@ if [ "$SOURCE_LAYOUT" = "v1" ]; then
   fi
 fi
 
+# Update version.txt from foundation source (v2 layout only)
+if [ "$SOURCE_LAYOUT" = "v2" ] && [ -f "$SOURCE_DIR/system/version.txt" ]; then
+  cp "$SOURCE_DIR/system/version.txt" "$HEX_DOTDIR/version.txt"
+fi
+
 # ─── Deletion pass — prune files no longer present in foundation ──────────────
 # Walk each tracked install dir; any file missing from the source is stale.
 # Back it up before deletion so it's recoverable. Loud logging — no silent deletes.
