@@ -459,12 +459,14 @@ def run_action_with_retry(action, event_id: int, recipe_name: str, payload: dict
 
     backoff = 1
     for attempt in range(max_retries + 1):
+        _action_start = time.monotonic()
         result = handler.run(action.params, event_payload=payload, db=db,
                              workflow_context=workflow_context)
         status = result.get("status", "error")
 
         if status != "error":
-            action_result_json = json.dumps({"retry_count": attempt})
+            _action_duration = round(time.monotonic() - _action_start, 3)
+            action_result_json = json.dumps({"retry_count": attempt, "duration": _action_duration})
             db.log_action(event_id, recipe_name, action.type,
                           json.dumps(action.params), status,
                           result.get("output", ""),
