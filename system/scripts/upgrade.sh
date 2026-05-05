@@ -568,7 +568,19 @@ if [ -f "$SOURCE_DIR/templates/CLAUDE.md.template" ]; then
   fi
 fi
 
-if [ "$CHANGED" -eq 0 ] && [ "$NEW" -eq 0 ] && [ "$TEMPLATE_CHANGED" = false ]; then
+# Check version.txt for v2 layout — must happen before the early-exit check
+VERSION_CHANGED=false
+if [ "$SOURCE_LAYOUT" = "v2" ] && [ -f "$SOURCE_DIR/system/version.txt" ]; then
+  _src_ver=$(cat "$SOURCE_DIR/system/version.txt")
+  _dst_ver=$(cat "$HEX_DOTDIR/version.txt" 2>/dev/null || echo "")
+  if [ "$_src_ver" != "$_dst_ver" ]; then
+    VERSION_CHANGED=true
+    CHANGES_LOG="${CHANGES_LOG}  ~ version.txt (${_dst_ver} → ${_src_ver})\n"
+    info "version.txt: ${_dst_ver} → ${_src_ver}"
+  fi
+fi
+
+if [ "$CHANGED" -eq 0 ] && [ "$NEW" -eq 0 ] && [ "$TEMPLATE_CHANGED" = false ] && [ "$VERSION_CHANGED" = false ]; then
   pass "Everything is up to date. Nothing to do."
   exit 0
 fi
