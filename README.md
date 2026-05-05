@@ -73,6 +73,7 @@ Companion systems installed alongside:
 ### Auto-configured by install.sh
 
 - **Claude Code hooks** — `install.sh` writes `PreToolUse`, `PostToolUse`, `Stop`, and `SessionStart` hooks into `.claude/settings.json` automatically. No manual hook setup required.
+- **Shell completions** — `install.sh` and `upgrade.sh` automatically install shell completions for your current shell (zsh, bash, or fish) after the binary is in place. Idempotent: re-running produces no diff. See [Shell completions](#shell-completions) for manual setup or bespoke paths.
 - **Default event policies** — a starter set of hex-events policies is deployed to `~/.hex-events/policies/` during install, enabling out-of-the-box reactivity (agent lifecycle, scheduler, BOI completion events).
 
 ---
@@ -343,6 +344,15 @@ bash tests/eval/run_eval_macos.sh            # macOS Tart
 ---
 
 ## Roadmap
+
+v0.12.0 adds: **Upgrade reliability, shell completions, failure-revive protocol, and doctor improvements.**
+- **Shell completions**: `hex completions bash|zsh|fish` generates completion scripts for all subcommands. Install snippets in README.
+- **Upgrade reliability**: 5-bug patch to `/hex-upgrade` — stale-symlink cleanup, RC file detection, hex-binary version sync via Cargo.toml. Docker E2E 101/101.
+- **Doctor enhanced**: hex events daemon status absorbed into health checks; hex-binary version-sync check added (catches binary/Cargo.toml divergence).
+- **Failure-revive protocol**: three-strike detection + spec-owner-resolver + build-failure-brief for automated BOI failure analysis.
+- **Policy validator**: `dagu` added to VALID_ACTION_TYPES, fixing false-positive validation errors.
+- **AGENTS.md**: Quick Start, Gotchas, and How to Modify sections; Layer 2 Mechanisms condensed to compact table. Cross-repo navigation links added.
+- **Cleanup**: cc-connect/slack-bot scripts removed (7 files). Attack surface reduced.
 
 v0.10.0 adds: **BOI v1.1.0 integration + containerized BOI E2E.**
 - **BOI v1.1.0**: pipeline-v2 phases (clean spec-pre / task / spec-post separation), interactive `boi dashboard` TUI, spec-critique↔spec-improve quality loop, deterministic phases (commit/merge/cleanup) that skip Claude. Upgrade: run `install.sh` again.
