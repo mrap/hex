@@ -188,10 +188,10 @@ else
     fail "check_23 not found in doctor.sh"
 fi
 
-if grep -q 'agent-dir-set' "$REPO_DIR/system/scripts/doctor.sh"; then
-    pass "agent-dir-set record in doctor.sh"
+if grep -q 'hex-dir-set' "$REPO_DIR/system/scripts/doctor.sh"; then
+    pass "hex-dir-set record in doctor.sh"
 else
-    fail "agent-dir-set not found in doctor.sh"
+    fail "hex-dir-set not found in doctor.sh"
 fi
 
 # ── Test 12: Install adds AGENT_DIR to shell rc ───────────────────

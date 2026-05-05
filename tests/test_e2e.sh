@@ -269,7 +269,7 @@ DOCTOR_JSON=$(HEX_DIR=/tmp/test-hex bash .hex/scripts/doctor.sh --json 2>&1 || t
 if echo "$DOCTOR_JSON" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
-found = any(c.get('id') == 23 and c.get('name') == 'agent-dir-set' for c in data.get('checks', []))
+found = any(c.get('id') == 23 and c.get('name') == 'hex-dir-set' for c in data.get('checks', []))
 sys.exit(0 if found else 1)
 " 2>/dev/null; then
     echo "  PASS: Doctor includes AGENT_DIR check (check 23)"
