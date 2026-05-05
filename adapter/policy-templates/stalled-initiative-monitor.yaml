@@ -1,0 +1,37 @@
+name: stalled-initiative-monitor
+description: >
+  6-hourly stalled-initiative detector. Scans projects/*/initiative-tracking.md
+  files for YAML frontmatter (required: initiative_id, horizon, blocked_by, krs[]).
+  Skips initiatives with no frontmatter or with blocked_by set.
+  Emits hex.initiative.stalled + messages owner after 48h silence.
+  Anti-spam: once per 24h per initiative (state in projects/cos/stall-monitor-state.json).
+  Critic-revised 2026-05-05 (HIGH severity): frontmatter gate, blocked suppression,
+  file-locked anti-spam state, "confirm status" directive.
+
+requires:
+  events:
+    - timer.tick.6h
+
+provides:
+  events:
+    - hex.initiative.stalled
+    - hex.initiative.blocked
+
+rate_limit:
+  max_fires: 4
+  window: 24h
+
+rules:
+  - name: check-stalled-initiatives
+    trigger:
+      event: timer.tick.6h
+    actions:
+      - type: shell
+        command: /Users/mrap/mrap-hex/.hex/scripts/health/check-stalled-initiatives.sh
+        timeout: 120
+        on_failure:
+          - type: shell
+            command: >
+              /Users/mrap/mrap-hex/.hex/scripts/hex-alert.sh ERROR
+              stall-monitor
+              "check-stalled-initiatives.sh failed to run (watchdog script error)"

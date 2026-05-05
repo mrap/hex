@@ -1,0 +1,34 @@
+name: fleet-pulse
+description: >
+  Hourly fleet health watchdog. Detects agent dormancy and ghost-waking.
+  Fires WARN for composite-liveness degradation, ERROR/CRITICAL for confirmed
+  dormancy. Suppresses alerts for budget-parked agents. Critic-revised
+  2026-05-05: composite liveness score, two-window escalation, budget-lockout
+  suppression.
+
+requires:
+  events:
+    - timer.tick.1h
+
+provides:
+  events:
+    - hex.fleet.agent.dormant
+
+rate_limit:
+  max_fires: 24
+  window: 24h
+
+rules:
+  - name: check-fleet-pulse
+    trigger:
+      event: timer.tick.1h
+    actions:
+      - type: shell
+        command: /Users/mrap/mrap-hex/.hex/scripts/health/check-fleet-pulse.sh
+        timeout: 120
+        on_failure:
+          - type: shell
+            command: >
+              /Users/mrap/mrap-hex/.hex/scripts/hex-alert.sh ERROR
+              fleet-pulse
+              "check-fleet-pulse.sh failed to run (watchdog script error)"
