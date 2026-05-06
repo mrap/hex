@@ -157,31 +157,53 @@ EOF
 mv "$TMP_STATE" "$STATE_FILE"
 
 # ─── Build payloads via Python to ensure valid JSON ──────────────────────────
-# Pass error as env var to avoid bash-null interpolation issues in heredoc
-_error_raw="$ERROR_MSG" \
+# Pass error as env var to the python subprocesses. CRITICAL: must `export`
+# before each `$(python3 -c ...)` capture — the `VAR=value FAIL_PAYLOAD=$(...)`
+# idiom does NOT propagate VAR into the command-substitution subshell because
+# both clauses are bash variable assignments (not a command invocation), so
+# VAR is set in the current shell but never exported. Bug shipped 11,948+
+# imessage events/day with `error: null` despite ERROR_MSG being correctly
+# populated in the state file. Fix: explicit export. See synthesis plan A5a.
+export _error_raw="$ERROR_MSG"
+
 OK_PAYLOAD="$(python3 -c "
-import json, os
+import json
 print(json.dumps({'name': '$NAME', 'latency_ms': $LATENCY_MS, 'checked_at': '$CHECKED_AT'}))
 ")"
 
-_error_raw="$ERROR_MSG" \
 FAIL_PAYLOAD="$(python3 -c "
 import json, os
 err = os.environ.get('_error_raw') or None
-print(json.dumps({'name': '$NAME', 'error': err, 'latency_ms': $LATENCY_MS, 'checked_at': '$CHECKED_AT'}))
+print(json.dumps({'name': '$NAME', 'error': err, 'latency_ms': $LATENCY_MS, 'checked_at': '$CHECKED_AT', 'streak': $NEW_STREAK}))
 ")"
 
-_error_raw="$ERROR_MSG" \
 TRANS_PAYLOAD="$(python3 -c "
 import json, os
 err = os.environ.get('_error_raw') or None
 print(json.dumps({'name': '$NAME', 'from': '$PRIOR_STATUS', 'to': '$NEW_STATUS', 'streak': $NEW_STREAK, 'error': err, 'checked_at': '$CHECKED_AT'}))
 ")"
 
+unset _error_raw
+
 # ─── Emit events ──────────────────────────────────────────────────────────────
+# Emit-throttle: when status is fail and streak > 1 with no transition, skip
+# the per-check fail event. The transition event still fires on entry to the
+# fail state, and downstream consumers (alert policies, doctor) can read the
+# state file for current snapshot. Without this, a single dead integration
+# (imessage with Messages.app down) generates 8+ events/min indefinitely —
+# observed at 11,948/day for the imessage probe alone. Heartbeat every 60
+# checks keeps long-running fails visible in the event log without spam.
+SHOULD_EMIT_FAIL=true
+if [[ "$NEW_STATUS" == "fail" && "$NEW_STREAK" -gt 1 && "$TRANSITION" == "false" ]]; then
+  # Heartbeat every 60 consecutive fails (~5-10 min depending on probe cadence)
+  if (( NEW_STREAK % 60 != 0 )); then
+    SHOULD_EMIT_FAIL=false
+  fi
+fi
+
 if [[ "$NEW_STATUS" == "ok" ]]; then
   $HEX_EMIT "hex.integration.check.ok" "$OK_PAYLOAD" "hex:integration-check" 2>/dev/null || true
-else
+elif $SHOULD_EMIT_FAIL; then
   $HEX_EMIT "hex.integration.check.fail" "$FAIL_PAYLOAD" "hex:integration-check" 2>/dev/null || true
 fi
 

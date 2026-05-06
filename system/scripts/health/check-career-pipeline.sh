@@ -57,7 +57,7 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 cat > "$TEST_DRAFT_SRC" << DRAFTEOF
 ---
 To: dryrun-test@example.com
-From: dryrun-test@example.com
+From: mike@mrap.me
 Subject: DRY-RUN TEST $TS
 ---
 
@@ -122,10 +122,10 @@ POLICY_PYTHON="${HOME}/.hex-events/venv/bin/python3"
 [[ -x "$POLICY_PYTHON" ]] || POLICY_PYTHON="python3"
 POLICY_LOADED="$("$POLICY_PYTHON" - 2>&1 <<'PYEOF'
 import sys
-sys.path.insert(0, __import__('os').path.expanduser('~/.hex-events'))
+sys.path.insert(0, '/Users/mrap/.hex-events')
 try:
     from policy import load_policies
-    ps = load_policies(__import__('os').path.expanduser('~/.hex-events/policies'))
+    ps = load_policies('/Users/mrap/.hex-events/policies')
     print('yes' if any(getattr(p, 'name', '') == 'career-auto-send' for p in ps) else 'no')
 except Exception as e:
     print('error:' + str(e))

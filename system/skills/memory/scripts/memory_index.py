@@ -424,6 +424,44 @@ def init_db(conn: sqlite3.Connection):
     conn.commit()
 
 
+def _delete_vec_for_rowids(conn: sqlite3.Connection, rowids: list) -> int:
+    """Delete vec_chunks rows for the given chunk rowids.
+
+    Returns the count deleted (best-effort — vec_chunks is a virtual table
+    backed by sqlite-vec; if the extension isn't loaded for this connection
+    we skip silently rather than crash).
+
+    Closes the orphan-vector leak where re-indexing a file deleted FTS5
+    chunks rows but left their vec_chunks embeddings dangling. As of
+    2026-05-06 that leak had accumulated 82,377 orphan rows (58% of vec
+    table).
+    """
+    if not rowids:
+        return 0
+    try:
+        # vec0 supports DELETE WHERE rowid = ? — iterate in chunks of 500
+        # to avoid SQLite expression-tree depth limits on large batches.
+        deleted = 0
+        for i in range(0, len(rowids), 500):
+            batch = rowids[i : i + 500]
+            placeholders = ",".join("?" for _ in batch)
+            cur = conn.execute(
+                f"DELETE FROM vec_chunks WHERE chunk_rowid IN ({placeholders})",
+                batch,
+            )
+            deleted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        return deleted
+    except sqlite3.OperationalError as e:
+        # vec_chunks may not exist if sqlite-vec wasn't available at init.
+        # Loud-but-non-fatal: warn and continue (not a silent failure —
+        # the warning surfaces in indexer output).
+        msg = str(e)
+        if "no such" in msg.lower() or "no such module" in msg.lower():
+            return 0
+        print(f"  WARN: vec_chunks cleanup failed: {e}", file=sys.stderr)
+        return 0
+
+
 def _set_metadata(conn: sqlite3.Connection, key: str, value: str):
     conn.execute(
         "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
@@ -517,6 +555,15 @@ def index_file(conn: sqlite3.Connection, filepath: Path, content: str, mtime: fl
             # Still record it in files table so we don't re-check it every run
             row = conn.execute("SELECT id FROM files WHERE path = ?", (rel_path,)).fetchone()
             if row:
+                # Capture old chunk rowids BEFORE deleting chunks so we can
+                # delete the corresponding vec_chunks embeddings (they're not
+                # cascade-deleted by FTS5 — orphan vector leak fix).
+                old_rowids = [
+                    r[0] for r in conn.execute(
+                        "SELECT rowid FROM chunks WHERE file_id = ?", (str(row[0]),)
+                    ).fetchall()
+                ]
+                _delete_vec_for_rowids(conn, old_rowids)
                 conn.execute("DELETE FROM chunks WHERE file_id = ?", (str(row[0]),))
                 conn.execute("DELETE FROM chunk_meta WHERE chunk_rowid IN (SELECT rowid FROM chunks WHERE file_id = ?)", (str(row[0]),))
                 conn.execute("DELETE FROM files WHERE id = ?", (row[0],))
@@ -537,11 +584,16 @@ def index_file(conn: sqlite3.Connection, filepath: Path, content: str, mtime: fl
             "SELECT rowid FROM chunks WHERE file_id = ?", (str(row[0]),)
         ).fetchall()
         if old_rowids:
+            row_ids_flat = [r[0] for r in old_rowids]
             placeholders = ",".join("?" for _ in old_rowids)
             conn.execute(
                 f"DELETE FROM chunk_meta WHERE chunk_rowid IN ({placeholders})",
-                [r[0] for r in old_rowids],
+                row_ids_flat,
             )
+            # Orphan vector leak fix: vec_chunks rows reference chunks rowids
+            # but FTS5 chunks deletion doesn't cascade to vec0. Pre-2026-05-06,
+            # 58% of vec_chunks (82K rows) were dangling.
+            _delete_vec_for_rowids(conn, row_ids_flat)
         conn.execute("DELETE FROM chunks WHERE file_id = ?", (str(row[0]),))
         conn.execute("DELETE FROM files WHERE id = ?", (row[0],))
 
@@ -673,6 +725,13 @@ def run_index(full: bool = False):
         if db_path not in all_paths:
             row = conn.execute("SELECT id FROM files WHERE path = ?", (db_path,)).fetchone()
             if row:
+                # Capture vec rowids before chunks deletion (orphan leak fix).
+                old_rowids = [
+                    r[0] for r in conn.execute(
+                        "SELECT rowid FROM chunks WHERE file_id = ?", (str(row[0]),)
+                    ).fetchall()
+                ]
+                _delete_vec_for_rowids(conn, old_rowids)
                 conn.execute("DELETE FROM chunks WHERE file_id = ?", (str(row[0]),))
                 conn.execute("DELETE FROM files WHERE id = ?", (row[0],))
                 removed += 1

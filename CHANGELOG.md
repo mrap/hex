@@ -2,6 +2,18 @@
 
 All notable changes to hex-foundation will be documented in this file.
 
+## [2026-05-06] — session-start checkpoint resume + integration-check fix + memory leak fix (v0.13.2)
+
+### Fixed
+- `system/hooks/scripts/session-start.sh`: channel→topic checkpoint resume — sessions matching `hex-<topic>` pattern now surface `projects/<topic>/checkpoint.md` as additionalContext. Generalized `.hex/state/blockers/*.flag` scan (any flag file surfaces as a blocker). Topic-regex sanitization strips leading `#` from CC_SESSION_KEY.
+- `system/scripts/hex-integration-check.sh`: `export _error_raw` bug fix — the prior `VAR=value FAIL_PAYLOAD=$(...)` idiom did not propagate `_error_raw` into the command-substitution subshell, causing 11,948+ events/day with `error: null`. Emit-throttle added for streak>1 fail (heartbeat every 60 consecutive checks prevents log spam without hiding persistent failures).
+- `system/skills/memory/scripts/memory_index.py`: cascade-delete `vec_chunks` orphans on re-index — FTS5 chunk deletion did not cascade to the `vec0` virtual table, accumulating 82,377 orphan rows (58% of the vec table). `_delete_vec_for_rowids()` called before every chunk delete.
+- `system/skills/memory/scripts/memory_search.py`: `_rrf_merge` documented as FTS-only (KNOWN GAP) — `--hybrid` was paying embedding+vec-query cost without fusing vec results into the score. Log line now honest; TODO surfaced.
+- `system/scripts/health/check-career-pipeline.sh`: switched from broken `hex_events_cli.py status` grep to `load_policies`-based check for policy validation.
+
+### Changed
+- `system/scripts/hex-doctor`: two new health modules added — Memory Vector Search (surfaces sqlite-vec drift where semantic search silently falls back to FTS) and hex-events Policy Load Errors (surfaces POLICY LOAD/VALIDATION ERROR entries from daemon log that were previously invisible).
+
 ## [2026-05-06] — doctor reliability + skip_llm WakeConfig (v0.13.1)
 
 ### Fixed

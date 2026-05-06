@@ -72,6 +72,12 @@ def _rrf_merge(fts_results: list, vec_results: list, top_n: int = 10, k: int = 6
     vec_results: list of (chunk_rowid, distance) from vec_chunks
 
     Returns merged list in FTS5 result format, sorted by RRF score.
+
+    KNOWN GAP (2026-05-06 audit): the current implementation builds vec_rowids
+    and discards them — final ordering uses FTS5 rank only. Real RRF fusion
+    would need a chunks-by-rowid lookup to add vec contributions to the score
+    for items not in fts_results. TODO. Until fixed, --hybrid pays the
+    embedding + vec-query cost without using the result.
     """
     # Build RRF scores from FTS5 ranks
     rrf_scores = {}  # chunk_key -> score
@@ -112,6 +118,34 @@ def _find_root():
 
 AGENT_ROOT = _find_root()
 DB_PATH = AGENT_ROOT / ".hex" / "memory.db"
+
+# ── Dual-schema memory paths ─────────────────────────────────────────────────
+# Claude Code stores memory at: .claude/projects/<slug>/memory.jsonl
+# Codex stores memory at:       .codex/memory/memory.jsonl
+# Both are checked when searching JSONL-based memory files.
+
+def _get_memory_jsonl_paths():
+    """Return all memory.jsonl paths for the active runtime(s)."""
+    paths = []
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    # Claude Code: per-project memory
+    claude_projects = home / ".claude" / "projects"
+    if claude_projects.exists():
+        paths.extend(claude_projects.rglob("memory.jsonl"))
+    # Codex: global memory
+    codex_mem = home / ".codex" / "memory" / "memory.jsonl"
+    if codex_mem.exists():
+        paths.append(codex_mem)
+    return paths
+
+
+def _normalize_memory_entry(entry: dict) -> dict:
+    """Normalize memory entries across Claude (text/timestamp) and Codex (content/created_at) schemas."""
+    if "content" in entry and "text" not in entry:
+        entry["text"] = entry["content"]
+    if "created_at" in entry and "timestamp" not in entry:
+        entry["timestamp"] = entry["created_at"]
+    return entry
 
 
 def truncate(text: str, max_chars: int = 300) -> str:
@@ -247,7 +281,10 @@ def execute_search(args):
                     vec_results = _vec_search(conn, query_emb, top_n=50)
                     results = _rrf_merge(fts_results, vec_results, top_n=args.top)
                     if args.verbose:
-                        print(f"[hybrid: {len(fts_results)} FTS + {len(vec_results)} vec -> {len(results)} merged]", file=sys.stderr)
+                        # Honest accounting: _rrf_merge currently sorts by FTS rank only
+                        # (see comment at the function's vec_rowids handling). Vec results
+                        # are computed but not fused into the score. TODO: real RRF.
+                        print(f"[hybrid: {len(fts_results)} FTS + {len(vec_results)} vec computed; ordering uses FTS only — vec fusion not implemented in _rrf_merge]", file=sys.stderr)
                 else:
                     results = fts_results[:args.top]
             else:

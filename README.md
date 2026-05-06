@@ -352,6 +352,13 @@ bash tests/eval/run_eval_macos.sh            # macOS Tart
 
 ## Roadmap
 
+v0.13.2 fixes: **Session-start checkpoint resume, integration-check emit fix, and memory leak fix.**
+- **Channel checkpoint resume**: `session-start.sh` now surfaces `projects/<topic>/checkpoint.md` for `hex-<topic>` channels. Sessions pick up where they left off automatically. Generalized blocker-flag scan (`.hex/state/blockers/*.flag`) and topic-regex sanitization included.
+- **Integration-check emit fix**: `export _error_raw` bug — 11,948+ events/day were emitted with `error: null` because the env var wasn't propagating into the command-substitution subshell. Fixed. Emit-throttle added for persistent fail streaks (heartbeat every 60 checks; no more event spam for a single dead probe).
+- **Memory vector leak fixed**: `memory_index.py` now cascade-deletes `vec_chunks` orphans on re-index. 82,377 orphan rows (58% of the vec table) had accumulated because FTS5 chunk deletion didn't cascade to the `vec0` virtual table. Fixed.
+- **Honest hybrid search**: `memory_search.py` documents `_rrf_merge` as FTS-only (KNOWN GAP) — `--hybrid` was paying embedding+vec-query cost without fusing vec results into the score.
+- **Doctor: two new health modules**: Memory Vector Search (surfaces sqlite-vec drift) and hex-events Policy Load Errors (surfaces broken policies that were previously invisible to doctor).
+
 v0.13.1 fixes: **Doctor reliability and skip_llm WakeConfig.**
 - **Doctor streaming**: Doctor command streams output live via `Stdio::inherit` (was buffered — appeared to hang on slow modules). `hex-doctor` bash script also switched to `tee | tail -n +5` streaming with full PIPESTATUS capture.
 - **Path bug fix**: 3 orchestration scripts had stale `CLAUDE_DIR=$HEX_DIR/.claude` (should be `.hex`). Caused 5 spurious doctor ERRORs on standard installs. Fixed.
