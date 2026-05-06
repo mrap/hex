@@ -13,6 +13,10 @@ All notable changes to hex-foundation will be documented in this file.
 ### Added
 - `system/harness/src/types.rs`: `WakeConfig.skip_llm` field (`#[serde(default)]` for backwards compat). Allows health-probe agents to exercise wake plumbing without paying for an LLM call.
 - `system/harness/src/wake.rs`: When `charter.wake.skip_llm=true`, bypass shift loop and self-assessment phase. Inbox loads, wake-start audit fires, `mark_delivered` runs. Inbox-sourced active queue items drained to prevent `state.json` unbounded growth.
+- `system/scripts/health/check-message-roundtrip.sh`: end-to-end validation of skip_llm health-probe wake — sends a message, wakes health-probe agent, verifies mark_delivered, state save, and audit emit.
+- `system/scripts/health/check-career-pipeline.sh`: career email pipeline health check — validates draft existence, policy load, and optional dry-run send. Sanitize-clean (env-var paths, example addresses).
+- `system/scripts/doctor-checks/boi.sh`: BOI daemon doctor check with LaunchAgent-aware detection.
+- `system/scripts/hex-watcher`: minimal tmux BOI status pane (one-shot or `--watch` loop).
 
 ## [2026-05-05] — agent performance review + calibration
 
