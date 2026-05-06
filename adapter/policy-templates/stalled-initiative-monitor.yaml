@@ -27,11 +27,11 @@ rules:
       event: timer.tick.6h
     actions:
       - type: shell
-        command: /Users/mrap/mrap-hex/.hex/scripts/health/check-stalled-initiatives.sh
+        command: ${HEX_DIR:-$HOME/hex}/.hex/scripts/health/check-stalled-initiatives.sh
         timeout: 120
         on_failure:
           - type: shell
             command: >
-              /Users/mrap/mrap-hex/.hex/scripts/hex-alert.sh ERROR
+              ${HEX_DIR:-$HOME/hex}/.hex/scripts/hex-alert.sh ERROR
               stall-monitor
               "check-stalled-initiatives.sh failed to run (watchdog script error)"

@@ -22,11 +22,11 @@ rules:
       event: timer.tick.daily
     actions:
       - type: shell
-        command: python3 /Users/mrap/mrap-hex/.hex/scripts/health/budget-period-reset.py
+        command: python3 ${HEX_DIR:-$HOME/hex}/.hex/scripts/health/budget-period-reset.py
         timeout: 120
         on_failure:
           - type: shell
             command: >
-              /Users/mrap/mrap-hex/.hex/scripts/hex-alert.sh ERROR
+              ${HEX_DIR:-$HOME/hex}/.hex/scripts/hex-alert.sh ERROR
               budget-period-reset
               "budget-period-reset.py failed to run (script error)"

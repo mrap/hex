@@ -24,11 +24,11 @@ rules:
       event: timer.tick.1h
     actions:
       - type: shell
-        command: /Users/mrap/mrap-hex/.hex/scripts/health/check-fleet-pulse.sh
+        command: ${HEX_DIR:-$HOME/hex}/.hex/scripts/health/check-fleet-pulse.sh
         timeout: 120
         on_failure:
           - type: shell
             command: >
-              /Users/mrap/mrap-hex/.hex/scripts/hex-alert.sh ERROR
+              ${HEX_DIR:-$HOME/hex}/.hex/scripts/hex-alert.sh ERROR
               fleet-pulse
               "check-fleet-pulse.sh failed to run (watchdog script error)"

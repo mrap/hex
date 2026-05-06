@@ -315,7 +315,7 @@ def send_slack_digest(
     n_improvements: int,
     scorecard_path: Path,
 ) -> None:
-    """Send ONE coalesced fleet digest to #from-mrap-hex.
+    """Send ONE coalesced fleet digest to configured Slack channel.
 
     Ergonomics rule: single message, no per-agent pings.
     """

@@ -3,7 +3,7 @@ description: >
   Weekly fleet performance scorecard — Sunday 09:00 ET.
   Runs fleet-scorecard-aggregate.py for all agents (7d period),
   writes aggregate to projects/cos/fleet-scorecard-<date>-7d.md,
-  and sends ONE coalesced Slack digest to #from-mrap-hex.
+  and sends ONE coalesced Slack digest to <your-slack-channel>.
   Ergonomics-critic rule applied: no per-agent pings, single coalesced message.
 
 requires:
@@ -28,11 +28,11 @@ rules:
           if [ "$DOW" != "0" ] || [ "$HOUR" != "09" ]; then
             exit 0
           fi
-          python3 /Users/mrap/mrap-hex/.hex/scripts/health/fleet-scorecard-aggregate.py \
+          python3 ${HEX_DIR:-$HOME/hex}/.hex/scripts/health/fleet-scorecard-aggregate.py \
             --period 7d
         on_failure:
           - type: shell
             command: >
-              /Users/mrap/mrap-hex/.hex/scripts/hex-alert.sh ERROR
+              ${HEX_DIR:-$HOME/hex}/.hex/scripts/hex-alert.sh ERROR
               agent-performance-review-weekly
               "fleet-scorecard-aggregate.py failed on weekly run (check stderr)"

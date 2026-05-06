@@ -1,7 +1,7 @@
 name: mike-pending-escalator
 description: >
   Escalates Mike-pending blocking items on a 2h cadence.
-  Sends a single digest to #from-mrap-hex when any item hits level >= 1.
+  Sends a single digest to <your-slack-channel> when any item hits level >= 1.
   Sends a direct ping when any item hits level >= 2.
   Anti-spam: digest rate-limited to 1/6h, direct ping to 1/2h.
   Max escalations per item enforced; terminal_action taken at ceiling.
@@ -27,4 +27,4 @@ rules:
     actions:
       - type: shell
         command: |
-          /Users/mrap/mrap-hex/.hex/scripts/health/check-mike-pending.sh
+          ${HEX_DIR:-$HOME/hex}/.hex/scripts/health/check-mike-pending.sh

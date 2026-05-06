@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-HEX_DIR = Path(os.environ.get("HEX_DIR", Path.home() / "mrap-hex"))
+HEX_DIR = Path(os.environ.get("HEX_DIR", str(Path.home() / "hex")))
 PROJECTS_DIR = HEX_DIR / "projects"
 AUDIT_DIR = HEX_DIR / ".hex" / "audit"
 

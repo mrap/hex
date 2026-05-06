@@ -31,7 +31,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-HEX_DIR = Path(os.environ.get("HEX_DIR", Path.home() / "mrap-hex"))
+HEX_DIR = Path(os.environ.get("HEX_DIR", str(Path.home() / "hex")))
 PROJECTS_DIR = HEX_DIR / "projects"
 BOI_DB = Path.home() / ".boi" / "boi-rust.db"
 MESSAGES_PATH = HEX_DIR / ".hex" / "data" / "messages.json"

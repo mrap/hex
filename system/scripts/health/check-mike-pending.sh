@@ -3,7 +3,7 @@
 # v2: tier:quiet/digest/direct-ping names, coalesced bus emission, DM user ID lookup
 set -uo pipefail
 
-HEX_DIR="/Users/mrap/mrap-hex"
+HEX_DIR="${HEX_DIR:-$HOME/hex}"
 JSONL_FILE="$HEX_DIR/projects/cos/mike-pending.jsonl"
 STATE_FILE="$HEX_DIR/projects/cos/mike-pending-state.json"
 AUDIT_LOG="$HEX_DIR/.hex/audit/actions.jsonl"

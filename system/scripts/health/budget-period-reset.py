@@ -6,7 +6,7 @@ Critic-revised 2026-05-05 (T3DED HIGH severity):
   - Tiered gate replaces binary 5x check:
       ratio ≤ 1.0       → auto-reset (within budget)
       1.0 < ratio ≤ 2.0 → auto-reset with audit log entry
-      2.0 < ratio ≤ 5.0 → blocked, emit WARN + digest to #from-mrap-hex
+      2.0 < ratio ≤ 5.0 → blocked, emit WARN + digest to configured Slack channel
       ratio > 5.0        → blocked, emit CRITICAL
   - Period length read from charter.yaml budget.period_days (default 7d)
   - Reset appended to agent's own trail so agent sees it on next wake
@@ -20,10 +20,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROJECTS = Path("/Users/mrap/mrap-hex/projects")
-AUDIT_DIR = Path("/Users/mrap/mrap-hex/.hex/audit")
+_HEX_DIR = Path(os.environ.get("HEX_DIR", str(Path.home() / "hex")))
+PROJECTS = _HEX_DIR / "projects"
+AUDIT_DIR = _HEX_DIR / ".hex" / "audit"
 ACTIONS_LOG = AUDIT_DIR / "actions.jsonl"
-HEX_ALERT = Path("/Users/mrap/mrap-hex/.hex/scripts/hex-alert.sh")
+HEX_ALERT = _HEX_DIR / ".hex" / "scripts" / "hex-alert.sh"
 HEX_EMIT = Path.home() / ".hex-events/hex_emit.py"
 DEFAULT_PERIOD_DAYS = 7
 SOURCE = "budget-period-reset"
