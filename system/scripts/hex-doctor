@@ -267,6 +267,77 @@ else
     check_65
   fi
 
+  # ── hex events status absorption (check_66) ──────────────────────────────────
+  # Runs `hex events status` and fails for every policy that failed to parse.
+  # One check absorbs all validation hex-events surfaces — future hex-events
+  # improvements are inherited automatically.
+  check_66() {
+    local hex_bin="$HEX_DIR/.hex/bin/hex"
+    if [ ! -x "$hex_bin" ]; then
+      _warn "hex-events.events-status: hex binary not found ($hex_bin) — skipping"
+      _rec 66 "hex-events.events-status" "warn" "hex binary not found"
+      return
+    fi
+
+    local _timeout_bin
+    _timeout_bin=$(command -v gtimeout || command -v timeout || true) 2>/dev/null
+
+    local combined exit_code
+    exit_code=0
+    if [ -n "$_timeout_bin" ]; then
+      combined=$(HEX_DIR="$HEX_DIR" "$_timeout_bin" 10 "$hex_bin" events status 2>&1) || exit_code=$?
+    else
+      combined=$(HEX_DIR="$HEX_DIR" "$hex_bin" events status 2>&1) || exit_code=$?
+    fi
+
+    if [ "$exit_code" -eq 124 ]; then
+      _error "hex-events.events-status: timed out after 10s (daemon unresponsive?)"
+      _rec 66 "hex-events.events-status" "error" "hex events status timed out"
+      return
+    fi
+
+    local failures
+    failures=$(printf '%s\n' "$combined" | grep '^events: failed to parse ') || true
+
+    if [ -n "$failures" ]; then
+      local count
+      count=$(printf '%s\n' "$failures" | wc -l | tr -d ' ')
+      if [ "$count" -eq 1 ]; then
+        _error "hex-events.events-status: 1 policy failed to parse:"
+      else
+        _error "hex-events.events-status: ${count} policies failed to parse:"
+      fi
+      while IFS= read -r line; do
+        local path err_msg
+        path=$(printf '%s' "$line" | sed 's/^events: failed to parse "//;s/": .*//')
+        err_msg=$(printf '%s' "$line" | sed 's/^events: failed to parse "[^"]*": //')
+        _info "  - $path: $err_msg"
+      done <<< "$failures"
+      _rec 66 "hex-events.events-status" "error" "${count} parse failure(s)"
+      return
+    fi
+
+    if [ "$exit_code" -ne 0 ]; then
+      local first_line
+      first_line=$(printf '%s\n' "$combined" | head -1)
+      _error "hex-events.events-status: hex events status exited $exit_code"
+      _info "  $first_line"
+      _rec 66 "hex-events.events-status" "error" "exit code $exit_code"
+      return
+    fi
+
+    local policy_count
+    policy_count=$(printf '%s\n' "$combined" | grep 'policies loaded:' | grep -oE '[0-9]+' | head -1) || policy_count="?"
+    _pass "hex-events.events-status: ${policy_count} policies loaded, 0 parse errors"
+    _rec 66 "hex-events.events-status" "pass" "${policy_count} policies loaded"
+  }
+
+  MODULE_COUNT=$((MODULE_COUNT + 1))
+  echo ""
+  echo -e "${BOLD}hex events status${RESET}"
+  echo "  ─────────────────────────────────────────"
+  check_66
+
 fi
 
 # ─── Alert Pipeline check ─────────────────────────────────────────────────────
