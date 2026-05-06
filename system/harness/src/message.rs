@@ -19,9 +19,11 @@ fn agent_inbox_path(
 
 pub fn send(store_dir: &Path, msg: &Message) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(store_dir)?;
-    let path = agent_inbox_path(store_dir, &msg.to)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    writeln!(file, "{}", serde_json::to_string(msg)?)?;
+    for recipient in &msg.to {
+        let path = agent_inbox_path(store_dir, recipient)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{}", serde_json::to_string(msg)?)?;
+    }
     Ok(())
 }
 

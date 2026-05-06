@@ -15,6 +15,7 @@ pub fn initialize(agent_id: &str, budget_usd: f64) -> AgentState {
             active: vec![],
             blocked: vec![],
             scheduled: vec![],
+            backlog: vec![],
         },
         trail: vec![],
         initiatives: Default::default(),
@@ -32,6 +33,10 @@ pub fn initialize(agent_id: &str, budget_usd: f64) -> AgentState {
         cadence_overrides: Default::default(),
         last_assessment_wake: 0,
         recent_action_hashes: vec![],
+        completed_backlog_ids: vec![],
+        backlog_wakes_today: 0,
+        backlog_wakes_date: None,
+        last_trail_act_at: None,
     }
 }
 
