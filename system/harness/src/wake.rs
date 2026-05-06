@@ -1,4 +1,4 @@
-use crate::{audit, charter, claude, cost, gate, message, messaging, prompt, queue, state};
+use crate::{audit, charter, claude, cost, gate, message, prompt, queue, state};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -129,27 +129,10 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
     agent_state.wake_count += 1;
     agent_state.last_wake = Some(Utc::now());
 
-    // 5. Populate inbox — messaging.rs (messages.json) for CLI/HTTP-sent messages
-    let inbox_ids: Vec<String> = {
-        let bus = crate::sse::SseBus::new();
-        let telemetry = std::sync::Arc::new(crate::telemetry::Telemetry::new(hex_dir));
-        let handler = messaging::MessagingHandler::new(hex_dir, bus, telemetry);
-        match handler.receive(&config.agent_id) {
-            Ok(msgs) => {
-                let ids = msgs.iter().map(|m| m.id.clone()).filter(|id| !id.is_empty()).collect();
-                agent_state.inbox = msgs;
-                ids
-            }
-            Err(e) => {
-                eprintln!("[{}] WARN: messaging receive failed: {e}", config.agent_id);
-                vec![]
-            }
-        }
-    };
-    // Also drain legacy JSONL inbox (agent-to-agent messages not using messaging.rs)
-    let old_inbox = message::receive(&msg_dir, &config.agent_id);
+    // 5. Populate inbox
+    let inbox_messages = message::receive(&msg_dir, &config.agent_id);
+    agent_state.inbox = inbox_messages;
     message::clear_inbox(&msg_dir, &config.agent_id);
-    agent_state.inbox.extend(old_inbox);
 
     // 6. Queue promotions
     let now = Utc::now();
@@ -198,10 +181,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
     let shift_budget = charter_data.budget.usd_per_shift;
     let allowed_tools = ["Bash", "Read", "Write", "Edit", "Grep", "Glob"];
     let mut invocation = 0;
-    // Only mark inbox messages delivered when the wake exits cleanly (active_drained
-    // or budget-hit). claude::invoke errors and parse errors set this false so
-    // in_progress messages survive for crash-recovery re-delivery on next wake.
-    let mut wake_succeeded = true;
 
     // health-probe agents (charter `wake.skip_llm: true`) bypass the LLM loop —
     // they exist to validate wake plumbing without paying for a Claude call.
@@ -275,7 +254,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
                         "invocation": invocation,
                     }),
                 );
-                wake_succeeded = false;
                 break;
             }
         };
@@ -296,7 +274,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
                         "raw_length": claude_output.result.len(),
                     }),
                 );
-                wake_succeeded = false;
                 break;
             }
         };
@@ -409,24 +386,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
 
         if response.active_drained || agent_state.queue.active.is_empty() {
             break;
-        }
-    }
-
-    // Only mark delivered on clean exits (active_drained, active-empty, or budget-hit).
-    // claude::invoke errors and parse errors leave messages in_progress so the next
-    // wake re-delivers them via crash-recovery. Budget-hit is a success variant — real
-    // work was done and stopping was intentional.
-    // KNOWN RISK: if a message consistently triggers Claude errors it will re-deliver
-    // indefinitely. A dead-letter queue (delivery_attempts >= threshold) is the
-    // circuit-breaker; tracked as a follow-up task.
-    if !inbox_ids.is_empty() && wake_succeeded {
-        let bus = crate::sse::SseBus::new();
-        let telemetry = std::sync::Arc::new(crate::telemetry::Telemetry::new(hex_dir));
-        let handler = messaging::MessagingHandler::new(hex_dir, bus, telemetry);
-        if let Err(e) = handler.mark_delivered(&inbox_ids, &config.agent_id) {
-            eprintln!("[{}] ERROR: mark_delivered failed: {}", config.agent_id, e);
-            audit::append(&audit_dir, &config.agent_id, "mark-delivered-failed",
-                &serde_json::json!({"ids": inbox_ids, "error": e.to_string()}));
         }
     }
 
