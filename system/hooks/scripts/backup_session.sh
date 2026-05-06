@@ -20,6 +20,12 @@ BACKUP_DIR="$HEX_DIR/raw/transcripts"
 
 mkdir -p "$BACKUP_DIR"
 
+# Log subshell output to a daily file instead of discarding it.
+LOG_DIR="$HEX_DIR/.hex/logs/stop-hooks"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/backup_session-$(date +%Y-%m-%d).log"
+find "$LOG_DIR" -name '*.log' -mtime +14 -delete 2>/dev/null || true
+
 # Run the copy in the background so the hook returns immediately.
 (
     LATEST=""
@@ -48,4 +54,5 @@ mkdir -p "$BACKUP_DIR"
         FILENAME=$(basename "$LATEST")
         cp "$LATEST" "$BACKUP_DIR/$FILENAME" 2>/dev/null || true
     fi
-) &
+) </dev/null >>"$LOG_FILE" 2>&1 &
+disown 2>/dev/null || true

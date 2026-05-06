@@ -14,12 +14,19 @@ set -uo pipefail
 
 HEX_DIR="${CLAUDE_PROJECT_DIR:-${HEX_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
 
+# Log subshell output to a daily file instead of discarding it.
+LOG_DIR="$HEX_DIR/.hex/logs/stop-hooks"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/session-stop-persist-$(date +%Y-%m-%d).log"
+find "$LOG_DIR" -name '*.log' -mtime +14 -delete 2>/dev/null || true
+
 {
   _ch="${CC_SESSION_KEY:-local-dev}"
   _ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   _payload=$(printf '{"channel":"%s","stop_ts":"%s","stop_reason":"hook"}' "$_ch" "$_ts")
   bash "$HEX_DIR/.hex/bin/hex-emit.sh" "session.stop" "$_payload" "claude-code"
-} 2>/dev/null &
+} </dev/null >>"$LOG_FILE" 2>&1 &
+disown 2>/dev/null || true
 
 SUMMARIES_DIR="${HEX_SESSIONS_DIR:-$HEX_DIR/.hex/sessions/summaries}"
 SESSION_DATA_DIR="${CLAUDE_SESSION_DATA_DIR:-}"
