@@ -1,4 +1,4 @@
-use crate::{audit, charter, claude, cost, gate, message, messaging, prompt, queue, state};
+use crate::{audit, charter, claude, cost, gate, message, prompt, queue, state};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -129,27 +129,10 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
     agent_state.wake_count += 1;
     agent_state.last_wake = Some(Utc::now());
 
-    // 5. Populate inbox — messaging.rs (messages.json) for CLI/HTTP-sent messages
-    let inbox_ids: Vec<String> = {
-        let bus = crate::sse::SseBus::new();
-        let telemetry = std::sync::Arc::new(crate::telemetry::Telemetry::new(hex_dir));
-        let handler = messaging::MessagingHandler::new(hex_dir, bus, telemetry);
-        match handler.receive(&config.agent_id) {
-            Ok(msgs) => {
-                let ids = msgs.iter().map(|m| m.id.clone()).filter(|id| !id.is_empty()).collect();
-                agent_state.inbox = msgs;
-                ids
-            }
-            Err(e) => {
-                eprintln!("[{}] WARN: messaging receive failed: {e}", config.agent_id);
-                vec![]
-            }
-        }
-    };
-    // Also drain legacy JSONL inbox (agent-to-agent messages not using messaging.rs)
-    let old_inbox = message::receive(&msg_dir, &config.agent_id);
+    // 5. Populate inbox
+    let inbox_messages = message::receive(&msg_dir, &config.agent_id);
+    agent_state.inbox = inbox_messages;
     message::clear_inbox(&msg_dir, &config.agent_id);
-    agent_state.inbox.extend(old_inbox);
 
     // 6. Queue promotions
     let now = Utc::now();
@@ -165,127 +148,8 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
     );
 
     let sched_promoted = queue::promote_scheduled(&mut agent_state.queue, now);
-    let unblocked = queue::promote_unblocked(&mut agent_state.queue, &agent_state.inbox);
+    let unblocked = queue::promote_unblocked(&mut agent_state.queue);
     let inbox_items = queue::inbox_to_active(&mut agent_state);
-
-    // 6c. Backlog auto-promotion — with critic-revised safety gates.
-    //
-    // CONSTRAINT 1 (source gate): Agent must have backlog.md OR proactive_initiatives.
-    //   Reactive-only agents with neither never self-assign work from backlog.
-    //
-    // CONSTRAINT 2 (spend ceiling): If usd_per_day > 0 and today's spend exceeds 80%, skip.
-    //
-    // CONSTRAINT 3 (idle gate): Only promote if last `act` trail entry was > 2h ago.
-    //   Prevents piling on when the agent recently produced real work.
-    //
-    // CONSTRAINT 4 (daily cap): Never auto-promote on more than 12 wakes per day.
-    //   Guards agents with usd_per_day == 0 that have no spend ceiling.
-    //
-    // CONSTRAINT 5 (wake ceiling): Never promote more than 2 items per wake.
-    let backlog_md_path = hex_dir.join(format!("projects/{}/backlog.md", config.agent_id));
-    let has_backlog_source = backlog_md_path.exists() || !charter_data.proactive_initiatives.is_empty();
-
-    let backlog_promoted = if has_backlog_source {
-        // Seed from backlog.md (grounded, quality-gated items)
-        if backlog_md_path.exists() {
-            queue::seed_backlog_from_md(
-                &mut agent_state.queue,
-                &backlog_md_path,
-                &agent_state.completed_backlog_ids,
-            );
-        }
-        // Legacy fallback: charter proactive_initiatives
-        if !charter_data.proactive_initiatives.is_empty() {
-            queue::seed_backlog_from_charter(
-                &mut agent_state.queue,
-                &charter_data.proactive_initiatives,
-            );
-        }
-
-        // CONSTRAINT 2: daily spend ceiling
-        let daily_wake_budget = charter_data.budget.usd_per_day;
-        let budget_ok = if daily_wake_budget > 0.0 {
-            let spent = cost::today_spend_usd(&cost_dir, &config.agent_id);
-            let ok = spent <= daily_wake_budget * 0.8;
-            if !ok {
-                audit::append(
-                    &audit_dir,
-                    &config.agent_id,
-                    "backlog-budget-ceiling",
-                    &serde_json::json!({
-                        "today_spend_usd": spent,
-                        "daily_wake_budget": daily_wake_budget,
-                        "threshold_usd": daily_wake_budget * 0.8,
-                    }),
-                );
-            }
-            ok
-        } else {
-            true
-        };
-
-        // CONSTRAINT 3: idle gate — only promote if last act was > 2h ago
-        const ACT_IDLE_SECONDS: i64 = 7200;
-        let idle_ok = match agent_state.last_trail_act_at {
-            None => true,
-            Some(last_act) => (Utc::now() - last_act).num_seconds() >= ACT_IDLE_SECONDS,
-        };
-        if !idle_ok {
-            audit::append(
-                &audit_dir,
-                &config.agent_id,
-                "backlog-skipped-not-idle",
-                &serde_json::json!({
-                    "last_trail_act_at": agent_state.last_trail_act_at,
-                    "required_idle_seconds": ACT_IDLE_SECONDS,
-                }),
-            );
-        }
-
-        // CONSTRAINT 4: daily backlog-wake cap (guards zero-budget agents)
-        const MAX_BACKLOG_WAKES_PER_DAY: u32 = 12;
-        let today = Utc::now().date_naive().to_string();
-        if agent_state.backlog_wakes_date.as_deref() != Some(today.as_str()) {
-            agent_state.backlog_wakes_today = 0;
-            agent_state.backlog_wakes_date = Some(today);
-        }
-        let daily_cap_ok = agent_state.backlog_wakes_today < MAX_BACKLOG_WAKES_PER_DAY;
-        if !daily_cap_ok {
-            audit::append(
-                &audit_dir,
-                &config.agent_id,
-                "backlog-daily-cap-hit",
-                &serde_json::json!({
-                    "backlog_wakes_today": agent_state.backlog_wakes_today,
-                    "cap": MAX_BACKLOG_WAKES_PER_DAY,
-                }),
-            );
-        }
-
-        if budget_ok && idle_ok && daily_cap_ok && agent_state.queue.active.is_empty() {
-            const WAKE_CEILING: usize = 2;
-            let n = queue::auto_promote_from_backlog(&mut agent_state.queue, WAKE_CEILING);
-            if n > 0 {
-                agent_state.backlog_wakes_today += 1;
-                audit::append(
-                    &audit_dir,
-                    &config.agent_id,
-                    "backlog-auto-promoted",
-                    &serde_json::json!({
-                        "promoted": n,
-                        "wake_ceiling": WAKE_CEILING,
-                        "daily_wake_budget": daily_wake_budget,
-                        "backlog_wakes_today": agent_state.backlog_wakes_today,
-                    }),
-                );
-            }
-            n
-        } else {
-            0
-        }
-    } else {
-        0
-    };
 
     audit::append(
         &audit_dir,
@@ -297,7 +161,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
             "scheduled_promoted": sched_promoted,
             "unblocked": unblocked,
             "inbox_items": inbox_items,
-            "backlog_promoted": backlog_promoted,
             "active_count": agent_state.queue.active.len(),
         }),
     );
@@ -318,10 +181,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
     let shift_budget = charter_data.budget.usd_per_shift;
     let allowed_tools = ["Bash", "Read", "Write", "Edit", "Grep", "Glob"];
     let mut invocation = 0;
-    // Only mark inbox messages delivered when the wake exits cleanly (active_drained
-    // or budget-hit). claude::invoke errors and parse errors set this false so
-    // in_progress messages survive for crash-recovery re-delivery on next wake.
-    let mut wake_succeeded = true;
 
     loop {
         invocation += 1;
@@ -371,7 +230,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
                         "invocation": invocation,
                     }),
                 );
-                wake_succeeded = false;
                 break;
             }
         };
@@ -382,7 +240,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
         let response = match claude::parse_agent_response(&claude_output.result) {
             Ok(r) => r,
             Err(e) => {
-                let qpath = quarantine_raw_response(hex_dir, &config.agent_id, &claude_output.result);
                 audit::append(
                     &audit_dir,
                     &config.agent_id,
@@ -391,10 +248,8 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
                         "error": e.to_string(),
                         "invocation": invocation,
                         "raw_length": claude_output.result.len(),
-                        "quarantine": qpath.as_deref().unwrap_or("save-failed"),
                     }),
                 );
-                wake_succeeded = false;
                 break;
             }
         };
@@ -444,23 +299,7 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
             return Ok(0);
         }
 
-        // Update last_trail_act_at from this invocation's accepted act entries
-        for entry in &accepted_entries {
-            if entry.entry_type == "act" {
-                agent_state.last_trail_act_at = Some(Utc::now());
-            }
-        }
-
-        // Apply queue updates — track completed backlog IDs before removing items
-        for completed_id in &response.queue_updates.completed {
-            if let Some(item) = agent_state.queue.active.iter().find(|i| &i.id == completed_id) {
-                if item.source == "backlog-auto-promote"
-                    && !agent_state.completed_backlog_ids.contains(&item.id)
-                {
-                    agent_state.completed_backlog_ids.push(item.id.clone());
-                }
-            }
-        }
+        // Apply queue updates
         agent_state
             .queue
             .active
@@ -468,12 +307,7 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
         for item in response.queue_updates.added_active {
             agent_state.queue.active.push(item);
         }
-        for mut item in response.queue_updates.moved_to_blocked {
-            // Bug fix 2026-04-30: agents have hallucinated future blocked_since
-            // timestamps (e.g., 6h ahead of true wall clock) which corrupted SLA
-            // math and kept items blocked beyond the real deadline. The harness
-            // owns the clock — overwrite whatever the agent supplied.
-            item.blocked_since = Utc::now();
+        for item in response.queue_updates.moved_to_blocked {
             agent_state.queue.blocked.push(item);
         }
 
@@ -502,15 +336,13 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
                         }),
                     );
                     if msg.response_requested {
-                        for t in &msg.to {
-                            auto_wake_target(hex_dir, t, &config.agent_id, &audit_dir);
-                        }
+                        auto_wake_target(hex_dir, &msg.to, &config.agent_id, &audit_dir);
                     }
                 }
                 Err(e) => {
                     eprintln!(
                         "[{}] MESSAGE SEND FAILED to {}: {e}",
-                        config.agent_id, msg.to.join(",")
+                        config.agent_id, msg.to
                     );
                     audit::append(
                         &audit_dir,
@@ -593,6 +425,11 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
                             agent_state
                                 .cadence_overrides
                                 .insert(change.responsibility.clone(), change.new_interval);
+                            let scheduled_id = format!("s-{}", change.responsibility);
+                            if let Some(item) = agent_state.queue.scheduled.iter_mut()
+                                .find(|s| s.id == scheduled_id) {
+                                item.interval_seconds = change.new_interval;
+                            }
                             audit::append(
                                 &audit_dir,
                                 &config.agent_id,
@@ -641,15 +478,11 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
                         );
                     }
                     Err(e) => {
-                        let qpath = quarantine_raw_response(hex_dir, &config.agent_id, &assess_output.result);
                         audit::append(
                             &audit_dir,
                             &config.agent_id,
                             "assessment-parse-error",
-                            &serde_json::json!({
-                                "error": e.to_string(),
-                                "quarantine": qpath.as_deref().unwrap_or("save-failed"),
-                            }),
+                            &serde_json::json!({"error": e.to_string()}),
                         );
                         agent_state.last_assessment_wake = agent_state.wake_count;
                     }
@@ -664,24 +497,6 @@ pub fn run(config: WakeConfig) -> Result<i32, Box<dyn std::error::Error>> {
                 );
                 agent_state.last_assessment_wake = agent_state.wake_count;
             }
-        }
-    }
-
-    // Only mark delivered on clean exits (active_drained, active-empty, or budget-hit).
-    // claude::invoke errors and parse errors leave messages in_progress so the next
-    // wake re-delivers them via crash-recovery. Budget-hit is a success variant — real
-    // work was done and stopping was intentional.
-    // KNOWN RISK: if a message consistently triggers Claude errors it will re-deliver
-    // indefinitely. A dead-letter queue (delivery_attempts >= threshold) is the
-    // circuit-breaker; tracked as a follow-up task.
-    if !inbox_ids.is_empty() && wake_succeeded {
-        let bus = crate::sse::SseBus::new();
-        let telemetry = std::sync::Arc::new(crate::telemetry::Telemetry::new(hex_dir));
-        let handler = messaging::MessagingHandler::new(hex_dir, bus, telemetry);
-        if let Err(e) = handler.mark_delivered(&inbox_ids, &config.agent_id) {
-            eprintln!("[{}] ERROR: mark_delivered failed: {}", config.agent_id, e);
-            audit::append(&audit_dir, &config.agent_id, "mark-delivered-failed",
-                &serde_json::json!({"ids": inbox_ids, "error": e.to_string()}));
         }
     }
 
@@ -762,40 +577,6 @@ pub fn auto_wake_target(hex_dir: &Path, target_id: &str, sender_id: &str, audit_
             );
         }
     }
-}
-
-/// Save an unparseable agent response to quarantine and fire a WARN alert.
-/// Returns the quarantine file path on success.
-fn quarantine_raw_response(hex_dir: &Path, agent_id: &str, raw: &str) -> Option<String> {
-    let qdir = hex_dir.join(format!("projects/{}/quarantine", agent_id));
-    if let Err(e) = std::fs::create_dir_all(&qdir) {
-        eprintln!("[{}] quarantine: cannot create dir {}: {e}", agent_id, qdir.display());
-        return None;
-    }
-    // Nanosecond precision prevents silent overwrite when two failures land in
-    // the same wall-clock second (e.g., rapid retry or concurrent assessment).
-    let ts = Utc::now().format("%Y%m%dT%H%M%S%.9fZ").to_string();
-    let qpath = qdir.join(format!("{ts}.txt"));
-    let tmp = qdir.join(format!("{ts}.tmp"));
-    if let Err(e) = std::fs::write(&tmp, raw) {
-        eprintln!("[{}] quarantine: write failed: {e}", agent_id);
-        return None;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &qpath) {
-        eprintln!("[{}] quarantine: rename failed: {e}", agent_id);
-        return None;
-    }
-    let path_str = qpath.to_string_lossy().to_string();
-    let alert_script = hex_dir.join(".hex/scripts/hex-alert.sh");
-    if alert_script.exists() {
-        let msg = format!("agent {agent_id} parse failed; raw at {path_str}");
-        let _ = std::process::Command::new(&alert_script)
-            .args(["WARN", "parse-discard", &msg])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-    Some(path_str)
 }
 
 pub fn compute_action_hash(agent_id: &str, trail_type: &str, detail: &serde_json::Value) -> String {
