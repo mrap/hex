@@ -2,7 +2,7 @@
 name = "hex"
 # Source of truth for hex version. Bumped by release.sh; build.rs
 # injects this via env!("CARGO_PKG_VERSION") at compile time.
-version = "0.13.2"
+version = "0.13.3"
 edition = "2021"
 
 [dependencies]
