@@ -57,7 +57,7 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 cat > "$TEST_DRAFT_SRC" << DRAFTEOF
 ---
 To: dryrun-test@example.com
-From: mike@mrap.me
+From: hex-test@example.com
 Subject: DRY-RUN TEST $TS
 ---
 
@@ -120,12 +120,13 @@ fi
 # Use the daemon's own policy loader so this check matches what's actually live in memory.
 POLICY_PYTHON="${HOME}/.hex-events/venv/bin/python3"
 [[ -x "$POLICY_PYTHON" ]] || POLICY_PYTHON="python3"
-POLICY_LOADED="$("$POLICY_PYTHON" - 2>&1 <<'PYEOF'
-import sys
-sys.path.insert(0, '/Users/mrap/.hex-events')
+POLICY_LOADED="$(HEX_EVENTS_DIR="${HOME}/.hex-events" "$POLICY_PYTHON" - 2>&1 <<'PYEOF'
+import sys, os
+_hex_events = os.environ.get('HEX_EVENTS_DIR', os.path.expanduser('~/.hex-events'))
+sys.path.insert(0, _hex_events)
 try:
     from policy import load_policies
-    ps = load_policies('/Users/mrap/.hex-events/policies')
+    ps = load_policies(os.path.join(_hex_events, 'policies'))
     print('yes' if any(getattr(p, 'name', '') == 'career-auto-send' for p in ps) else 'no')
 except Exception as e:
     print('error:' + str(e))
