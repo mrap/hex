@@ -2,6 +2,18 @@
 
 All notable changes to hex-foundation will be documented in this file.
 
+## [2026-05-06] — messaging.receive + wake crash-recovery + health scripts (v0.13.3)
+
+### Added
+- `system/harness/src/messaging.rs`: `MessagingHandler.receive()` — fetches agent-type messages for `agent_id` (status=new or in_progress), transitions to `in_progress` atomically so messages survive wake crashes and are re-delivered on next wake.
+- `system/scripts/health/check-hex-events-policy-load.sh`: surfaces POLICY LOAD/VALIDATION ERROR entries from the hex-events daemon log (previously sat silently; this closes the gap).
+- `system/scripts/health/check-vector-search.sh`: verifies sqlite-vec is loadable and memory.db has vectors; surfaces the silent degradation to FTS-only keyword search.
+
+### Fixed
+- `system/harness/src/wake.rs`: use `messaging.receive()` for inbox population (fixes type mismatch between `messaging::Message` and `types::Message`); drain legacy JSONL inbox in parallel; track `wake_succeeded` flag so in_progress messages survive `claude::invoke` errors.
+- `system/hooks/scripts/backup_session.sh`, `session-stop-persist.sh`: redirect subshell output to daily log in `.hex/logs/stop-hooks/` instead of discarding; disown to suppress job notifications; 14-day log rotation.
+- `tests/test-doctor-events-coverage.sh`: updated to test the new external-script architecture (inline `check_66` was replaced by `check-hex-events-policy-load.sh` in v0.13.2).
+
 ## [2026-05-06] — session-start checkpoint resume + integration-check fix + memory leak fix (v0.13.2)
 
 ### Fixed
