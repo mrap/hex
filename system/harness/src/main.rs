@@ -1185,15 +1185,21 @@ fn main() {
             if quiet { cmd.arg("--quiet"); }
             if json { cmd.arg("--json"); }
             cmd.env("HEX_DIR", &hex_dir);
-            let output = cmd.output().unwrap_or_else(|e| {
+            // Stream stdout/stderr live so module headers, check results, and
+            // long-running integration check progress appear as they happen.
+            // Buffering broke perceived responsiveness — see hang investigation 2026-05-05.
+            cmd.stdout(std::process::Stdio::inherit());
+            cmd.stderr(std::process::Stdio::inherit());
+            let mut child = cmd.spawn().unwrap_or_else(|e| {
                 eprintln!("hex doctor: failed to run script: {e}");
                 std::process::exit(1);
             });
-            let exit_code = output.status.code().unwrap_or(1);
+            let status = child.wait().unwrap_or_else(|e| {
+                eprintln!("hex doctor: wait failed: {e}");
+                std::process::exit(1);
+            });
+            let exit_code = status.code().unwrap_or(1);
             let duration_ms = start.elapsed().as_millis() as u64;
-            // Forward stdout/stderr to terminal
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), &output.stdout);
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
             telemetry.emit("hex.doctor.run", &serde_json::json!({
                 "fix": fix,
                 "smoke": smoke,
@@ -1203,12 +1209,9 @@ fn main() {
                 "duration_ms": duration_ms,
             }));
             if exit_code != 0 {
-                let stderr_str = String::from_utf8_lossy(&output.stderr);
-                let stdout_str = String::from_utf8_lossy(&output.stdout);
                 telemetry.emit("hex.doctor.failed", &serde_json::json!({
                     "exit_code": exit_code,
-                    "stdout": stdout_str.chars().take(2000).collect::<String>(),
-                    "stderr": stderr_str.chars().take(2000).collect::<String>(),
+                    "duration_ms": duration_ms,
                 }));
             }
             std::process::exit(exit_code);

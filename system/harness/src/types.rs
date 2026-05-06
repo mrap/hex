@@ -6,6 +6,18 @@ fn default_now() -> DateTime<Utc> {
     Utc::now()
 }
 
+fn default_now_string() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn default_new_status() -> String {
+    "new".to_string()
+}
+
+fn default_agent_msg_type() -> MessageType {
+    MessageType::Agent
+}
+
 /// Deserialize a Vec<T>, skipping items that fail to parse instead of failing the whole response.
 pub fn deserialize_lenient_vec<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
@@ -68,10 +80,22 @@ pub struct ScheduledItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklogItem {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Queue {
     pub active: Vec<ActiveItem>,
     pub blocked: Vec<BlockedItem>,
     pub scheduled: Vec<ScheduledItem>,
+    #[serde(default)]
+    pub backlog: Vec<BacklogItem>,
 }
 
 // ── Trail ───────────────────────────────────────────────────────────────────
@@ -87,22 +111,99 @@ pub struct TrailEntry {
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageType {
+    Comment,
+    Agent,
+    Notification,
+}
+
+impl std::fmt::Display for MessageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageType::Comment => write!(f, "comment"),
+            MessageType::Agent => write!(f, "agent"),
+            MessageType::Notification => write!(f, "notification"),
+        }
+    }
+}
+
+impl std::str::FromStr for MessageType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "comment" => Ok(MessageType::Comment),
+            "agent" => Ok(MessageType::Agent),
+            "notification" => Ok(MessageType::Notification),
+            other => Err(format!("unknown msg_type '{}'; expected comment, agent, or notification", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionEntry {
+    pub ts: String,
+    pub action: String,
+    #[serde(default)]
+    pub related_assets: Vec<String>,
+}
+
+/// Deserializes the `to` field accepting both a JSON string and a JSON array of strings.
+/// Agents emit `"to": "agent-id"` (single string); Store A stores `"to": ["agent-id"]` (array).
+pub fn deserialize_to_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ToField {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+    match ToField::deserialize(deserializer)? {
+        ToField::Single(s) => Ok(vec![s]),
+        ToField::Multiple(v) => Ok(v),
+    }
+}
+
+/// The canonical message struct — the single source of truth for all message surfaces:
+/// CLI send, HTTP create, inter-agent emit, agent inbox, audit log, and dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    // Audit log fields (always present in messages.json)
     #[serde(default)]
     pub id: String,
+    #[serde(default = "default_agent_msg_type")]
+    pub msg_type: MessageType,
     #[serde(default)]
     pub from: String,
+    #[serde(default, deserialize_with = "deserialize_to_vec")]
+    pub to: Vec<String>,
+    /// Canonical content: `[subject] body` format. Populated by harness on send.
     #[serde(default)]
-    pub to: String,
+    pub content: String,
+    pub anchor: Option<String>,
+    #[serde(default = "default_new_status")]
+    pub status: String,
+    #[serde(default = "default_now_string")]
+    pub created_at: String,
+    #[serde(default)]
+    pub action_log: Vec<ActionEntry>,
+    #[serde(default)]
+    pub routed_to: Vec<String>,
+    // Agent-interaction fields (used in outbound_messages and agent inbox)
+    /// Subject line. Agents set this when sending; harness populates at receive from content.
     #[serde(default)]
     pub subject: String,
+    /// Message body. Agents set this when sending; harness populates at receive from content.
     #[serde(default)]
     pub body: String,
     pub initiative_id: Option<String>,
     #[serde(default)]
     pub response_requested: bool,
     pub in_reply_to: Option<String>,
+    /// Backward-compat alias for created_at; defaulted to now on old records.
     #[serde(default = "default_now")]
     pub sent_at: DateTime<Utc>,
 }
@@ -143,6 +244,18 @@ pub struct AgentState {
     pub last_assessment_wake: u64,
     #[serde(default)]
     pub recent_action_hashes: Vec<(String, u64)>,
+    /// Stable IDs of backlog items the agent has completed; prevents re-seeding from backlog.md.
+    #[serde(default)]
+    pub completed_backlog_ids: Vec<String>,
+    /// How many backlog-driven wakes fired today; resets at date rollover.
+    #[serde(default)]
+    pub backlog_wakes_today: u32,
+    /// Date string (YYYY-MM-DD) for the current backlog_wakes_today window.
+    #[serde(default)]
+    pub backlog_wakes_date: Option<String>,
+    /// Timestamp of the most recent accepted `act` trail entry; used for idle-gate.
+    #[serde(default)]
+    pub last_trail_act_at: Option<DateTime<Utc>>,
 }
 
 // ── Claude Output ───────────────────────────────────────────────────────────
@@ -229,6 +342,11 @@ pub struct Responsibility {
 pub struct WakeConfig {
     pub triggers: Vec<String>,
     pub responsibilities: Vec<Responsibility>,
+    /// When true, the wake skips the Claude shift loop entirely. Used by
+    /// health-probe agents that exercise the wake plumbing (inbox → audit →
+    /// mark_delivered) without paying for an LLM call.
+    #[serde(default)]
+    pub skip_llm: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,4 +416,8 @@ pub struct Charter {
     pub core: bool,
     #[serde(default)]
     pub context_files: Vec<String>,
+    /// Proactive work this agent may self-assign when active queue is empty.
+    /// Empty = reactive-only agent; never auto-promotes from backlog.
+    #[serde(default)]
+    pub proactive_initiatives: Vec<String>,
 }

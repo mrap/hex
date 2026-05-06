@@ -30,7 +30,7 @@ done
 # ─── Paths ────────────────────────────────────────────────────────────────────
 # Derive HEX_DIR from this script's location: scripts/ → hex/
 HEX_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-CLAUDE_DIR="$HEX_DIR/.claude"
+CLAUDE_DIR="$HEX_DIR/.hex"
 
 # ─── State ────────────────────────────────────────────────────────────────────
 PASS_COUNT=0

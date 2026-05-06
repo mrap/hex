@@ -28,7 +28,7 @@ if [ -z "${HEX_DIR:-}" ]; then
   HEX_DIR="${HEX_DIR:-${HEX_DIR:-$HOME/hex}}"
 fi
 
-CLAUDE_DIR="$HEX_DIR/.claude"
+CLAUDE_DIR="$HEX_DIR/.hex"
 
 # ─── Flags ────────────────────────────────────────────────────────────────────
 FIX=false

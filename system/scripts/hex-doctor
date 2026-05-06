@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-# ─── Resolve AGENT_DIR ────────────────────────────────────────────────────────
+# ─── Resolve HEX_DIR ────────────────────────────────────────────────────────
 if [ -z "${HEX_DIR:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   candidate="$SCRIPT_DIR"
@@ -28,9 +28,10 @@ if [ -z "${HEX_DIR:-}" ]; then
     fi
     candidate="$(dirname "$candidate")"
   done
-  HEX_DIR="${HEX_DIR:-$HOME/hex}"
+  HEX_DIR="${HEX_DIR:-${HEX_DIR:-$HOME/hex}}"
 fi
 
+CLAUDE_DIR="$HEX_DIR/.hex"
 SCRIPTS_DIR="$HEX_DIR/.hex/scripts"
 HEX_CHECKS_DIR="$HEX_DIR/.hex/scripts/doctor-checks"
 
@@ -73,7 +74,8 @@ HAS_ERRORS=false
 HAS_WARNINGS=false
 
 CHECKS_FILE=$(mktemp /tmp/hex-doctor-checks.XXXXXX)
-trap 'rm -f "$CHECKS_FILE"' EXIT
+DOCTOR_TMP=$(mktemp -t hex-doctor-XXXXXX)
+trap 'rm -f "$CHECKS_FILE" "$DOCTOR_TMP"' EXIT
 
 # ─── Output helpers ───────────────────────────────────────────────────────────
 _pass() {
@@ -130,22 +132,27 @@ if [ -f "$DOCTOR_SH" ]; then
   echo -e "${BOLD}Installation Checks${RESET}"
   echo "  ─────────────────────────────────────────"
 
-  # Run doctor.sh and capture output (avoid empty array with -u)
+  # Stream doctor.sh output live to the terminal AND tee to a temp file so we
+  # can parse the summary line afterward. Capturing into a variable buffered the
+  # entire run — caused the appearance of hangs during integration checks.
+  # tail -n +5 strips doctor.sh's own header (4 lines) so it doesn't duplicate
+  # the bold "Installation Checks" header we just printed.
   if $FIX && $QUIET; then
-    doctor_output=$(bash "$DOCTOR_SH" --fix --quiet 2>&1) || true
+    bash "$DOCTOR_SH" --fix --quiet 2>&1 | tee "$DOCTOR_TMP" | tail -n +5
   elif $FIX; then
-    doctor_output=$(bash "$DOCTOR_SH" --fix 2>&1) || true
+    bash "$DOCTOR_SH" --fix 2>&1 | tee "$DOCTOR_TMP" | tail -n +5
   elif $QUIET; then
-    doctor_output=$(bash "$DOCTOR_SH" --quiet 2>&1) || true
+    bash "$DOCTOR_SH" --quiet 2>&1 | tee "$DOCTOR_TMP" | tail -n +5
   else
-    doctor_output=$(bash "$DOCTOR_SH" 2>&1) || true
+    bash "$DOCTOR_SH" 2>&1 | tee "$DOCTOR_TMP" | tail -n +5
   fi
-
-  # Print doctor.sh output (skip the header lines it already prints, show check results)
-  # Filter: remove the doctor.sh header (first 4 lines with title/separator/AGENT_DIR/blank)
-  echo "$doctor_output" | tail -n +5 | while IFS= read -r line; do
-    echo "$line"
-  done
+  # PIPESTATUS[0]=doctor.sh, [1]=tee, [2]=tail. Without -e we keep going on
+  # failure, so capture all three and surface explicitly. tee failing (disk full,
+  # permission, ENOSPC) while doctor.sh exits 0 was a silent-failure path.
+  doctor_sh_exit="${PIPESTATUS[0]}"
+  doctor_tee_exit="${PIPESTATUS[1]:-0}"
+  doctor_tail_exit="${PIPESTATUS[2]:-0}"
+  doctor_output="$(cat "$DOCTOR_TMP")"
 
   # Parse summary from doctor.sh output: "  Summary: N passed, N warnings, N errors, N fixed"
   summary_line=$(echo "$doctor_output" | grep "Summary:" | tail -1) || summary_line=""
@@ -161,6 +168,15 @@ if [ -f "$DOCTOR_SH" ]; then
     FIXED_COUNT=$((FIXED_COUNT + ${INSTALL_FIXED:-0}))
     [ "${INSTALL_ERRORS:-0}" -gt 0 ] && HAS_ERRORS=true
     [ "${INSTALL_WARNINGS:-0}" -gt 0 ] && HAS_WARNINGS=true
+  elif [ "${doctor_sh_exit:-1}" -ne 0 ]; then
+    _error "Installation checks crashed (doctor.sh exit $doctor_sh_exit) — no Summary line"
+    HAS_ERRORS=true
+  elif [ "${doctor_tee_exit:-0}" -ne 0 ] || [ "${doctor_tail_exit:-0}" -ne 0 ]; then
+    _error "Installation checks output pipeline failed (tee=$doctor_tee_exit tail=$doctor_tail_exit) — Summary may be incomplete"
+    HAS_ERRORS=true
+  else
+    _error "Installation checks produced no Summary line — counts unverified"
+    HAS_ERRORS=true
   fi
 else
   _warn "Installation checks skipped: doctor.sh not found at $DOCTOR_SH"
@@ -251,195 +267,180 @@ else
     check_65
   fi
 
-  # ── hex events status absorption (check_66) ──────────────────────────────────
-  # Runs `hex events status` and fails for every policy that failed to parse.
-  # One check absorbs all validation hex-events surfaces — future hex-events
-  # improvements are inherited automatically.
-  check_66() {
-    local hex_bin="$HEX_DIR/.hex/bin/hex"
-    if [ ! -x "$hex_bin" ]; then
-      _warn "hex-events.events-status: hex binary not found ($hex_bin) — skipping"
-      _rec 66 "hex-events.events-status" "warn" "hex binary not found"
-      return
-    fi
+fi
 
-    local _timeout_bin
-    _timeout_bin=$(command -v gtimeout || command -v timeout || true) 2>/dev/null
-
-    local combined exit_code
-    exit_code=0
-    if [ -n "$_timeout_bin" ]; then
-      combined=$(HEX_DIR="$HEX_DIR" "$_timeout_bin" 10 "$hex_bin" events status 2>&1) || exit_code=$?
-    else
-      combined=$(HEX_DIR="$HEX_DIR" "$hex_bin" events status 2>&1) || exit_code=$?
-    fi
-
-    if [ "$exit_code" -eq 124 ]; then
-      _error "hex-events.events-status: timed out after 10s (daemon unresponsive?)"
-      _rec 66 "hex-events.events-status" "error" "hex events status timed out"
-      return
-    fi
-
-    local failures
-    failures=$(printf '%s\n' "$combined" | grep '^events: failed to parse ') || true
-
-    if [ -n "$failures" ]; then
-      local count
-      count=$(printf '%s\n' "$failures" | wc -l | tr -d ' ')
-      if [ "$count" -eq 1 ]; then
-        _error "hex-events.events-status: 1 policy failed to parse:"
-      else
-        _error "hex-events.events-status: ${count} policies failed to parse:"
-      fi
-      while IFS= read -r line; do
-        local path err_msg
-        path=$(printf '%s' "$line" | sed 's/^events: failed to parse "//;s/": .*//')
-        err_msg=$(printf '%s' "$line" | sed 's/^events: failed to parse "[^"]*": //')
-        _info "  - $path: $err_msg"
-      done <<< "$failures"
-      _rec 66 "hex-events.events-status" "error" "${count} parse failure(s)"
-      return
-    fi
-
-    if [ "$exit_code" -ne 0 ]; then
-      local first_line
-      first_line=$(printf '%s\n' "$combined" | head -1)
-      _error "hex-events.events-status: hex events status exited $exit_code"
-      _info "  $first_line"
-      _rec 66 "hex-events.events-status" "error" "exit code $exit_code"
-      return
-    fi
-
-    local policy_count
-    policy_count=$(printf '%s\n' "$combined" | grep 'policies loaded:' | grep -oE '[0-9]+' | head -1) || policy_count="?"
-    _pass "hex-events.events-status: ${policy_count} policies loaded, 0 parse errors"
-    _rec 66 "hex-events.events-status" "pass" "${policy_count} policies loaded"
-  }
-
+# ─── Alert Pipeline check ─────────────────────────────────────────────────────
+ALERT_PIPELINE_CHECK="$SCRIPTS_DIR/health/check-alert-pipeline.sh"
+if [ -f "$ALERT_PIPELINE_CHECK" ]; then
   MODULE_COUNT=$((MODULE_COUNT + 1))
   echo ""
-  echo -e "${BOLD}hex events status${RESET}"
+  echo -e "${BOLD}Alert Pipeline${RESET}"
   echo "  ─────────────────────────────────────────"
-  check_66
+  alert_out=""
+  alert_exit=0
+  alert_out="$(bash "$ALERT_PIPELINE_CHECK" 2>&1)" || alert_exit=$?
+  if [ "$alert_exit" -eq 0 ]; then
+    _pass "$alert_out"
+  else
+    _error "$alert_out"
+  fi
+fi
 
-  # ── Version sync (check_67) ──────────────────────────────────────────────────
-  # Verifies compiled binary version == Cargo.toml version.
-  # WARN (not FAIL) when git tag lags Cargo.toml — that's expected between bumps.
-  check_67() {
-    local harness_toml="$HEX_DIR/.hex/harness/Cargo.toml"
-    local hex_bin="$HEX_DIR/.hex/bin/hex"
-    local foundation_repo="$HOME/github.com/mrap/hex-foundation"
-
-    if [ ! -f "$harness_toml" ]; then
-      _warn "version-sync: harness Cargo.toml not found ($harness_toml) — skipping"
-      _rec 67 "version-sync" "warn" "Cargo.toml not found"
-      return
-    fi
-
-    local CARGO_VER
-    CARGO_VER=$(grep -E '^version' "$harness_toml" | head -1 | cut -d'"' -f2)
-
-    if [ -z "$CARGO_VER" ]; then
-      _error "version-sync: could not read version from $harness_toml"
-      _rec 67 "version-sync" "error" "could not parse Cargo.toml version"
-      return
-    fi
-
-    if [ ! -x "$hex_bin" ]; then
-      _error "version-sync: hex binary not found or not executable ($hex_bin)"
-      _rec 67 "version-sync" "error" "hex binary missing"
-      return
-    fi
-
-    local hex_version
-    hex_version=$("$hex_bin" --version 2>&1 | awk '{print $2}')
-
-    if [ "$CARGO_VER" != "$hex_version" ]; then
-      _error "version-sync: Cargo.toml=$CARGO_VER but binary reports $hex_version — rebuild needed"
-      _info  "  Run: cd $HEX_DIR/.hex/harness && cargo build --release && cp target/release/hex $hex_bin"
-      _rec 67 "version-sync" "error" "Cargo.toml=$CARGO_VER binary=$hex_version"
-      return
-    fi
-
-    _pass "version-sync: Cargo.toml == binary == $CARGO_VER"
-    _rec 67 "version-sync" "pass" "$CARGO_VER"
-
-    local TAG_VER
-    TAG_VER=$(git -C "$foundation_repo" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//') || TAG_VER=""
-
-    if [ -n "$TAG_VER" ] && [ "$TAG_VER" != "$CARGO_VER" ]; then
-      _warn "version-sync: latest git tag v$TAG_VER != Cargo.toml $CARGO_VER (expected between bumps)"
-      _rec 67 "version-sync.tag" "warn" "tag=$TAG_VER cargo=$CARGO_VER"
-    elif [ -n "$TAG_VER" ]; then
-      if ! $QUIET; then
-        echo -e "  [${GREEN}PASS${RESET}] version-sync: git tag v$TAG_VER matches Cargo.toml"
-      fi
-    fi
-  }
-
+# ─── Reflection Liveness check ───────────────────────────────────────────────
+REFLECTION_LIVENESS_CHECK="$SCRIPTS_DIR/health/check-reflection-liveness.sh"
+if [ -f "$REFLECTION_LIVENESS_CHECK" ]; then
   MODULE_COUNT=$((MODULE_COUNT + 1))
   echo ""
-  echo -e "${BOLD}Version Sync${RESET}"
+  echo -e "${BOLD}Reflection Liveness${RESET}"
   echo "  ─────────────────────────────────────────"
-  check_67
+  rl_out=""
+  rl_exit=0
+  rl_out="$(bash "$REFLECTION_LIVENESS_CHECK" 2>&1)" || rl_exit=$?
+  if [ "$rl_exit" -eq 0 ]; then
+    _pass "$rl_out"
+  else
+    _error "$rl_out"
+  fi
+fi
 
-  # ── hex binary version-sync (check_68) ──────────────────────────────────────
-  # Verifies the `hex` binary on PATH matches the Cargo.toml version.
-  # Detects a stale PATH binary after a foundation repo upgrade.
-  # HEX_FOUNDATION_DIR can be overridden (default: ~/github.com/mrap/hex-foundation).
-  check_68() {
-    local foundation_dir="${HEX_FOUNDATION_DIR:-$HOME/github.com/mrap/hex-foundation}"
-    local foundation_toml="$foundation_dir/system/harness/Cargo.toml"
-    local installed_toml="$HEX_DIR/.hex/harness/Cargo.toml"
-    local toml_path
-
-    if [ -f "$foundation_toml" ]; then
-      toml_path="$foundation_toml"
-    elif [ -f "$installed_toml" ]; then
-      toml_path="$installed_toml"
-    else
-      _warn "hex-binary version-sync: Cargo.toml not found — skipping"
-      _rec 68 "hex-binary version-sync" "warn" "Cargo.toml not found"
-      return
-    fi
-
-    local CARGO_VER
-    CARGO_VER=$(grep -E '^version' "$toml_path" | head -1 | cut -d'"' -f2)
-
-    if [ -z "$CARGO_VER" ]; then
-      _error "hex-binary version-sync: could not read version from $toml_path"
-      _rec 68 "hex-binary version-sync" "error" "could not parse Cargo.toml version"
-      return
-    fi
-
-    local hex_path
-    hex_path=$(command -v hex 2>/dev/null) || true
-
-    if [ -z "$hex_path" ]; then
-      _error "hex-binary version-sync: hex not found on PATH"
-      _rec 68 "hex-binary version-sync" "error" "hex not on PATH"
-      return
-    fi
-
-    local BIN_VER
-    BIN_VER=$(hex --version 2>&1 | awk '{print $2}')
-
-    if [ "$BIN_VER" = "$CARGO_VER" ]; then
-      _pass "hex-binary version-sync: hex binary == Cargo.toml == $CARGO_VER"
-      _rec 68 "hex-binary version-sync" "pass" "$CARGO_VER"
-    else
-      _error "hex-binary version-sync: binary=$BIN_VER but Cargo.toml=$CARGO_VER — rebuild needed"
-      _info  "  Run: cd ~/github.com/mrap/hex-foundation && make install"
-      _rec 68 "hex-binary version-sync" "error" "binary=$BIN_VER cargo=$CARGO_VER"
-    fi
-  }
-
+# ─── BOI DB Canonical check ───────────────────────────────────────────────────
+BOI_DB_CHECK="$SCRIPTS_DIR/health/check-boi-db-canonical.sh"
+if [ -f "$BOI_DB_CHECK" ]; then
   MODULE_COUNT=$((MODULE_COUNT + 1))
   echo ""
-  echo -e "${BOLD}Hex Binary Version Sync${RESET}"
+  echo -e "${BOLD}BOI DB Canonical${RESET}"
   echo "  ─────────────────────────────────────────"
-  check_68
+  boi_db_out=""
+  boi_db_exit=0
+  boi_db_out="$(bash "$BOI_DB_CHECK" 2>&1)" || boi_db_exit=$?
+  if [ "$boi_db_exit" -eq 0 ]; then
+    _pass "$boi_db_out"
+  else
+    _error "$boi_db_out"
+  fi
+fi
 
+# ─── Message Roundtrip check ─────────────────────────────────────────────────
+# Targets the `health-probe` agent (skip_llm) — exercises the wake plumbing
+# (inbox → mark_delivered → audit) without an LLM call. Fast and free.
+MSG_ROUNDTRIP_CHECK="$SCRIPTS_DIR/health/check-message-roundtrip.sh"
+if [ -f "$MSG_ROUNDTRIP_CHECK" ]; then
+  MODULE_COUNT=$((MODULE_COUNT + 1))
+  echo ""
+  echo -e "${BOLD}Message Roundtrip${RESET}"
+  echo "  ─────────────────────────────────────────"
+  bash "$MSG_ROUNDTRIP_CHECK" 2>&1 | tee "$DOCTOR_TMP.msgrt"
+  msg_rt_exit="${PIPESTATUS[0]}"
+  if [ "$msg_rt_exit" -eq 0 ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+  else
+    ERROR_COUNT=$((ERROR_COUNT + 1))
+    HAS_ERRORS=true
+  fi
+  rm -f "$DOCTOR_TMP.msgrt"
+fi
+
+# ─── Message Divergence check ────────────────────────────────────────────────
+MSG_DIVERGENCE_CHECK="$SCRIPTS_DIR/health/check-message-divergence.sh"
+if [ -f "$MSG_DIVERGENCE_CHECK" ]; then
+  MODULE_COUNT=$((MODULE_COUNT + 1))
+  echo ""
+  echo -e "${BOLD}Message Divergence${RESET}"
+  echo "  ─────────────────────────────────────────"
+  msg_div_out=""
+  msg_div_exit=0
+  msg_div_out="$(bash "$MSG_DIVERGENCE_CHECK" 2>&1)" || msg_div_exit=$?
+  if [ "$msg_div_exit" -eq 0 ]; then
+    _pass "$msg_div_out"
+  else
+    _error "$msg_div_out"
+  fi
+fi
+
+# ─── Career Auto-Send Pipeline check ─────────────────────────────────────────
+CAREER_PIPELINE_CHECK="$SCRIPTS_DIR/health/check-career-pipeline.sh"
+if [ -f "$CAREER_PIPELINE_CHECK" ]; then
+  MODULE_COUNT=$((MODULE_COUNT + 1))
+  echo ""
+  echo -e "${BOLD}Career Auto-Send Pipeline${RESET}"
+  echo "  ─────────────────────────────────────────"
+  career_out=""
+  career_exit=0
+  career_out="$(bash "$CAREER_PIPELINE_CHECK" --dry-run 2>&1)" || career_exit=$?
+  if [ "$career_exit" -eq 0 ]; then
+    _pass "$career_out"
+  else
+    _error "$career_out"
+  fi
+fi
+
+# ─── Fleet Pulse check ───────────────────────────────────────────────────────
+# Note: SCRIPTS_DIR may be overridden by sourced check files; use absolute path.
+FLEET_PULSE_CHECK="$HEX_DIR/.hex/scripts/health/check-fleet-pulse.sh"
+if [ -f "$FLEET_PULSE_CHECK" ]; then
+  MODULE_COUNT=$((MODULE_COUNT + 1))
+  echo ""
+  echo -e "${BOLD}Fleet Pulse${RESET}"
+  echo "  ─────────────────────────────────────────"
+  fleet_pulse_out=""
+  fleet_pulse_exit=0
+  fleet_pulse_out="$(bash "$FLEET_PULSE_CHECK" --dry-run 2>&1)" || fleet_pulse_exit=$?
+  if [ "$fleet_pulse_exit" -eq 0 ]; then
+    _pass "$fleet_pulse_out"
+  else
+    _error "$fleet_pulse_out"
+  fi
+fi
+
+# ─── Stalled Initiative Monitor check ────────────────────────────────────────
+STALLED_INIT_CHECK="$HEX_DIR/.hex/scripts/health/check-stalled-initiatives.sh"
+if [ -f "$STALLED_INIT_CHECK" ]; then
+  MODULE_COUNT=$((MODULE_COUNT + 1))
+  echo ""
+  echo -e "${BOLD}Stalled Initiative Monitor${RESET}"
+  echo "  ─────────────────────────────────────────"
+  stalled_out=""
+  stalled_exit=0
+  stalled_out="$(bash "$STALLED_INIT_CHECK" --dry-run 2>&1)" || stalled_exit=$?
+  if [ "$stalled_exit" -eq 0 ]; then
+    _pass "$stalled_out"
+  else
+    _error "$stalled_out"
+  fi
+fi
+
+# ─── Failure Routing Roundtrip check ─────────────────────────────────────────
+FAILURE_ROUTING_CHECK="$HEX_DIR/.hex/scripts/health/check-failure-routing-roundtrip.sh"
+if [ -f "$FAILURE_ROUTING_CHECK" ]; then
+  MODULE_COUNT=$((MODULE_COUNT + 1))
+  echo ""
+  echo -e "${BOLD}Failure Routing Roundtrip${RESET}"
+  echo "  ─────────────────────────────────────────"
+  fr_out=""
+  fr_exit=0
+  fr_out="$(bash "$FAILURE_ROUTING_CHECK" 2>&1)" || fr_exit=$?
+  if [ "$fr_exit" -eq 0 ]; then
+    _pass "$fr_out"
+  else
+    _error "$fr_out"
+  fi
+fi
+
+# ─── Slack Alert Roundtrip check ─────────────────────────────────────────────
+SLACK_ROUNDTRIP_CHECK="$SCRIPTS_DIR/health/check-slack-alert-roundtrip.sh"
+if [ -f "$SLACK_ROUNDTRIP_CHECK" ]; then
+  MODULE_COUNT=$((MODULE_COUNT + 1))
+  echo ""
+  echo -e "${BOLD}Slack Alert Roundtrip${RESET}"
+  echo "  ─────────────────────────────────────────"
+  slack_rt_out=""
+  slack_rt_exit=0
+  slack_rt_out="$(bash "$SLACK_ROUNDTRIP_CHECK" 2>&1)" || slack_rt_exit=$?
+  if [ "$slack_rt_exit" -eq 0 ]; then
+    _pass "$slack_rt_out"
+  else
+    _error "$slack_rt_out"
+  fi
 fi
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
