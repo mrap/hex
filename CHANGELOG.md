@@ -2,6 +2,18 @@
 
 All notable changes to hex-foundation will be documented in this file.
 
+## [2026-05-06] — doctor reliability + skip_llm WakeConfig (v0.13.1)
+
+### Fixed
+- `system/harness/src/main.rs`: Doctor command switches from `cmd.output()` (buffered) to `cmd.spawn()` with `Stdio::inherit()` — output streams live instead of appearing all-at-once after completion.
+- `system/scripts/run-startup-checks.sh`, `run-memory-checks.sh`, `run-landings-workspace-checks.sh`: Stale `CLAUDE_DIR=$HEX_DIR/.claude` path changed to `$HEX_DIR/.hex`. Was causing 5 spurious ERRORs on install paths that follow the `.hex` layout.
+- `system/scripts/hex-doctor`: Replace buffered `$()` capture with `tee | tail -n +5` streaming. All PIPESTATUS slots captured so mid-pipeline failures surface explicitly. Combined two EXIT traps into one.
+- BOI daemon check in hex-doctor rewritten for LaunchAgent-aware detection (was `pgrep`-based, missed managed processes).
+
+### Added
+- `system/harness/src/types.rs`: `WakeConfig.skip_llm` field (`#[serde(default)]` for backwards compat). Allows health-probe agents to exercise wake plumbing without paying for an LLM call.
+- `system/harness/src/wake.rs`: When `charter.wake.skip_llm=true`, bypass shift loop and self-assessment phase. Inbox loads, wake-start audit fires, `mark_delivered` runs. Inbox-sourced active queue items drained to prevent `state.json` unbounded growth.
+
 ## [2026-05-05] — agent performance review + calibration
 
 ### Added

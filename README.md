@@ -352,15 +352,21 @@ bash tests/eval/run_eval_macos.sh            # macOS Tart
 
 ## Roadmap
 
+v0.13.1 fixes: **Doctor reliability and skip_llm WakeConfig.**
+- **Doctor streaming**: Doctor command streams output live via `Stdio::inherit` (was buffered — appeared to hang on slow modules). `hex-doctor` bash script also switched to `tee | tail -n +5` streaming with full PIPESTATUS capture.
+- **Path bug fix**: 3 orchestration scripts had stale `CLAUDE_DIR=$HEX_DIR/.claude` (should be `.hex`). Caused 5 spurious doctor ERRORs on standard installs. Fixed.
+- **BOI daemon detection**: LaunchAgent-aware detection replaces `pgrep`-based check.
+- **`skip_llm` WakeConfig**: Agents that exercise wake plumbing without needing LLM reasoning (e.g. health probes) can set `wake.skip_llm: true`. Harness bypasses shift loop and self-assessment; inbox still loads and `mark_delivered` fires. `state.json` inbox drain prevents unbounded growth on high-frequency skip_llm wakes.
+
 v0.13.0 adds: **Fleet self-driving mechanisms and agent performance review.**
 - **Fleet pulse watchdog**: `check-fleet-pulse.sh` emits `hex.agent.needs-attention` events for dormant agents. Composite liveness score with WARN/ERROR escalation tiers. Suppresses during budget lockout.
 - **Stalled initiative monitor**: `check-stalled-initiatives.sh` detects initiatives with no progress signal in 48h (commit, act trail, or KR update). Sends drive-or-close directives to initiative owners. Anti-spam guard prevents re-fire within 24h.
 - **Mike-pending board monitor**: `check-mike-pending.sh` tracks Mike-blocked items with tier labels (quiet/digest/direct-ping). Coalesced per-run alerts with DM fallback.
 - **Budget period auto-reset**: `budget-period-reset.py` rolls `cost.current_period.start` forward when a period expires. 5x runaway safety gate emits ERROR alert instead of clearing an out-of-control agent.
-- **Backlog auto-promotion**: `wake.rs` gains proactive backlog promotion with three safety constraints — `proactive_initiatives` gate (reactive-only agents never self-assign), per-agent daily wake-budget ceiling at 80% of charter budget, and a per-wake ceiling of 2 backlog items.
 - **Agent performance review**: `agent-performance-review.py` produces per-agent quality/velocity/autonomy scorecards from critic reviews, BOI DB, audit trail, and Mike-pushback signals. Composite geometric mean (0.0–1.0) with cold-start handling.
 - **Fleet scorecard aggregate**: `fleet-scorecard-aggregate.py` runs per-agent reviews and produces fleet-wide top/bottom 5, biggest movers, and Mike-pushback heatmap. Outputs a single coalesced digest — no per-agent pings.
 - **Policy templates**: `adapter/policy-templates/` gains fleet-pulse, stalled-initiative-monitor, mike-pending-escalator, budget-period-reset, and agent-performance-review-weekly templates for out-of-the-box fleet health wiring.
+- **Note**: Backlog auto-promotion (`wake.rs`) was staged but reverted — supporting modules incomplete. Tracked for v0.14.0.
 
 v0.12.0 adds: **Upgrade reliability, shell completions, failure-revive protocol, and doctor improvements.**
 - **Shell completions**: `hex completions bash|zsh|fish` generates completion scripts for all subcommands. Install snippets in README.
