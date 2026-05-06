@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# hex-watcher — minimal BOI status pane (used by .hex/scripts/workspace.sh tmux setup).
+#
+# Usage: hex-watcher              # one-shot status print
+#        hex-watcher --watch      # tail in a loop (5s interval)
+#
+# Created 2026-05-05 to satisfy doctor check workspace.panes-configured. Replace
+# with richer status display as needed.
+
+set -uo pipefail
+
+HEX_DIR="${HEX_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd | sed 's|/\.hex$||')}"
+BOI_CMD="${BOI_CMD:-bash $HOME/.boi/boi}"
+INTERVAL="${HEX_WATCHER_INTERVAL:-5}"
+
+print_once() {
+  printf '\n=== hex-watcher %s ===\n' "$(date '+%H:%M:%S')"
+  $BOI_CMD status 2>&1 | head -40 || echo "[boi status failed]"
+  echo
+  if [ -x "$HEX_DIR/.hex/bin/hex" ]; then
+    echo "--- fleet ---"
+    "$HEX_DIR/.hex/bin/hex" agent fleet 2>&1 | head -10 || echo "[fleet read failed]"
+  fi
+}
+
+if [ "${1:-}" = "--watch" ]; then
+  while true; do
+    clear
+    print_once
+    sleep "$INTERVAL"
+  done
+else
+  print_once
+fi
