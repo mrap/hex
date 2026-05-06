@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Test: hex-doctor check_66 absorbs hex events status parse failures.
+# Test: hex-doctor invokes external health scripts for hex-events and vector search.
 #
-# Creates a temp HEX_DIR with a stub hex binary and asserts:
-#   - Broken policies  → doctor FAILs, path + error named in output
-#   - Clean policies   → events check PASSes, policy count shown
-#   - Daemon down      → doctor FAILs with error indicator
-#   - Missing binary   → WARN only (not hard fail)
+# The v0.13.2 design moved policy-load checking out of inline check_66 into
+# external scripts (check-hex-events-policy-load.sh, check-vector-search.sh).
+# hex-doctor guards each with `if [ -f "$SCRIPT" ]` so absent scripts are skipped.
 #
-# No Docker needed; stubs the hex binary entirely.
+# Asserts:
+#   - No external scripts → modules skipped, doctor exits 0
+#   - policy-load script present, daemon log clean → doctor shows PASS
+#   - policy-load script present, daemon log has errors → doctor shows ERROR
+#   - policy-load script present, no daemon log → doctor skips gracefully
+#
+# No hex binary stub needed — the new scripts don't call `hex events status`.
 set -uo pipefail
 
 PASS=0
@@ -16,6 +20,7 @@ TOTAL=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HEX_DOCTOR="$SCRIPT_DIR/../system/scripts/hex-doctor"
+POLICY_LOAD_SCRIPT="$SCRIPT_DIR/../system/scripts/health/check-hex-events-policy-load.sh"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -57,8 +62,6 @@ assert_not_contains() {
 }
 
 run_doctor() {
-  # Run hex-doctor under a fake HEX_DIR; return output via stdout, exit code via DOCTOR_EXIT.
-  # Cannot use ||true here — that would mask the exit code.
   DOCTOR_EXIT=0
   DOCTOR_OUT=$(HEX_DIR="$1" bash "$HEX_DOCTOR" 2>&1) || DOCTOR_EXIT=$?
 }
@@ -68,14 +71,10 @@ run_doctor() {
 FAKE_HEX=$(mktemp -d)
 trap 'rm -rf "$FAKE_HEX"' EXIT
 
-# .hex/bin/hex             — stub binary  (replaced per test)
-# .hex/scripts/doctor.sh   — no-op stub to suppress installation-skip WARN
-# .hex/scripts/doctor-checks/  — triggers the check_66 block in hex-doctor
-mkdir -p "$FAKE_HEX/.hex/bin"
+mkdir -p "$FAKE_HEX/.hex/scripts/health"
 mkdir -p "$FAKE_HEX/.hex/scripts/doctor-checks"
+mkdir -p "$FAKE_HEX/.hex/bin"
 
-# Minimal doctor.sh stub: outputs the Summary line hex-doctor greps for,
-# with zero errors/warnings so it doesn't pollute the global counters.
 cat > "$FAKE_HEX/.hex/scripts/doctor.sh" << 'DOCEOF'
 #!/bin/bash
 echo ""
@@ -89,114 +88,78 @@ chmod +x "$FAKE_HEX/.hex/scripts/doctor.sh"
 echo "=== test-doctor-events-coverage ==="
 echo ""
 
-# ── Test 1: Broken policy — parse failure detected ────────────────────────────
-echo "[1] Broken policy: parse failure detection"
-
-cat > "$FAKE_HEX/.hex/bin/hex" << 'HEXEOF'
-#!/bin/bash
-if [ "$1" = "events" ] && [ "$2" = "status" ]; then
-  printf 'events: failed to parse "/tmp/fake-policies/broken.yaml": duplicate field `timeout` at line 5 column 9\n' >&2
-  printf 'events: loaded 0 policies from "/tmp/fake-policies"\n' >&2
-  printf 'hex events status\n  policies loaded:  0\n'
-fi
-HEXEOF
-chmod +x "$FAKE_HEX/.hex/bin/hex"
+# ── Test 1: No external scripts → modules skipped, doctor exits 0 ─────────────
+echo "[1] No external check scripts: modules skipped gracefully"
 
 run_doctor "$FAKE_HEX"
-assert_exit     "exit code is 1 (errors)"                  1              "$DOCTOR_EXIT"
-assert_contains "output contains ERROR"                    "ERROR"        "$DOCTOR_OUT"
-assert_contains "failing policy path named in output"      "broken.yaml"  "$DOCTOR_OUT"
-assert_contains "parse error message present in output"    "duplicate field" "$DOCTOR_OUT"
-
-# ── Test 2: Multiple broken policies — all named ──────────────────────────────
-echo ""
-echo "[2] Multiple broken policies: all paths + errors listed"
-
-cat > "$FAKE_HEX/.hex/bin/hex" << 'HEXEOF'
-#!/bin/bash
-if [ "$1" = "events" ] && [ "$2" = "status" ]; then
-  printf 'events: failed to parse "/hex/policies/boi-daemon-watchdog.yaml": duplicate field `timeout` at line 19 column 9\n' >&2
-  printf 'events: failed to parse "/hex/policies/goal-alignment.yaml": missing field `field` at line 21 column 9\n' >&2
-  printf 'events: failed to parse "/hex/policies/hex-v2-exp-agent.yaml": duplicate field `timeout` at line 26 column 9\n' >&2
-  printf 'events: loaded 124 policies from "/hex/policies"\n' >&2
-  printf 'hex events status\n  policies loaded:  124\n'
-fi
-HEXEOF
-chmod +x "$FAKE_HEX/.hex/bin/hex"
-
-run_doctor "$FAKE_HEX"
-assert_exit     "exit code is 1 (errors)"                          1                       "$DOCTOR_EXIT"
-assert_contains "first failing policy named"                        "boi-daemon-watchdog"   "$DOCTOR_OUT"
-assert_contains "second failing policy named"                       "goal-alignment"        "$DOCTOR_OUT"
-assert_contains "third failing policy named"                        "hex-v2-exp-agent"      "$DOCTOR_OUT"
-assert_contains "first error message present"                       "duplicate field"       "$DOCTOR_OUT"
-assert_contains "second error message present (missing field)"      "missing field"         "$DOCTOR_OUT"
-
-# ── Test 3: Happy path — clean policies → events check PASSES ─────────────────
-echo ""
-echo "[3] Happy path: all policies valid"
-
-cat > "$FAKE_HEX/.hex/bin/hex" << 'HEXEOF'
-#!/bin/bash
-if [ "$1" = "events" ] && [ "$2" = "status" ]; then
-  printf 'events: loaded 5 policies from "/tmp/fake-policies"\n' >&2
-  printf 'hex events status\n  policies loaded:  5\n'
-fi
-HEXEOF
-chmod +x "$FAKE_HEX/.hex/bin/hex"
-
-run_doctor "$FAKE_HEX"
-# exit 2 = warnings from unrelated checks (e.g. version-sync Cargo.toml missing in fake env)
-# exit 0 = all pass; either is acceptable — must NOT be 1 (errors)
 TOTAL=$((TOTAL + 1))
 if [ "$DOCTOR_EXIT" -ne 1 ]; then
-  echo "  PASS: exit code is not 1 (no errors from events check)"
+  echo "  PASS: doctor exits 0 or 2 (no errors when scripts absent)"
   PASS=$((PASS + 1))
 else
-  echo "  FAIL: exit code is 1 (unexpected error in happy path)"
+  echo "  FAIL: doctor exits 1 (unexpected error when scripts absent)"
   FAIL=$((FAIL + 1))
 fi
-assert_contains     "events check PASS in output"          "PASS"        "$DOCTOR_OUT"
-assert_contains     "policy count shown in output"         "5 policies"  "$DOCTOR_OUT"
-assert_not_contains "no ERROR in output"                   "ERROR"       "$DOCTOR_OUT"
+assert_not_contains "no ERROR when scripts absent"  "ERROR"  "$DOCTOR_OUT"
 
-# ── Test 4: Hex binary missing → WARN (not hard fail) ────────────────────────
+# ── Test 2: policy-load script present, no daemon log → SKIP (not ERROR) ──────
 echo ""
-echo "[4] Missing hex binary: warns but does not hard-error"
+echo "[2] Policy-load script present, daemon log absent: SKIP (not ERROR)"
 
-rm -f "$FAKE_HEX/.hex/bin/hex"
+cp "$POLICY_LOAD_SCRIPT" "$FAKE_HEX/.hex/scripts/health/check-hex-events-policy-load.sh"
+chmod +x "$FAKE_HEX/.hex/scripts/health/check-hex-events-policy-load.sh"
 
-run_doctor "$FAKE_HEX"
-assert_contains     "output contains WARN for missing binary"  "WARN"   "$DOCTOR_OUT"
-assert_not_contains "no ERROR for missing binary"              "ERROR"  "$DOCTOR_OUT"
-# exit 2 = warnings only (acceptable); 0 = all pass also acceptable if WARN is suppressed
-# Either way: must NOT be 1 (errors)
+DAEMON_LOG="$FAKE_HEX/daemon-absent.log"  # doesn't exist
+DOCTOR_EXIT=0
+DOCTOR_OUT=$(HEX_DIR="$FAKE_HEX" HEX_EVENTS_DAEMON_LOG="$DAEMON_LOG" bash "$HEX_DOCTOR" 2>&1) || DOCTOR_EXIT=$?
+
 TOTAL=$((TOTAL + 1))
 if [ "$DOCTOR_EXIT" -ne 1 ]; then
-  echo "  PASS: exit code is not 1 (no hard error for missing binary)"
+  echo "  PASS: exit code is not 1 (absent daemon log is a SKIP, not ERROR)"
   PASS=$((PASS + 1))
 else
-  echo "  FAIL: exit code is 1 (unexpected hard error for missing binary)"
+  echo "  FAIL: exit code is 1 (absent daemon log should be SKIP, not ERROR)"
   FAIL=$((FAIL + 1))
 fi
+assert_not_contains "no ERROR for absent daemon log"   "ERROR"  "$DOCTOR_OUT"
+assert_contains     "SKIP shown for absent daemon log" "SKIP"   "$DOCTOR_OUT"
 
-# Restore hex binary for test 5
-cat > "$FAKE_HEX/.hex/bin/hex" << 'HEXEOF'
-#!/bin/bash
-if [ "$1" = "events" ] && [ "$2" = "status" ]; then
-  printf 'daemon not running\n' >&2
-  exit 1
-fi
-HEXEOF
-chmod +x "$FAKE_HEX/.hex/bin/hex"
-
-# ── Test 5: Non-zero exit from hex binary (daemon down) ───────────────────────
+# ── Test 3: policy-load script present, daemon log clean → PASS ───────────────
 echo ""
-echo "[5] Daemon down: hex events status exits non-zero"
+echo "[3] Policy-load script present, daemon log clean: PASS"
 
-run_doctor "$FAKE_HEX"
-assert_exit     "exit code is 1 (errors)"                   1       "$DOCTOR_EXIT"
-assert_contains "ERROR in output for failed hex command"    "ERROR"  "$DOCTOR_OUT"
+DAEMON_LOG="$FAKE_HEX/daemon-clean.log"
+# Recent normal daemon log line (no POLICY errors)
+echo "$(date -u '+%Y-%m-%d %H:%M:%S'),000 hex-events INFO Loaded 5 policies" > "$DAEMON_LOG"
+
+DOCTOR_EXIT=0
+DOCTOR_OUT=$(HEX_DIR="$FAKE_HEX" HEX_EVENTS_DAEMON_LOG="$DAEMON_LOG" bash "$HEX_DOCTOR" 2>&1) || DOCTOR_EXIT=$?
+
+TOTAL=$((TOTAL + 1))
+if [ "$DOCTOR_EXIT" -ne 1 ]; then
+  echo "  PASS: exit code is not 1 (clean log has no errors)"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: exit code is 1 (clean log should not produce errors)"
+  FAIL=$((FAIL + 1))
+fi
+assert_not_contains "no ERROR for clean daemon log"  "ERROR"  "$DOCTOR_OUT"
+
+# ── Test 4: policy-load script present, daemon log has POLICY LOAD ERROR ──────
+echo ""
+echo "[4] Policy-load script present, daemon log has errors: ERROR"
+
+DAEMON_LOG="$FAKE_HEX/daemon-errors.log"
+# Simulate a POLICY LOAD ERROR entry within the last 2h
+NOW_UTC="$(date -u '+%Y-%m-%d %H:%M:%S')"
+echo "${NOW_UTC},000 hex-events ERROR [POLICY LOAD ERROR] /hex/policies/broken-policy.yaml: duplicate field 'timeout'" > "$DAEMON_LOG"
+
+DOCTOR_EXIT=0
+DOCTOR_OUT=$(HEX_DIR="$FAKE_HEX" HEX_EVENTS_DAEMON_LOG="$DAEMON_LOG" bash "$HEX_DOCTOR" 2>&1) || DOCTOR_EXIT=$?
+
+assert_exit "exit code is 1 (errors from policy-load check)" 1 "$DOCTOR_EXIT"
+assert_contains "ERROR shown in doctor output"               "ERROR"              "$DOCTOR_OUT"
+assert_contains "failing policy path named"                  "broken-policy.yaml" "$DOCTOR_OUT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
