@@ -582,9 +582,11 @@ Every status change gets a timestamped changelog entry at the bottom.
 
 ## Gotchas
 
-- **`<!-- hex:system-start -->` / `<!-- hex:system-end -->` markers** delimit the managed section. `hex upgrade` replaces everything between them. Never put custom rules between these markers — they will be overwritten on the next upgrade.
+- **`<!-- hex:system-start -->` / `<!-- hex:system-end -->` markers** delimit the managed section. `hex upgrade` replaces everything between them. Never put custom rules between these markers — they will be overwritten on the next upgrade. See also `<!-- hex:user-local -->` below for file-level preservation.
 - **`## My Rules` section is user-preserved.** All instance customization goes in the `## My Rules` block below `<!-- hex:user-end -->`. It survives upgrades.
 - **Not every runtime-specific instruction file is a symlink to this one.** Some hex instances ship a sibling instruction file that is a real file, not a symlink — its content can drift from `AGENTS.md`. If a sibling exists and is not a symlink, treat it separately and keep the two in sync by hand.
+- **User-customized commands/skills survive upgrades if they contain `<!-- hex:user-local -->`.** Add this HTML comment anywhere in `~/hex/.hex/{commands,skills,scripts,hooks}/<your-file>` and `hex upgrade` will preserve it across syncs. Without the marker, user-added files in these directories are deleted by the sync deletion pass (treated as stale foundation files). Backup is always written to `~/hex/.hex/.upgrade-backup-YYYYMMDD-HHMMSS/`.
+- **`GEMINI.md` is NOT a symlink in hex instances** — it has Gemini-specific runtime differences. Treat it separately from `AGENTS.md`/`CLAUDE.md`.
 - **`hex upgrade` pulls, never pushes.** Running `hex upgrade` in an instance overwrites the system section with the latest from hex-foundation. Changes to an instance don't flow back automatically.
 - **Sibling instruction files in this repo are symlinks to `AGENTS.md`.** `AGENTS.md` is canonical; the runtime-named variant(s) point at it so every runtime reads identical content. If a git clone resolves a symlink as a plain text file (Windows without `core.symlinks=true`), run `git checkout <file>` to restore the symlink.
 - **32 KiB combined instruction-file limit.** Some runtimes cap the total size of the instruction file plus any subdirectory `AGENTS.md` files at 32 KiB. Keep the combined total under that. Currently ~22 KB — keep additions modest.

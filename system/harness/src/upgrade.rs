@@ -18,6 +18,12 @@ use crate::path_map;
 
 const DEFAULT_REPO: &str = "https://github.com/mrap/hex-foundation.git";
 
+/// HTML comment marker that exempts a file from deletion_pass.
+/// Convention matches existing `<!-- hex:system-start -->` markers
+/// in AGENTS.md / CLAUDE.md. Place anywhere in the file (top, bottom,
+/// inside a frontmatter block — case-sensitive).
+pub const USER_LOCAL_MARKER: &str = "<!-- hex:user-local -->";
+
 struct Args {
     dry_run: bool,
     repo_url: Option<String>,
@@ -220,7 +226,20 @@ pub fn apply_sync(src_dir: &Path, dst_dir: &Path, backup_dir: Option<&Path>) -> 
     Ok(count)
 }
 
-/// Remove files in dst_dir that are absent from src_dir. Backs them up first.
+/// True if the file contains `USER_LOCAL_MARKER` anywhere in its contents.
+/// Files matching are preserved by `deletion_pass` even when the foundation
+/// does not ship them.
+/// Non-UTF-8 / binary files: always returns false (cannot contain marker).
+fn is_user_local(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| s.contains(USER_LOCAL_MARKER))
+        .unwrap_or(false)
+}
+
+/// Remove files in dst_dir that are absent from src_dir, EXCEPT files
+/// containing the `<!-- hex:user-local -->` HTML comment marker (which are
+/// preserved). Backs deleted files up first.
 pub fn deletion_pass(dst_dir: &Path, src_dir: &Path, backup_dir: &Path) -> io::Result<usize> {
     if !dst_dir.exists() || !src_dir.exists() {
         return Ok(0);
@@ -232,6 +251,10 @@ pub fn deletion_pass(dst_dir: &Path, src_dir: &Path, backup_dir: &Path) -> io::R
             Err(_) => continue,
         };
         if !src_dir.join(rel).exists() {
+            if is_user_local(&dst_file) {
+                println!("  → preserved (user-local marker): {}", rel.display());
+                continue;
+            }
             let bak_file = backup_dir.join(rel);
             if let Some(p) = bak_file.parent() {
                 fs::create_dir_all(p)?;
@@ -1545,6 +1568,71 @@ mod tests {
         assert!(
             !cache_is_healthy(&corrupt),
             "a headless .git shell must be unhealthy (must not resolve up-tree)"
+        );
+    }
+
+    #[test]
+    fn test_deletion_pass_preserves_user_local_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let dst = temp.path().join("dst");
+        let src = temp.path().join("src");
+        let bak = temp.path().join("bak");
+        fs::create_dir_all(&dst).unwrap();
+        fs::create_dir_all(&src).unwrap();
+
+        // User-local file (not in foundation) — must be preserved
+        let user_file = dst.join("my-custom.md");
+        fs::write(
+            &user_file,
+            "# My Custom Command\n<!-- hex:user-local -->\nUser content here.\n",
+        )
+        .unwrap();
+
+        // Stale file (not in foundation, no marker) — must be deleted
+        let stale_file = dst.join("stale.md");
+        fs::write(&stale_file, "# Stale\nNo marker here.\n").unwrap();
+
+        let deleted = deletion_pass(&dst, &src, &bak).unwrap();
+
+        assert_eq!(deleted, 1, "only stale file should be deleted");
+        assert!(user_file.exists(), "user-local file must survive");
+        assert!(!stale_file.exists(), "stale file must be deleted");
+    }
+
+    #[test]
+    fn test_is_user_local_marker_anywhere_in_file() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // Marker at top
+        let top = temp.path().join("top.md");
+        fs::write(&top, "<!-- hex:user-local -->\nrest of file").unwrap();
+        assert!(super::is_user_local(&top));
+
+        // Marker in middle
+        let mid = temp.path().join("mid.md");
+        fs::write(&mid, "# Heading\nbody\n<!-- hex:user-local -->\nmore body").unwrap();
+        assert!(super::is_user_local(&mid));
+
+        // Marker at bottom
+        let bot = temp.path().join("bot.md");
+        fs::write(&bot, "# Heading\nbody\n<!-- hex:user-local -->").unwrap();
+        assert!(super::is_user_local(&bot));
+
+        // No marker
+        let none = temp.path().join("none.md");
+        fs::write(&none, "# Heading\nbody\n").unwrap();
+        assert!(!super::is_user_local(&none));
+    }
+
+    #[test]
+    fn test_is_user_local_binary_file_returns_false() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        // Non-UTF-8 byte sequence
+        fs::write(&bin, [0xff_u8, 0xfe, 0xfd, 0xfc, 0x00]).unwrap();
+        assert!(
+            !super::is_user_local(&bin),
+            "binary files cannot contain UTF-8 marker; should not crash"
         );
     }
 }
