@@ -7,9 +7,10 @@ skills — `iii-getting-started`, `iii-functions-and-triggers`, `iii-trigger-sch
 `iii-state-reactions`, `iii-queue-processing`, `iii-state-management`. This doc only
 covers the hex layer on top.
 
-> Status (2026-06-04): the `hex worker` / `hex triggers` surfaces + the `ops` seam are
-> being built (spec `Skt0r3dbg`). The **concepts and conventions** below are stable;
-> verify exact CLI flags against `hex worker --help` / `hex triggers --help` once shipped.
+> Status: the **concepts and conventions** below are stable. The CLI shipped as
+> `hex module …` (worker lifecycle) + `hex triggers …` (event production) — NOT the
+> `hex worker run` form an earlier draft assumed (that YAML worker host was never built).
+> Verify exact flags against `hex module --help` / `hex triggers --help`.
 
 ---
 
@@ -21,7 +22,7 @@ iii is three nouns and a set of channels.
 |---|---|---|
 | **Function** | a unit of work — "do this" | `hex::landings::reconcile` |
 | **Trigger** | a *subscription*: "fire function F when X happens." Registered **once**, when the consumer sets up. Has a **type**. | a `state` trigger watching scope `boi` |
-| **Worker** | a process that hosts functions + triggers | `hex worker run <config>` |
+| **Worker** | a typed-Rust unit binding a function to a trigger, run in-process by the harness engine | `Worker::new("hex-backup").on_cron_named(...)`; inspect via `hex module list` |
 
 A **trigger's type is the channel it listens on:**
 
@@ -53,30 +54,35 @@ We do **not** scatter `iii_sdk::` calls across hex. One seam owns iii.
 - **`system/harness/src/ops.rs`** — the *only* place (besides the worker host) that calls
   `iii_sdk::`. Exposes hex-native `emit(...)`, state read/write, connect. If iii's API
   changes or we swap substrate, only this file changes.
-- **`hex worker run | list | status`** — worker lifecycle, hex-native (was `hex iii worker
-  run`; the `iii` is gone from the surface). A worker config is declarative YAML:
-  `{ worker_name, jobs: [{ id, command, cron | trigger }] }`, hosted by `hex worker run`.
-  The hex binary **is** the worker host — no node, no per-worker binary.
+- **Workers are typed Rust, not YAML.** Each is a `Worker` (`system/harness/src/worker/mod.rs`)
+  binding a function to a trigger — e.g. `Worker::new("hex-backup").on_cron_named("daily",
+  CRON_DAILY, run_backup)` (`system/harness/src/modules/backup.worker.rs`). They are collected
+  in `hex_modules::module_registry()` (surfaced by `hex::workers::registry()`) and run
+  in-process by the harness engine (`hex harness serve`) — no node, no per-worker binary.
+- **`hex module list | status <name> | enable <name> | disable <name>`** — worker (module)
+  lifecycle. There is **no `hex worker run`**; an earlier draft of this doc described a
+  `{ worker_name, jobs }` YAML host that was never built.
 - **`hex triggers emit <event> [--data <json>] [--producer <name>]`** — the producer.
   One `iii.trigger(...)` call under the hood; writes the event onto a channel so reactive
   workers fire. Shell/hook callers use the CLI; Rust callers use `ops::emit(...)` directly
   — same code path, the CLI is just `clap` + the lib.
 
-### Trigger config in a worker YAML
+### Authoring a worker (real model)
 
-```yaml
-worker_name: hex-landings
-jobs:
-  - id: hex::memory::index
-    command: [hex, memory, index]
-    cron: "0 */15 * * * * *"          # bare cron = a cron trigger
-  - id: hex::landings::reconcile
-    command: [hex, landings, reconcile]
-    trigger:
-      state: { scope: "boi" }          # state | queue (cron also valid here)
+A worker is typed Rust — bind a function to a trigger via the `Worker` builder, then register
+it so `hex harness serve` runs it:
+
+```rust
+// system/harness/src/modules/backup.worker.rs (illustrative)
+Worker::new("hex-backup")
+    .on_cron_named("daily", CRON_DAILY, run_backup)   // cron trigger (7-field expr)
+// .on_event(...) binds a state/queue trigger instead
 ```
 
-The fired command receives the trigger event as the **`III_EVENT`** env var (JSON).
+Add it to `hex_modules::module_registry()` so the engine schedules it. The bound function
+receives the trigger event as a typed argument (not an env var). Authoring a new worker is a
+**foundation change** (it compiles into the harness), not a config edit; inspect/pause running
+workers with `hex module list` / `hex module disable <name>`.
 
 ---
 
