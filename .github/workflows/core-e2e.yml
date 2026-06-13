@@ -1,17 +1,24 @@
 # .github/workflows/core-e2e.yml
 #
 # Runs the hex core E2E suite on every PR and on main/tag pushes.
-# Blocks merges on failure (configure in Settings → Branches → Required status checks:
-#   "Hex core suites" and "BOI integration suites").
 #
-# Release gate: running on `v*.*.*` tag pushes ensures all tests pass before
-# a tagged release. Combine with a required status check on tag protection rules.
+# NOT a required status check. The releaser (`hex release cut`) runs these same
+# suites locally as pre-push gates before any main push, so this workflow is a
+# clean-room / PR signal, not the release gate. Do NOT wire it back as a required
+# check until it is reliably green AND fast — and if you ever do, pair it with a
+# bypass actor for the releaser (which direct-pushes and can't satisfy PR-style
+# required checks). See docs/ci-release-relationship.md for the full rationale.
 #
-# Three jobs:
+# Speed: the two image-building jobs use cargo-chef + buildx gha layer cache, so
+# the cold ~8-11 min dep compile (iii engine git deps + rusqlite bundled SQLite)
+# is skipped whenever the dependency graph is unchanged. Target: < 15 min/run.
+#
+# Three jobs (PR path runs the first two; BOI is nightly/post-merge only):
 #   hex-core          — non-BOI suites run inside the core-e2e Docker image
-#   boi-integration   — BOI suites run on the GHA host (needs Docker access)
 #   harness-lifecycle — at-most-once harness lifecycle E2E against the baked-in
 #                       iii engine (vendorless harness-e2e image)
+#   boi-integration   — BOI suites on the GHA host (needs Docker + API key);
+#                       skipped on PRs (slowest leg) — see its `if:` below
 name: core-e2e
 
 on:
@@ -21,9 +28,14 @@ on:
     branches: [main]
     tags:
       - 'v*.*.*'
-  release:
-    types: [published]
+  # Nightly full signal — including the slow BOI leg, which is skipped on PRs
+  # (see the boi-integration job's `if:`) to keep the per-PR path fast.
+  schedule:
+    - cron: '0 8 * * *'   # 08:00 UTC ≈ 01:00 PT
+  workflow_dispatch:       # manual full-suite run on demand
 
+# Cancel superseded PR runs so stacked pushes don't starve the free-runner queue.
+# main/tag runs are NOT cancelled (each release commit must get a full signal).
 concurrency:
   group: core-e2e-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -32,15 +44,21 @@ jobs:
   hex-core:
     name: Hex core suites
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build test image
-        run: |
-          docker build \
-            -t hex-core-e2e:${{ github.sha }} \
-            -f tests/core-e2e/Dockerfile \
-            .
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build test image (cargo-chef + gha layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/core-e2e/Dockerfile
+          tags: hex-core-e2e:${{ github.sha }}
+          load: true
+          cache-from: type=gha,scope=core-e2e
+          cache-to: type=gha,mode=max,scope=core-e2e
 
       - name: Run hex core suites (excluding BOI which need host Docker)
         run: |
@@ -51,6 +69,15 @@ jobs:
   boi-integration:
     name: BOI integration suites
     runs-on: ubuntu-latest
+    # BOI suites spin their own Docker containers on the host, need a live
+    # ANTHROPIC_API_KEY, and are the slowest leg (~50 min). They run the wall
+    # clock of the whole workflow, so they are kept OFF the per-PR path — only
+    # on push-to-main/tags, the nightly schedule, and manual dispatch. This is
+    # what lets a PR run (the two cached image jobs) finish in < 15 min.
+    # See docs/ci-release-relationship.md.
+    if: github.event_name != 'pull_request'
+    # Generous cap kills a true hang without false-failing a legitimately slow run.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -62,20 +89,26 @@ jobs:
   harness-lifecycle:
     name: Harness lifecycle E2E (in-process engine)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
 
       # Builds the vendorless harness-e2e image (hex binary WITH the baked-in
       # iii engine — no separate iii binary) and runs the at-most-once lifecycle
       # proof: in-process engine up -> emit fires handler -> SIGTERM drains
       # in-flight to completion + diverts emits to the outbox -> restart replays
       # the outbox EXACTLY ONCE. Exits nonzero on any failed assertion.
-      - name: Build harness-e2e image
-        run: |
-          docker build \
-            -t hex-harness-e2e:${{ github.sha }} \
-            -f tests/harness-e2e/Dockerfile \
-            .
+      - name: Build harness-e2e image (cargo-chef + gha layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/harness-e2e/Dockerfile
+          tags: hex-harness-e2e:${{ github.sha }}
+          load: true
+          cache-from: type=gha,scope=harness-e2e
+          cache-to: type=gha,mode=max,scope=harness-e2e
 
       - name: Run harness lifecycle test
         run: docker run --rm hex-harness-e2e:${{ github.sha }}

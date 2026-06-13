@@ -4,21 +4,42 @@
 #
 # Adds Python 3, SQLite CLI, and curl on top of the base agent-harness pattern.
 
-# ── Stage 1: Build ───────────────────────────────────────────────────────────
-FROM rust:latest AS builder
-
+# ── Stage 0: cargo-chef base ─────────────────────────────────────────────────
+# cargo-chef splits dependency compilation into its own cacheable layer keyed
+# ONLY on the dependency graph (recipe.json ≈ Cargo.lock), not on our source.
+# With buildx `--cache-to type=gha,mode=max` (see .github/workflows/core-e2e.yml)
+# the `cook` layer persists across CI runs, so the expensive cold compile of the
+# iii engine git deps + rusqlite's bundled SQLite (~8-11 min) is skipped on every
+# run where deps are unchanged — only our changed source recompiles (~1-2 min).
+FROM rust:1.96 AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config git \
-    && rm -rf /var/lib/apt/lists/*
-
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-chef --locked
 WORKDIR /build
+
+# ── Stage 1: Plan ────────────────────────────────────────────────────────────
+# Generate recipe.json from the full manifest graph. The path dep scipd
+# (../code-intel → /code-intel) must be present for `prepare` to read its
+# manifest; cargo-chef captures it (and its deps) into the recipe.
+FROM chef AS planner
 COPY system/harness/ ./
-# The harness depends on the sibling system/code-intel crate by path
-# (scipd = { path = "../code-intel" }); with the harness manifest at /build,
-# `../code-intel` resolves to /code-intel. Copy it there or the build can't
-# resolve the dependency. (Fixed in tests/Dockerfile 2026-06-11 for the same
-# reason; core-e2e/harness-e2e/agent-harness were missed → CI RED on all PRs.)
 COPY system/code-intel/ /code-intel/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: Build ───────────────────────────────────────────────────────────
+FROM chef AS builder
+# Cook deps only — this layer is the cache target. The scipd path dep lives at
+# /code-intel (a sibling, outside /build), which cargo-chef can NOT reconstruct
+# from the recipe, so the real crate must be present for cook to resolve it. It
+# is copied BEFORE cook, so the cook layer keys on (recipe.json + code-intel);
+# editing the harness source — the common case — leaves the warm cache intact,
+# and code-intel changes rarely.
+COPY --from=planner /build/recipe.json recipe.json
+COPY system/code-intel/ /code-intel/
+RUN cargo chef cook --release --recipe-path recipe.json
+# Real harness source over the warmed dep cache: only our crates recompile.
+COPY system/harness/ ./
 RUN cargo build --release 2>&1
 # Stamp the Cargo.toml version for runtime consistency checks (source of truth)
 RUN grep '^version' ./Cargo.toml | head -1 | cut -d'"' -f2 > /build/compiled-version.txt
