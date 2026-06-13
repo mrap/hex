@@ -1996,3 +1996,5 @@ mod tests {
         );
     }
 }
+
+// ci-cache-probe: source-only edit to validate warm cook-layer reuse (run 2, 2026-06-13)
