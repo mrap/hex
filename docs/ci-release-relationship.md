@@ -84,3 +84,31 @@ exercise the upgrade path (rarely regressed by a hex PR), nightly coverage is su
 
 > **The < 15-min acceptance target applies to the per-PR path** (the two cached image jobs). A
 > full run that includes `boi-integration` (nightly / post-merge) is expected to take ~50 min.
+
+## Validation (2026-06-13, PR #15)
+
+Three consecutive green per-PR runs on `fix/ci-e2e-cache`, all < 15 min — the full
+cache-state matrix:
+
+| Run | Build context vs cache | `hex-core` wall | What it proves |
+|-----|------------------------|-----------------|----------------|
+| 1 (cold) | nothing cached | **14m49s** | full cold build populates the gha cache; under target |
+| 2 (+source edit) | dep/cook layer warm, source changed | **7m49s** | the common case — editing harness source reuses the cook layer, hits the < 10-min stretch |
+| 3 (identical context) | every layer warm | **~19s** | byte-identical context → full image-layer hit; 34/34 suites still execute against the cached image |
+
+Local correctness alongside: core-e2e chef image 34/34 suites, harness-e2e lifecycle 8/8.
+
+## Operating risk: gha cache eviction
+
+The gha cache backend has a **10 GB per-repo limit**. Two `mode=max` scopes
+(`core-e2e` + `harness-e2e`) each persist a full `target/`, so the two scopes together can
+approach that ceiling. If the cache is evicted (size pressure, or 7-day inactivity), the next
+run falls back to a **cold ~15-min build** — a thin-margin breach of the < 15-min target, not a
+failure. Steady-state warm runs (~8 min, run 2) are the norm; this only bites right after an
+eviction.
+
+**Mitigation if it recurs:** drop the `harness-e2e` cache scope to `mode=min` (it exports only
+the final image layer, not the intermediate cook layer — halving that scope's footprint at the
+cost of a slower harness-job warm rebuild). `core-e2e` keeps `mode=max` since it's the
+acceptance-gating job. Watch the cache list (`gh cache list --repo mrap/hex`) if cold runs start
+appearing intermittently.
