@@ -7,6 +7,13 @@ LaunchAgents, and **telemetry**.
 
 ## LaunchAgents (launchd)
 
+> **Note:** This section documents hex's **sanctioned** supervised services (the harness
+> bootstrap and the personal BOI daemon). It is **not** a pattern to copy for new scheduled
+> jobs — new recurring/scheduled work is a **hex worker**, and new persistent processes ride
+> the engine via **iii-exec** (see the AGENTS.md "Automation" rule and `docs/iii-hex.md`). Do
+> not add new per-job LaunchAgents (decision:
+> `persistent-processes-via-iii-exec-not-launchagents-2026-06-11`).
+
 hex's supervised long-running services run as **per-user gui LaunchAgents** in
 `~/Library/LaunchAgents/`, bootstrapped into the **`gui/<uid>`** domain, with
 **`SessionCreate=true`** and **no `UserName`**. Examples: `com.hex.harness` (the core

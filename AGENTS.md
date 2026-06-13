@@ -137,7 +137,7 @@ The behavioral contract is identical across agent runtimes — only the tool mod
 |---|---|---|
 | Skills / slash commands | Invoke the skill directly | Browse `.hex/skills/*/SKILL.md` and follow its instructions |
 | Hooks (pre/post tool) | Use the runtime's hook config | Apply the behavior manually |
-| Scheduling / automation | — | OS-level scheduling (launchd/cron) per job |
+| Scheduling / automation | — | hex workers (foundation-registry cron/trigger workers); never new LaunchAgents |
 | Sandbox model | Whatever the runtime enforces | Per-session isolation |
 | Web access | Use the native fetch/search tool | `curl` + public APIs, or note the limitation |
 
@@ -392,7 +392,9 @@ Enforcement checkpoints with "teeth" — they activate automatically, not on req
 
 ## Automation
 
-Recurring and scheduled work is handled by OS-level scheduling (launchd on macOS, cron on Linux) configured per job. There is no general event bus or policy engine in hex. For a new scheduled job, write a launchd plist or crontab entry targeting the specific script and wire it manually. Do not use polling loops or `sleep` loops.
+Recurring and scheduled work runs as **hex workers** — never as new LaunchAgents. A hex worker is a typed Rust worker (`Worker::new("name").on_cron_named(...)`) registered in the foundation worker registry (`hex_modules::module_registry()`) and run in-process by the harness engine; cron triggers carry a 7-field cron expression, reactive triggers bind a `state`/`queue` event. Authoring a new scheduled job is therefore a **foundation change** (it ships to every instance), not a config edit. **Persistent local processes** (long-running daemons) ride the engine via an `iii-exec` entry in the instance `.hex/iii/engine-workers.yaml` (additive — survives `/hex-upgrade`); that file hosts engine worker factories and supervised processes, **not** new cron schedules. See `docs/iii-hex.md` ("Instance engine workers").
+
+**Do not create new LaunchAgents.** The single sanctioned LaunchAgent is the harness bootstrap itself (`com.hex.harness`; see `docs/hex-ops.md`) — it hosts the engine that runs every worker. New per-job plists or crontab entries are forbidden (decision: `persistent-processes-via-iii-exec-not-launchagents-2026-06-11`). There is no general event bus or policy engine built into hex. Do not use runtime-built-in cron/schedule primitives, polling loops, or `sleep` loops.
 
 ---
 

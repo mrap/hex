@@ -241,10 +241,11 @@ No per-workspace plist installs: register workspaces with `cq register
 `hex harness restart` after an upgrade (rebuild = install). Verify with
 `hex module status hex-codeintel-indexer`.
 
-Categorical distinction: scheduled **jobs** live in the harness as worker
-modules, while long-running **daemons** like scipd stay on launchd
-(`system/templates/launchd/com.hex.scipd.plist` and its install steps above
-are unchanged).
+Categorical distinction: scheduled **jobs** are hex workers (typed Rust, foundation
+registry), not launchd. scipd is an **existing** long-running daemon documented here as-is; its launchd
+plist (`system/templates/launchd/com.hex.scipd.plist`) and the install steps above are
+unchanged. **New** long-running daemons should ride the engine via **iii-exec** (see the
+AGENTS.md "Automation" rule), not a new plist.
 
 ## Known limitation: calls inside `macro_rules!` bodies
 
