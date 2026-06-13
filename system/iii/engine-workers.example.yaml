@@ -72,3 +72,25 @@
 #       sampling_ratio: 1.0
 #       metrics_enabled: true
 #       logs_enabled: true
+#
+#   # Event-driven log-tail daemon (`hex log-tail`): capture headroom's per-request
+#   # overhead (STAGE_TIMINGS.total_pre_upstream) into hex telemetry + the event bus,
+#   # treating headroom as an opaque, swappable upstream (reads only the log file it
+#   # already writes — no proxy code touched). The reusable core is `--observer`;
+#   # headroom-stage-timings is the first impl. notify-driven (no polling).
+#   # Breaches (>500ms) and coalesced stall episodes land as `headroom.overhead` bus
+#   # events + durable telemetry rows (source=headroom-proxy). Consume with a worker
+#   # registered `on_event("headroom.overhead", …)`; query `hex telemetry failures`.
+#   - name: log-tail-headroom
+#     type: iii-exec
+#     config:
+#       exec:
+#         - pkill -f 'hex log-tail .*headroom-stage-timings' 2>/dev/null; true
+#         # Absolute path — the hex binary lives at $HEX_DIR/.hex/bin/hex and is not
+#         # guaranteed on PATH in iii-exec's minimal spawn shell (cf. the headroom /
+#         # console stanzas above, which also use absolute paths).
+#         - $HEX_DIR/.hex/bin/hex log-tail --path "$HOME/.headroom/logs/proxy.log" --observer headroom-stage-timings --event headroom.overhead --source headroom-proxy
+#       restart:
+#         on_crash: true
+#         backoff_secs: 5
+#         max_backoff_secs: 60

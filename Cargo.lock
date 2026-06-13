@@ -1836,6 +1836,7 @@ dependencies = [
  "iii",
  "iii-sdk",
  "libc",
+ "notify",
  "regex",
  "rusqlite",
  "rustls-pemfile",

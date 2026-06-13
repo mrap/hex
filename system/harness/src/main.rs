@@ -99,6 +99,36 @@ enum Commands {
         #[command(subcommand)]
         command: StateCommands,
     },
+    /// Follow a log file (event-driven) and emit observed signals into telemetry + the bus.
+    ///
+    /// A long-running, iii-exec-supervised daemon (not a cron worker). The reusable
+    /// core is the `--observer` impl; headroom is the first one.
+    #[command(display_order = 14)]
+    LogTail {
+        /// Absolute path of the log file to follow.
+        #[arg(long)]
+        path: String,
+        /// Observer impl that parses each line (e.g. `headroom-stage-timings`).
+        #[arg(long)]
+        observer: String,
+        /// Bus event name to emit for breaches/episodes. Generic default; the
+        /// headroom deployment sets `--event headroom.overhead` explicitly.
+        #[arg(long, default_value = "log.overhead")]
+        event: String,
+        /// Telemetry `source` + bus producer label (keeps upstreams attributable).
+        #[arg(long)]
+        source: String,
+        /// Degraded latency floor in ms (stall floor = 4×). Default 500.
+        #[arg(long, default_value_t = 500.0)]
+        threshold_ms: f64,
+        /// Quiet window in ms that closes a stall episode. Default 3000; clamped
+        /// to a minimum of 50 (0 would busy-spin the watcher loop).
+        #[arg(long, default_value_t = 3000)]
+        quiet_ms: u64,
+        /// Read the whole file from the start (default: only new lines from EOF).
+        #[arg(long)]
+        from_start: bool,
+    },
     /// Telemetry store: query and emit events from the native SQLite log
     #[command(display_order = 6)]
     Telemetry {
@@ -810,6 +840,26 @@ fn main() {
                 }
             },
         },
+        Commands::LogTail {
+            path,
+            observer,
+            event,
+            source,
+            threshold_ms,
+            quiet_ms,
+            from_start,
+        } => {
+            let code = hex::log_tail::run(hex::log_tail::LogTailConfig {
+                path,
+                observer,
+                event,
+                source,
+                threshold_ms,
+                quiet_ms,
+                from_start,
+            });
+            std::process::exit(code);
+        }
         Commands::Integration { command } => {
             if let IntegrationCommands::Template = command {
                 integration::template();

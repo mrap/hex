@@ -15,6 +15,7 @@ pub mod harness;
 pub mod ledger;
 pub mod lint_gates;
 pub mod llm_cost;
+pub mod log_tail;
 pub mod reconciler;
 pub mod capability_exec;
 pub mod charter;

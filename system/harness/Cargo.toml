@@ -35,6 +35,10 @@ sha2 = "0.10"
 fs2 = "0.4"
 rusqlite = { version = "0.31", features = ["bundled-full"] }
 regex = "1"
+# Cross-platform filesystem watcher (FSEvents/inotify/kqueue) for the event-driven
+# `hex log-tail` daemon — already present transitively (8.x via the iii engine), so
+# promoting it to a direct dep pulls no new version.
+notify = "8"
 sqlite-vec = "0.1"
 # Tree-trim attempted (2026-05-21): `default-features = false, features = ["ort-download-binaries"]`
 # broke the build — `TextEmbedding::try_new` is only available with default features enabled
