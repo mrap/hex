@@ -7,7 +7,7 @@
 name = "hex-harness"
 # Source of truth for hex version. Bumped by `hex release cut`; build.rs
 # injects this via env!("CARGO_PKG_VERSION") at compile time.
-version = "0.51.0"
+version = "0.52.0"
 edition = "2021"
 
 # Keep the lib + bin named `hex` even though the package is `hex-harness`.
