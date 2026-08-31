@@ -1143,6 +1143,119 @@ fn setup_shell(hex_dir: &Path) {
     }
 }
 
+/// True iff `dir` is itself the TOP LEVEL of a git work tree, not merely nested
+/// inside some surrounding repo. The post-upgrade commit is gated on this so we
+/// only ever commit into the instance's OWN repo — never a parent repo that
+/// happens to contain the workspace. `git rev-parse --show-toplevel` is the same
+/// call `main.rs` already uses to resolve a repo root.
+fn is_own_git_toplevel(dir: &Path) -> bool {
+    let out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            match (fs::canonicalize(&top), fs::canonicalize(dir)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// After a successful sync + rebuild, commit the synced tracked files under
+/// `.hex/` in the instance workspace so the repo reflects the deployed version.
+/// This closes the "deployed-but-orphaned" blind spot (a live deploy left
+/// uncommitted that git — and `hex upgrade`'s own change detection — reads as
+/// "nothing changed").
+///
+/// Returns:
+///   Ok(true)  — a commit was made.
+///   Ok(false) — the synced tree was already clean (no-op success, NOT an error).
+///   Err(msg)  — the commit could not be made; the caller MUST surface this
+///               LOUDLY (S6: no quiet failures), never a silent skip.
+///
+/// Scope: only tracked changes under `.hex/` are staged (`git add -u -- .hex`),
+/// so the operator's unrelated tracked work (todo.md, me/, projects/, landings/)
+/// is never swept into the upgrade commit. New, untracked files are deliberately
+/// left out — see docs/hex-ops.md on the instance-side gitignore shadowing of
+/// new harness source files.
+fn commit_synced_files(workspace: &Path, version: &str) -> Result<bool, String> {
+    // Lead with `git status` — it yields all three outcomes deterministically and,
+    // unlike `git add -u -- <pathspec>`, does NOT exit-128 when the pathspec matches
+    // no tracked files (which would otherwise spuriously fail a clean upgrade).
+    // `-uno` = tracked changes only (no untracked noise).
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "-uno", "--", ".hex"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| format!("could not run git status in {}: {e}", workspace.display()))?;
+    if !status.status.success() {
+        // Non-zero here means git could not operate here at all (e.g. exit 128:
+        // not a git repository). The caller surfaces this loudly.
+        return Err(format!(
+            "git status failed in {}: {}",
+            workspace.display(),
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    if status.stdout.is_empty() {
+        // Clean synced tree — nothing to commit. No-op success.
+        return Ok(false);
+    }
+
+    // There ARE tracked changes under .hex/: stage exactly those.
+    let add = Command::new("git")
+        .args(["add", "-u", "--", ".hex"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| format!("could not run git add in {}: {e}", workspace.display()))?;
+    if !add.status.success() {
+        return Err(format!(
+            "git add -u -- .hex failed in {}: {}",
+            workspace.display(),
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
+    }
+
+    // Commit with a message naming the version. gpgsign is disabled and hooks are
+    // skipped for this bookkeeping commit so it can never hang on a passphrase or
+    // pre-commit prompt inside an unattended `hex upgrade`. The commit is given the
+    // SAME `.hex` pathspec as the `add` above (`--only -- .hex`): without a pathspec,
+    // `git commit` records the WHOLE index, so any work the operator had pre-staged
+    // (`git add todo.md`) before running `hex upgrade` would be swept into this
+    // bookkeeping commit. `--only -- .hex` records only the working-tree content of
+    // `.hex`, leaving every other staged path untouched — matching the scope
+    // guarantee documented in docs/hex-ops.md.
+    let msg = format!("chore(hex): sync harness files to v{version}");
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-verify",
+            "--only",
+            "-q",
+            "-m",
+            &msg,
+            "--",
+            ".hex",
+        ])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| format!("could not run git commit in {}: {e}", workspace.display()))?;
+    if !commit.status.success() {
+        return Err(format!(
+            "git commit failed in {}: {}",
+            workspace.display(),
+            String::from_utf8_lossy(&commit.stderr).trim()
+        ));
+    }
+    Ok(true)
+}
+
 pub fn run(args: &[String]) -> i32 {
     let cfg = match parse_args(args) {
         Ok(c) => c,
@@ -1379,6 +1492,45 @@ pub fn run(args: &[String]) -> i32 {
         println!();
         return 1;
     }
+
+    // Commit the synced tracked files so the instance repo reflects the deployed
+    // version. Closes the deployed-but-orphaned blind spot: without this, a live
+    // deploy sits uncommitted and git — plus `hex upgrade`'s own change detection
+    // — reads it as "nothing changed" indefinitely. Only ever commit into the
+    // instance's OWN repo; a failure here is LOUD (S6) and exits nonzero so the
+    // operator knows the deploy is live but unrecorded in git.
+    if is_own_git_toplevel(&hex_dir) {
+        let synced_version = fs::read_to_string(hex_dot_dir.join("version.txt"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        match commit_synced_files(&hex_dir, &synced_version) {
+            Ok(true) => {
+                println!("  [OK] Committed synced files (v{synced_version}) in instance repo.");
+            }
+            Ok(false) => {
+                println!("  → Instance repo already consistent; no synced-file changes to commit.");
+            }
+            Err(e) => {
+                eprintln!(
+                    "  [FAIL] Sync and rebuild SUCCEEDED, but the instance repo could not be committed: {e}"
+                );
+                eprintln!(
+                    "  The deployed version is live but not reflected in git (deployed-but-orphaned)."
+                );
+                eprintln!(
+                    "  Fix: git -C {ws} add -u -- .hex && git -C {ws} commit -m \"chore(hex): sync harness files to v{synced_version}\"",
+                    ws = hex_dir.display()
+                );
+                println!();
+                return 1;
+            }
+        }
+    } else {
+        println!("  → Workspace is not its own git repo; skipping upgrade commit.");
+    }
+
     println!("  Upgrade complete.");
     println!();
 
@@ -2301,6 +2453,200 @@ CUSTOM_INSTANCE_PIN=abc123
             Err(BinaryStepFailure::Build),
             "an unparseable Cargo.toml must fail the binary step as Build, \
              never RestartFailed"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Task Tyeav60q3: after a successful sync + rebuild, `hex upgrade`
+    // must commit the synced tracked files in the instance workspace
+    // with a message naming the version, and fail LOUDLY (never a silent
+    // skip) if the commit cannot be made.
+    //
+    // RED tests: `commit_synced_files` does not exist yet, so this whole
+    // test target will not compile until it is implemented. The seam:
+    //
+    //   fn commit_synced_files(workspace: &Path, version: &str)
+    //       -> Result<bool, String>
+    //     Ok(true)  = a commit was made
+    //     Ok(false) = nothing to commit (clean synced tree) — NOT an error
+    //     Err(msg)  = commit could not be made — caller MUST surface this
+    //                 loudly (eprintln! + nonzero return in run()).
+    //
+    // The commit is scoped to synced files under `.hex/`; the operator's
+    // unrelated tracked work (todo.md, me/, projects/, landings/) must NOT
+    // be swept into the upgrade commit.
+    // -----------------------------------------------------------------
+
+    fn init_test_repo(dir: &Path) {
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("git must be runnable in tests")
+                .success();
+            assert!(ok, "git {args:?} failed while preparing test repo");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "commit.gpgsign", "false"]);
+    }
+
+    fn seed_commit(dir: &Path, msg: &str) {
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        let ok = Command::new("git")
+            .args(["commit", "-q", "-m", msg])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "seed commit must succeed");
+    }
+
+    fn head_subject(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn path_is_dirty(dir: &Path, rel: &str) -> bool {
+        let out = Command::new("git")
+            .args(["status", "--porcelain", "--", rel])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        !out.stdout.is_empty()
+    }
+
+    // 1. A modified, already-tracked synced file under `.hex/` is committed,
+    //    and the commit subject names the upgraded version.
+    #[test]
+    fn commit_synced_files_commits_tracked_changes_and_names_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/scripts/foo.sh"), "echo old\n");
+        seed_commit(ws, "seed");
+        // Simulate the upgrade sync editing the tracked synced file.
+        write_file(&ws.join(".hex/scripts/foo.sh"), "echo new\n");
+
+        let made = commit_synced_files(ws, "9.9.9-test")
+            .expect("committing tracked synced changes must succeed");
+        assert!(made, "a commit must have been made (Ok(true))");
+        assert!(
+            head_subject(ws).contains("9.9.9-test"),
+            "commit subject must name the version; got: {}",
+            head_subject(ws)
+        );
+        assert!(
+            !path_is_dirty(ws, ".hex/scripts/foo.sh"),
+            "the synced file's change must now be committed"
+        );
+    }
+
+    // 2. A clean synced tree is a no-op success, NOT a loud error.
+    #[test]
+    fn commit_synced_files_clean_tree_is_ok_false_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/scripts/foo.sh"), "echo old\n");
+        seed_commit(ws, "seed");
+
+        let res = commit_synced_files(ws, "9.9.9-test");
+        assert_eq!(
+            res,
+            Ok(false),
+            "a clean synced tree must return Ok(false), never an error: {res:?}"
+        );
+    }
+
+    // 3. A commit that cannot be made (workspace is not a git repo) fails
+    //    LOUDLY with an Err, never a silent Ok.
+    #[test]
+    fn commit_synced_files_fails_loudly_when_not_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path(); // deliberately NOT `git init`ed
+        write_file(&ws.join(".hex/scripts/foo.sh"), "echo new\n");
+
+        let res = commit_synced_files(ws, "9.9.9-test");
+        assert!(
+            res.is_err(),
+            "a commit that cannot be made must return Err, never a silent Ok: {res:?}"
+        );
+    }
+
+    // 4. Scope guard: the operator's unrelated tracked work (todo.md at the
+    //    workspace root) must survive UNCOMMITTED — the upgrade commit only
+    //    sweeps synced files under `.hex/`.
+    #[test]
+    fn commit_synced_files_leaves_unrelated_tracked_work_uncommitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/scripts/foo.sh"), "echo old\n");
+        write_file(&ws.join("todo.md"), "- item one\n");
+        seed_commit(ws, "seed");
+        // The sync edits a synced file; the operator independently edits todo.md.
+        write_file(&ws.join(".hex/scripts/foo.sh"), "echo new\n");
+        write_file(&ws.join("todo.md"), "- item one\n- operator edit\n");
+
+        let _ = commit_synced_files(ws, "9.9.9-test");
+        assert!(
+            path_is_dirty(ws, "todo.md"),
+            "unrelated operator work (todo.md) must remain uncommitted after \
+             the upgrade commit"
+        );
+    }
+
+    // 5. Scope guard, harder case: the operator PRE-STAGED unrelated work
+    //    (`git add todo.md`) before `hex upgrade` ran. A bare `git commit`
+    //    records the whole index and would sweep that staged work into the
+    //    bookkeeping commit. The commit must be pathspec-scoped to `.hex/`, so
+    //    the pre-staged todo.md must NOT land in the upgrade commit (it stays
+    //    staged / dirty relative to HEAD).
+    #[test]
+    fn commit_synced_files_does_not_sweep_pre_staged_operator_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/scripts/foo.sh"), "echo old\n");
+        write_file(&ws.join("todo.md"), "- item one\n");
+        seed_commit(ws, "seed");
+        // The sync edits a synced file.
+        write_file(&ws.join(".hex/scripts/foo.sh"), "echo new\n");
+        // The operator independently edits AND stages todo.md before upgrading.
+        write_file(&ws.join("todo.md"), "- item one\n- operator edit\n");
+        let staged = Command::new("git")
+            .args(["add", "todo.md"])
+            .current_dir(ws)
+            .status()
+            .unwrap()
+            .success();
+        assert!(staged, "pre-staging todo.md must succeed");
+
+        let made = commit_synced_files(ws, "9.9.9-test")
+            .expect("committing tracked synced changes must succeed");
+        assert!(made, "a commit must have been made for the .hex change");
+        // The synced file IS committed.
+        assert!(
+            !path_is_dirty(ws, ".hex/scripts/foo.sh"),
+            "the synced .hex change must be committed"
+        );
+        // The pre-staged operator work is NOT in the commit: if it had been
+        // swept in, todo.md would match HEAD and read clean.
+        assert!(
+            path_is_dirty(ws, "todo.md"),
+            "pre-staged operator work (todo.md) must NOT be swept into the \
+             upgrade commit"
         );
     }
 }

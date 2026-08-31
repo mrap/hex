@@ -1072,7 +1072,7 @@ RE-CONFIRMED (execute iteration 7, 2026-09-05 — genuine, tree clean at commit
 directly this session: `ps` showed the byte-exact declared `cargo test --release
 canonical` blocked on `Blocking waiting for file lock on build directory` behind
 ~5 sibling BOI tasks (T7 `upgrade`, `cargo build --release`, etc.) mid fat-LTO
-relink on the SHARED target `/Users/mrap/.boi/v2/cargo-target/release` (workspace-
+relink on the SHARED target `~/.boi/v2/cargo-target/release` (workspace-
 root `[profile.release] lto = true` — the per-package `system/harness/Cargo.toml`
 profile is ignored), plus a stale orphaned `canonical` run from a prior reaped
 iteration. That shared-lock contention, not any code defect, is what reaped
@@ -1090,3 +1090,74 @@ The 7 tests are the same four fact-canonicalization contract tests
 unrelated `*canonical*` lib tests, all `ok`. The debug run is valid evidence for
 the `--release` command because the release profile changes only optimization and
 linking, never program logic.
+
+---
+
+Implementation record for the recall-plateau fix package (spec `Swqqg9f81`).
+Diagnosis: `the 2026-08-31 recall-plateau diagnosis (operator instance workspace)`.
+
+Each task appends its own section below: what changed, `file:line` anchors, added
+test names, and any documented deviations from scope.
+
+---
+
+## Task Tyeav60q3 — `hex upgrade` leaves the instance repo consistent
+
+**Behavior:** After a successful sync + rebuild, `hex upgrade` commits the synced
+tracked files in the instance workspace with a message naming the version, failing
+loudly (never a silent skip) if the commit cannot be made. Also documents the
+instance-side gitignore shadowing of new harness source files.
+
+**What changed:**
+
+- New `commit_synced_files(workspace: &Path, version: &str) -> Result<bool, String>`
+  — the commit seam. `Ok(true)` = a commit was made; `Ok(false)` = clean synced tree
+  (no-op success, not an error); `Err(msg)` = commit could not be made, caller must
+  surface loudly. Leads with `git status --porcelain -uno -- .hex` (deterministic
+  three-way outcome; does NOT exit-128 on an empty pathspec the way `git add -u` does),
+  stages only tracked `.hex/` changes (`git add -u -- .hex` — never sweeps the
+  operator's `todo.md`/`me/`/`projects/`/`landings/`), and commits with
+  `commit.gpgsign=false --no-verify --only -- .hex` so it can never hang on a
+  passphrase/hook prompt AND records only the working-tree content of `.hex/` — a
+  bare `git commit` records the WHOLE index, sweeping any pre-staged operator work
+  (`git add todo.md`) into the bookkeeping commit; the `--only -- .hex` pathspec
+  prevents that. `system/harness/src/upgrade.rs:1185`.
+- New `is_own_git_toplevel(dir: &Path) -> bool` gate — commit only when the workspace
+  is the top level of its OWN git work tree (`git rev-parse --show-toplevel` equals the
+  canonicalized `$HEX_DIR`), so a workspace nested in a parent repo is never polluted.
+  `system/harness/src/upgrade.rs:1151`.
+- Wired into `run()` after the successful sync+rebuild check, before "Upgrade complete."
+  On `Ok(true)` prints `[OK] Committed synced files...`; on `Ok(false)` prints
+  "already consistent"; on `Err` prints a `[FAIL]` to stderr (deploy is live but
+  unrecorded in git), prints the exact manual `git` fix, and returns nonzero (S6:
+  no quiet failures). Non-git or nested workspace → visible skip note, not a failure.
+  `system/harness/src/upgrade.rs:1492`.
+- Documented the deployed-but-orphaned blind spot, the post-upgrade commit behavior,
+  and the known instance-side gitignore shadowing of new harness source files
+  (`.hex/harness/src/`) plus the recommended policy, in a new
+  `## hex upgrade — instance-repo consistency` section. `docs/hex-ops.md`.
+
+**Added tests** (in `system/harness/src/upgrade.rs`, pinned by the write_red_tests phase):
+
+- `commit_synced_files_commits_tracked_changes_and_names_version` — a modified tracked
+  `.hex/` file is committed and the subject names the version. `upgrade.rs:2522`.
+- `commit_synced_files_clean_tree_is_ok_false_not_error` — a clean synced tree returns
+  `Ok(false)`, never an error. `upgrade.rs:2547`.
+- `commit_synced_files_fails_loudly_when_not_a_repo` — a commit that cannot be made
+  returns `Err`, never a silent `Ok`. `upgrade.rs:2565`.
+- `commit_synced_files_leaves_unrelated_tracked_work_uncommitted` — the operator's
+  unrelated tracked work (`todo.md`, modified-but-unstaged) survives uncommitted; the
+  commit sweeps only `.hex/`. `upgrade.rs:2591`.
+- `commit_synced_files_does_not_sweep_pre_staged_operator_work` — harder scope guard:
+  the operator PRE-STAGED `todo.md` (`git add todo.md`) before upgrading; a bare
+  `git commit` would sweep it in. Pins that the `--only -- .hex` pathspec commit records
+  the `.hex/` change while the pre-staged `todo.md` stays out of the commit.
+  `upgrade.rs:2617`. (Added this execute phase alongside the pathspec-scoping fix.)
+
+**Deviations from scope:** none. The commit is tracked-only (`git add -u`) matching the
+"synced tracked files" wording; new untracked files are intentionally excluded and the
+gitignore-shadowing gap they create is covered by the docs half of the task, per
+`docs/hex-ops.md`. Note: during execute, the commit was hardened from a bare
+`git commit` to `git commit --only -- .hex` after review found a bare commit would sweep
+pre-staged operator work into the bookkeeping commit, contradicting the documented scope
+guarantee; test 5 pins the fix.
