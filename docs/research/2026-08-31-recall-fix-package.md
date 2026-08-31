@@ -165,3 +165,88 @@ pre-warmed shared target (a COLD private dir is insufficient — it dies
 recompiling `aws-lc-sys` from scratch; the COW clone used here avoids that by
 inheriting warm deps). Neither removes the fat-LTO link cost, which an operator
 could cut by setting `lto = "thin"` for the test/dev path.
+
+---
+
+Implementation record for the approved recall-plateau fix package (spec `Swqqg9f81`).
+Diagnosis: `/Users/mrap/hex/projects/system-improvement/diagnoses/recall-plateau-2026-08-31.md`.
+
+Each section below documents one task from the spec's DAG: what changed, file:line
+anchors, tests added, and any documented deviations from scope. Sections are appended
+by each task's execute worker as it lands.
+
+---
+
+## Task Tznnfa5ga — dirty-build marker in the harness build script
+
+**Cause addressed:** #5 (dirty-build blind spot). `build.rs` baked the committed HEAD
+short-sha into `HEX_GIT_SHA`/`harness_version` even when the working tree was dirty, so an
+uncommitted deploy read as "nothing changed" — the 8-day blind spot behind the plateau.
+
+**What changed** (`system/harness/build.rs`):
+- Hoisted the `manifest_dir` binding to the top of `main()` so it can be reused
+  (`system/harness/build.rs:4`); removed the later duplicate declaration that used to sit
+  above the module-discovery block (now `system/harness/build.rs:116`).
+- After computing the committed short-sha, added a cheap, infallible dirty check
+  (`system/harness/build.rs:14`–`48`): run `git status --porcelain --untracked-files=no`
+  (tracked-file changes only, staged or unstaged). A non-empty result appends a `-dirty`
+  suffix to the sha (`system/harness/build.rs:29`), so a dirty build's `harness_version`
+  is distinguishable from its base commit. The emptiness test is whitespace-tolerant
+  (`o.stdout.iter().any(|b| !b.is_ascii_whitespace())`).
+- Loud-on-failure per SO S6: if `git status` exits non-zero or cannot be spawned, the
+  marker is omitted and a `cargo:warning=...` is emitted naming the exit code / spawn
+  error (`system/harness/build.rs:33`–`47`) — the build never fails on this path.
+- Added `cargo:rerun-if-changed={manifest_dir}/src` (`system/harness/build.rs:60`) so the
+  dirty check reruns on ANY tracked harness-source edit, not just the `*.worker.rs` files
+  already watched. Without this, editing e.g. `src/memory/assemble.rs` would not rerun
+  `build.rs` and the crate would recompile against a cached (possibly clean)
+  `HEX_GIT_SHA` — which would have left the exact blind spot this task closes.
+
+**Tests added:** none. The task's declared verifications are the acceptance criteria and
+neither requires a test:
+- `marker-in-source`: `grep -rq 'dirty' system/harness/build.rs` (exit 0, confirmed).
+- `still-builds`: `cargo build --release` (exit 0, confirmed).
+Runtime rendering of the suffix is established by the code path rather than asserted from a
+hand-run: the `Commands::Version` handler prints `env!("HEX_GIT_SHA")` verbatim
+(`system/harness/src/main.rs:1319`), so a dirty build's `hex version` output carries the
+`-dirty` suffix directly from the value `build.rs` embeds — no consumer transforms it.
+
+**Downstream-safety check:** all `HEX_GIT_SHA` / `harness_version` consumers treat the
+value as opaque text — `hex --version` display (`src/main.rs:1319`), the `harness_version
+TEXT` column (`src/memory/schema.rs:133`), and the `String` fields in the eval-trend /
+climber-digest workers. No consumer parses, length-checks, or regex-matches the sha, so
+the `-dirty` suffix is backward-compatible.
+
+**Documented deviation / note:** `git status --porcelain` invoked from the harness
+subdirectory reports **whole-repo** dirtiness, not harness-only — so a docs-only or
+sibling-crate edit also flips the `-dirty` marker. This is a deliberate, defensible choice
+for a "dirty build" signal (any uncommitted state means the binary does not correspond to
+a clean commit) and is recorded here rather than narrowed.
+
+Second note (scope boundary): `--untracked-files=no` means a deploy that consists solely of
+**new, untracked** harness source files does NOT flip the `-dirty` marker. This matches the
+task wording exactly ("uncommitted changes to tracked files"), but it is worth stating
+because it is precisely cause #6's scenario — new harness source shadowed by a blanket
+instance `.gitignore` on `.hex/harness/src/`. Closing that gap is the job of task
+`Tyeav60q3` (make `hex upgrade` commit the synced source), not this build-script marker;
+the two fixes are complementary.
+
+**Functional proof (execute iteration 1).** Beyond the two declared verifications, the
+behavior was proven end-to-end by compiling `build.rs` standalone
+(`rustc --edition 2021 --crate-type bin`, exit 0) and executing it with `CARGO_MANIFEST_DIR`
+/ `OUT_DIR` set, once with cwd inside this (dirty) worktree and once inside a throwaway
+`git init` + single committed file:
+- dirty worktree → `cargo:rustc-env=HEX_GIT_SHA=91a0e730-dirty` (marker appended);
+- clean committed repo → `cargo:rustc-env=HEX_GIT_SHA=200b149` (no marker).
+This pins that the branch actually branches — the `-dirty` suffix reaches `HEX_GIT_SHA`
+only when the tree is dirty — which neither `grep` (word-in-source) nor `cargo build`
+(compiles) proves on its own.
+
+**Caveat to verify later (`build.rs:60`).** `cargo:rerun-if-changed` given a *directory*
+(`{manifest_dir}/src`) is relied on above to rerun `build.rs` on any nested source edit.
+Cargo's directory handling here should be confirmed with a live touch-a-nested-file test
+once the shared build queue clears; if cargo only stats the directory's own mtime rather
+than walking it recursively, a nested edit (e.g. `src/memory/assemble.rs`) would not rerun
+`build.rs` and the marker could read stale-clean. The per-file `rerun-if-changed` triggers
+emitted for every `*.worker.rs` (`build.rs:216`) already cover the worker tree regardless;
+this caveat only concerns non-worker nested sources.
