@@ -1131,7 +1131,7 @@ instance-side gitignore shadowing of new harness source files.
   "already consistent"; on `Err` prints a `[FAIL]` to stderr (deploy is live but
   unrecorded in git), prints the exact manual `git` fix, and returns nonzero (S6:
   no quiet failures). Non-git or nested workspace → visible skip note, not a failure.
-  `system/harness/src/upgrade.rs:1492`.
+  `system/harness/src/upgrade.rs:1502`.
 - Documented the deployed-but-orphaned blind spot, the post-upgrade commit behavior,
   and the known instance-side gitignore shadowing of new harness source files
   (`.hex/harness/src/`) plus the recommended policy, in a new
@@ -1140,11 +1140,11 @@ instance-side gitignore shadowing of new harness source files.
 **Added tests** (in `system/harness/src/upgrade.rs`, pinned by the write_red_tests phase):
 
 - `commit_synced_files_commits_tracked_changes_and_names_version` — a modified tracked
-  `.hex/` file is committed and the subject names the version. `upgrade.rs:2522`.
+  `.hex/` file is committed and the subject names the version. `upgrade.rs:2532`.
 - `commit_synced_files_clean_tree_is_ok_false_not_error` — a clean synced tree returns
-  `Ok(false)`, never an error. `upgrade.rs:2547`.
+  `Ok(false)`, never an error. `upgrade.rs:2557`.
 - `commit_synced_files_fails_loudly_when_not_a_repo` — a commit that cannot be made
-  returns `Err`, never a silent `Ok`. `upgrade.rs:2565`.
+  returns `Err`, never a silent `Ok`. `upgrade.rs:2575`.
 - `commit_synced_files_leaves_unrelated_tracked_work_uncommitted` — the operator's
   unrelated tracked work (`todo.md`, modified-but-unstaged) survives uncommitted; the
   commit sweeps only `.hex/`. `upgrade.rs:2591`.
