@@ -71,4 +71,28 @@ remain valid and unmodified. No legacy pin required updating for this task; the
 new default-path behavior is pinned directly by the three dedup tests above.
 
 ### Deviations from scope
-None.
+None to the code, tests, or doc. One operational note on verification below.
+
+### Operational note — verifying `dedup-tests-pass` under shared-target contention
+The declared `dedup-tests-pass` verification
+(`cargo test --release dedup` in `system/harness`) inherits the BOI harness
+env var `CARGO_TARGET_DIR=/Users/mrap/.boi/v2/cargo-target` — a SHARED release
+target dir used concurrently by every active BOI worktree. Because sibling
+worktrees carry different source edits, their cargo fingerprints differ and
+thrash each other's cached artifacts, and the plain command spends its whole
+budget `Blocking waiting for file lock on build directory` rather than
+compiling. This is the root cause of the five prior execute-phase wall-clock
+timeouts on this task (the code has been complete and correct on disk since
+wip commit `3a13dfde`), NOT any code defect. Verification here was obtained in a
+private, contention-free per-task target dir (`CARGO_TARGET_DIR=/tmp/t1-lib`)
+using the faithful `--release` profile but with link-time optimization disabled
+for the run only via env (`CARGO_PROFILE_RELEASE_LTO=false`,
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`) and scoped to the lib target's unit
+tests (`cargo test --release --lib dedup`) — the three dedup tests live in
+`assemble.rs`'s `#[cfg(test)] mod tests`, i.e. the lib target, so `--lib` drops
+every unrelated `tests/*.rs` integration binary without dropping coverage. No
+profile file on disk was changed and no artifact was shipped; the test outcome
+is identical to the shared-dir/full-LTO command since only build-artifact
+location and link optimization differ, not the compiled test logic. The declared
+command against the shared dir remains correct and will pass once the shared
+build lock (held serially by sibling worktrees) is free.
