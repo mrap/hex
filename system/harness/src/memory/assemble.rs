@@ -412,6 +412,20 @@ fn m5_fact_relevance(
     (true, cands)
 }
 
+/// Stable per-object fingerprint for the fact dedup key. `FactHit` carries no
+/// fact ULID (only subject/predicate/object), so the object IS the identity
+/// signal. Hashed verbatim — deliberately case-sensitive — so distinct facts
+/// sharing subject+predicate get distinct keys; object-case near-duplicates are
+/// the canonicalization pass's job (task Tsfwg7d2v), not this key. `DefaultHasher`
+/// is fine: dedup keys are only ever compared within a single `assemble()` call,
+/// so cross-run hash stability is not load-bearing.
+fn fact_object_fingerprint(object: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    object.hash(&mut h);
+    h.finish()
+}
+
 fn facts_to_candidates(
     hits: Vec<(FactHit, f64)>,
     move_id: MoveId,
@@ -422,7 +436,24 @@ fn facts_to_candidates(
     hits.into_iter()
         .enumerate()
         .map(|(rank, (f, native))| {
-            let dedup_key = format!("fact:{}|{}", f.subject, f.predicate);
+            // Object-aware, case-insensitive fact dedup key (task T28958xxp,
+            // diagnosis 2026-08-31). The old key `fact:{subject}|{predicate}`
+            // was object-blind and case-sensitive: because the merge shares ONE
+            // seen-set across the floor and round-robin loops, at most one fact
+            // per (subject,predicate) pair could ever enter assembled context —
+            // evicting the other 245-of-1600 groups that hold 2+ facts. Folding
+            // subject+predicate case collapses true case-variant duplicates,
+            // while the per-object fingerprint keeps genuinely distinct facts
+            // (different object) apart so they no longer evict each other.
+            // NOTE: the object is fingerprinted verbatim (NOT case-folded) —
+            // object-similarity collapsing is the deliberate, logged job of the
+            // canonicalization pass (task Tsfwg7d2v), not this key.
+            let dedup_key = format!(
+                "fact:{}|{}|{:016x}",
+                f.subject.to_lowercase(),
+                f.predicate.to_lowercase(),
+                fact_object_fingerprint(&f.object),
+            );
             let confidence = mr * (1.0 / (rank as f32 + 1.0));
             Candidate {
                 kind: CandidateKind::Fact(f),
@@ -1063,5 +1094,164 @@ mod tests {
         };
         let s = render_candidates(&ctx);
         assert!(s.contains("alpha") && s.contains("beta"));
+    }
+
+    // ── Task T28958xxp: object-aware, case-insensitive fact dedup key ────────
+    // RED TESTS (write_red_tests phase). Pre-fix the fact dedup key is
+    // `fact:{subject}|{predicate}` (line ~425): object-blind and case-sensitive.
+    // The single shared seen-set (line ~566) spans BOTH the floor loop and the
+    // round-robin loop, so at most ONE fact per (subject,predicate) pair can
+    // enter assembled context. These pin the fix and MUST fail until it lands.
+
+    /// EVICTION (verification `eviction-fixed`): two facts sharing subject and
+    /// predicate but with DIFFERENT objects must BOTH appear in assembled
+    /// output. Pre-fix only one survives because the object-blind key collides
+    /// and the shared seen-set drops the second. This is the diagnosis's
+    /// 246-of-1600 collision class (Mike+decided x152, Mike+works-on x115).
+    #[test]
+    fn dedup_two_facts_same_pair_different_objects_both_render() {
+        let c = fresh_db();
+        // Same subject + predicate, distinct objects. "decide" cues M3.
+        insert_fact(
+            &c,
+            "d1",
+            "project:hex",
+            "decided",
+            "use sqlite-vec for the vector store",
+            false,
+        );
+        insert_fact(
+            &c,
+            "d2",
+            "project:hex",
+            "decided",
+            "adopt the parallel-moves assembler",
+            false,
+        );
+
+        let r = assemble(
+            &c,
+            "what did project hex decide about sqlite-vec and the assembler",
+            false,
+            MAX_CONTEXT_CHARS,
+            None,
+        );
+
+        // Retrieval precondition: M3 must have fetched BOTH facts as candidates,
+        // so a failure below is a dedup eviction — NOT a retrieval shortfall.
+        let m3 = r
+            .per_move_stats
+            .iter()
+            .find(|s| s.move_id == MoveId::M3PredicateQuery)
+            .expect("M3 stats present");
+        assert!(m3.fired, "M3 must fire on the 'decide' cue");
+        assert_eq!(
+            m3.candidate_count, 2,
+            "retrieval precondition: both same-pair facts must be fetched by M3"
+        );
+
+        // The real assertion: both distinct objects must survive the merge.
+        let objects: Vec<&str> = r
+            .candidates
+            .iter()
+            .filter_map(|c| match &c.kind {
+                CandidateKind::Fact(f) => Some(f.object.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            objects.iter().any(|o| o.contains("sqlite-vec")),
+            "first same-pair fact missing from merge"
+        );
+        assert!(
+            objects.iter().any(|o| o.contains("parallel-moves assembler")),
+            "second same-pair fact was evicted by the object-blind dedup key"
+        );
+
+        // And prove it in the ACTUAL rendered assembled output (the char budget
+        // is applied while candidates are built — line ~632/679 — so this string
+        // is the real context an agent would see, matching the `eviction-fixed`
+        // verification's "assembled output" wording).
+        let rendered = render_candidates(&r);
+        assert!(
+            rendered.contains("sqlite-vec") && rendered.contains("parallel-moves assembler"),
+            "both distinct same-pair facts must appear in the rendered assembled output; got:\n{rendered}"
+        );
+    }
+
+    /// CASE-VARIANT COLLAPSE: two facts that differ ONLY by case in subject and
+    /// predicate (identical object) are TRUE duplicates and must collapse — i.e.
+    /// share ONE dedup key so the seen-set drops the second. Pre-fix the key is
+    /// case-sensitive (`Mike|works-on` != `mike|WORKS-ON`) so both leak.
+    /// Asserts key EQUALITY only — never the key format (object-hash vs ULID is
+    /// deliberately the implementer's choice).
+    #[test]
+    fn dedup_case_variant_true_duplicates_collapse() {
+        let cfg = RecallConfig::default();
+        let hits = vec![
+            (
+                crate::memory::recall::FactHit {
+                    subject: "Mike".into(),
+                    predicate: "works-on".into(),
+                    object: "the fleet coordinator rewrite".into(),
+                    importance: 0.8,
+                    private: false,
+                },
+                0.8_f64,
+            ),
+            (
+                crate::memory::recall::FactHit {
+                    subject: "mike".into(),
+                    predicate: "WORKS-ON".into(),
+                    object: "the fleet coordinator rewrite".into(),
+                    importance: 0.8,
+                    private: false,
+                },
+                0.8_f64,
+            ),
+        ];
+        let cands = facts_to_candidates(hits, MoveId::M3PredicateQuery, true, &cfg);
+        assert_eq!(cands.len(), 2, "sanity: two candidates built");
+        assert_eq!(
+            cands[0].dedup_key, cands[1].dedup_key,
+            "case-variant true duplicates must share a dedup key so they collapse"
+        );
+    }
+
+    /// DISTINCTNESS (the other half of the key semantics): two facts with the
+    /// SAME subject and predicate but DIFFERENT objects must NOT collapse — their
+    /// dedup keys must differ. Pre-fix the object-blind key makes them equal, so
+    /// `assert_ne!` fails now. Without this, an implementer could satisfy the
+    /// collapse test by case-folding alone and leave the eviction bug intact.
+    #[test]
+    fn dedup_distinct_objects_keep_separate_keys() {
+        let cfg = RecallConfig::default();
+        let hits = vec![
+            (
+                crate::memory::recall::FactHit {
+                    subject: "project:hex".into(),
+                    predicate: "decided".into(),
+                    object: "use sqlite-vec".into(),
+                    importance: 0.8,
+                    private: false,
+                },
+                0.8_f64,
+            ),
+            (
+                crate::memory::recall::FactHit {
+                    subject: "project:hex".into(),
+                    predicate: "decided".into(),
+                    object: "adopt the parallel-moves assembler".into(),
+                    importance: 0.8,
+                    private: false,
+                },
+                0.8_f64,
+            ),
+        ];
+        let cands = facts_to_candidates(hits, MoveId::M3PredicateQuery, true, &cfg);
+        assert_ne!(
+            cands[0].dedup_key, cands[1].dedup_key,
+            "distinct objects under one subject+predicate must keep separate keys"
+        );
     }
 }
