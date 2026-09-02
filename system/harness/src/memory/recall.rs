@@ -187,28 +187,52 @@ pub(crate) fn facts_recall_with_config(
         if tok.len() < 3 {
             continue;
         }
-        // Match the token at ANY word boundary of the subject, not just after a
-        // colon: hyphen-, underscore-, slash-, and space-delimited AND
-        // multi-word subjects (fleet-coordinator, hex-v2-arch, "hex project")
-        // were unreachable when the pattern was colon-only (task Tkmz6c46q,
-        // diagnosis 2026-08-31). The final arm is start-anchored so a token that
-        // is the subject's FIRST word (which has no leading separator) matches
-        // too. LIKE is ASCII-case-insensitive, so no lowercasing of `subject`
-        // is needed. `tok` is bound (never interpolated) — no injection surface.
+        // Match the token at a real word boundary of the subject: after a
+        // separator (colon, hyphen, underscore, slash, space) so hyphen-,
+        // underscore-, slash- and space-delimited AND multi-word subjects
+        // (fleet-coordinator, hex-v2-arch, "hex project") are reachable, or the
+        // token IS the subject's first word — a leading match whose next char is
+        // a separator, or the whole subject (task Tkmz6c46q, diagnosis
+        // 2026-08-31).
+        //
+        // Two LIKE-metacharacter traps this arm must NOT fall into (review redo
+        // 2026-09-02, four rounds):
+        //   * A literal `_` separator in a LIKE pattern is a single-char
+        //     wildcard, degrading `%_tok%` into an unanchored substring match
+        //     (token "art" matched subject person:bart-smith). The `_`
+        //     separator is written `\_` with an explicit ESCAPE clause.
+        //   * A bare start-anchored `?1 || '%'` prefix-matches any longer word
+        //     (token "hex" bled into subject `hexagon`). The start-anchored
+        //     branches require the char after the token to be a separator, or
+        //     the token to equal the whole subject (`subject LIKE ?1`, no
+        //     wildcard = exact, still ASCII-case-insensitive).
+        // The query token itself is escaped (backslash, percent, underscore)
+        // and bound, so any metacharacter inside it is matched literally and
+        // there is no injection surface. LIKE is ASCII-case-insensitive, so no
+        // lowercasing of `subject` is needed.
+        let esc = tok
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let ids: Vec<i64> = conn
             .prepare(&format!(
                 "SELECT rowid FROM facts f
                  WHERE tombstone = 0{privacy} AND (
-                     subject LIKE '%:' || ?1 || '%' OR
-                     subject LIKE '%-' || ?1 || '%' OR
-                     subject LIKE '%_' || ?1 || '%' OR
-                     subject LIKE '% ' || ?1 || '%' OR
-                     subject LIKE '%/' || ?1 || '%' OR
-                     subject LIKE ?1 || '%'
+                     subject LIKE '%:' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE '%-' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE '%\\_' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE '% ' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE '%/' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE ?1 ESCAPE '\\' OR
+                     subject LIKE ?1 || ':%' ESCAPE '\\' OR
+                     subject LIKE ?1 || '-%' ESCAPE '\\' OR
+                     subject LIKE ?1 || '\\_%' ESCAPE '\\' OR
+                     subject LIKE ?1 || ' %' ESCAPE '\\' OR
+                     subject LIKE ?1 || '/%' ESCAPE '\\'
                  )
                  ORDER BY importance DESC LIMIT 3",
             ))?
-            .query_map([&tok], |r| r.get(0))?
+            .query_map([&esc], |r| r.get(0))?
             .filter_map(Result::ok)
             .collect();
         for id in ids {
@@ -951,6 +975,150 @@ mod plan2_tests {
         assert!(
             hits.iter().any(|f| f.subject == "person:alexandra"),
             "slug-arm entity match starved out of the top-k window, got {:?}",
+            hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+    }
+
+    /// RED (task Tkmz6c46q, review redo 2026-09-02): the slug arm's underscore
+    /// branch used a LITERAL `_` in a LIKE pattern (`subject LIKE '%_' || ?1 ||
+    /// '%'`), and SQLite reads `_` as a single-character wildcard. That degrades
+    /// the branch into an unanchored substring match: query token "art" matches
+    /// subject `person:bart-smith` — the `_` wildcard eats the leading "b" of
+    /// "bart". That reintroduces the cross-subject flooding this task must
+    /// remove. Isolation: for "art", the colon/hyphen/space/slash branches see
+    /// `:bart`/`-smith` (no `:art`/`-art`), the start-anchored branch needs a
+    /// "person" prefix, and FTS (no `*`) matches the exact token "art", never
+    /// "bart" — so the buggy underscore-wildcard branch is the ONLY matcher.
+    /// After the fix escapes it (`'%\_' || ?1 || '%' ESCAPE '\'`) the branch
+    /// matches only a real underscore separator, so "art" no longer retrieves
+    /// `person:bart-smith`.
+    #[test]
+    fn slug_arm_literal_underscore_not_wildcard() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('bs','person:bart-smith','likes','strong coffee',0.9,'2026-06-11','2026-06-11')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "art", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            !hits.iter().any(|f| f.subject == "person:bart-smith"),
+            "slug-arm underscore is read as an SQLite wildcard: token 'art' matched \
+             subject person:bart-smith (unanchored substring flooding), got {:?}",
+            hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+    }
+
+    /// RED (task Tkmz6c46q, review redo 2026-09-02): the slug arm's
+    /// start-anchored branch `subject LIKE ?1 || '%'` prefix-matches any longer
+    /// word, so query token "hex" bleeds into subject `hexagon`. That branch is
+    /// meant to match a token that is the subject's FIRST WORD (e.g. `hex` in
+    /// `hex-v2-arch`), NOT an arbitrary prefix of one word. Isolation: for "hex"
+    /// the separator branches need a leading `:`/`-`/`_`/` `/`/`, and FTS (no
+    /// `*`) matches only the exact token "hex", never "hexagon" — so the
+    /// start-anchored branch is the ONLY matcher. After the fix anchors the
+    /// match so the character after the token is a separator (colon, hyphen,
+    /// underscore, space, slash) or end-of-string, "hex" no longer retrieves
+    /// `hexagon`.
+    #[test]
+    fn slug_arm_start_anchor_requires_word_boundary() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('hg','hexagon','is','a six sided polygon',0.9,'2026-06-11','2026-06-11')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "hex", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            !hits.iter().any(|f| f.subject == "hexagon"),
+            "start-anchored slug branch prefix-bled: token 'hex' matched subject \
+             hexagon, got {:?}",
+            hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+    }
+
+    /// GREEN guard (task Tkmz6c46q, review redo 2026-09-02): the operator
+    /// rejected the reviewer's alternative of DROPPING the underscore branch —
+    /// the fix must ESCAPE the underscore and KEEP the arm. This pin fails if
+    /// the branch is deleted. Subject `fleet_coordinator` (a diagnosis
+    /// fleet-coordinator spelling) is reachable by the token "coordin" ONLY via
+    /// the underscore separator branch: "coordin" is a strict PREFIX of
+    /// "coordinator" so FTS (exact token, no `*`) never matches it, and no other
+    /// slug branch has a matching separator context. Green before the fix
+    /// (`_` wildcard eats the literal `_`) and green after (`\_` matches the
+    /// literal `_`); only removing the branch turns it red.
+    #[test]
+    fn slug_arm_keeps_literal_underscore_subject() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('fc','fleet_coordinator','owns','the deploy queue',0.9,'2026-06-11','2026-06-11')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "coordin", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            hits.iter().any(|f| f.subject == "fleet_coordinator"),
+            "underscore-separated subject fleet_coordinator became unreachable by \
+             'coordin' — the underscore slug branch must be ESCAPED, not dropped, got {:?}",
+            hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+    }
+
+    /// GREEN guard (task Tkmz6c46q, review redo 2026-09-02): anchoring the
+    /// start-anchored branch to separator-or-end must NOT kill a legitimate
+    /// first-word match. Token "hex" is the whole first word of subject
+    /// `hex-v2-arch` (next char is a hyphen separator), so it must stay
+    /// retrievable. Green before and after the anchor fix; it turns red only if
+    /// the anchor over-restricts and drops exact first-word matches.
+    #[test]
+    fn slug_arm_first_word_still_matches_at_separator() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('hv','hex-v2-arch','describes','the second architecture',0.9,'2026-06-11','2026-06-11')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "hex", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            hits.iter().any(|f| f.subject == "hex-v2-arch"),
+            "legitimate first-word slug match lost: token 'hex' no longer retrieves \
+             subject hex-v2-arch after anchoring, got {:?}",
             hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
         );
     }

@@ -64,7 +64,7 @@ This task intentionally changes default-path behavior (more distinct
 same-pair facts now survive the merge). The named legacy pins
 `default_config_reproduces_legacy_facts_recall_exactly` and
 `default_config_vector_arm_off_is_byte_identical`
-(`system/harness/src/memory/recall.rs:934` and `:1004`) operate at the
+(`system/harness/src/memory/recall.rs:1205` and `:1275`) operate at the
 `facts_recall` / `facts_recall_with_config` RETRIEVAL layer and do NOT route
 through `facts_to_candidates` (the merge/dedup layer this task edits), so they
 remain valid and unmodified. No legacy pin required updating for this task; the
@@ -291,9 +291,9 @@ class.
    never caught "who are the blockers".
 
 2. **camelCase predicate reachability** — new retrieval-side arm in
-   `facts_recall_with_config` (`system/harness/src/memory/recall.rs:221-260`),
-   fused at `recall.rs:293`, backed by the `split_camel_words` helper
-   (`recall.rs:61-83`). unicode61 indexes `knowsAbout` as the single token
+   `facts_recall_with_config` (`system/harness/src/memory/recall.rs:245-302`),
+   fused at `recall.rs:316-317`, backed by the `split_camel_words` helper
+   (`recall.rs:61-77`). unicode61 indexes `knowsAbout` as the single token
    `knowsabout` (empirically confirmed this session), so `know`/`about` can
    never FTS-match it. The arm splits each DISTINCT predicate on internal
    lower→upper case transitions and, when a query term prefix-matches a split
@@ -319,10 +319,26 @@ class.
    single query token.
 
 5. **Slug arm for hyphen/word-boundary subjects** — `facts_recall_with_config`
-   (`system/harness/src/memory/recall.rs:188-215`). The slug LIKE pattern was
+   (`system/harness/src/memory/recall.rs:180-243`). The slug LIKE pattern was
    colon-only (`%:tok%`); it now matches the token at any word boundary
-   (`:`,`-`,`_`,`/`,space) plus a start-anchored arm for a token that is the
-   subject's FIRST word. `tok` is bound, never interpolated (no injection).
+   (`:`,`-`,`_`,`/`,space) plus start-anchored arms for a token that is the
+   subject's FIRST word (next char a separator) or the whole subject. The query
+   token is escaped (backslash/percent/underscore) and bound, never interpolated
+   (no injection). Two LIKE-metacharacter fixes were made after four review
+   rounds (redo 2026-09-02): (a) the underscore separator is written `\_` with an
+   explicit `ESCAPE '\'` clause — a literal `_` in a LIKE pattern is a
+   single-char wildcard, which had degraded `%_tok%` into an unanchored substring
+   match (token "art" wrongly retrieved subject `person:bart-smith`); (b) the
+   start-anchored branch, formerly a bare `?1 || '%'` prefix, now requires the
+   char after the token to be a separator or the token to equal the whole subject
+   (`subject LIKE ?1`, exact yet ASCII-case-insensitive) — a bare prefix had bled
+   token "hex" into subject `hexagon`. **Deliberate narrowing (test-pinned):** a
+   subject reachable ONLY as a bare prefix of one word — e.g. `alexandra` via
+   query token "alex", with no separator and not an exact match — is no longer
+   surfaced by the slug arm. This is the intended fix for the prefix-bleed and is
+   pinned by `slug_arm_start_anchor_requires_word_boundary`; separator-first-word
+   matches (`hex` → `hex-v2-arch`) stay reachable, pinned by
+   `slug_arm_first_word_still_matches_at_separator`.
 
 6. **Query-relevance blend into M2** — `m2_entity` (`system/harness/src/memory/assemble.rs:341-407`)
    with helpers `query_terms` (`assemble.rs:180`) and `object_relevance`
@@ -351,12 +367,24 @@ class.
   only the 2-char token `v2` with the query is retrievable end-to-end.
 
 `system/harness/src/memory/recall.rs` (`mod plan2_tests`):
-- `split_camel_words_splits_on_case_transition_only` (`:1195`) — unit for the
+- `split_camel_words_splits_on_case_transition_only` (`:1363`) — unit for the
   helper: camelCase yields 2+ words; hyphenated/single yield one.
-- `facts_recall_camelcase_predicate_arm_surfaces_fact` (`:1210`) — the arm at
+- `facts_recall_camelcase_predicate_arm_surfaces_fact` (`:1378`) — the arm at
   the `facts_recall` layer, with the unrelated-query control.
-- `facts_recall_keeps_two_char_digit_token` (`:1249`) — `v2` retrievable at the
+- `facts_recall_keeps_two_char_digit_token` (`:1417`) — `v2` retrievable at the
   `facts_recall` layer.
+- `slug_arm_literal_underscore_not_wildcard` (`:996`) — RED→green: token "art"
+  must NOT retrieve `person:bart-smith` (the `\_` ESCAPE fix; a literal `_` was
+  read as a single-char wildcard).
+- `slug_arm_start_anchor_requires_word_boundary` (`:1033`) — RED→green: token
+  "hex" must NOT retrieve `hexagon` (the start-anchor now requires a separator or
+  exact match, not a bare prefix).
+- `slug_arm_keeps_literal_underscore_subject` (`:1069`) — GREEN guard: the
+  escaped underscore branch is KEPT, not dropped — `fleet_coordinator` stays
+  reachable by "coordin".
+- `slug_arm_first_word_still_matches_at_separator` (`:1101`) — GREEN guard:
+  anchoring must not kill a legitimate first-word match — `hex-v2-arch` stays
+  reachable by "hex".
 
 ### Deviations from scope
 1. **camelCase split is retrieval-side, not index-side.** The behavior text says
@@ -393,8 +421,8 @@ fix, which is what keeps the broader match from flooding the merge.
 ### Backward-compatibility / default-behavior note
 This task changes default-path retrieval (a new fused arm, a widened tokenizer,
 a broader slug/entity surface, a relevance-blended M2). The named legacy pins
-`default_config_reproduces_legacy_facts_recall_exactly` (`recall.rs:934`) and
-`default_config_vector_arm_off_is_byte_identical` (`recall.rs:1004`) compare two
+`default_config_reproduces_legacy_facts_recall_exactly` (`recall.rs:1205`) and
+`default_config_vector_arm_off_is_byte_identical` (`recall.rs:1275`) compare two
 config PATHS of the same function against each other (live default vs explicit
 default literals), not against a frozen external baseline, so an additive change
 applied uniformly to both paths leaves them equal — verified: their fixtures use
