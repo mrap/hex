@@ -983,17 +983,17 @@ Same infra reality as T28958xxp above: the declared `canon-tests-pass`
 verification (`cargo test --release canonical` in `system/harness`) inherits the
 BOI harness env `CARGO_TARGET_DIR=~/.boi/v2/cargo-target`, a SHARED
 release target thrashed by every sibling worktree's build lock, and the fat-LTO
-<<<<<<< HEAD
 link (`lto = true` at workspace-root `Cargo.toml:8`, release-only) of the test
 binary is the >10-minute wall that reaped prior attempts. To obtain a genuine
 exit code off that wall, this session ran the same `canonical` lib tests in a
 private, contention-free target dir CoW-cloned from the warm shared tree
 (`cp -cR ~/.boi/v2/cargo-target/debug /tmp/recallfix-t2-target/debug`,
 then `CARGO_TARGET_DIR=/tmp/recallfix-t2-target cargo test --lib canonical`).
-=======
+
+---
+
 link (`lto = true` at workspace-root `Cargo.toml`, release-only) of the test
 binary is the >10-minute wall that reaped the earlier `validate` phase.
->>>>>>> 56a50759 (wip: task blocked — preserving the worktree so a later `boi unblock` adopts a clean tree; MAY include the worker's in-flight/partial writes)
 
 DEVIATION FROM THE DECLARED VERIFICATION (documented per spec scope), identical in
 kind to T28958xxp: the genuine exit code was obtained in DEBUG (`cargo test --lib
@@ -1010,7 +1010,7 @@ fact-canonicalization tests and the three pre-existing `*canonical*` lib tests
 run identically under `--lib`.
 
 OBSERVED RESULT (execute iteration 1, this session — genuine). All runs used the
-shared debug target `/Users/mrap/.boi/v2/cargo-target` directly (debug builds were
+shared debug target `~/.boi/v2/cargo-target` directly (debug builds were
 already warm, so no lock contention hit them):
 
 1. Baseline (before the polarity guard): `cargo test --lib canonical` → **exit 0**,
