@@ -117,7 +117,7 @@ Tasks an engineer or coding agent could pick up cold:
 
 ## Deliverable
 
-One document, in this order: **Executive Summary** (health grade A–F with one-line justification, top 3 risks, top 3 opportunities, attrition stats; ≤10 sentences) · **Repo Map** · **Confirmed Findings** (by theme, sorted by severity, each with file:line, consequence, FACT/JUDGMENT, verification note; then Strengths) · **Strategy** (themes, do-NOT-fix list, done signals) · **Task Plan** (milestone table, quick wins, top-3 sketches) · **Coverage & Open Questions** (what got lighter review, what you couldn't verify and why, decisions needing a human).
+One document, in this order: **Executive Summary** (health grade A–F with one-line justification, top 3 risks, top 3 opportunities, attrition stats; skimmable before the detail sections) · **Repo Map** · **Confirmed Findings** (by theme, sorted by severity, each with file:line, consequence, FACT/JUDGMENT, verification note; then Strengths) · **Strategy** (themes, do-NOT-fix list, done signals) · **Task Plan** (milestone table, quick wins, top-3 sketches) · **Coverage & Open Questions** (what got lighter review, what you couldn't verify and why, decisions needing a human).
 
 Save it to a file — don't leave it only in chat. Write it outside the audited repo (audits are read-only) unless the user asks for it in-repo (e.g. `docs/audits/YYYY-MM-DD-repo-audit.md`); writing the report in-repo is the one permitted write. If the user wants the plan executed, the task format maps directly onto tickets or agent-delegation specs; offer to convert M0/M1.
 

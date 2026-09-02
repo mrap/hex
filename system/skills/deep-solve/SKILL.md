@@ -99,7 +99,7 @@ stated persona, scoring against explicit criteria — is bounded, checkable work
 5. **Finalize.** The same frontier seat that wrote the draft applies the corrections:
    fix wrong citations, state what is actually true wherever a claim was refuted, fold
    material gaps into the constraints and open-questions sections.
-6. **Persist**, then surface to the user: the file path, the 5-line summary, and the open
+6. **Persist**, then surface to the user: the file path, the summary, and the open
    design questions. **Proceed straight into Phase 2** unless the user asked for a checkpoint.
 
 ## Phase 2 — converge on a solution
