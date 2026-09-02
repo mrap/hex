@@ -250,3 +250,18 @@ than walking it recursively, a nested edit (e.g. `src/memory/assemble.rs`) would
 `build.rs` and the marker could read stale-clean. The per-file `rerun-if-changed` triggers
 emitted for every `*.worker.rs` (`build.rs:216`) already cover the worker tree regardless;
 this caveat only concerns non-worker nested sources.
+
+**`still-builds` capture (execute iteration 5).** The declared `still-builds` command
+(`cargo build --release`) was stalled across five iterations by shared-target-dir lock
+contention: every spec worktree inherits one ambient `CARGO_TARGET_DIR`
+(`/Users/mrap/.boi/v2/cargo-target`), which cargo serializes with a build-directory flock,
+while the task DAG fans build/test verifications out in parallel — so this task's build sat
+behind sibling `cargo test`/`cargo build` runs indefinitely. The declared verification does
+not pin `CARGO_TARGET_DIR` (it is ambient env, not part of the command string), so the
+byte-identical command was run against a private APFS copy-on-write clone of the warm target
+(`CARGO_TARGET_DIR=/tmp/t5-target cargo build --release`). Result: `Finished 'release'
+profile [optimized] target(s) in 21m 07s`, exit code 0 — the full `hex-harness` crate still
+compiles cleanly with the dirty-marker `build.rs`. The clone was removed afterward to reclaim
+disk. This is a verification-environment note only; no code changed. Underlying infra fix for
+the loop (out of this task's scope, `system/harness/` only): give each spec worktree its own
+`CARGO_TARGET_DIR`, or serialize build/test verifications across sibling DAG tasks.
