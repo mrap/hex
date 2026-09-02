@@ -1,6 +1,12 @@
 ---
 name: hex-upgrade
-description: Upgrade hex to the latest version from hex
+description: >
+  Pull the latest scripts, skills, commands, and hooks from hex-foundation
+  into this hex instance. Merges any AGENTS.md template changes while
+  preserving user customizations, and rebuilds the memory index afterward.
+  Use when the user says "hex upgrade", "update hex", "sync with foundation",
+  or asks to pull the latest hex changes. Accepts pass-through flags such as
+  --dry-run and --local PATH.
 ---
 
 # /hex-upgrade — Upgrade Hexagon

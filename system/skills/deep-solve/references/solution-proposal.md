@@ -13,7 +13,7 @@ The Phase 2 output, written by the frontier convergence seat. Persisted as
 
 ## Verdict
 
-[Plain language, 5 lines maximum. What to build and the one reason it wins.]
+[Plain language. What to build and the one reason it wins, stated so it can be argued with.]
 
 ## How it works
 

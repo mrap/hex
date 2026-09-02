@@ -1,0 +1,75 @@
+title    = "Refactor: {{MODULE_NAME}}"
+pipeline = "standard"
+delivery = "merge"
+
+[contract]
+base_branch = "main"
+workspace   = "{{PROJECT_PATH}}"
+scope       = """
+  Phase 3 of the vibe-to-production pipeline: refactor {{MODULE_PATH}} in
+  {{PROJECT_PATH}} to reduce cyclomatic complexity and improve
+  maintainability, using the characterization tests at
+  {{PROJECT_PATH}}/tests/characterization/test_{{MODULE_NAME}}.py as the
+  behavior lock. Baseline before-metrics: CC={{CC}}, MI={{MI}}.
+
+  Hard constraints, apply to every task:
+  - Do NOT change any function signature or return type.
+  - Do NOT add new dependencies (no imports from outside the project).
+  - Do NOT modify any file outside {{MODULE_PATH}}.
+  - All characterization tests must pass after every change. If a step
+    breaks them, revert that step and report failure instead of proceeding.
+
+  Refactor techniques to apply: extract complex conditional logic into
+  named helper functions, replace nested if/else chains with guard
+  clauses or early returns, extract repeated logic into shared in-module
+  helpers, use list/dict comprehensions where they read more clearly than
+  loops, and break down any function with cyclomatic complexity above 10
+  into smaller, focused functions.
+"""
+exclusions = [
+  "changes to function signatures or return types",
+  "new dependencies or imports from outside the project",
+  "edits to files other than {{MODULE_PATH}}",
+]
+must_emit = ["{{MODULE_PATH}}"]
+
+[[tasks]]
+ref           = "verify-characterization-baseline"
+behavior      = "Run the characterization tests for {{MODULE_NAME}} to confirm the baseline is green before any refactoring begins. If any test fails, stop immediately and report the failure instead of proceeding."
+verifications = [
+  { name = "baseline-tests-pass", command = "cd \"{{PROJECT_PATH}}\" && export PATH=\"/opt/homebrew/bin:$PATH\" && python3 -m pytest \"tests/characterization/test_{{MODULE_NAME}}.py\" -q" },
+]
+
+[[tasks]]
+ref           = "reduce-complexity"
+behavior      = "Refactor {{MODULE_PATH}} to reduce cyclomatic complexity per the techniques in scope. Do not change function signatures, return types, or the public API. Do not add imports outside the standard library or existing project dependencies. Do not modify any file other than {{MODULE_PATH}}."
+blocked_by    = ["verify-characterization-baseline"]
+verifications = [
+  { name = "characterization-tests-still-pass", command = "cd \"{{PROJECT_PATH}}\" && export PATH=\"/opt/homebrew/bin:$PATH\" && python3 -m pytest \"tests/characterization/test_{{MODULE_NAME}}.py\" -q" },
+  { name = "complexity-report-runs", command = "export PATH=\"/opt/homebrew/bin:$PATH\" && radon cc \"{{MODULE_PATH}}\" -a -s" },
+]
+
+[[tasks]]
+ref           = "verify-behavior-and-metrics"
+behavior      = "Run the characterization tests and radon complexity/maintainability against {{MODULE_PATH}}, and report before/after values against the baseline (CC={{CC}}, MI={{MI}}). Confirm every characterization test passes, max CC has decreased from {{CC}}, and MI has increased from {{MI}}. If any characterization test fails, revert the refactor and report failure."
+blocked_by    = ["reduce-complexity"]
+verifications = [
+  { name = "characterization-tests-pass", command = "cd \"{{PROJECT_PATH}}\" && export PATH=\"/opt/homebrew/bin:$PATH\" && python3 -m pytest \"tests/characterization/test_{{MODULE_NAME}}.py\" -q" },
+  { name = "complexity-metrics-emitted", command = "export PATH=\"/opt/homebrew/bin:$PATH\" && radon cc \"{{MODULE_PATH}}\" -a -s && radon mi \"{{MODULE_PATH}}\" -s" },
+]
+
+[[tasks]]
+ref           = "security-regression-check"
+behavior      = "Run bandit against {{MODULE_PATH}} and confirm no new HIGH or MEDIUM severity findings were introduced versus the pre-refactor baseline. If new HIGH/MEDIUM findings exist, revert the change that introduced them and report failure with details."
+blocked_by    = ["verify-behavior-and-metrics"]
+verifications = [
+  { name = "no-new-high-or-medium-findings", command = "export PATH=\"/opt/homebrew/bin:$PATH\" && bandit \"{{MODULE_PATH}}\" -f json 2>/dev/null | python3 -c \"import json, sys; d=json.load(sys.stdin); r=d.get('results', []); hm=[x for x in r if x.get('issue_severity') in ('HIGH', 'MEDIUM')]; assert not hm, f'{len(hm)} HIGH/MEDIUM findings'\"" },
+]
+
+[[tasks]]
+ref           = "full-suite-regression-check"
+behavior      = "Run the full project test suite to confirm no regressions beyond what the characterization tests cover. Every test that passed before refactoring must still pass; investigate and fix any regression before completing."
+blocked_by    = ["security-regression-check"]
+verifications = [
+  { name = "full-suite-passes", command = "cd \"{{PROJECT_PATH}}\" && export PATH=\"/opt/homebrew/bin:$PATH\" && python3 -m pytest --tb=short -q" },
+]

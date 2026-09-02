@@ -17,7 +17,7 @@ than smoothing it over.
 
 ## Summary
 
-[Plain language, 5 lines maximum. What breaks, how often, what it costs. A reader who
+[Plain language, short enough to paste into a message as-is. What breaks, how often, what it costs. A reader who
 stops here knows whether to care.]
 
 ## Symptom & blast radius
@@ -84,8 +84,7 @@ rests on. Also: which evidence lenses came back empty, and what that leaves unve
 
 ## Section notes
 
-**Summary at 5 lines** is a hard cap, not a target. It is the part that gets pasted into
-a message.
+**Summary stays short enough to paste into a message as-is** — a ceiling to respect, not a target to hit.
 
 **Mechanism is the load-bearing section.** It is the one the frontier refuter attacks. If
 it cannot be written with citations, the evidence phase is not finished — go back and run

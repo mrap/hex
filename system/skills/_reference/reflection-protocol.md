@@ -1,17 +1,24 @@
 ---
 name: hex-reflect
 description: >
-  Session reflection and self-improvement. Reviews the full conversation to
-  extract learnings, identify failure patterns, and produce concrete upgrades
-  to hex's operating model. Generates standing orders, learnings entries, skills,
-  and behavioral rules — auto-applied after adversarial critic validation.
-  Use at session end, on-demand via /hex-reflect, or when the session had
-  corrections or pushback.
+  Reference content for hex's reflection protocol: issue extraction,
+  adversarial critique, and fix-generation templates used by hex memory
+  consolidate's cron-driven synthesis pass. Not a live, user-invocable skill —
+  /hex-reflect and the session-end trigger this file once described were
+  removed 2026-06-05.
 version: 1.0.0
 ---
 <!-- # sync-safe -->
 
 # Session Reflection
+
+> **HISTORICAL — invocation commands removed.** This file is kept as reference
+> content only. `/hex-reflect`, `/hex-shutdown`, and the Stop-hook execution
+> model described below were deleted 2026-06-05.
+> Reflection now runs inside `hex memory consolidate` (cron) — see `CLAUDE.md`
+> → "How hex improves (reflection)". Nothing in this workspace invokes this
+> file as a live skill; treat everything below as protocol content, not as
+> commands to execute on a session boundary.
 
 ## Philosophy
 
@@ -51,7 +58,7 @@ speed at which errors are permanently resolved.
 
 ## Protocol
 
-Execute these steps in order. Do not skip steps. Do not reorder.
+Execute these steps in order.
 
 1. **Announce.** Print: "Running session reflection..."
 2. **Load history.** Read `evolution/reflection-log.md` to get previously tracked issues,
@@ -83,18 +90,6 @@ Execute these steps in order. Do not skip steps. Do not reorder.
 11. **Update evolution engine.** Write to reflection-log.md, changelog.md, and
     (if recurring) observations.md and suggestions.md. Deduplicate before writing.
     Rebuild memory index if the script exists.
-11a. **Write eval signal.** After updating the evolution engine, write the session
-    reflection to a JSON file and call session-delta.py to persist eval_records:
-    ```bash
-    # session_reflection.json must contain: session_id, session_date,
-    # sos_violated (list), sos_held (list), sos_not_tested (list)
-    python3 "$HEX_DIR/evolution/eval/session-delta.py" \
-      --input /tmp/hex-reflect-session.json \
-      --output /tmp/hex-reflect-delta.json \
-      --db "$HEX_DIR/.hex/memory.db"
-    ```
-    The JSON file should be written to `/tmp/hex-reflect-session.json` before
-    calling session-delta.py. If memory.db does not exist, skip this step silently.
 12. **Report.** Print: "Reflection complete. Applied N/M fixes." List what was applied
     and what was skipped.
 
@@ -117,7 +112,7 @@ do not rely on regex or keyword matching. Read for intent, tone, and context.
 
 ### Extraction Procedure
 
-Follow these steps in order. Do not skip steps.
+Follow these steps in order.
 
 **Step 1: Chronological scan**
 
@@ -1009,109 +1004,3 @@ tracking table, and status values, ready to append.]
 - **Horizontal rules** (`---`) separate issues for readability.
 - **Metrics are computed, not estimated.** Read the reflection-log to compute actual totals.
   If the log is empty (first run), cumulative metrics equal session metrics.
-
-## Execution Mode
-
-hex-reflect runs as a **post-session Stop hook** via `claude -p`. This is fully decoupled
-from the interactive session — it cannot be interrupted by context window limits, user
-navigation, connection drops, or session timeouts.
-
-### Architecture: Stop Hook + `claude -p`
-
-```
-Interactive Session                     Post-Session (background)
-┌──────────────┐                       ┌──────────────────────┐
-│ User works   │                       │ Stop hook fires      │
-│ Session ends │──Stop event──────────>│ 1. backup_session.sh │
-│              │                       │    (saves transcript) │
-└──────────────┘                       │ 2. session-reflect.sh│
-                                       │    (runs claude -p   │
-                                       │     with transcript  │
-                                       │     + reflect prompt)│
-                                       │ 3. Applies fixes     │
-                                       │ 4. Logs results      │
-                                       └──────────────────────┘
-```
-
-### How It Works
-
-1. **Transcript saved first.** The existing `backup_session.sh` Stop hook copies the
-   latest `.jsonl` transcript to `raw/transcripts/`. This already runs on every session
-   stop.
-
-2. **Reflection runs second.** A new Stop hook entry runs `session-reflect.sh`, which:
-   - Reads the saved transcript from `raw/transcripts/`
-   - Constructs a prompt containing the full reflection protocol + transcript content
-   - Calls `claude -p --dangerously-skip-permissions` in the agent working directory
-   - The `claude -p` session executes the reflection protocol and applies fixes directly
-   - Output is logged to `evolution/reflection-log.md`
-
-3. **Backgrounded.** The reflection script runs in the background (`nohup ... &`) so it
-   doesn't block the Stop hook or terminal. If the user starts a new session before
-   reflection finishes, there's no conflict — reflection writes to evolution files, not
-   active session state.
-
-4. **Error handling.** If `claude -p` fails, the script logs the error and retries once.
-   If it still fails, the raw transcript is preserved for manual reflection next session.
-
-### Why This Approach
-
-| Requirement | How It's Met |
-|------------|--------------|
-| Not blocking | Runs after session closes, backgrounded |
-| Resilient | Stop hook fires regardless of how session ends; transcript is already saved |
-| Has conversation content | Reads the saved `.jsonl` transcript |
-| Can write to hex files | `claude -p` runs in the agent directory with full file access |
-
-### Mid-Session Reflection (Checkpoint)
-
-When reflection is triggered mid-session (via `/hex-checkpoint`), it uses the same mechanism
-but runs via `Task` with `run_in_background: true` instead of waiting for a Stop hook. The
-background subagent has access to conversation context and runs the reflection protocol
-asynchronously.
-
-### Script Location
-
-`hex session reflect` — the subcommand that orchestrates the post-session reflection.
-
-
-## Configuration (reflect-config.yaml)
-
-Behavior is controlled by `evolution/reflect-config.yaml` in the target repo.
-If the file is not found, fall back to the hardcoded defaults listed below — do not crash.
-
-```yaml
-# evolution/reflect-config.yaml — canonical location
-version: "1.0"
-pattern_detection:
-  recurrence_threshold_for_suggestion: 3   # default: 3
-  recurrence_threshold_for_escalation: 5   # default: 5
-  recurrence_window_days: 30               # default: 30
-fix_generation:
-  auto_apply_after_critic: true            # default: true
-  max_so_additions_per_session: 3          # default: 3
-  so_requires_min_severity: "medium"       # default: medium
-  layer2_mechanism_threshold: 2            # default: 2
-triggers:
-  skip_if_below_n_exchanges: 5            # default: 5
-output:
-  tiered_output: true                     # default: true
-  quick_issue_threshold: 3               # default: 3
-  deep_issue_check_interval_days: 30     # default: 30
-```
-
-To load the config in any script (with fallback to defaults if not found):
-
-```python
-import yaml, os
-cfg_path = os.path.join(os.environ.get('HEX_DIR', '.'), 'evolution/reflect-config.yaml')
-try:
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f) or {}
-except FileNotFoundError:
-    cfg = {}  # use defaults if config not found
-
-pd = cfg.get('pattern_detection', {})
-recurrence_threshold = pd.get('recurrence_threshold_for_suggestion', 3)
-escalation_threshold = pd.get('recurrence_threshold_for_escalation', 5)
-```

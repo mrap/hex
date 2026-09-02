@@ -22,10 +22,10 @@ Generate your best approach to this decision from the perspective of
 ## Output Format
 
 ### My Approach
-[Your proposed approach in 3-5 sentences]
+[Your proposed approach, concrete enough for another agent to critique]
 
 ### Thesis
-[Why this is the best approach, in 2-3 sentences. Be direct.]
+[Why this is the best approach. Be direct.]
 
 ### Key Trade-offs I Accept
 [What you're deliberately sacrificing and why it's worth it]

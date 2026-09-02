@@ -1,0 +1,94 @@
+title    = "Assess: {{PROJECT_NAME}}"
+pipeline = "standard"
+delivery = "merge"
+
+[contract]
+base_branch = "main"
+workspace   = "{{PROJECT_PATH}}"
+scope       = """
+  Phase 1 of the vibe-to-production pipeline: automated assessment of
+  {{PROJECT_PATH}} using static analysis, dependency mapping, git history,
+  and security scanning. Supports mixed-language codebases (Python + bash):
+  Python files get radon/vulture/bandit/ruff, bash scripts get shellcheck.
+  All outputs go under {{OUTPUT_DIR}}/raw/.
+
+  CRITICAL: every file write MUST use an absolute path.
+
+  Skip pydeps unless {{PROJECT_PATH}} has setup.py or pyproject.toml. If a
+  language has zero matching files (no .py or no .sh files), write minimal
+  placeholder outputs (empty JSON object/list) for that language's expected
+  files instead of failing.
+
+  before-metrics.json schema (the aggregate the whole pipeline diffs
+  against later -- field names and nesting must match exactly):
+  {
+    "project_path": "{{PROJECT_PATH}}",
+    "project_name": "{{PROJECT_NAME}}",
+    "timestamp": "<ISO timestamp>",
+    "phase": "before",
+    "metrics": {
+      "total_functions": <int>,
+      "max_cyclomatic_complexity": <float>,
+      "avg_cyclomatic_complexity": <float>,
+      "functions_cc_above_10": <int>,
+      "functions_cc_above_15": <int>,
+      "functions_cc_above_25": <int>,
+      "avg_maintainability_index": <float>,
+      "min_maintainability_index": <float>,
+      "modules_mi_below_20": <int>,
+      "total_modules": <int>,
+      "total_loc": <int>,
+      "total_sloc": <int>,
+      "comment_ratio": <float>,
+      "security_high_findings": <int>,
+      "security_medium_findings": <int>,
+      "dead_code_items_90pct": <int>,
+      "bash_scripts_total": <int>,
+      "bash_loc": <int>,
+      "bash_shellcheck_errors": <int>,
+      "bash_shellcheck_warnings": <int>,
+      "bash_shellcheck_info": <int>,
+      "bash_shellcheck_style": <int>
+    }
+  }
+  Compute every value from the raw tool outputs with stdlib-only Python
+  (no pip dependencies in the aggregation step itself).
+"""
+must_emit = [
+  "{{OUTPUT_DIR}}/raw/",
+  "{{OUTPUT_DIR}}/before-metrics.json",
+]
+
+[[tasks]]
+ref           = "python-static-analysis"
+behavior      = "Install vulture, radon, bandit, and ruff (pip or pip3), then run dead-code, complexity, maintainability, dependency-cycle, security, and lint analysis against every .py file under {{PROJECT_PATH}}; write raw outputs to {{OUTPUT_DIR}}/raw/ (complexity.json, maintainability.json, raw_metrics.json, security.json, vulture_*.txt, ruff.json/.txt, and deps.json/cycles.txt when {{PROJECT_PATH}} has setup.py or pyproject.toml)."
+verifications = [
+  { name = "raw-dir-exists", command = "test -d \"{{OUTPUT_DIR}}/raw\"" },
+  { name = "core-outputs-written", command = "test -f \"{{OUTPUT_DIR}}/raw/complexity.json\" && test -f \"{{OUTPUT_DIR}}/raw/maintainability.json\" && test -f \"{{OUTPUT_DIR}}/raw/security.json\"" },
+  { name = "raw-dir-nonempty", command = "count=$(ls \"{{OUTPUT_DIR}}/raw\" 2>/dev/null | wc -l | tr -d ' '); test \"$count\" -ge 1" },
+]
+
+[[tasks]]
+ref           = "bash-static-analysis"
+behavior      = "Install shellcheck and run it against every .sh file under {{PROJECT_PATH}}; write JSON and text findings, a syntax-validation pass, and per-file LOC counts to {{OUTPUT_DIR}}/raw/ (shellcheck.json, shellcheck.txt, syntax_errors.txt, bash_loc.txt). If no .sh files exist, write an empty shellcheck.json ([]) and skip the rest."
+verifications = [
+  { name = "shellcheck-json-written", command = "test -f \"{{OUTPUT_DIR}}/raw/shellcheck.json\"" },
+  { name = "shellcheck-json-valid", command = "export PATH=\"/opt/homebrew/bin:$PATH\" && python3 -c \"import json; json.load(open('{{OUTPUT_DIR}}/raw/shellcheck.json'))\"" },
+]
+
+[[tasks]]
+ref           = "git-hotspot-analysis"
+behavior      = "Mine {{PROJECT_PATH}}'s git history over the last 6 months for change-frequency and churn hotspots across .py and .sh files; write {{OUTPUT_DIR}}/raw/change_freq.txt and {{OUTPUT_DIR}}/raw/churn.txt."
+verifications = [
+  { name = "change-freq-written", command = "test -f \"{{OUTPUT_DIR}}/raw/change_freq.txt\"" },
+  { name = "churn-written", command = "test -f \"{{OUTPUT_DIR}}/raw/churn.txt\"" },
+]
+
+[[tasks]]
+ref           = "generate-before-metrics"
+behavior      = "Aggregate the raw outputs in {{OUTPUT_DIR}}/raw/ into {{OUTPUT_DIR}}/before-metrics.json using the schema defined in scope (stdlib-only Python, phase set to \"before\"). Missing or unparseable raw files degrade to zero/empty values rather than failing the task."
+blocked_by    = ["python-static-analysis", "bash-static-analysis"]
+verifications = [
+  { name = "before-metrics-written", command = "test -f \"{{OUTPUT_DIR}}/before-metrics.json\"" },
+  { name = "before-metrics-schema-valid", command = "export PATH=\"/opt/homebrew/bin:$PATH\" && python3 -c \"import json; d=json.load(open('{{OUTPUT_DIR}}/before-metrics.json')); assert d.get('phase')=='before'; m=d.get('metrics', {}); assert 'avg_cyclomatic_complexity' in m; assert 'avg_maintainability_index' in m; assert 'security_high_findings' in m\"" },
+]

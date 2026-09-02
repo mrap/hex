@@ -53,25 +53,13 @@ Run automatically on first launch after bootstrap migration.
 
 ## Health Checks
 
-Run these checks in order. For each, report the result and fix if possible.
+`hex doctor run --fix` owns the check registry (`system/harness/src/doctor/checks/` in hex-foundation) — that list is the source of truth, not a copy here. It currently runs checks across three categories:
 
-| # | Check | Severity | Auto-fix |
-|---|-------|----------|----------|
-| 1 | `.hex/` directory exists | error | mkdir |
-| 2 | `.git/` initialized | error | git init |
-| 3 | `.hex/` directory exists with skills | error | cannot fix (re-run bootstrap) |
-| 4 | `.hex/skills/` has skill directories | error | cannot fix (re-run bootstrap) |
-| 5 | `.agents/skills/` linked to `.hex/skills/` | error | create symlink |
-| 6 | `CLAUDE.md` exists and is >1000 bytes | error | cannot fix |
-| 7 | `AGENTS.md` exists | warning | generate from CLAUDE.md |
-| 8 | `.codex/config.toml` exists | warning | create with CLAUDE.md fallback |
-| 9 | `me/me.md` exists and has content | info | report only |
-| 10 | `todo.md` exists | warning | create skeleton |
-| 11 | `memory.db` exists | warning | rebuild index |
-| 12 | No broken symlinks in agent dir | error | remove and recreate |
-| 13 | All `.sh` scripts in `.hex/scripts/` are executable | warning | chmod +x |
-| 14 | `.hex/llm-preference` exists | warning | detect CLI and create |
-| 15 | No stale `.hex/llm-preference` conflicts | warning | resolve to canonical location |
+- **Health** — structural: `.hex/`, skills present and populated, git init, symlinks, memory/telemetry/vector-search liveness, script permissions, binary/interpreter availability.
+- **Config** — settings and credentials: CLAUDE.md/AGENTS.md presence and freshness, Codex parity (CLI, version, API key, AGENTS.md sections), `me/me.md`, `todo.md`, LLM preference, `settings.json`, timezone.
+- **Registry** — skill/bin metadata: orphaned entries, stale policy.
+
+Each check reports Pass, Warn, Fail, Fixed, or Skip. Read the actual list and statuses from the script's own output for each run — the registry changes across releases, so report what `hex doctor run --fix` says, not a hardcoded checklist.
 
 ## Migration Data Handling
 

@@ -28,11 +28,11 @@ each dispatched as BOI specs.
 
 | Phase | Name | BOI Spec | Input | Output |
 |-------|------|----------|-------|--------|
-| 1 | Assessment | `assess-<project>.spec.md` | Source code | Metrics JSON, priority list |
-| 2 | Safety Net | `characterize-<project>.spec.md` | P1-P2 modules from Phase 1 | Characterization tests |
+| 1 | Assessment | `assess-<project>.spec.toml` | Source code | Metrics JSON, priority list |
+| 2 | Safety Net | `characterize-<project>.spec.toml` | P1-P2 modules from Phase 1 | Characterization tests |
 | 3 | Prioritization | Inline (no BOI) | Phase 1 metrics | Prioritized backlog |
-| 4 | Execution | `refactor-<module>.spec.md` (one per P1/P2 module) | Char tests + priority list | Refactored code |
-| 5 | Verification | `verify-<project>.spec.md` | Before/after metrics | Improvement report |
+| 4 | Execution | `refactor-<module>.spec.toml` (one per P1/P2 module) | Char tests + priority list | Refactored code |
+| 5 | Verification | `verify-<project>.spec.toml` | Before/after metrics | Improvement report |
 | 6 | Maintain | Inline (no BOI) | Verification report | CI config, CLAUDE.md updates |
 
 ## Orchestration Flow
@@ -56,13 +56,13 @@ each dispatched as BOI specs.
 - Generate assessment BOI spec from template:
   ```bash
   bash .hex/skills/vibe-to-prod/scripts/expand_template.sh \
-    .hex/skills/vibe-to-prod/templates/assess.spec.md \
-    $OUTPUT_DIR/assess-$PROJECT_NAME.spec.md \
+    .hex/skills/vibe-to-prod/templates/assess.spec.toml \
+    $OUTPUT_DIR/assess-$PROJECT_NAME.spec.toml \
     PROJECT_PATH=$PROJECT_PATH \
     PROJECT_NAME=$PROJECT_NAME \
     OUTPUT_DIR=$OUTPUT_DIR
   ```
-- Dispatch: `boi dispatch --spec $OUTPUT_DIR/assess-$PROJECT_NAME.spec.md --priority 50`
+- Dispatch: `boi dispatch $OUTPUT_DIR/assess-$PROJECT_NAME.spec.toml`
 - On completion: run priority computation script, save `$OUTPUT_DIR/priorities.json`
 - Update pipeline state
 
@@ -72,14 +72,14 @@ each dispatched as BOI specs.
 - Generate characterization test spec from template:
   ```bash
   bash .hex/skills/vibe-to-prod/scripts/expand_template.sh \
-    .hex/skills/vibe-to-prod/templates/characterize.spec.md \
-    $OUTPUT_DIR/characterize-$PROJECT_NAME.spec.md \
+    .hex/skills/vibe-to-prod/templates/characterize.spec.toml \
+    $OUTPUT_DIR/characterize-$PROJECT_NAME.spec.toml \
     PROJECT_PATH=$PROJECT_PATH \
     PROJECT_NAME=$PROJECT_NAME \
     OUTPUT_DIR=$OUTPUT_DIR \
     MODULE_LIST=$MODULE_LIST
   ```
-- Dispatch: `boi dispatch --spec $OUTPUT_DIR/characterize-$PROJECT_NAME.spec.md --priority 50`
+- Dispatch: `boi dispatch $OUTPUT_DIR/characterize-$PROJECT_NAME.spec.toml`
 - On completion: verify all characterization tests pass
 - Update pipeline state
 
@@ -96,8 +96,8 @@ each dispatched as BOI specs.
   ```bash
   # Set MODULE_PATH, MODULE_NAME, CC, MI from priorities.json for each module
   bash .hex/skills/vibe-to-prod/scripts/expand_template.sh \
-    .hex/skills/vibe-to-prod/templates/refactor.spec.md \
-    $OUTPUT_DIR/refactor-$MODULE_NAME.spec.md \
+    .hex/skills/vibe-to-prod/templates/refactor.spec.toml \
+    $OUTPUT_DIR/refactor-$MODULE_NAME.spec.toml \
     PROJECT_PATH=$PROJECT_PATH \
     MODULE_PATH=$MODULE_PATH \
     MODULE_NAME=$MODULE_NAME \
@@ -106,17 +106,17 @@ each dispatched as BOI specs.
   ```
 - One BOI spec per module, one concern per task within the spec
 - Dispatch sequentially (each spec must pass char tests before next):
-  `boi dispatch --spec $OUTPUT_DIR/refactor-$MODULE_NAME.spec.md --priority 50`
+  `boi dispatch $OUTPUT_DIR/refactor-$MODULE_NAME.spec.toml`
 - Update pipeline state after each module completes
 
 #### Phase 5: Verification
 - Generate verification BOI spec from template
-- Template: `.hex/skills/vibe-to-prod/templates/verify.spec.md`
+- Template: `.hex/skills/vibe-to-prod/templates/verify.spec.toml`
 - **IMPORTANT:** Pass `SKILL_DIR` when expanding this template so helper scripts resolve correctly:
   ```bash
   bash .hex/skills/vibe-to-prod/scripts/expand_template.sh \
-    .hex/skills/vibe-to-prod/templates/verify.spec.md \
-    $OUTPUT_DIR/verify-$PROJECT_NAME.spec.md \
+    .hex/skills/vibe-to-prod/templates/verify.spec.toml \
+    $OUTPUT_DIR/verify-$PROJECT_NAME.spec.toml \
     PROJECT_PATH=$PROJECT_PATH \
     PROJECT_NAME=$PROJECT_NAME \
     OUTPUT_DIR=$OUTPUT_DIR \
@@ -146,8 +146,8 @@ each dispatched as BOI specs.
   "output_dir": "$HEX_DIR/projects/boi-v2p",
   "started": "2026-03-16T19:00:00",
   "phases": {
-    "1": {"status": "completed", "completed_at": "2026-03-16T19:30:00", "boi_queue_id": "q-099"},
-    "2": {"status": "completed", "completed_at": "2026-03-16T20:00:00", "boi_queue_id": "q-100"},
+    "1": {"status": "completed", "completed_at": "2026-03-16T19:30:00", "spec_id": "Sgzffh520"},
+    "2": {"status": "completed", "completed_at": "2026-03-16T20:00:00", "spec_id": "Tqk3xhw02"},
     "3": {"status": "completed", "completed_at": "2026-03-16T20:05:00"},
     "4": {"status": "in_progress", "modules_completed": ["status.py"], "modules_remaining": ["daemon_ops.py"]},
     "5": {"status": "not_started"},
@@ -172,10 +172,10 @@ All templates live at `.hex/skills/vibe-to-prod/templates/`:
 
 | Template | Phase | Description |
 |----------|-------|-------------|
-| `assess.spec.md` | 1 | Run all 5 analysis tools, save raw JSON, compute before-metrics |
-| `characterize.spec.md` | 2 | Generate inline-snapshot characterization tests for target modules |
-| `refactor.spec.md` | 4 | Per-module constraint-based refactoring with safety checks |
-| `verify.spec.md` | 5 | Re-run assessment, compare before/after, produce improvement report |
+| `assess.spec.toml` | 1 | Run all 5 analysis tools, save raw JSON, compute before-metrics |
+| `characterize.spec.toml` | 2 | Generate inline-snapshot characterization tests for target modules |
+| `refactor.spec.toml` | 4 | Per-module constraint-based refactoring with safety checks |
+| `verify.spec.toml` | 5 | Re-run assessment, compare before/after, produce improvement report |
 
 ## Reference
 
