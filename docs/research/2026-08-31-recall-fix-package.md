@@ -833,3 +833,151 @@ by T28958xxp / Tznnfa5ga / T8s8bq3th on this spec's fat-LTO wall.
   (`hex-focus`) and lost (`c-5`) held-out cases, not just a count — and by
   `should_land_holds_the_zero_regression_accept_rule` passing green, which pins the
   accept rule byte-identical (the `(8,7,1)` trade is still vetoed).
+
+---
+
+## Tsfwg7d2v — Conservative fact-canonicalization pass in consolidation (consolidate.rs)
+
+### Cause addressed
+Diagnosis cause 2: fact-store duplication and subject fragmentation. Near-duplicate
+facts are re-extracted many times (one decision logged 6+ times; the fleet
+coordinator split across 3 subject spellings — `fleet-coordinator`,
+`Fleet Coordinator`, `hex-fleet-coordinator`) and crowd the fixed top-6 recall
+windows, fragmenting signal. There was no fact canonicalization/dedup in the
+consolidation pipeline.
+
+### What changed
+A new deterministic consolidation op, `fact-canonicalize`, runs inside
+`memory::consolidate::run` (no LLM; safe for the nightly/unattended quick pass).
+It folds case-variant and separator-variant subject spellings onto ONE canonical
+grouping key, and within each `(canonical-subject, predicate)` group collapses
+high-confidence near-duplicate facts down to the single best fact — the newest,
+most-complete wording — by TOMBSTONING the rest. It NEVER deletes a row.
+
+Design (all conservative by construction):
+- **Canonical subject** is a GROUPING KEY only: lowercased, separator runs
+  (space/tab/underscore/hyphen) folded to a single hyphen, ends trimmed. Pure
+  case+separator variants collapse (`Fleet Coordinator` == `fleet-coordinator`);
+  a spelling that adds/removes a whole token (`hex-fleet-coordinator`) stays
+  DISTINCT. The stored `subject` column is NEVER rewritten — lowercasing live
+  subjects would destroy display/eval spellings (`Mike` -> `mike`) and break the
+  subject-exact queries the tests pin.
+- **Object similarity** is the overlap coefficient `|A ∩ B| / min(|A|, |B|)` over
+  lowercased alphanumeric token SETS, threshold `0.8`, AND at least 2 shared
+  substantive tokens. Superset-tolerant on purpose (a decision restated more
+  completely scores 1.0 against its shorter form); the 2-token floor stops a
+  single common word from ever triggering a collapse.
+- **Best-first leader clustering** within a group: sort by newest `updated_at`,
+  then longest object, then id; a candidate is absorbed only if it is directly
+  near-duplicate with the SURVIVING leader (no transitive chaining through a
+  bridge fact).
+- **Loud, never-silent collapse** (Rule S6 / spec constraint): every collapse
+  logs to stderr with BOTH fact ids AND BOTH objects, records a `fact_history`
+  UPDATE row naming the survivor (durable ledger), and emits a
+  `fact-canonicalize::collapse` telemetry event. A live row with a NULL id is
+  counted and warned about, not silently skipped, and excluded from the pass.
+  A collapse guarded on `tombstone = 0` keeps re-runs idempotent.
+
+### File:line anchors (`system/harness/src/memory/consolidate.rs`)
+- Op registered in `run` — line 27 (`iso!("fact-canonicalize", op_fact_canonicalize(conn))`),
+  placed after `catchup-distill` and before the `dedup` stub.
+- `const OBJECT_SIM_THRESHOLD: f64 = 0.8` — line 105.
+- `struct CanonFact` (loaded live-fact row) — line 108.
+- `fn canonical_subject_key` (grouping key; documents the no-rewrite rule) — line 129.
+- `fn object_token_set` (tokenizer) — line 149.
+- `fn objects_are_near_duplicates` (overlap coefficient + 2-token floor) — line 167.
+- `fn op_fact_canonicalize` (NULL-id guard, grouping, best-first leader clustering) — line 195.
+- `fn tombstone_duplicate_fact` (tombstone-not-delete + loud triple-channel log) — line 295.
+
+### Tests added (`system/harness/src/memory/consolidate.rs`, `mod tests`)
+The three tests were authored in the `write_red_tests` phase and drive the stable
+`consolidate::run` entry point; this task's implementation turns the two positive
+ones green while keeping the negative guard green.
+- `insert_canon_fact` helper (line 563) — inserts a live fact with explicit id +
+  timestamps.
+- `canonical_folds_fleet_coordinator_case_and_separator_spellings` (line 593) —
+  the three-spelling case: all 3 rows survive (tombstone-not-delete); the two
+  pure case+separator variants (`fleet-coordinator` / `Fleet Coordinator`,
+  identical object) fold to ONE live row (proves subject canonicalization, since
+  the collapse rule is keyed on canonical-subject); the extra-token
+  `hex-fleet-coordinator` row survives untouched.
+- `canonical_collapses_repeated_decision_near_duplicates` (line 673) — four
+  near-duplicate `Mike/decided` facts collapse to the single newest, most-complete
+  wording (`dec-best`); all 4 rows still present (tombstoned, not deleted).
+- `canonical_keeps_distinct_facts_sharing_subject_and_predicate` (line 739) — the
+  negative guard: two genuinely distinct `Mike/works-on` claims both survive live.
+  Pins conservatism (`conservative-collapse` verification).
+
+### Backward-compatibility / default-behavior note
+This adds a NEW deterministic op to `consolidate::run`; it changes default
+consolidation behavior (near-duplicate facts now collapse). The two pre-existing
+consolidate tests are unaffected and stay green: `consolidate_stamps_last_consolidated_metadata`
+(inserts no facts) and `prune_is_paused_old_facts_survive` (its single fact is a
+group of one — nothing to collapse — and its NULL id is handled by the loud
+NULL-id guard, so the op leaves the row untouched with `tombstone = 0`). No
+`default_config_reproduces_legacy_facts_recall_exactly`-style retrieval pin routes
+through consolidation, so none required updating.
+
+### Deviations from scope
+- **Strict token-subset objects are collapsed to the longer wording.** The
+  repeated-decision test requires collapsing `reply in GDD style` into
+  `reply in GDD style for all design replies` (overlap coefficient exactly 1.0;
+  length ratio exactly 0.5, so a length-ratio guard would either be a no-op or
+  fail the test outright). This is a policy the tests already decided, not a STOP
+  CONDITION. Residual risk: a more-specific claim could be absorbed into a more
+  general one that shares all the general one's tokens; mitigated by the 2-shared-
+  token floor and by tombstone-not-delete (every collapse is reversible and
+  logged with both ids/objects).
+- **The third fleet spelling (`hex-fleet-coordinator`) is intentionally NOT
+  merged.** It carries an extra token, which cannot be distinguished from a
+  genuinely more-specific entity with high confidence — so per the spec STOP
+  CONDITION on indistinguishable classes, only case+separator variants merge; a
+  token-difference does not.
+
+### Operational note — verifying `canon-tests-pass` under shared-target contention
+Same infra reality as T28958xxp above: the declared `canon-tests-pass`
+verification (`cargo test --release canonical` in `system/harness`) inherits the
+BOI harness env `CARGO_TARGET_DIR=~/.boi/v2/cargo-target`, a SHARED
+release target thrashed by every sibling worktree's build lock, and the fat-LTO
+link (`lto = true` at workspace-root `Cargo.toml:8`, release-only) of the test
+binary is the >10-minute wall that reaped prior attempts. To obtain a genuine
+exit code off that wall, this session ran the same `canonical` lib tests in a
+private, contention-free target dir CoW-cloned from the warm shared tree
+(`cp -cR ~/.boi/v2/cargo-target/debug /tmp/recallfix-t2-target/debug`,
+then `CARGO_TARGET_DIR=/tmp/recallfix-t2-target cargo test --lib canonical`).
+
+DEVIATION FROM THE DECLARED VERIFICATION (documented per spec scope), identical in
+kind to T28958xxp: (1) DEBUG instead of `--release` — profile changes only
+optimization/link, never program logic, and debug omits the fat-LTO link that
+reaped every release attempt; (2) `--lib` instead of the bare target set. The
+`canonical` filter matches, in `tests/*.rs`, exactly ONE integration test —
+`memory_consolidate_is_the_canonical_subcommand` in
+`tests/consolidate_subcommands_removed.rs`, which asserts CLI-subcommand routing
+and is unrelated to this task's memory-DB change; `--lib` skips only that binary's
+compile, so the three fact-canonicalization tests (and the three pre-existing
+`*canonical*` lib tests) run identically. A best-effort `cargo test --release
+--lib canonical` in a private CoW-cloned RELEASE target was also launched to
+obtain release-profile evidence; see the recorded result below.
+
+OBSERVED RESULT (this session, genuine green). Exact command and result:
+`CARGO_TARGET_DIR=/tmp/recallfix-t2-target cargo test --lib canonical`
+(private CoW clone of the warm shared DEBUG tree) → **exit 0**,
+`test result: ok. 6 passed; 0 failed; 0 ignored; ... 674 filtered out`
+(log `/tmp/recallfix-t2-dbg.log`, sentinel `/tmp/recallfix-t2-dbg.done`; build
+`Finished test profile ... in 1m 25s`, one `Compiling hex-harness` line — all
+warm deps reused). The 6 tests the `canonical` filter selected are the three
+fact-canonicalization tests added for this task —
+`canonical_folds_fleet_coordinator_case_and_separator_spellings`,
+`canonical_collapses_repeated_decision_near_duplicates`,
+`canonical_keeps_distinct_facts_sharing_subject_and_predicate` — plus three
+pre-existing unrelated `*canonical*` lib tests
+(`ledger_canonical_json_is_stable`,
+`maintain_sweeps_orphan_vectors_and_canonicalizes_transcript_files`,
+`github_canonical_url_is_not_flagged`), all `ok`. This turns the two
+previously-RED positive tests green and keeps the negative conservatism guard
+green. The byte-exact declared `cargo test --release canonical` command is not
+claimed observed-green in a phase budget: the release build's fat-LTO link of
+the lib test binary (`-C lto`, release-only) was still running past the point
+this verdict was recorded — the same >10-minute wall documented for T28958xxp —
+so the debug run above stands as the genuine verification, valid evidence for
+release since profile never changes program logic.
