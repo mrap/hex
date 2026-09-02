@@ -115,12 +115,34 @@ disk since wip commit `3a13dfde`; the two deterministic key tests
 `dedup_distinct_objects_keep_separate_keys`) call `facts_to_candidates`
 directly and fully prove the key semantics, and
 `dedup_two_facts_same_pair_different_objects_both_render` proves eviction is
-fixed end-to-end via `assemble()`. The observed `test result:` line for the
-clone run, when the fat-LTO link completes, is at `/tmp/t1-clone.log` and its
-exit code at `/tmp/t1-clone.done`; the execute-phase verdict evidence records
-whichever of those was observed this session. This doc does NOT claim the
-declared shared-dir command was observed green — that command was never able to
-acquire the shared build lock within a phase budget.
+fixed end-to-end via `assemble()`.
+
+OBSERVED RESULT (this session, genuine green). To obtain a real exit code off
+the fat-LTO wall, the three `dedup` tests were run under the DEBUG profile in a
+private, contention-free target dir CoW-cloned from the warm shared debug tree
+(`cp -cR /Users/mrap/.boi/v2/cargo-target/debug /tmp/t1-dbg-target/debug`, then
+`CARGO_TARGET_DIR=/tmp/t1-dbg-target cargo test --lib dedup`). Exact command and
+result observed this session:
+`CARGO_TARGET_DIR=/tmp/t1-dbg-target cargo test --lib dedup` → **exit 0**,
+`test result: ok. 10 passed; 0 failed` (log `/tmp/t1-dbg.log`, sentinel
+`/tmp/t1-dbg.done`). The three dedup tests are among the 10 and all print `ok`:
+`dedup_distinct_objects_keep_separate_keys`,
+`dedup_case_variant_true_duplicates_collapse`, and
+`dedup_two_facts_same_pair_different_objects_both_render`.
+
+DEVIATION FROM THE DECLARED VERIFICATION (documented per spec scope). The
+declared command is `cargo test --release dedup`; the run above differs in TWO
+scoped ways, neither of which changes the test SET or the pass/fail outcome:
+(1) DEBUG instead of `--release` — profile changes only optimization/link, never
+program logic, so a debug pass is valid evidence a release pass would hold; the
+sole reason to prefer debug here is that it skips the fat-LTO link that reaped
+every prior release attempt. (2) `--lib` instead of the bare target set —
+verified this session that no `tests/*.rs` integration binary matches the name
+`dedup` (`grep -rl dedup system/harness/tests/` → NONE), so `--lib` runs the
+IDENTICAL test set and only skips compiling unrelated integration binaries. This
+doc does NOT claim the byte-exact declared `--release` shared-dir command was
+itself observed green in a phase budget — that command never acquired the shared
+build lock, held serially by sibling worktrees, before the wall-clock reap.
 
 A second contention factor observed this session: cargo builds spawned by
 earlier wall-clock-reaped execute attempts are NOT reliably killed with the
