@@ -265,3 +265,139 @@ compiles cleanly with the dirty-marker `build.rs`. The clone was removed afterwa
 disk. This is a verification-environment note only; no code changed. Underlying infra fix for
 the loop (out of this task's scope, `system/harness/` only): give each spec worktree its own
 `CARGO_TARGET_DIR`, or serialize build/test verifications across sibling DAG tasks.
+
+---
+
+## Tkmz6c46q — Matching batch (assemble.rs + recall.rs)
+
+### Cause addressed
+Diagnosis cause 3 (fetch-stage matching gaps), the sub-set assigned to this task:
+predicate-cue table lacks "blocker(s)"; camelCase predicates (`knowsAbout`) index
+as one token and are unreachable by the split words; the facts tokenizer drops
+2-char tokens like `v2`; entity detection + the slug arm miss hyphen-delimited
+and multi-word subjects (`fleet-coordinator`, `hex project`, `hex-v2-arch`); and
+M2 orders purely by importance, ignoring query relevance
+(`b-brand-lead-restrictions`). Named cases used as fixture shapes: `c-13`
+(blockers), `a-mike-knowsabout` (camelCase), `c-14` (`v2`),
+`b-brand-lead-restrictions` (M2 relevance), plus the multi-word/hyphen subject
+class.
+
+### What changed — six changes
+
+1. **blocker/blockers cue** — `predicate_cues` (`system/harness/src/memory/assemble.rs:82-90`).
+   Added the NOUN forms `blocker`/`blockers` to the `blocked-by` cue tuple.
+   `predicate_cues` does exact `HashSet` membership (no stemming), so the nouns
+   needed explicit entries; the verb-only cues (`block`/`blocked`/`blocking`)
+   never caught "who are the blockers".
+
+2. **camelCase predicate reachability** — new retrieval-side arm in
+   `facts_recall_with_config` (`system/harness/src/memory/recall.rs:221-260`),
+   fused at `recall.rs:293`, backed by the `split_camel_words` helper
+   (`recall.rs:61-83`). unicode61 indexes `knowsAbout` as the single token
+   `knowsabout` (empirically confirmed this session), so `know`/`about` can
+   never FTS-match it. The arm splits each DISTINCT predicate on internal
+   lower→upper case transitions and, when a query term prefix-matches a split
+   word, fuses that predicate's facts as their own ranked arm — structurally the
+   same device as the pre-existing slug arm (which exists because FTS "can't see
+   inside slugs"). Restricted to genuine case-transition predicates (2+ split
+   words); single-token and hyphenated predicates (`decided`, `works-on`) are
+   already unicode61-tokenized and are deliberately excluded so the arm does not
+   become a new flooding path.
+
+3. **2-char digit tokens kept** — facts tokenizer in `facts_recall_with_config`
+   (`system/harness/src/memory/recall.rs:120-127`). The sub-3-char filter now
+   keeps 2-char alphanumeric tokens that carry a digit (`v2`, `k8`, `m1`); pure
+   2-char alpha words (`of`, `to`, `an`) stay dropped. `v2` was the single most
+   distinctive term of case `c-14` and was previously discarded.
+
+4. **Entity detection for hyphen/multi-word subjects** — `detect_entity_subjects`
+   (`system/harness/src/memory/assemble.rs:148-172`). Strips an optional leading
+   `type:` prefix (so the type token never triggers a match), then splits the
+   remainder on every word separator `[':' '-' '_' '/' ' ']` and matches any
+   piece (len ≥ 3) against the query tokens. Reaches `fleet-coordinator`,
+   `hex project`, `hex-v2-arch`, `person:brand-lead` — none of which is ever a
+   single query token.
+
+5. **Slug arm for hyphen/word-boundary subjects** — `facts_recall_with_config`
+   (`system/harness/src/memory/recall.rs:188-215`). The slug LIKE pattern was
+   colon-only (`%:tok%`); it now matches the token at any word boundary
+   (`:`,`-`,`_`,`/`,space) plus a start-anchored arm for a token that is the
+   subject's FIRST word. `tok` is bound, never interpolated (no injection).
+
+6. **Query-relevance blend into M2** — `m2_entity` (`system/harness/src/memory/assemble.rs:341-407`)
+   with helpers `query_terms` (`assemble.rs:180`) and `object_relevance`
+   (`assemble.rs:210`). M2 was importance-only, so a low-importance fact that
+   actually answers the query was buried below generic high-importance facts
+   under the same subject and never entered the per-subject top-K window. M2 now
+   fetches a WIDER importance-ordered window (`TOP_K_PER_MOVE * 3`) per subject,
+   re-ranks it by (query-relevance, importance), and keeps the top-K — so the
+   relevant fact is re-surfaced without changing how many candidates the move
+   ultimately contributes.
+
+### Tests added
+`system/harness/src/memory/assemble.rs` (`mod tests`):
+- `assemble_camelcase_predicate_reachable_by_split_words` (`:1030`) — the
+  `camelcase-reachable` proof end-to-end through `assemble()`, with a control
+  query that must NOT surface the fact. (Authored in write_red_tests; now green.)
+- `predicate_cue_blockers_maps_to_blocked_by` (`:1091`) — "blockers" cues
+  `blocked-by`. (Authored in write_red_tests; now green.)
+- `entity_detection_reaches_hyphen_and_multiword_subjects` (`:1106`) — hyphen,
+  space, and hyphen+version subjects match; the bare `person:` type prefix does
+  NOT match every subject of that type.
+- `m2_blends_query_relevance_over_importance` (`:1151`) — direct `m2_entity`
+  call: a low-importance query-relevant fact, buried past the top-K by
+  importance alone, is re-surfaced AND ranks first under the blend.
+- `assemble_two_char_versioned_token_reaches_fact` (`:1199`) — a fact sharing
+  only the 2-char token `v2` with the query is retrievable end-to-end.
+
+`system/harness/src/memory/recall.rs` (`mod plan2_tests`):
+- `split_camel_words_splits_on_case_transition_only` (`:1195`) — unit for the
+  helper: camelCase yields 2+ words; hyphenated/single yield one.
+- `facts_recall_camelcase_predicate_arm_surfaces_fact` (`:1210`) — the arm at
+  the `facts_recall` layer, with the unrelated-query control.
+- `facts_recall_keeps_two_char_digit_token` (`:1249`) — `v2` retrievable at the
+  `facts_recall` layer.
+
+### Deviations from scope
+1. **camelCase split is retrieval-side, not index-side.** The behavior text says
+   "with whatever index-side normalization that needs" and the write_red_tests
+   comment says "needs index-side camelCase token split feeding facts_fts"; this
+   task instead adds a retrieval-time predicate arm. Rationale (verifiable, not a
+   preference): `facts_fts` is external-content (`schema.rs:76-84`,
+   `content=facts, content_rowid=rowid`). External-content FTS5 rebuilds from
+   `facts.predicate` VERBATIM (`schema.rs:220` `INSERT INTO facts_fts VALUES('rebuild')`)
+   and the `'delete'` commands in the `facts_fts_ad`/`facts_fts_au` triggers pass
+   `old.predicate` raw, so any trigger-time transform of the stored predicate
+   desyncs from the content table and corrupts the index. Pure SQL cannot split
+   on case transitions, and a custom scalar SQL function referenced from the
+   triggers would make every fact INSERT fail on any connection that had not
+   registered it — 9+ write sites (distill, consolidate, maintain_facts,
+   dedup, …). The retrieval-side arm is the same class of fix already precedented
+   by the slug arm and carries zero write-path blast radius. The
+   `camelcase-reachable` verification (a `knowsAbout` fact retrievable by
+   `know`/`about`) is satisfied either way.
+2. **`v2` reachability for `hex-v2-arch`.** The 2-char-token fix makes `v2`
+   retrievable via the facts FTS arm (object/subject text). Entity detection and
+   the slug arm still gate word pieces at len ≥ 3, so `hex-v2-arch` is reached by
+   its `hex`/`arch` pieces, NOT by the `v2` piece. This is deliberate (a 2-char
+   entity piece is too weak a signal to widen M2/slug matching on) and is called
+   out so the `v2` case is not over-claimed.
+
+### Cross-task note for the flooding task (T8s8bq3th)
+Change 4 broadens `detect_entity_subjects`, so M2's firing rate goes UP relative
+to develop `91a0e730`. T8s8bq3th's "when M2 detects entities, intersect M3/M4
+before the top-K window" work sits directly downstream of this — its baseline
+moved; the wider M2 match surface is the intended input to that entity-intersect
+fix, which is what keeps the broader match from flooding the merge.
+
+### Backward-compatibility / default-behavior note
+This task changes default-path retrieval (a new fused arm, a widened tokenizer,
+a broader slug/entity surface, a relevance-blended M2). The named legacy pins
+`default_config_reproduces_legacy_facts_recall_exactly` (`recall.rs:934`) and
+`default_config_vector_arm_off_is_byte_identical` (`recall.rs:1004`) compare two
+config PATHS of the same function against each other (live default vs explicit
+default literals), not against a frozen external baseline, so an additive change
+applied uniformly to both paths leaves them equal — verified: their fixtures use
+no camelCase/2-char/hyphen shapes, so the new arm/tokenizer contribute nothing
+to those fixtures and the pins hold unmodified. No legacy pin required updating;
+the new behavior is pinned directly by the eight tests above.

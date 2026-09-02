@@ -79,7 +79,14 @@ fn predicate_cues(query: &str) -> Vec<&'static str> {
         (&["decide", "decided", "decision"], "decided"),
         (&["prefer", "prefers", "preference"], "prefers"),
         (&["dislike", "dislikes"], "dislikes"),
-        (&["block", "blocked", "blocking"], "blocked-by"),
+        // "blocker"/"blockers" are the NOUN phrasing ("who are the blockers")
+        // the verb-only cues missed — `predicate_cues` does exact HashSet
+        // membership (no stemming), so the nouns need explicit entries
+        // (task Tkmz6c46q, diagnosis 2026-08-31 case c-13).
+        (
+            &["block", "blocked", "blocking", "blocker", "blockers"],
+            "blocked-by",
+        ),
         (&["responsible", "owner", "owns"], "responsible-for"),
         (&["plan", "plans", "planning"], "plans-to"),
         (&["focus", "focused", "focusing"], "current-focus"),
@@ -140,9 +147,20 @@ fn detect_entity_subjects(conn: &Connection, query: &str) -> Vec<String> {
         let lower = subj.to_lowercase();
         let mut hit = false;
         if toks.contains(&lower) {
+            // Whole-subject exact token (single-word subjects like "zwerk").
             hit = true;
-        } else if let Some(slug) = lower.split(':').nth(1) {
-            for piece in slug.split(['-', '_', '/']) {
+        } else {
+            // Strip an optional leading `type:` prefix (person:, project:) so
+            // the type token never triggers a match, then split the remainder
+            // on every word separator. This reaches hyphen-, underscore-,
+            // slash-, and space-delimited AND multi-word subjects — none of
+            // which is ever a single query token: fleet-coordinator,
+            // "hex project", hex-v2-arch (task Tkmz6c46q, diagnosis 2026-08-31).
+            // Broadening M2's match surface raises its firing rate; the
+            // entity-intersection window fix (task T8s8bq3th) is what keeps the
+            // wider match from flooding the merge.
+            let slug = lower.splitn(2, ':').nth(1).unwrap_or(lower.as_str());
+            for piece in slug.split([':', '-', '_', '/', ' ']) {
                 if piece.len() >= 3 && toks.contains(piece) {
                     hit = true;
                     break;
@@ -154,6 +172,52 @@ fn detect_entity_subjects(conn: &Connection, query: &str) -> Vec<String> {
         }
     }
     matched
+}
+
+/// Distinctive query terms for the M2 relevance blend: lowercased, alphanumeric,
+/// length >= 3, with the generic question/stop words dropped so they can't
+/// inflate an object's relevance score.
+fn query_terms(query: &str) -> HashSet<String> {
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| {
+            t.len() >= 3
+                && !matches!(
+                    *t,
+                    "the" | "and"
+                        | "for"
+                        | "are"
+                        | "was"
+                        | "who"
+                        | "what"
+                        | "how"
+                        | "does"
+                        | "did"
+                        | "you"
+                        | "this"
+                        | "that"
+                        | "about"
+                )
+        })
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Count how many distinct query terms appear as tokens of `object`. This is
+/// the query-relevance signal M2 blends into its previously importance-only
+/// ordering (task Tkmz6c46q, diagnosis 2026-08-31 case b-brand-lead-restrictions).
+fn object_relevance(object: &str, qterms: &HashSet<String>) -> usize {
+    if qterms.is_empty() {
+        return 0;
+    }
+    let obj_toks: HashSet<String> = object
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_string())
+        .collect();
+    qterms.iter().filter(|q| obj_toks.contains(*q)).count()
 }
 
 // ─────────────────────────────────── moves ─────────────────────────────────
@@ -284,7 +348,17 @@ fn m2_entity(
     if subjects.is_empty() {
         return (false, Vec::new());
     }
-    let mut hits: Vec<(FactHit, f64)> = Vec::new();
+    // Query relevance blended into M2's ordering (task Tkmz6c46q). M2 used to
+    // order purely by importance, so a low-importance fact that actually
+    // answers the query was buried below generic high-importance facts under
+    // the same subject and never entered the per-subject top-K window
+    // (diagnosis 2026-08-31 case b-brand-lead-restrictions). We now fetch a
+    // WIDER importance-ordered window per subject, re-rank it by
+    // (query-relevance, importance), and keep the top-K — so a relevant fact
+    // that importance alone would drop is re-surfaced, without widening the
+    // number of candidates the move ultimately contributes.
+    let qterms = query_terms(query);
+    let mut scored: Vec<(FactHit, f64, usize)> = Vec::new();
     for subj in &subjects {
         let extra = if for_agent {
             " AND subject = ?1 AND private = 0"
@@ -296,18 +370,41 @@ fn m2_entity(
             Ok(s) => s,
             Err(_) => continue,
         };
-        let collected: Vec<(FactHit, f64)> = match stmt
-            .query_map(rusqlite::params![subj, TOP_K_PER_MOVE as i64], |r| {
-                fact_from_row(r)
-            }) {
+        let window: Vec<(FactHit, f64)> = match stmt
+            .query_map(
+                rusqlite::params![subj, (TOP_K_PER_MOVE * 3) as i64],
+                fact_from_row,
+            ) {
             Ok(rows) => rows.filter_map(Result::ok).collect(),
             Err(_) => Vec::new(),
         };
         drop(stmt);
-        hits.extend(collected);
+        let mut ranked: Vec<(FactHit, f64, usize)> = window
+            .into_iter()
+            .map(|(f, imp)| {
+                let rel = object_relevance(&f.object, &qterms);
+                (f, imp, rel)
+            })
+            .collect();
+        // Relevance first, importance breaks ties. Stable sort preserves the
+        // SQL importance/recency order within an equal (relevance, importance).
+        ranked.sort_by(|a, b| {
+            b.2.cmp(&a.2).then(
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        ranked.truncate(TOP_K_PER_MOVE);
+        scored.extend(ranked);
     }
-    // Sort by importance DESC for stable rank ordering across multiple subjects.
-    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Same blended key across subjects for a stable overall rank ordering.
+    scored.sort_by(|a, b| {
+        b.2.cmp(&a.2).then(
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    let hits: Vec<(FactHit, f64)> = scored.into_iter().map(|(f, imp, _)| (f, imp)).collect();
     let cands = facts_to_candidates(hits, MoveId::M2EntityFilter, true, cfg);
     (true, cands)
 }
@@ -913,6 +1010,213 @@ mod tests {
             .iter()
             .any(|s| s.move_id == MoveId::M3PredicateQuery && s.fired);
         assert!(m3_fired, "'have' must cue the 'has' predicate");
+    }
+
+    /// RED (task Tkmz6c46q — matching batch, diagnosis 2026-08-31 cause 3
+    /// "camelCase predicates (knowsAbout) index as one token"): a fact whose
+    /// predicate is camelCase is invisible to a query naming the split words.
+    /// The facts FTS tokenizer (`porter unicode61`, schema.rs:83) indexes
+    /// `knowsAbout` as the single token `knowsabout`, so neither `know` nor
+    /// `about` matches it. Subject and object deliberately share NO token with
+    /// the query, and the `know` cue maps to the DISTINCT predicate `knows`
+    /// (M3 does exact `predicate = 'knows'`, assemble.rs:331, which never
+    /// equals `knowsAbout`), so the ONLY path to this fact is an index-side
+    /// camelCase split feeding M5's facts_fts arm.
+    ///
+    /// After the fix (split camelCase predicates into word tokens for FTS
+    /// matching, with index-side normalization), the fact MUST appear in the
+    /// assembled candidates. This is the `camelcase-reachable` verification.
+    #[test]
+    fn assemble_camelcase_predicate_reachable_by_split_words() {
+        let c = fresh_db();
+        insert_fact(
+            &c,
+            "kc1",
+            "person:dana",
+            "knowsAbout",
+            "distributed consensus protocols",
+            false,
+        );
+
+        // Query names the split words `know` and `about`; it contains nothing
+        // that matches the subject slug `dana` or the object text, so retrieval
+        // can only come from splitting the camelCase predicate index-side.
+        let r = assemble(
+            &c,
+            "what do you know about this",
+            false,
+            MAX_CONTEXT_CHARS,
+            None,
+        );
+        let hit = r.candidates.iter().any(|cand| match &cand.kind {
+            CandidateKind::Fact(f) => f.predicate == "knowsAbout",
+            _ => false,
+        });
+        assert!(
+            hit,
+            "fact with camelCase predicate `knowsAbout` must be retrievable by a \
+             query containing the split words `know`/`about` (needs index-side \
+             camelCase token split feeding facts_fts)"
+        );
+
+        // Control (green now AND after the fix): a query naming NEITHER split
+        // word must not surface the fact — pins that the split words are what
+        // surface it, not some unrelated FTS widening.
+        let ctrl = assemble(
+            &c,
+            "what is the weather forecast",
+            false,
+            MAX_CONTEXT_CHARS,
+            None,
+        );
+        let ctrl_hit = ctrl.candidates.iter().any(|cand| match &cand.kind {
+            CandidateKind::Fact(f) => f.predicate == "knowsAbout",
+            _ => false,
+        });
+        assert!(
+            !ctrl_hit,
+            "control: fact must NOT surface for a query naming neither split word"
+        );
+    }
+
+    /// RED (task Tkmz6c46q — matching batch): the `blocked-by` predicate cue
+    /// list carries only the verbs `block`/`blocked`/`blocking`, so the noun
+    /// phrasing "who are the blockers" never cues M3 toward `blocked-by` facts.
+    /// `predicate_cues` does exact `HashSet` membership (no stemming), so
+    /// `blockers` is not caught by the existing verbs.
+    ///
+    /// After the fix (add `blocker`/`blockers` to the cue list), the cue must
+    /// resolve to `blocked-by`.
+    #[test]
+    fn predicate_cue_blockers_maps_to_blocked_by() {
+        let preds = predicate_cues("who are the blockers on hex");
+        assert!(
+            preds.contains(&"blocked-by"),
+            "`blockers` must cue the `blocked-by` predicate; got {preds:?}"
+        );
+    }
+
+    /// Entity detection must reach hyphen-delimited and multi-word subjects
+    /// (task Tkmz6c46q, diagnosis 2026-08-31 cases fleet-coordinator,
+    /// hex-v2-arch, "hex project"). Pre-fix, only the after-colon slug was
+    /// split, so a subject like `fleet-coordinator` (no colon) or `hex project`
+    /// (a space) was matchable only as ONE whole query token, which never
+    /// occurs.
+    #[test]
+    fn entity_detection_reaches_hyphen_and_multiword_subjects() {
+        let c = fresh_db();
+        insert_fact(&c, "e1", "fleet-coordinator", "has", "three arms", false);
+        insert_fact(&c, "e2", "hex project", "has", "a recall eval", false);
+        insert_fact(&c, "e3", "hex-v2-arch", "has", "a merge stage", false);
+        insert_fact(&c, "e4", "person:brand-lead", "avoids", "public pricing", false);
+
+        let m = detect_entity_subjects(&c, "who owns the fleet coordinator rewrite");
+        assert!(
+            m.iter().any(|s| s == "fleet-coordinator"),
+            "hyphen subject unreachable: {m:?}"
+        );
+
+        let m = detect_entity_subjects(&c, "what does the hex project track");
+        assert!(
+            m.iter().any(|s| s == "hex project"),
+            "multi-word (space) subject unreachable: {m:?}"
+        );
+
+        let m = detect_entity_subjects(&c, "describe the arch of hex-v2-arch design");
+        assert!(
+            m.iter().any(|s| s == "hex-v2-arch"),
+            "hyphen+version subject unreachable via a word piece: {m:?}"
+        );
+
+        let m = detect_entity_subjects(&c, "what restrictions bind the brand lead");
+        assert!(
+            m.iter().any(|s| s == "person:brand-lead"),
+            "hyphen slug after a type prefix unreachable: {m:?}"
+        );
+
+        // The bare type prefix must NOT match every subject of that type.
+        let m = detect_entity_subjects(&c, "who is this person anyway");
+        assert!(
+            !m.iter().any(|s| s == "person:brand-lead"),
+            "the `person:` type prefix must not trigger an entity match: {m:?}"
+        );
+    }
+
+    /// M2 must blend query relevance into its previously importance-only order
+    /// (task Tkmz6c46q, diagnosis 2026-08-31 case b-brand-lead-restrictions):
+    /// a low-importance fact that answers the query, ranked below the top-K by
+    /// importance alone, must be re-surfaced. Tested directly on `m2_entity` so
+    /// no other move can mask the effect.
+    #[test]
+    fn m2_blends_query_relevance_over_importance() {
+        let c = fresh_db();
+        // Seven generic HIGH-importance facts under the subject — enough to push
+        // the relevant fact past the top-K window on importance alone.
+        for i in 0..7 {
+            c.execute(
+                "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at,private)
+                 VALUES (?1,'person:brand-lead','has',?2,0.9,'2026-06-04','2026-06-04',0)",
+                rusqlite::params![format!("bl{i}"), format!("quarterly scheduling note number {i}")],
+            )
+            .unwrap();
+        }
+        // The query-relevant fact: LOW importance, but its object carries the
+        // query term "restrictions".
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at,private)
+             VALUES ('blx','person:brand-lead','avoids','discussing pricing restrictions with the press',0.3,'2026-06-04','2026-06-04',0)",
+            [],
+        )
+        .unwrap();
+
+        let cfg = RecallConfig::default();
+        let (fired, cands) = m2_entity(&c, "what restrictions bind the brand lead", false, &cfg);
+        assert!(fired, "M2 must fire on the brand-lead entity");
+        let objs: Vec<&str> = cands
+            .iter()
+            .filter_map(|cand| match &cand.kind {
+                CandidateKind::Fact(f) => Some(f.object.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            objs.iter().any(|o| o.contains("restrictions")),
+            "relevance-blended M2 must surface the query-relevant low-importance \
+             fact that importance-only ordering buries; got {objs:?}"
+        );
+        // The relevant fact must WIN the ordering, not merely appear.
+        assert!(
+            matches!(&cands[0].kind, CandidateKind::Fact(f) if f.object.contains("restrictions")),
+            "the query-relevant fact must rank first under the blend; got {objs:?}"
+        );
+    }
+
+    /// The facts tokenizer must keep 2-char alphanumeric tokens that carry a
+    /// digit (v2), routed end-to-end through `assemble` (task Tkmz6c46q,
+    /// diagnosis 2026-08-31 case c-14). "v2" is the ONLY query term shared with
+    /// the fact, so pre-fix (sub-3-char tokens dropped) the fact is unreachable.
+    #[test]
+    fn assemble_two_char_versioned_token_reaches_fact() {
+        let c = fresh_db();
+        insert_fact(
+            &c,
+            "v1",
+            "project:hex",
+            "uses",
+            "the v2 arch pipeline",
+            false,
+        );
+
+        let r = assemble(&c, "what is the v2 design", false, MAX_CONTEXT_CHARS, None);
+        let hit = r.candidates.iter().any(|cand| match &cand.kind {
+            CandidateKind::Fact(f) => f.object.contains("v2 arch"),
+            _ => false,
+        });
+        assert!(
+            hit,
+            "fact sharing only the 2-char token `v2` with the query must be \
+             retrievable now that the facts tokenizer keeps digit-bearing 2-char tokens"
+        );
     }
 
     /// Privacy: for_agent=true MUST exclude facts marked private from every

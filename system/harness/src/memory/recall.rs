@@ -52,6 +52,30 @@ fn chunks_recall(conn: &rusqlite::Connection, query: &str, k: usize) -> rusqlite
     super::search::search_fts_public(conn, query, k, None)
 }
 
+/// Split an identifier on internal lower->upper case transitions into lowercased
+/// word pieces. `knowsAbout` -> ["knows", "about"]; `knows` -> ["knows"];
+/// `works-on` -> ["works-on"] (no case transition). Only genuinely camelCase
+/// predicates yield 2+ pieces — which is exactly how the camelCase predicate arm
+/// distinguishes them from single-word and hyphenated predicates that unicode61
+/// already tokenizes.
+fn split_camel_words(s: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for ch in s.chars() {
+        if ch.is_uppercase() && prev_lower && !cur.is_empty() {
+            words.push(cur.to_lowercase());
+            cur = String::new();
+        }
+        cur.push(ch);
+        prev_lower = ch.is_lowercase();
+    }
+    if !cur.is_empty() {
+        words.push(cur.to_lowercase());
+    }
+    words
+}
+
 /// Facts retrieval: dual-weighted FTS arms + slug arm + KNN arm over
 /// `facts_vec` when the caller already holds a query embedding (hoist it from
 /// the chunk path — do NOT cold-load the model here), fused by RRF. Returns
@@ -93,7 +117,14 @@ pub(crate) fn facts_recall_with_config(
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| {
-            t.len() >= 3
+            // Keep 2-char alphanumeric tokens that carry a digit (v2, k8, m1):
+            // the facts tokenizer used to drop every sub-3-char token, so a
+            // query naming a versioned entity like "v2" lost its single most
+            // distinctive term (task Tkmz6c46q, diagnosis 2026-08-31 case c-14).
+            // Pure 2-char alpha words (of, to, an) stay dropped — only a digit
+            // makes a 2-char token distinctive enough to keep.
+            let short_alnum_with_digit = t.len() == 2 && t.bytes().any(|b| b.is_ascii_digit());
+            (t.len() >= 3 || short_alnum_with_digit)
                 && !matches!(
                     *t,
                     "the"
@@ -156,19 +187,91 @@ pub(crate) fn facts_recall_with_config(
         if tok.len() < 3 {
             continue;
         }
-        let pattern = format!("%:{tok}%");
+        // Match the token at ANY word boundary of the subject, not just after a
+        // colon: hyphen-, underscore-, slash-, and space-delimited AND
+        // multi-word subjects (fleet-coordinator, hex-v2-arch, "hex project")
+        // were unreachable when the pattern was colon-only (task Tkmz6c46q,
+        // diagnosis 2026-08-31). The final arm is start-anchored so a token that
+        // is the subject's FIRST word (which has no leading separator) matches
+        // too. LIKE is ASCII-case-insensitive, so no lowercasing of `subject`
+        // is needed. `tok` is bound (never interpolated) — no injection surface.
         let ids: Vec<i64> = conn
             .prepare(&format!(
                 "SELECT rowid FROM facts f
-                 WHERE subject LIKE ?1 AND tombstone = 0{privacy}
+                 WHERE tombstone = 0{privacy} AND (
+                     subject LIKE '%:' || ?1 || '%' OR
+                     subject LIKE '%-' || ?1 || '%' OR
+                     subject LIKE '%_' || ?1 || '%' OR
+                     subject LIKE '% ' || ?1 || '%' OR
+                     subject LIKE '%/' || ?1 || '%' OR
+                     subject LIKE ?1 || '%'
+                 )
                  ORDER BY importance DESC LIMIT 3",
             ))?
-            .query_map([&pattern], |r| r.get(0))?
+            .query_map([&tok], |r| r.get(0))?
             .filter_map(Result::ok)
             .collect();
         for id in ids {
             if !slug_ids.contains(&id) {
                 slug_ids.push(id);
+            }
+        }
+    }
+
+    // camelCase predicate arm (task Tkmz6c46q). unicode61 indexes a camelCase
+    // predicate like `knowsAbout` as ONE token (`knowsabout`), so a query naming
+    // the split words (`know`, `about`) can never FTS-match it — the same class
+    // of tokenizer blind spot the slug arm handles for colon-slugs. We split
+    // each DISTINCT predicate on its internal lower->upper case transitions and,
+    // when a query term prefix-matches one of the split words, fuse that
+    // predicate's facts as their own ranked arm. Restricted to genuine
+    // case-transition predicates (2+ split words): single-token and hyphenated
+    // predicates (`decided`, `works-on`) are already unicode61-tokenized and
+    // reachable, so including them here would just re-add a flooding path.
+    //
+    // Index-side splitting was rejected deliberately: facts_fts is
+    // external-content (schema.rs:76-84), so a trigger-time transform of the
+    // predicate desyncs the 'delete'/'rebuild' paths (which read facts.predicate
+    // verbatim) and corrupts the index; and a custom SQL function referenced
+    // from the triggers would make every fact INSERT fail on any connection that
+    // had not registered it (9+ write sites). See the recall-fix package doc.
+    let qtoks: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_string())
+        .collect();
+    let mut pred_ids: Vec<i64> = Vec::new();
+    if !qtoks.is_empty() {
+        let matched_preds: Vec<String> = conn
+            .prepare("SELECT DISTINCT predicate FROM facts WHERE tombstone = 0")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .filter(|pred| {
+                let words = split_camel_words(pred);
+                words.len() >= 2
+                    && words.iter().any(|w| {
+                        w.len() >= 3
+                            && qtoks.iter().any(|q| {
+                                q == w || w.starts_with(q.as_str()) || q.starts_with(w.as_str())
+                            })
+                    })
+            })
+            .collect();
+        for pred in &matched_preds {
+            let ids: Vec<i64> = conn
+                .prepare(&format!(
+                    "SELECT rowid FROM facts f
+                     WHERE predicate = ?1 AND tombstone = 0{privacy}
+                     ORDER BY importance DESC LIMIT ?2",
+                ))?
+                .query_map(rusqlite::params![pred, (k * 3) as i64], |r| r.get(0))?
+                .filter_map(Result::ok)
+                .collect();
+            for id in ids {
+                if !pred_ids.contains(&id) {
+                    pred_ids.push(id);
+                }
             }
         }
     }
@@ -187,7 +290,7 @@ pub(crate) fn facts_recall_with_config(
 
     let slug_top1 = slug_ids.first().copied();
     let fused = super::rrf::rrf_fuse(
-        &[fts_content_ids, fts_entity_ids, slug_ids, knn_ids],
+        &[fts_content_ids, fts_entity_ids, slug_ids, pred_ids, knn_ids],
         cfg.rrf_k,
     );
 
@@ -1082,6 +1185,87 @@ mod plan2_tests {
         assert!(
             recall.facts.iter().any(|f| f.subject == "person:alice"),
             "expected person:alice fact in recall results"
+        );
+    }
+
+    /// Unit: `split_camel_words` splits ONLY on lower->upper case transitions,
+    /// so genuine camelCase predicates yield 2+ words while single-word and
+    /// hyphenated predicates yield exactly one (task Tkmz6c46q).
+    #[test]
+    fn split_camel_words_splits_on_case_transition_only() {
+        assert_eq!(split_camel_words("knowsAbout"), vec!["knows", "about"]);
+        assert_eq!(split_camel_words("worksOnHex"), vec!["works", "on", "hex"]);
+        assert_eq!(split_camel_words("knows"), vec!["knows"]);
+        // Hyphenated predicates have no case transition — one piece, so the
+        // camelCase arm skips them (unicode61 already tokenizes the hyphen).
+        assert_eq!(split_camel_words("works-on"), vec!["works-on"]);
+        assert_eq!(split_camel_words("blocked-by"), vec!["blocked-by"]);
+    }
+
+    /// The camelCase predicate arm makes a `knowsAbout` fact retrievable by a
+    /// query naming the split words, at the `facts_recall` layer (task
+    /// Tkmz6c46q, verification `camelcase-reachable`). The subject/object share
+    /// NO token with the query, so only the predicate arm can surface it.
+    #[test]
+    fn facts_recall_camelcase_predicate_arm_surfaces_fact() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('kc','person:dana','knowsAbout','distributed consensus protocols',0.5,'2026-06-04','2026-06-04')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "what do you know about this", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            hits.iter().any(|f| f.predicate == "knowsAbout"),
+            "camelCase predicate `knowsAbout` unreachable by split words `know`/`about`: {:?}",
+            hits.iter().map(|f| &f.predicate).collect::<Vec<_>>()
+        );
+
+        // Control: a query naming neither split word must not surface it.
+        let ctrl: Vec<FactHit> = facts_recall(&c, "what is the weather forecast", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            !ctrl.iter().any(|f| f.predicate == "knowsAbout"),
+            "control: camelCase arm must not fire for an unrelated query"
+        );
+    }
+
+    /// The facts tokenizer keeps digit-bearing 2-char tokens (v2), so a fact
+    /// sharing only `v2` with the query is retrievable (task Tkmz6c46q, case
+    /// c-14). Pre-fix the sub-3-char filter dropped `v2` and the fact missed.
+    #[test]
+    fn facts_recall_keeps_two_char_digit_token() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('v','project:hex','uses','the v2 arch pipeline',0.5,'2026-06-04','2026-06-04')",
+            [],
+        )
+        .unwrap();
+        let hits: Vec<FactHit> = facts_recall(&c, "what is the v2 design", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            hits.iter().any(|f| f.object.contains("v2 arch")),
+            "fact sharing only the 2-char digit token `v2` must be retrievable: {:?}",
+            hits.iter().map(|f| &f.object).collect::<Vec<_>>()
         );
     }
 }
