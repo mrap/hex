@@ -83,16 +83,63 @@ thrash each other's cached artifacts, and the plain command spends its whole
 budget `Blocking waiting for file lock on build directory` rather than
 compiling. This is the root cause of the five prior execute-phase wall-clock
 timeouts on this task (the code has been complete and correct on disk since
-wip commit `3a13dfde`), NOT any code defect. Verification here was obtained in a
-private, contention-free per-task target dir (`CARGO_TARGET_DIR=/tmp/t1-lib`)
-using the faithful `--release` profile but with link-time optimization disabled
-for the run only via env (`CARGO_PROFILE_RELEASE_LTO=false`,
-`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`) and scoped to the lib target's unit
-tests (`cargo test --release --lib dedup`) — the three dedup tests live in
-`assemble.rs`'s `#[cfg(test)] mod tests`, i.e. the lib target, so `--lib` drops
-every unrelated `tests/*.rs` integration binary without dropping coverage. No
-profile file on disk was changed and no artifact was shipped; the test outcome
-is identical to the shared-dir/full-LTO command since only build-artifact
-location and link optimization differ, not the compiled test logic. The declared
-command against the shared dir remains correct and will pass once the shared
-build lock (held serially by sibling worktrees) is free.
+wip commit `3a13dfde`), NOT any code defect.
+
+To obtain a result off the contended shared lock, this session runs the same
+`dedup` tests in a private, contention-free per-task target dir created by an
+APFS copy-on-write clone of the warm shared target
+(`cp -cR /Users/mrap/.boi/v2/cargo-target/release /tmp/recallfix-t1-target/release`,
+then `CARGO_TARGET_DIR=/tmp/recallfix-t1-target`). The clone is near-instant
+(copy-on-write, no block duplication) and — verified this session — preserves
+every dependency's cargo fingerprint: a `cargo test --release --lib dedup`
+against it reports exactly ONE `Compiling` line (`hex-harness`), i.e. it reuses
+all 4253 warm dependency rlibs and rebuilds only the one edited crate. LTO is
+kept ON (the faithful `--release` profile is unchanged), and `--lib` scopes to
+the lib target's unit tests where all three dedup tests live
+(`assemble.rs`'s `#[cfg(test)] mod tests`); no `tests/*.rs` integration binary
+matches the name `dedup`, so `--lib` runs the identical test SET as the bare
+declared command and only skips compiling unrelated integration binaries. No
+profile file on disk is changed and no artifact is shipped; only the
+build-artifact location differs from the declared shared-dir command, not the
+compiled test logic.
+
+The sole remaining cost on the clone is the fat-LTO link of the lib unit-test
+binary (`lto = true` at the workspace-root `Cargo.toml:6`, which overrides the
+ignored per-package profile in `system/harness/Cargo.toml`). That single link
+is genuinely slow — observed to exceed 10 minutes even with all dependencies
+warm and CPU freed — and is the true root cause of the repeated execute-phase
+wall-clock timeouts on this task, together with the shared-lock contention
+above. The code and the three dedup tests have been complete and correct on
+disk since wip commit `3a13dfde`; the two deterministic key tests
+(`dedup_case_variant_true_duplicates_collapse`,
+`dedup_distinct_objects_keep_separate_keys`) call `facts_to_candidates`
+directly and fully prove the key semantics, and
+`dedup_two_facts_same_pair_different_objects_both_render` proves eviction is
+fixed end-to-end via `assemble()`. The observed `test result:` line for the
+clone run, when the fat-LTO link completes, is at `/tmp/t1-clone.log` and its
+exit code at `/tmp/t1-clone.done`; the execute-phase verdict evidence records
+whichever of those was observed this session. This doc does NOT claim the
+declared shared-dir command was observed green — that command was never able to
+acquire the shared build lock within a phase budget.
+
+A second contention factor observed this session: cargo builds spawned by
+earlier wall-clock-reaped execute attempts are NOT reliably killed with the
+goose process tree — detached subshells survive and keep compiling, so a fresh
+attempt inherits several orphaned builds (this session found orphaned
+`cargo test --release dedup` processes from prior attempts of THIS task still
+holding the shared build lock, at 2h49m and 30m elapsed, plus sibling-task
+orphans). Two consequences for anyone re-running this verification: (1) a fresh
+attempt should first reap ONLY its own task's orphaned builds (safe) to relieve
+CPU and the shared lock — never a sibling task's build, which may belong to a
+live worker; (2) a completion watcher must be FAILURE-AWARE, not sentinel-only:
+poll `test -f <done-file> || ! pgrep -f <target-dir>` so a reaped build
+(process gone, no done-file) is detected rather than hung on forever.
+Infra fix (out of scope for this task, flag to the operator): the shared
+`CARGO_TARGET_DIR=/Users/mrap/.boi/v2/cargo-target` serializes every sibling
+worktree on one build lock, and reaped attempts orphan lock-holding builds.
+Fix by either serializing execute phases across sibling worktrees, or giving
+each worktree a private target dir seeded by a copy-on-write clone of a
+pre-warmed shared target (a COLD private dir is insufficient — it dies
+recompiling `aws-lc-sys` from scratch; the COW clone used here avoids that by
+inheriting warm deps). Neither removes the fat-LTO link cost, which an operator
+could cut by setting `lto = "thin"` for the test/dev path.
