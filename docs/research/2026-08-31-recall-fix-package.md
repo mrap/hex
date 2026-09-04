@@ -429,3 +429,287 @@ applied uniformly to both paths leaves them equal — verified: their fixtures u
 no camelCase/2-char/hyphen shapes, so the new arm/tokenizer contribute nothing
 to those fixtures and the pins hold unmodified. No legacy pin required updating;
 the new behavior is pinned directly by the eight tests above.
+
+---
+
+## T8s8bq3th — Flooding fixes (recall.rs + assemble.rs)
+
+### Causes addressed
+Diagnosis cause 3 "fetch-stage design limits", the flooding sub-class:
+- **Generic-token flooding.** OR-expanded facts FTS queries matched 1,300–1,900
+  facts and drowned rank-17..52 correct answers outside the top-K window
+  (cases a-hex-startup-skill, b-hex-project-correction-rule, c-10).
+- **Global per-predicate / per-day windows.** M3 ran one GLOBAL top-6 per
+  predicate and M4 one GLOBAL recency window, with NO entity scoping, so a query
+  naming one entity was crowded out by higher-importance (M3) or same-day (M4)
+  facts from OTHER subjects sharing the predicate (case hex-focus).
+- **M4 fires on bare `now`.** The lone filler word `now` fired the temporal move
+  and flooded non-temporal questions with same-day facts (case a-mike-building).
+
+### What changed
+
+**1. Drop generic question words AND corpus-ubiquitous tokens from the
+OR-expanded facts FTS query** (`system/harness/src/memory/recall.rs`).
+- **1a — generic question / filler words.** Extracted the inline OR-expansion
+  stopword set into a named predicate `is_generic_query_word(t: &str) -> bool`
+  (`recall.rs:99`), preserving the original set and adding generic question /
+  filler words: `where, when, why, which, whose, will, can, could, would,
+  should, have, has, had, about, here, your, you, our, this, that, with, from,
+  into`. A natural-language question's OR expansion narrows to the terms that
+  actually discriminate, so it no longer OR-matches a broad slice of the corpus.
+- **1b — corpus-ubiquitous CONTENT tokens (dynamic, foundation-safe).** The
+  inline token filter was moved into a helper `fts_query_tokens(conn, query) ->
+  Vec<String>` (`recall.rs:185`) that runs a THREE-stage filter: (1) sub-3-char
+  drop keeping 2-char digit tokens like `v2` (task Tkmz6c46q, unchanged);
+  (2) `is_generic_query_word`; (3) a DYNAMIC document-frequency drop of tokens
+  appearing in more than half of all facts (`hex` in >50%, the diagnosis's own
+  threshold). `facts_recall_with_config` now builds its query as
+  `fts_query_tokens(conn, query).join(" OR ")` (`recall.rs:278`). Stage 3 is
+  corpus-derived — NO instance-specific token is hardcoded into this foundation
+  code — and double-guarded so it can never starve retrieval (see the DELIVERED
+  section below for the constants and guards).
+
+**2. Entity-intersected M3/M4 windows**
+(`system/harness/src/memory/assemble.rs`).
+- `detect_entity_subjects` now runs ONCE in `assemble_with_config`
+  (`assemble.rs:744`) and its result is threaded to M2, M3, and M4.
+- `m2_entity` takes the pre-detected `subjects: &[String]` instead of detecting
+  internally (`assemble.rs:354`) — single source of truth, one DB scan.
+- `m3_predicate` (`assemble.rs:434`) and `m4_temporal` (`assemble.rs:494`) take
+  `entity_subjects: &[String]`. When NON-empty, they add `AND subject IN (...)`
+  to their fetch BEFORE the top-K / recency cut, so foreign-subject facts can no
+  longer flood the window. Built with dynamic SQL + `rusqlite::params_from_iter`
+  over a `Vec<rusqlite::types::Value>` to avoid mixing `?1` and bare-`?`
+  parameter numbering. When EMPTY (no entity named), the SQL is the previous
+  global window — the no-entity path stays byte-identical.
+- **Known risk (documented, not pre-mitigated).** The intersection is a HARD
+  scope: if `detect_entity_subjects` returns a SPURIOUS match (Tkmz6c46q widened
+  it to any ≥3-char slug piece, so a weak incidental piece can now fire M2), M3
+  is hard-restricted to that wrong subject and may lose a result the old global
+  window would have surfaced. The task mandates the intersection, so it ships as
+  written; a fallback ("if the entity-scoped M3/M4 fetch returns empty, retry
+  the global window") is deliberately NOT added pre-emptively — it would weaken
+  the `recall_entity_scoped_window_beats_flooding` discriminator (whose whole
+  point is that scoping removes the foreign facts). If a future eval shows a
+  regression of exactly this shape (an entity query losing its answer to an
+  over-eager M2 match), that empty-intersection-falls-back-to-global retry is
+  the intended fix. The full lib suite shows no such regression today.
+
+**3. Gate M4 off a lone `now`** (`system/harness/src/memory/assemble.rs`).
+- `is_temporal` (`assemble.rs:113`) splits temporal cues: strong cues
+  (`current, latest, today, recent, recently`) always fire M4; a lone `now` is
+  treated as NON-temporal. `now` fires M4 only inside an explicit temporal
+  phrase (`right now`, `as of now`, `just now`), where it is genuinely temporal.
+
+### Tests added
+- `recall.rs:1581` `recall_generic_query_words_classified_droppable` — pins the
+  drop-list predicate directly (question words droppable; content tokens incl.
+  `v2` survive).
+- `recall.rs:1616` `recall_generic_words_dropped_from_or_expanded_fts_query` —
+  end-to-end: a lone distinctive content token still retrieves the fact; a
+  pure-filler query surfaces nothing (all tokens dropped from the OR expansion).
+- `recall.rs:1663` `recall_ubiquitous_token_dropped_above_corpus_floor` — the
+  corpus-ubiquitous drop (change 1b): above the corpus floor a token in >50% of
+  facts (`hex`) is dropped while a distinctive token (`parallax`) survives and
+  still retrieves its fact; below the floor the same token is KEPT (protects
+  small fixtures); a query of only-ubiquitous tokens is not emptied
+  (zero-survivor guard). Foundation-safe: the drop is derived from live document
+  frequency, never a hardcoded token list.
+- `recall_entity_scoped_window_beats_flooding` (the phase's red test, now green)
+  — the `entity-scoped-windows` verification: a `blocker`→`blocked-by` query
+  naming `person:tara`; with M2 entities present, M3's window is scoped to those
+  subjects, so NO foreign subject's `blocked-by` fact reaches the assembled
+  context; the target entity's low-importance (0.05) fact wins over 10
+  higher-importance (0.90) foreign facts. See the fixture-correction deviation
+  below for why the cue/predicate is `blocker`/`blocked-by` and not the
+  originally-written `preference`/`prefers`.
+- `assemble.rs:1758` `recall_m4_gate_ignores_lone_now` — is_temporal gate: lone
+  `now` does NOT fire; strong cues and explicit `right now`/`as of now`/`just
+  now` phrases DO.
+- `assemble.rs:1792` `recall_lone_now_leaves_m4_unfired_in_assemble` —
+  end-to-end proof M4 stays unfired for a lone-`now` question in the pipeline.
+- `assemble.rs` `m2_blends_query_relevance_over_importance` (task Tkmz6c46q's
+  test) updated to pass the pre-detected subjects to the new `m2_entity`
+  signature (`detect_entity_subjects` then `m2_entity(..., &subjects, &cfg)`).
+
+### Backward-compatibility / default-behavior note
+- The generic-word drop, the corpus-ubiquitous drop, and the entity
+  intersection all change default-path behavior deliberately. The named legacy
+  pins `default_config_reproduces_legacy_facts_recall_exactly`
+  (`recall.rs:1339`) and `default_config_vector_arm_off_is_byte_identical`
+  (`recall.rs:1409`) compare two config PATHS of the SAME function against each
+  other and route through the identical (now-extended) query expansion, so they
+  remain equal; their fixture query `what powers the vector store` uses none of
+  the newly-dropped generic words. Crucially the corpus-ubiquitous drop is
+  INERT on that fixture: its 4-fact corpus is far below `UBIQUITOUS_MIN_CORPUS`
+  (50), so the df stage is skipped entirely and the fixture's FTS query stays
+  byte-identical — the `!live.is_empty()` half of the pin cannot be broken by
+  it. (The largest test fixture anywhere in the memory module is 30 facts, so
+  the 50-fact floor keeps the df stage inert across the whole existing suite;
+  only a real instance with thousands of facts engages it.) No legacy pin
+  required updating; the new behavior is pinned directly by the six tests above.
+- The entity intersection only alters behavior for queries where
+  `detect_entity_subjects` returns a non-empty set; every no-entity query keeps
+  the prior global M3/M4 SQL byte-for-byte, which is what protects
+  `privacy_excludes_private_facts_when_for_agent`,
+  `per_move_quota_protects_fired_fact_moves_from_m1_domination`, and
+  `floor_places_m1_top1_first_and_each_fired_move_top1` (verified: those
+  fixtures detect no entity, or their facts are still covered by M5).
+
+### DELIVERED — corpus-ubiquitous token drop (dynamic, foundation-safe)
+The task behavior says "drop or down-weight generic question words AND
+corpus-ubiquitous tokens". BOTH halves are now delivered. The
+corpus-ubiquitous half (the diagnosis names `hex` in >50% of facts) is
+implemented as change 1b: `fts_query_tokens` (`recall.rs:185`) drops any
+surviving token whose live document frequency exceeds half the corpus.
+
+Design constraints and how each is met (an earlier draft of this task cut this
+half over these same concerns; the guards below resolve them, so it is shipped
+rather than deviated):
+1. **No hardcoded instance vocabulary.** `hex`/`mike` are ubiquitous only in
+   mrap-hex's corpus; this is foundation code shipping to every instance. The
+   drop is therefore DYNAMIC — derived per query from live document frequency
+   via the SAME porter-tokenized `facts_fts` the arms use (`recall.rs:219-226`)
+   — so no instance-specific token is ever baked into shared code. Constants:
+   `UBIQUITOUS_DF_FRACTION = 0.5` (`recall.rs:154`, "more than half of all
+   facts").
+2. **Cannot empty a small corpus / break the legacy pin.** The one objection
+   that killed the earlier draft — on the 4-fact
+   `default_config_reproduces_legacy_facts_recall_exactly` fixture, `vector`
+   and `store` both exceed half and would be dropped, leaving only `powers`
+   (matches nothing) and emptying the result — is defused by a corpus-size
+   floor: `UBIQUITOUS_MIN_CORPUS = 50` (`recall.rs:148`). Below 50 facts the df
+   stage is skipped entirely (df is not a stable signal on a tiny store), so
+   the 4-fact fixture (and every ≤30-fact test fixture in the module) keeps its
+   FTS query byte-identical. df is a stable "corpus-ubiquitous" signal only on a
+   real store (3,451 facts on the diagnosis snapshot).
+3. **Cannot starve retrieval.** A second guard: if dropping the ubiquitous
+   tokens would leave NO tokens (a query built entirely of ubiquitous terms),
+   the pre-drop set is kept (`recall.rs`, zero-survivor guard). A single
+   surviving token is never probed or dropped (it is the query's only signal).
+4. **Bounded cost & loud-safe.** Per-token df probes are capped at
+   `UBIQUITOUS_MAX_PROBES = 12` (`recall.rs:159`); tokens past the cap are kept
+   unprobed. Every probe failure (MATCH syntax error, DB error) reads df as 0,
+   which KEEPS the token — the drop biases toward keeping, never toward silently
+   dropping (SO S6: no quiet mis-drop).
+
+Note on "down-weight": bm25 weighting in FTS5 is per-COLUMN, not per-term (the
+codebase's own `arm_weights.content_sql()` / `entity_sql()` vectors like
+`1.0, 0.25, 2.0` weight the subject/predicate/object columns), so "down-weight
+this one token" is not expressible in a MATCH query; the drop form is the
+available realization of the behavior's "drop OR down-weight"; the
+guards above make the drop safe. This flooding class is ALSO attacked from the
+ranking side by the entity-intersection window (change 2, this task) and the M2
+query-relevance blend (task Tkmz6c46q); the df drop additionally shrinks the
+candidate SET (the per-arm `LIMIT k*3` window) so ubiquitous-only matches no
+longer crowd it. No deviation on this half.
+
+### DEVIATION — red-test fixture correction (write_red_tests output)
+The `write_red_tests` phase wrote `recall_entity_scoped_window_beats_flooding`
+with a `preference`→`prefers` fixture and a stated discriminator: the 10 foreign
+facts "can reach the assembled output through ONE path only, M3's global
+window." That premise is FALSE against the live tokenizer, so the test could
+never go green from the in-scope M3/M4 fix alone. `facts_fts` uses a `porter`
+tokenizer (`system/harness/src/memory/schema.rs:77-83`, which indexes the
+`predicate` column), and porter stems the cue word `preference` to `prefer` —
+identical to the stem of the indexed predicate `prefers`. So M5's relevance FTS
+arm matched EVERY `prefers` fact via the predicate column and surfaced foreign
+subjects independently of M3. Evidence (this session):
+
+    sqlite3 ':memory:' "CREATE VIRTUAL TABLE t USING fts5(s,p,o,tokenize='porter unicode61');
+      INSERT INTO t VALUES('person:subject0','prefers','the lightweight variant choice');
+      INSERT INTO t VALUES('person:tara','prefers','the zzmarker editing style');
+      SELECT s FROM t WHERE t MATCH 'preference';"
+    -- returns BOTH person:subject0 AND person:tara
+
+And the observed failure with the correct M3 fix in place: assembled `prefers`
+subjects were `[person:tara, person:subject0..4]` — the 5 foreign subjects came
+from M5, not M3 (scoped M3 contributed only `person:tara`).
+
+The task behavior scopes the fix to M3 and M4 explicitly; a predicate-token
+match in M5 is relevance working as designed, not flooding, so M5 was
+deliberately NOT entity-intersected. Instead the fixture was corrected to a
+predicate whose cue does NOT stem-collide, so the test validly isolates the
+M3/M4 behavior it claims to: `blocked-by` cued by `blocker`. `blocker` is an
+exact `predicate_cues` entry (fires M3) but porter does not stem it to
+`blocked`/`block`, verified the same way:
+
+    sqlite3 ':memory:' "CREATE VIRTUAL TABLE t USING fts5(s,p,o,tokenize='porter unicode61');
+      INSERT INTO t VALUES('person:subject0','blocked-by','the lightweight variant choice');
+      SELECT s FROM t WHERE t MATCH 'blocker';"
+    -- returns nothing
+
+With `blocked-by`/`blocker` the foreign facts reach the assembled output only via
+M3's global window, so the test is RED pre-fix (observed: foreign subjects
+present) and GREEN post-fix (observed: only `person:tara`). The fixture change
+STRENGTHENS the test into a valid discriminator; it does not weaken it (it still
+fails pre-fix and passes post-fix, and now genuinely proves the entity
+intersection rather than an M5 artifact).
+
+### Verification execution — observed results (execute redo, 2026-09-03)
+This execute session added change 1b (the corpus-ubiquitous df drop) on top of
+the prior in-flight implementation already on disk, then verified the whole
+task. The shared `CARGO_TARGET_DIR=/Users/mrap/.boi/v2/cargo-target` release
+tree was under the fat-LTO + cross-worktree lock contention documented under
+T28958xxp and Tznnfa5ga (this session a sibling worktree held the release lock,
+and a CoW clone of the release tree via `cp -cR` timed out after 2 min). Per the
+established precedent of every prior task in this spec, the test LOGIC was
+therefore proven under the DEBUG profile on the uncontended shared debug tree;
+the profile change affects only optimization/link, never program logic (the
+debug frontend runs the identical type/borrow checking, so a clean debug build
+proves the source compiles). Exact commands and exit codes observed THIS session:
+
+- `flooding-tests-pass` (declared `cargo test --release recall`): run as
+  `cargo test recall` (DEBUG profile, ambient shared debug target) → **exit 0**;
+  the lib unit-test set matching the `recall` filter reported **42 passed;
+  0 failed; 0 ignored** (log `/tmp/recallfix-t4-debug.log`). All six task tests
+  are among them and print `ok`:
+  `recall_generic_query_words_classified_droppable`,
+  `recall_generic_words_dropped_from_or_expanded_fts_query`,
+  `recall_ubiquitous_token_dropped_above_corpus_floor`,
+  `recall_entity_scoped_window_beats_flooding`,
+  `recall_m4_gate_ignores_lone_now`,
+  `recall_lone_now_leaves_m4_unfired_in_assemble`. The bare `cargo test recall`
+  also builds and runs every `tests/*.rs` integration binary; none defines a
+  test matching `recall` (each reports `0 passed; N filtered out`), so the run's
+  pass SET equals the declared `cargo test --release recall` command's set.
+  DEVIATION (documented): DEBUG profile instead of `--release`. The declared
+  command's `--release` fat-LTO link of the cfg(test) binary is the wall that
+  reaped 5+ prior execute attempts on this spec (see the T28958xxp verification
+  note); a debug build compiles and runs the identical test logic and is the
+  precedent stand-in used by T28958xxp and Tznnfa5ga. No `--release` test binary
+  was linked this session.
+- `build-clean` (declared `cargo build --release`): NOT re-run to completion
+  this session (the release lock/LTO wall above; the CoW clone attempt timed
+  out). Source compilation is instead proven by the DEBUG builds underlying the
+  two test runs below, which compile the full `hex-harness` lib (frontend
+  type/borrow checking is profile-independent). The prior in-flight session
+  recorded a genuine `cargo build --release` → exit 0 in 14m 27s on the
+  PRE-change-1b tree; change 1b adds only ordinary `rusqlite` query calls and
+  three `const`s (no new deps, no unsafe, no macro), so it does not alter the
+  release-compilability the debug build confirms.
+- `entity-scoped-windows`: satisfied by
+  `recall_entity_scoped_window_beats_flooding` (`assemble.rs:1671`) passing
+  green — the target subject `person:tara`'s low-importance (0.05) `blocked-by`
+  fact wins over 10 higher-importance (0.90) foreign facts once M3 is
+  entity-scoped. The discriminator's validity was re-confirmed this session via
+  the two porter probes quoted above (run this session): `blocker` does NOT
+  porter-stem to `blocked`, so the foreign facts reach the assembled output ONLY
+  through M3's global window — never M5 — which is what makes the test a genuine
+  M3/M4 discriminator rather than an M5 artifact.
+- Full-suite regression (spec-level `tests-green`): `cargo test --lib` (DEBUG,
+  ambient shared debug target) → **688 passed; 0 failed; 7 ignored; 0 measured;
+  exit 0** across 695 lib tests (log `/tmp/recallfix-t4-fulllib.log`) — no
+  regression anywhere in the harness lib from the df drop, the entity
+  intersection, the M4 gate, or the generic-word drop. This is the whole harness
+  lib unit-test set, a superset of the `recall`-filtered run.
+- Red-before-green (prior in-flight session, corroborating): the prior execute
+  session directly observed the entity-intersection TDD gate — with the
+  `m3_predicate` intersection block neutered, the entity-scoped test failed with
+  assembled `blocked-by` subjects `[person:tara, person:subject0..5]` (6 foreign
+  from the global M3 window, none from M5); restoring the block flipped it to
+  `ok`. This session did not re-run that neutered-code experiment (it would
+  require editing then reverting `m3_predicate`); the same conclusion follows by
+  construction from the porter probes this session ran (M5 cannot reach the
+  `blocked-by` foreign facts), so M3's global window is their only pre-fix path.
+  change 1b does not touch M3/M4, so this observation is unaffected by it.

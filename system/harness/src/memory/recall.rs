@@ -76,6 +76,167 @@ fn split_camel_words(s: &str) -> Vec<String> {
     words
 }
 
+/// Generic question / filler words dropped from the OR-expanded facts FTS query.
+///
+/// OR-ing these into the query makes a natural-language question match a huge
+/// slice of the corpus and drowns the genuinely-relevant facts outside the
+/// top-K window (task T8s8bq3th, diagnosis 2026-08-31 root cause 3
+/// "generic-token flooding": a-hex-startup-skill, b-hex-project-correction-rule,
+/// c-10). They carry no retrieval signal, so dropping them narrows the OR
+/// expansion to the terms that actually discriminate.
+///
+/// NOTE on corpus-ubiquitous CONTENT tokens (e.g. `hex` in >50% of facts,
+/// `mike` in ~40% on the diagnosis snapshot): those are INSTANCE-specific and
+/// are deliberately NOT hardcoded here — this is foundation code shipping to
+/// every instance, where a different corpus makes a different set of tokens
+/// ubiquitous. A dynamic document-frequency drop was evaluated and rejected:
+/// its only guard against deleting a normal content word in a SMALL corpus is
+/// an uncalibratable corpus-size constant (with the `df > half` rule it empties
+/// the 4-fact `default_config_reproduces_legacy_facts_recall_exactly` fixture,
+/// which has no distinctive-token survivor). The entity-intersection window fix
+/// (M3/M4, this same task) and the M2 relevance blend (task Tkmz6c46q) attack
+/// the flooding from the ranking side instead. See the recall-fix package doc.
+fn is_generic_query_word(t: &str) -> bool {
+    matches!(
+        t,
+        // original stopword set (pre-T8s8bq3th)
+        "the" | "and"
+            | "for"
+            | "are"
+            | "was"
+            | "who"
+            | "what"
+            | "how"
+            | "does"
+            | "did"
+            | "is"
+            // generic question / filler words added by task T8s8bq3th
+            | "where"
+            | "when"
+            | "why"
+            | "which"
+            | "whose"
+            | "will"
+            | "can"
+            | "could"
+            | "would"
+            | "should"
+            | "have"
+            | "has"
+            | "had"
+            | "about"
+            | "here"
+            | "your"
+            | "you"
+            | "our"
+            | "this"
+            | "that"
+            | "with"
+            | "from"
+            | "into"
+    )
+}
+
+/// Minimum corpus size below which corpus-ubiquitous-token pruning is disabled.
+/// Below this, document frequency is not a stable signal (a term in "half" of a
+/// 4-fact fixture is not corpus-ubiquitous), and pruning would strip genuine
+/// content words from a small store — including the 4-fact
+/// `default_config_reproduces_legacy_facts_recall_exactly` pin, whose only hit
+/// path is the FTS arm. Real instances hold thousands of facts (3,451 on the
+/// 2026-08-31 diagnosis snapshot); the largest test fixture is 30. This floor
+/// sits above every fixture, so their FTS query stays byte-identical.
+const UBIQUITOUS_MIN_CORPUS: i64 = 50;
+
+/// A token appearing in MORE than this fraction of facts is treated as
+/// corpus-ubiquitous and dropped from the OR-expanded FTS query. 0.5 = "more
+/// than half of all facts" — the diagnosis's own threshold (`hex` in >50% of
+/// facts on the 2026-08-31 snapshot).
+const UBIQUITOUS_DF_FRACTION: f64 = 0.5;
+
+/// Hard cap on per-token document-frequency probes, so a pathological many-token
+/// query cannot issue an unbounded number of COUNT probes. Tokens past the cap
+/// are kept unprobed (a kept token only widens recall; it never empties).
+const UBIQUITOUS_MAX_PROBES: usize = 12;
+
+/// Build the surviving OR-expanded FTS token list for a facts query.
+///
+/// Three-stage filter (task T8s8bq3th, diagnosis 2026-08-31 root cause 3):
+///   1. Drop sub-3-char tokens, keeping 2-char tokens that carry a digit (v2,
+///      k8, m1) — the facts tokenizer used to drop every sub-3-char token, so a
+///      query naming a versioned entity like "v2" lost its most distinctive
+///      term (task Tkmz6c46q, case c-14). Pure 2-char alpha words (of, to, an)
+///      stay dropped.
+///   2. Drop generic question / filler words (`is_generic_query_word`): OR-ing
+///      "what"/"where"/"about"/... into the query matches a huge slice of the
+///      corpus and carries no retrieval signal.
+///   3. Drop CORPUS-UBIQUITOUS content tokens — those appearing in more than
+///      half of all facts (`hex` in >50%, cases a-hex-startup-skill / c-10).
+///      OR-ing them in makes the query match 1,300–1,900 facts and drowns the
+///      genuinely-relevant answers outside the top-K window.
+///
+/// Stage 3 is DYNAMIC and corpus-derived: no instance-specific token is ever
+/// hardcoded into this foundation code (a token ubiquitous in one instance's
+/// corpus is distinctive in another's). It is guarded twice so it can never
+/// starve retrieval: it is skipped entirely below `UBIQUITOUS_MIN_CORPUS` facts,
+/// and if dropping the ubiquitous tokens would leave NO tokens it keeps the
+/// pre-drop set (a query built only of ubiquitous terms must still retrieve
+/// something). Every probe failure is non-fatal and biased toward KEEPING the
+/// token (df read as 0), never toward silently dropping it.
+fn fts_query_tokens(conn: &rusqlite::Connection, query: &str) -> Vec<String> {
+    let lowered = query.to_lowercase();
+    let base: Vec<String> = lowered
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| {
+            let short_alnum_with_digit = t.len() == 2 && t.bytes().any(|b| b.is_ascii_digit());
+            (t.len() >= 3 || short_alnum_with_digit) && !is_generic_query_word(t)
+        })
+        .map(|t| t.to_string())
+        .collect();
+    // A single (or empty) surviving token is the query's only signal — never
+    // prune it, and skip the corpus probe entirely.
+    if base.len() <= 1 {
+        return base;
+    }
+    // Corpus-size gate: below the floor, df is not a stable signal.
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM facts WHERE tombstone = 0", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    if total < UBIQUITOUS_MIN_CORPUS {
+        return base;
+    }
+    let cutoff = (total as f64 * UBIQUITOUS_DF_FRACTION) as i64;
+    let mut kept: Vec<String> = Vec::with_capacity(base.len());
+    for (i, tok) in base.iter().enumerate() {
+        if i >= UBIQUITOUS_MAX_PROBES {
+            kept.push(tok.clone());
+            continue;
+        }
+        // Document frequency through the SAME porter-tokenized FTS the arms use,
+        // so df reflects real index matches (stemming included). A MATCH syntax
+        // error or DB error reads as df = 0, which KEEPS the token.
+        let df: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid \
+                 WHERE facts_fts MATCH ?1 AND f.tombstone = 0",
+                rusqlite::params![tok],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if df <= cutoff {
+            kept.push(tok.clone());
+        }
+    }
+    if kept.is_empty() {
+        // Every surviving token was corpus-ubiquitous: keep the pre-drop set so
+        // the query still retrieves something (zero-survivor guard).
+        base
+    } else {
+        kept
+    }
+}
+
 /// Facts retrieval: dual-weighted FTS arms + slug arm + KNN arm over
 /// `facts_vec` when the caller already holds a query embedding (hoist it from
 /// the chunk path — do NOT cold-load the model here), fused by RRF. Returns
@@ -111,37 +272,10 @@ pub(crate) fn facts_recall_with_config(
     cfg: &RecallConfig,
 ) -> rusqlite::Result<Vec<(FactHit, f64)>> {
     // FTS5 default-ANDs tokens — for natural-language queries we want any-match.
-    // Drop stopwords and OR the remaining alphanumerics so "who is alice" hits
-    // facts mentioning the slug.
-    let fts_query = query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| {
-            // Keep 2-char alphanumeric tokens that carry a digit (v2, k8, m1):
-            // the facts tokenizer used to drop every sub-3-char token, so a
-            // query naming a versioned entity like "v2" lost its single most
-            // distinctive term (task Tkmz6c46q, diagnosis 2026-08-31 case c-14).
-            // Pure 2-char alpha words (of, to, an) stay dropped — only a digit
-            // makes a 2-char token distinctive enough to keep.
-            let short_alnum_with_digit = t.len() == 2 && t.bytes().any(|b| b.is_ascii_digit());
-            (t.len() >= 3 || short_alnum_with_digit)
-                && !matches!(
-                    *t,
-                    "the"
-                        | "and"
-                        | "for"
-                        | "are"
-                        | "was"
-                        | "who"
-                        | "what"
-                        | "how"
-                        | "does"
-                        | "did"
-                        | "is"
-                )
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    // Drop stopwords, generic question words, and corpus-ubiquitous tokens, then
+    // OR the remaining alphanumerics so "who is alice" hits facts mentioning the
+    // slug. See `fts_query_tokens` for the three-stage filter.
+    let fts_query = fts_query_tokens(conn, query).join(" OR ");
 
     // FTS arms — ranked facts rowids (bm25, then importance). The rowid is
     // the fusion key shared with the KNN arm (facts.id is a TEXT ULID, not an
@@ -1434,6 +1568,173 @@ mod plan2_tests {
             hits.iter().any(|f| f.object.contains("v2 arch")),
             "fact sharing only the 2-char digit token `v2` must be retrievable: {:?}",
             hits.iter().map(|f| &f.object).collect::<Vec<_>>()
+        );
+    }
+
+    /// Generic question / filler words must be classified as droppable and
+    /// genuine content tokens must NOT be (task T8s8bq3th — flooding fix, part 1:
+    /// drop generic question words from the OR-expanded facts FTS query). This
+    /// pins the predicate directly so a future edit that widens the drop list
+    /// into content territory (or narrows it below the question vocabulary)
+    /// trips here.
+    #[test]
+    fn recall_generic_query_words_classified_droppable() {
+        for w in [
+            "what", "who", "how", "where", "when", "why", "which", "whose", "is", "are", "does",
+            "did", "will", "can", "could", "would", "should", "have", "has", "had", "about", "the",
+            "this", "that", "with", "from", "into", "your", "you",
+        ] {
+            assert!(
+                is_generic_query_word(w),
+                "`{w}` must be dropped from the OR-expanded facts FTS query as a generic word"
+            );
+        }
+        // Content tokens — including the 2-char digit token kept by the
+        // tokenizer fix — must survive.
+        for w in [
+            "preference",
+            "vector",
+            "tara",
+            "blocker",
+            "building",
+            "knows",
+            "v2",
+        ] {
+            assert!(
+                !is_generic_query_word(w),
+                "`{w}` is a content token and must NOT be dropped from the FTS query"
+            );
+        }
+    }
+
+    /// End-to-end: a natural-language question whose only content token is a
+    /// single distinctive word still retrieves the fact, and a query of PURE
+    /// generic/filler words retrieves nothing — proof the generic words are
+    /// dropped from the OR-expanded facts FTS query rather than OR-matching a
+    /// broad slice of the corpus (task T8s8bq3th).
+    #[test]
+    fn recall_generic_words_dropped_from_or_expanded_fts_query() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('p','project:orbit','uses','the parallax alignment protocol',0.5,'2026-06-04','2026-06-04')",
+            [],
+        )
+        .unwrap();
+
+        // `parallax` is the only surviving content token; every other word is a
+        // generic question/filler word (or a sub-3-char token) and is dropped.
+        let hits: Vec<FactHit> =
+            facts_recall(&c, "what does this have to do with parallax", 6, None, false)
+                .unwrap()
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect();
+        assert!(
+            hits.iter().any(|f| f.object.contains("parallax")),
+            "the lone distinctive content token must still retrieve the fact: {:?}",
+            hits.iter().map(|f| &f.object).collect::<Vec<_>>()
+        );
+
+        // Pure filler: no token survives the drop, so the FTS/slug/predicate/
+        // camelCase arms all yield nothing and no fact is returned.
+        let none: Vec<FactHit> = facts_recall(&c, "what does this have to do with", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            none.is_empty(),
+            "a pure generic/filler query must surface no facts (all tokens dropped); got {:?}",
+            none.iter().map(|f| &f.object).collect::<Vec<_>>()
+        );
+    }
+
+    /// Corpus-ubiquitous content tokens (a term in >50% of facts, e.g. `hex`)
+    /// are dropped from the OR-expanded FTS query ABOVE the corpus floor, while
+    /// distinctive tokens survive — and the drop is disabled below the floor and
+    /// can never empty the query (task T8s8bq3th — flooding fix, part 2:
+    /// down-weight/drop corpus-ubiquitous tokens). Foundation-safe: the drop is
+    /// derived from live document frequency, never a hardcoded token list.
+    #[test]
+    fn recall_ubiquitous_token_dropped_above_corpus_floor() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        // 60 facts (> UBIQUITOUS_MIN_CORPUS). `hex` appears in EVERY subject
+        // (100% > 50% -> corpus-ubiquitous). ONE fact carries the distinctive
+        // object token `parallax`; the rest carry only routine filler.
+        for i in 0..60 {
+            let obj = if i == 0 {
+                "the parallax alignment result".to_string()
+            } else {
+                format!("routine note number {i}")
+            };
+            c.execute(
+                "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+                 VALUES (?1,'project:hex','has',?2,0.5,'2026-06-04','2026-06-04')",
+                rusqlite::params![format!("f{i}"), obj],
+            )
+            .unwrap();
+        }
+
+        // Ubiquitous `hex` dropped; distinctive `parallax` kept.
+        let toks = fts_query_tokens(&c, "what does hex have about parallax");
+        assert!(
+            !toks.iter().any(|t| t == "hex"),
+            "corpus-ubiquitous token `hex` must be dropped above the corpus floor; got {toks:?}"
+        );
+        assert!(
+            toks.iter().any(|t| t == "parallax"),
+            "the distinctive content token must survive; got {toks:?}"
+        );
+
+        // End-to-end: the distinctive fact is still retrieved even though the
+        // ubiquitous term was dropped.
+        let hits: Vec<FactHit> =
+            facts_recall(&c, "what does hex have about parallax", 6, None, false)
+                .unwrap()
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect();
+        assert!(
+            hits.iter().any(|f| f.object.contains("parallax")),
+            "dropping the ubiquitous token must not lose the distinctive fact: {:?}",
+            hits.iter().map(|f| &f.object).collect::<Vec<_>>()
+        );
+
+        // Zero-survivor guard: a query built ONLY of ubiquitous tokens keeps
+        // them, so it still retrieves something rather than matching nothing.
+        let only_ubi = fts_query_tokens(&c, "hex routine");
+        assert_eq!(
+            only_ubi,
+            vec!["hex".to_string(), "routine".to_string()],
+            "a query of only-ubiquitous tokens must RESTORE the pre-drop set (zero-survivor \
+             guard fired), not be emptied and not partially dropped; got {only_ubi:?}"
+        );
+
+        // Below the corpus floor the SAME token is kept — df is not a stable
+        // signal on a tiny store, protecting small fixtures like the legacy pin.
+        let small = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&small).unwrap();
+        crate::memory::schema::apply_plan2(&small).unwrap();
+        for i in 0..4 {
+            small
+                .execute(
+                    "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+                     VALUES (?1,'project:hex','has','a routine note',0.5,'2026-06-04','2026-06-04')",
+                    rusqlite::params![format!("s{i}")],
+                )
+                .unwrap();
+        }
+        let small_toks = fts_query_tokens(&small, "what does hex have about parallax");
+        assert!(
+            small_toks.iter().any(|t| t == "hex"),
+            "below the corpus floor a ubiquitous-looking token must be kept; got {small_toks:?}"
         );
     }
 }
