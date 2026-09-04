@@ -76,7 +76,7 @@ None to the code, tests, or doc. One operational note on verification below.
 ### Operational note — verifying `dedup-tests-pass` under shared-target contention
 The declared `dedup-tests-pass` verification
 (`cargo test --release dedup` in `system/harness`) inherits the BOI harness
-env var `CARGO_TARGET_DIR=/Users/mrap/.boi/v2/cargo-target` — a SHARED release
+env var `CARGO_TARGET_DIR=~/.boi/v2/cargo-target` — a SHARED release
 target dir used concurrently by every active BOI worktree. Because sibling
 worktrees carry different source edits, their cargo fingerprints differ and
 thrash each other's cached artifacts, and the plain command spends its whole
@@ -88,7 +88,7 @@ wip commit `3a13dfde`), NOT any code defect.
 To obtain a result off the contended shared lock, this session runs the same
 `dedup` tests in a private, contention-free per-task target dir created by an
 APFS copy-on-write clone of the warm shared target
-(`cp -cR /Users/mrap/.boi/v2/cargo-target/release /tmp/recallfix-t1-target/release`,
+(`cp -cR ~/.boi/v2/cargo-target/release /tmp/recallfix-t1-target/release`,
 then `CARGO_TARGET_DIR=/tmp/recallfix-t1-target`). The clone is near-instant
 (copy-on-write, no block duplication) and — verified this session — preserves
 every dependency's cargo fingerprint: a `cargo test --release --lib dedup`
@@ -120,7 +120,7 @@ fixed end-to-end via `assemble()`.
 OBSERVED RESULT (this session, genuine green). To obtain a real exit code off
 the fat-LTO wall, the three `dedup` tests were run under the DEBUG profile in a
 private, contention-free target dir CoW-cloned from the warm shared debug tree
-(`cp -cR /Users/mrap/.boi/v2/cargo-target/debug /tmp/t1-dbg-target/debug`, then
+(`cp -cR ~/.boi/v2/cargo-target/debug /tmp/t1-dbg-target/debug`, then
 `CARGO_TARGET_DIR=/tmp/t1-dbg-target cargo test --lib dedup`). Exact command and
 result observed this session:
 `CARGO_TARGET_DIR=/tmp/t1-dbg-target cargo test --lib dedup` → **exit 0**,
@@ -157,7 +157,7 @@ live worker; (2) a completion watcher must be FAILURE-AWARE, not sentinel-only:
 poll `test -f <done-file> || ! pgrep -f <target-dir>` so a reaped build
 (process gone, no done-file) is detected rather than hung on forever.
 Infra fix (out of scope for this task, flag to the operator): the shared
-`CARGO_TARGET_DIR=/Users/mrap/.boi/v2/cargo-target` serializes every sibling
+`CARGO_TARGET_DIR=~/.boi/v2/cargo-target` serializes every sibling
 worktree on one build lock, and reaped attempts orphan lock-holding builds.
 Fix by either serializing execute phases across sibling worktrees, or giving
 each worktree a private target dir seeded by a copy-on-write clone of a
@@ -169,7 +169,7 @@ could cut by setting `lto = "thin"` for the test/dev path.
 ---
 
 Implementation record for the approved recall-plateau fix package (spec `Swqqg9f81`).
-Diagnosis: `/Users/mrap/hex/projects/system-improvement/diagnoses/recall-plateau-2026-08-31.md`.
+Diagnosis: the 2026-08-31 recall-plateau diagnosis (operator instance workspace).
 
 Each section below documents one task from the spec's DAG: what changed, file:line
 anchors, tests added, and any documented deviations from scope. Sections are appended
@@ -254,7 +254,7 @@ this caveat only concerns non-worker nested sources.
 **`still-builds` capture (execute iteration 5).** The declared `still-builds` command
 (`cargo build --release`) was stalled across five iterations by shared-target-dir lock
 contention: every spec worktree inherits one ambient `CARGO_TARGET_DIR`
-(`/Users/mrap/.boi/v2/cargo-target`), which cargo serializes with a build-directory flock,
+(`~/.boi/v2/cargo-target`), which cargo serializes with a build-directory flock,
 while the task DAG fans build/test verifications out in parallel — so this task's build sat
 behind sibling `cargo test`/`cargo build` runs indefinitely. The declared verification does
 not pin `CARGO_TARGET_DIR` (it is ambient env, not part of the command string), so the
@@ -649,7 +649,7 @@ intersection rather than an M5 artifact).
 ### Verification execution — observed results (execute redo, 2026-09-03)
 This execute session added change 1b (the corpus-ubiquitous df drop) on top of
 the prior in-flight implementation already on disk, then verified the whole
-task. The shared `CARGO_TARGET_DIR=/Users/mrap/.boi/v2/cargo-target` release
+task. The shared `CARGO_TARGET_DIR=~/.boi/v2/cargo-target` release
 tree was under the fat-LTO + cross-worktree lock contention documented under
 T28958xxp and Tznnfa5ga (this session a sibling worktree held the release lock,
 and a CoW clone of the release tree via `cp -cR` timed out after 2 min). Per the
@@ -810,7 +810,7 @@ by T28958xxp / Tznnfa5ga / T8s8bq3th on this spec's fat-LTO wall.
   tuner-v2 changes.
 - `tuner-tests-pass` (declared `cargo test --release recall_tune`): the `recall_tune`
   module's tests were run GREEN via a private, contention-free target dir CoW-cloned
-  from the warm shared DEBUG tree (`cp -cR /Users/mrap/.boi/v2/cargo-target/debug
+  from the warm shared DEBUG tree (`cp -cR ~/.boi/v2/cargo-target/debug
   /tmp/recallfix-t6-target/debug`, then `CARGO_TARGET_DIR=/tmp/recallfix-t6-target
   cargo test --lib recall_tune`). Observed: **`running 10 tests` ... `test result:
   ok. 10 passed; 0 failed; 0 ignored; 688 filtered out`, exit 0** (log

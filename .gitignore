@@ -48,5 +48,6 @@ system/scripts/bin/
 
 # Local embedding model cache (fastembed/nomic) — never commit (538MB+)
 .fastembed_cache/
-target-t*/
+target-t*
+target-iso-*/
 target-adjust/
