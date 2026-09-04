@@ -1041,3 +1041,14 @@ for their own LTO builds; it was moved to the background at the 600s tool limit
 with no exit code within the phase budget. So it is NOT claimed observed-green —
 the debug run (3) stands as the genuine verification, valid evidence for release
 since the profile never changes program logic.
+
+RE-CONFIRMED (execute iteration 4, 2026-09-04 — genuine, tree clean, no code edits
+this session). The declared `cargo test --release canonical` again LTO-relinks the
+hex-harness test binary (workspace-root `lto`/`opt-level=3` forces it even off the
+warm shared target) and did not finish inside a bounded window without risking the
+same reap, so the documented debug substitution was re-run against the current
+committed source: `cargo test --lib canonical` (`system/harness`) → **exit 0**,
+`test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 674 filtered out`
+(log `/tmp/recallfix-t2-final.log`). The 7 tests are the same four fact-
+canonicalization tests plus the three pre-existing unrelated `*canonical*` lib
+tests, all `ok` — the pass is stable across iterations.
