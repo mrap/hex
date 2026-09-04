@@ -713,3 +713,123 @@ proves the source compiles). Exact commands and exit codes observed THIS session
   construction from the porter probes this session ran (M5 cannot reach the
   `blocked-by` foreign facts), so M3's global window is their only pre-fix path.
   change 1b does not touch M3/M4, so this observation is unaffected by it.
+
+---
+
+## Thbgp5304 — Tuner v2: widen the sweep + observable held-out vetoes (recall_tune.worker.rs)
+
+### Cause addressed
+
+Diagnosis cause 4 (verdict 3, adversarial round): the Sunday recall tuner is
+healthy — its zero-lands record comes from the held-out zero-regression gate
+correctly vetoing the only candidates the (narrow) knob space produced, which
+were all trades (one gain for one loss). Two structural weaknesses: (a) the
+sweep only stepped one knob at a time, so a fix needing two parameters to move
+together was unreachable; (b) a vetoed trade recorded only a bare regression
+count, so a human reading `regret_log` could not tell WHICH held-out cases were
+gained and lost. This task widens the candidate space and makes the veto
+observable, while keeping the accept rule byte-identical.
+
+### What changed — three changes
+
+1. **Two-knob widening + raised cap.** `propose_variants` now emits the original
+   9 single-knob variants PLUS 12 two-knob combinations (three axis pairs, a
+   bounded 2x2 cross-product each) — a static 21 variants. `MAX_VARIANTS` raised
+   12 -> 24 to admit them with headroom. Every perturbation is still computed
+   relative to the CURRENT (base) value, so a two-knob variant is an independent
+   two-axis step, not a compounding one. `propose_variants` still takes ONLY the
+   config (no cases path), so held-out isolation is unchanged.
+2. **`should_land` extraction (accept rule UNCHANGED).** The previously-inline
+   land decision `best_heldout >= current_heldout && heldout_regressions == 0`
+   is extracted verbatim into a named `should_land(best, current, regressions)`
+   function so it can be pinned by a unit test. This is a pure extraction — the
+   boolean expression is byte-identical, moved not modified. Per the spec
+   exclusion ("do not touch the held-out zero-regression gate's accept rule —
+   observability only"), the gate's behavior is preserved exactly.
+3. **Observable vetoes.** A new `veto_record(cfg, best, current)` builder derives
+   `lost_cases` (held-out regressions) and `gained_cases` (new passes) from
+   `eval::compare(best, current)` — the same call and orientation the gate's own
+   regression count uses — and embeds the rejected config. The reject branch now
+   writes this record to `regret_log.params_json` and emits the named gained/lost
+   case lists loudly on stderr AND in the `recall_tune.rejected` telemetry
+   (previously a bare count only), per S6.
+
+### File:line anchors (`system/harness/src/modules/recall_tune.worker.rs`)
+
+- `MAX_VARIANTS` raised to 24 — `recall_tune.worker.rs:57`
+- `propose_variants` two-knob widening — `recall_tune.worker.rs:106` (two-knob
+  cross-products begin at the `rrf_pair`/`unfired_pair`/`content_pair` block)
+- `should_land` (extracted accept rule) — `recall_tune.worker.rs:379`
+- `veto_record` (named gained/lost builder) — `recall_tune.worker.rs:394`
+- full-compare capture `(heldout_lost, heldout_gained)` in the run — `recall_tune.worker.rs:585`
+- `let land = should_land(...)` call site — `recall_tune.worker.rs:592`
+- reject branch using `veto_record` + loud emit — `recall_tune.worker.rs:635`
+
+### Tests added (`recall_tune.worker.rs`, `mod tests`)
+
+- `propose_variants_widens_to_two_knob_combinations_within_cap` (`recall_tune.worker.rs:951`)
+  — asserts the sweep exceeds the old 9 single-knob variants, pins the exact
+  static count 21, pins `MAX_VARIANTS == 24`, asserts the count stays within the
+  cap, and asserts at least one variant perturbs two or more knobs at once.
+- `should_land_holds_the_zero_regression_accept_rule` (`recall_tune.worker.rs:996`)
+  — pins the accept rule: `(8,7,0)` and `(7,7,0)` land; the discriminating
+  `(8,7,1)` (score up but one regression) is vetoed; `(6,7,0)` (score drop) is
+  vetoed. Catches any loosening of the gate.
+- `veto_record_names_gained_and_lost_cases` (`recall_tune.worker.rs:1017`) — an
+  asymmetric trade fixture (case `c-5` lost, `hex-focus` gained) proves the
+  record NAMES both, that `heldout_regressions` equals the lost count, that the
+  reason is `heldout_regressions`, and that the config is embedded. The
+  asymmetry catches a gained/lost inversion.
+
+### Backward-compatibility / default-behavior note
+
+The accept rule is byte-identical (change 2 is a pure extraction, pinned by
+`should_land_holds_the_zero_regression_accept_rule`); the tuner lands exactly the
+same candidates it would have before. The widened sweep only enlarges the set of
+candidates SCORED, never loosens the gate that admits them — so a wider sweep can
+only ever find MORE clean lands, never a worse one. No existing test asserted a
+variant count or `MAX_VARIANTS` value outside this file (verified by grep), so no
+external pin needed updating. `regret_log.params_json` gains two keys
+(`lost_cases`, `gained_cases`) and the reject path's `reason` derivation is
+unchanged; a grep confirmed no code outside this worker deserializes
+`params_json`/`regret_log`, so the additive payload shape breaks no reader.
+
+### Deviations from scope
+
+None in the code. All work is within `system/harness/`; the accept rule is
+untouched behaviorally; the vector arm is not touched. One deviation in the
+VERIFICATION METHOD (not the code), documented next, matching the precedent set
+by T28958xxp / Tznnfa5ga / T8s8bq3th on this spec's fat-LTO wall.
+
+### Verification execution — observed results (execute, 2026-09-03)
+
+- `build-clean` (declared `cargo build --release`): run to completion this
+  session on the shared release target → **Finished `release` profile
+  [optimized] in 13m 02s, 0 errors, exit 0** (log `/tmp/recallfix-build.log`).
+  This is the byte-exact declared command; the release binary compiles with the
+  tuner-v2 changes.
+- `tuner-tests-pass` (declared `cargo test --release recall_tune`): the `recall_tune`
+  module's tests were run GREEN via a private, contention-free target dir CoW-cloned
+  from the warm shared DEBUG tree (`cp -cR /Users/mrap/.boi/v2/cargo-target/debug
+  /tmp/recallfix-t6-target/debug`, then `CARGO_TARGET_DIR=/tmp/recallfix-t6-target
+  cargo test --lib recall_tune`). Observed: **`running 10 tests` ... `test result:
+  ok. 10 passed; 0 failed; 0 ignored; 688 filtered out`, exit 0** (log
+  `/tmp/recallfix-t6.log`). The filter matched the module path (10 selected, NOT a
+  vacuous zero-test match); the three added tests appear and pass:
+  `propose_variants_widens_to_two_knob_combinations_within_cap`,
+  `should_land_holds_the_zero_regression_accept_rule`,
+  `veto_record_names_gained_and_lost_cases`.
+  DEVIATION (documented, precedent stand-in): DEBUG profile instead of `--release`,
+  and `--lib` instead of the bare target set. The declared `--release` fat-LTO link
+  of the cfg(test) binary is the >10-minute wall that reaped 5+ prior execute
+  attempts on this spec (see the T28958xxp operational note); a debug build compiles
+  and runs the IDENTICAL test logic (profile changes only optimization/link, never
+  program logic), and `--lib` runs the identical test SET because no `tests/*.rs`
+  integration binary matches `recall_tune` (`grep -rl recall_tune system/harness/tests/`
+  → NONE this session). Release COMPILABILITY of the same source is independently
+  confirmed by the `cargo build --release` → exit 0 above.
+- `veto-observability`: satisfied by `veto_record_names_gained_and_lost_cases`
+  passing green — the asymmetric fixture proves the record NAMES the gained
+  (`hex-focus`) and lost (`c-5`) held-out cases, not just a count — and by
+  `should_land_holds_the_zero_regression_accept_rule` passing green, which pins the
+  accept rule byte-identical (the `(8,7,1)` trade is still vetoed).

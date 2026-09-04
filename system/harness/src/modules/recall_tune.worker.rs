@@ -50,8 +50,11 @@ use hex::worker::{ctx::Ctx, event::Event, Result, Worker};
 pub const CRON_WEEKLY_SUN_0500: &str = "0 0 5 * * SUN *";
 
 /// Hard cap on variants scored in one run — the sweep is a bounded neighborhood
-/// hill-climbing step, never an unbounded grid search.
-const MAX_VARIANTS: usize = 12;
+/// hill-climbing step, never an unbounded grid search. Raised from 12 to 24 for
+/// the tuner-v2 widening (spec Thbgp5304): the sweep now also proposes two-knob
+/// combinations, so the cap must admit the single-knob neighborhood (9) plus the
+/// bounded two-knob cross-products (12) — a static 21 today, headroom to 24.
+const MAX_VARIANTS: usize = 24;
 
 /// Instance opt-in tuning slice.
 fn tuning_cases_path(root: &Path) -> PathBuf {
@@ -92,9 +95,18 @@ impl TuningPath {
 /// Takes ONLY the current config — no cases path of any kind — so neither the
 /// tuning nor (critically) the held-out slice can influence which variants are
 /// proposed. This signature is the structural half of held-out isolation.
+///
+/// Tuner-v2 widening (spec Thbgp5304): the sweep proposes BOTH single-knob steps
+/// (the original neighborhood) AND two-knob combinations across the three tunable
+/// axes, so a fix that needs two parameters to move together is now reachable.
+/// Every perturbation is computed relative to the CURRENT (base) value, so a
+/// two-knob variant is an independent two-axis step, not a compounding one. The
+/// enumeration is static (9 single-knob + 12 two-knob = 21) and stays under the
+/// hard `MAX_VARIANTS` cap.
 fn propose_variants(current: &RecallConfig) -> Vec<RecallConfig> {
     let mut out = Vec::new();
 
+    // --- Single-knob neighborhood (unchanged from tuner-v1) ---
     // RRF fusion constant neighborhood (multiplicative, kept >= 1.0).
     for factor in [0.5_f64, 0.75, 1.5, 2.0] {
         let mut v = current.clone();
@@ -112,6 +124,41 @@ fn propose_variants(current: &RecallConfig) -> Vec<RecallConfig> {
         let mut v = current.clone();
         v.arm_weights.content[2] = (current.arm_weights.content[2] * factor).max(0.0);
         out.push(v);
+    }
+
+    // --- Two-knob combinations (tuner-v2) ---
+    // Bounded representative subsets per axis keep the three cross-products small
+    // (2 x 2 each = 12 total) so single- plus two-knob stays under MAX_VARIANTS.
+    let rrf_pair = [0.5_f64, 1.5];
+    let unfired_pair = [-0.1_f32, 0.1];
+    let content_pair = [0.5_f64, 1.5];
+
+    // rrf_k x move_relevance.unfired
+    for factor in rrf_pair {
+        for delta in unfired_pair {
+            let mut v = current.clone();
+            v.rrf_k = (current.rrf_k * factor).max(1.0);
+            v.move_relevance.unfired = (current.move_relevance.unfired + delta).clamp(0.0, 1.0);
+            out.push(v);
+        }
+    }
+    // rrf_k x arm_weights.content[2]
+    for factor in rrf_pair {
+        for cfactor in content_pair {
+            let mut v = current.clone();
+            v.rrf_k = (current.rrf_k * factor).max(1.0);
+            v.arm_weights.content[2] = (current.arm_weights.content[2] * cfactor).max(0.0);
+            out.push(v);
+        }
+    }
+    // move_relevance.unfired x arm_weights.content[2]
+    for delta in unfired_pair {
+        for cfactor in content_pair {
+            let mut v = current.clone();
+            v.move_relevance.unfired = (current.move_relevance.unfired + delta).clamp(0.0, 1.0);
+            v.arm_weights.content[2] = (current.arm_weights.content[2] * cfactor).max(0.0);
+            out.push(v);
+        }
     }
 
     out.truncate(MAX_VARIANTS);
@@ -320,6 +367,50 @@ fn should_revert(prev_heldout_score: i64, live_heldout_score: i64) -> bool {
     live_heldout_score < prev_heldout_score
 }
 
+/// The land decision — the ZERO-REGRESSION accept rule. A candidate lands iff
+/// its held-out score does not drop AND it regresses NOT ONE held-out case.
+///
+/// This is a verbatim extraction of the previously-inline decision; the
+/// tuner-v2 widening (spec Thbgp5304) enlarges only the CANDIDATE space
+/// (`propose_variants`), never this gate — the spec exclusion pins the accept
+/// rule as "observability only". Extracted as a named function so a unit test
+/// can pin it byte-identical against accidental loosening (e.g. admitting a
+/// score-neutral trade that costs one held-out case).
+fn should_land(best_heldout: usize, current_heldout: usize, heldout_regressions: usize) -> bool {
+    best_heldout >= current_heldout && heldout_regressions == 0
+}
+
+/// Build the observable `regret_log` payload for a REJECTED candidate, naming
+/// the specific held-out cases it would have GAINED and LOST (spec Thbgp5304).
+///
+/// A vetoed candidate is almost always a trade — it wins some held-out cases and
+/// loses others — and the zero-regression gate vetoes any trade. Recording bare
+/// counts hides WHICH cases were traded, so a human reading the ledger cannot
+/// tell a near-miss (one incidental loss) from a bad candidate (many). Derives
+/// `lost` from the regressions and `gained` from the new-passes of
+/// `eval::compare(best, current)` — same call, same orientation as the gate's
+/// own regression count — and embeds the rejected `cfg` for provenance. The
+/// caller emits these lists loudly (stderr + telemetry), per S6.
+fn veto_record(
+    cfg: &RecallConfig,
+    best: &BTreeMap<String, CaseResult>,
+    current: &BTreeMap<String, CaseResult>,
+) -> serde_json::Value {
+    let (lost, gained) = eval::compare(best, current);
+    let reason = if lost.is_empty() {
+        "heldout_not_better"
+    } else {
+        "heldout_regressions"
+    };
+    serde_json::json!({
+        "config": cfg,
+        "reason": reason,
+        "heldout_regressions": lost.len(),
+        "lost_cases": lost,
+        "gained_cases": gained,
+    })
+}
+
 /// Restore the archived `.prev` config over the live `recall.toml`, mark the win
 /// reverted, and append a `reverted` `regret_log` row. Mechanical half of the
 /// revert — the caller supplies the freshly measured `live_heldout_score`, so
@@ -488,14 +579,17 @@ fn run_recall_tune(_e: Event, ctx: Ctx) -> Result<()> {
     let best_heldout_results = score_heldout(&snap_root, &heldout, &best)?;
     let current_heldout = eval::facts_hits(&current_heldout_results);
     let best_heldout = eval::facts_hits(&best_heldout_results);
-    // Held-out regressions = cases the current config hit that the candidate misses.
-    let heldout_regressions = eval::compare(&best_heldout_results, &current_heldout_results)
-        .0
-        .len();
+    // Held-out trade, named: `lost` = cases the current config hit that the
+    // candidate misses (the regressions the gate vetoes on); `gained` = cases
+    // the candidate newly hits. Same call/orientation the reject record reuses.
+    let (heldout_lost, heldout_gained) =
+        eval::compare(&best_heldout_results, &current_heldout_results);
+    let heldout_regressions = heldout_lost.len();
     drop(snap);
 
-    // (vi) Land iff the candidate does not lose on held-out AND regresses nothing.
-    let land = best_heldout >= current_heldout && heldout_regressions == 0;
+    // (vi) Land iff the candidate does not lose on held-out AND regresses nothing
+    // — the zero-regression accept rule, unchanged by the tuner-v2 widening.
+    let land = should_land(best_heldout, current_heldout, heldout_regressions);
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
 
     if land {
@@ -534,22 +628,19 @@ fn run_recall_tune(_e: Event, ctx: Ctx) -> Result<()> {
             }),
         )?;
     } else {
-        // Reject → regret_log row.
-        let reason = if heldout_regressions > 0 {
-            "heldout_regressions"
-        } else {
-            "heldout_not_better"
-        };
-        let payload = serde_json::json!({
-            "config": best,
-            "reason": reason,
-            "heldout_regressions": heldout_regressions,
-        })
-        .to_string();
+        // Reject → observable regret_log row: name the specific held-out cases
+        // the candidate would have GAINED and LOST so a vetoed trade is legible
+        // in the ledger and on stderr, not a bare regression count (spec
+        // Thbgp5304 veto-observability; S6).
+        let record = veto_record(&best, &best_heldout_results, &current_heldout_results);
+        let reason = record["reason"]
+            .as_str()
+            .unwrap_or("heldout_regressions")
+            .to_string();
         insert_ledger(
             &conn,
             "regret_log",
-            &payload,
+            &record.to_string(),
             best_tuning as i64,
             best_heldout as i64,
             "reject",
@@ -558,7 +649,8 @@ fn run_recall_tune(_e: Event, ctx: Ctx) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("recall-tune: regret_log(reject) insert failed: {e}"))?;
         eprintln!(
             "[recall-tune] REJECTED ({reason}): held-out {best_heldout} vs current \
-             {current_heldout}, regressions {heldout_regressions}"
+             {current_heldout}, regressions {heldout_regressions}; \
+             gained {heldout_gained:?} lost {heldout_lost:?}"
         );
         ctx.emit(
             "recall_tune.rejected",
@@ -567,6 +659,8 @@ fn run_recall_tune(_e: Event, ctx: Ctx) -> Result<()> {
                 "current_heldout_score": current_heldout,
                 "best_heldout_score": best_heldout,
                 "heldout_regressions": heldout_regressions,
+                "gained_cases": heldout_gained,
+                "lost_cases": heldout_lost,
             }),
         )?;
     }
@@ -846,5 +940,136 @@ mod tests {
             )
             .unwrap();
         assert_eq!((act.as_str(), rev, hs), ("reverted", 1, 6));
+    }
+
+    /// Tuner-v2 widening (spec Thbgp5304): the sweep now proposes MORE than the
+    /// old nine single-knob variants, includes at least one two-knob combination,
+    /// and still respects the raised hard cap. The exact count is pinned so a
+    /// future enumeration change that would silently exceed the cap (and be
+    /// truncated) is caught loudly instead.
+    #[test]
+    fn propose_variants_widens_to_two_knob_combinations_within_cap() {
+        let base = RecallConfig::default();
+        let variants = propose_variants(&base);
+
+        // Widened past the old single-step-only space (was 9 single-knob variants).
+        assert!(
+            variants.len() > 9,
+            "widened sweep must exceed the old 9 single-knob variants, got {}",
+            variants.len()
+        );
+        // Cap raised to 24; the static enumeration is exactly 21 (9 single + 12 two-knob).
+        assert_eq!(MAX_VARIANTS, 24, "cap must be 24 for the two-knob widening");
+        assert!(
+            variants.len() <= MAX_VARIANTS,
+            "variant count must respect the hard cap ({MAX_VARIANTS}), got {}",
+            variants.len()
+        );
+        assert_eq!(
+            variants.len(),
+            21,
+            "enumeration is static at 21; if this grows past MAX_VARIANTS the truncate would silently drop variants"
+        );
+
+        // At least one variant must perturb TWO or more knobs at once — the whole
+        // point of the widening.
+        let two_knob = variants
+            .iter()
+            .filter(|v| {
+                let d_rrf = u8::from(v.rrf_k != base.rrf_k);
+                let d_unfired = u8::from(v.move_relevance.unfired != base.move_relevance.unfired);
+                let d_content = u8::from(v.arm_weights.content != base.arm_weights.content);
+                d_rrf + d_unfired + d_content >= 2
+            })
+            .count();
+        assert!(
+            two_knob >= 1,
+            "at least one variant must move two or more knobs at once"
+        );
+    }
+
+    /// The zero-regression accept rule, pinned byte-identical (spec Thbgp5304
+    /// keeps the gate unchanged — observability only). The discriminating case
+    /// `(8, 7, 1)` — held-out score UP but one case regressed — must still be
+    /// vetoed; a loosened rule that accepted score-up trades would flip it.
+    #[test]
+    fn should_land_holds_the_zero_regression_accept_rule() {
+        assert!(should_land(8, 7, 0), "clean improvement, zero regressions → land");
+        assert!(
+            should_land(7, 7, 0),
+            "score-neutral with zero regressions → land"
+        );
+        assert!(
+            !should_land(8, 7, 1),
+            "any held-out regression vetoes the trade, even with the aggregate score up"
+        );
+        assert!(
+            !should_land(6, 7, 0),
+            "a held-out score drop vetoes even with zero regressions"
+        );
+    }
+
+    /// Veto observability (spec Thbgp5304): a rejected candidate's regret record
+    /// NAMES the held-out cases it gained and lost, not just a count. The fixture
+    /// is an asymmetric trade — one case gained, one lost — so a gained/lost
+    /// inversion is caught.
+    #[test]
+    fn veto_record_names_gained_and_lost_cases() {
+        let hit = CaseResult {
+            facts: true,
+            anywhere: true,
+        };
+        let miss = CaseResult {
+            facts: false,
+            anywhere: false,
+        };
+
+        // current (baseline) held-out results.
+        let mut current = BTreeMap::new();
+        current.insert("keep".to_string(), hit); // both configs hold this
+        current.insert("c-5".to_string(), hit); // current holds, candidate loses → LOST
+        current.insert("hex-focus".to_string(), miss); // current misses, candidate gains → GAINED
+
+        // candidate (best) held-out results: trades c-5 (lost) for hex-focus (gained).
+        let mut best = BTreeMap::new();
+        best.insert("keep".to_string(), hit);
+        best.insert("c-5".to_string(), miss);
+        best.insert("hex-focus".to_string(), hit);
+
+        let rec = veto_record(&RecallConfig::default(), &best, &current);
+
+        let lost: Vec<String> = rec["lost_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let gained: Vec<String> = rec["gained_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(lost, vec!["c-5".to_string()], "the lost held-out case must be named");
+        assert_eq!(
+            gained,
+            vec!["hex-focus".to_string()],
+            "the gained held-out case must be named"
+        );
+        assert_eq!(
+            rec["heldout_regressions"].as_u64().unwrap(),
+            1,
+            "regression count must equal the number of lost cases"
+        );
+        assert_eq!(
+            rec["reason"].as_str().unwrap(),
+            "heldout_regressions",
+            "a trade with a loss is vetoed for heldout_regressions"
+        );
+        assert!(
+            rec.get("config").is_some(),
+            "the rejected config must be embedded for provenance"
+        );
     }
 }
