@@ -1500,11 +1500,28 @@ pub fn run(args: &[String]) -> i32 {
     // instance's OWN repo; a failure here is LOUD (S6) and exits nonzero so the
     // operator knows the deploy is live but unrecorded in git.
     if is_own_git_toplevel(&hex_dir) {
-        let synced_version = fs::read_to_string(hex_dot_dir.join("version.txt"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Read the version to name the commit. A missing/empty/unreadable
+        // version.txt must NOT silently degrade (Standing Order S6: no quiet
+        // failures) — the deploy still gets committed so the tree is consistent,
+        // but the operator is warned loudly that the commit names "unknown".
+        let version_file = hex_dot_dir.join("version.txt");
+        let synced_version = match fs::read_to_string(&version_file) {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            Ok(_) => {
+                eprintln!(
+                    "  [WARN] {} is empty; the upgrade commit will name the version \"unknown\".",
+                    version_file.display()
+                );
+                "unknown".to_string()
+            }
+            Err(e) => {
+                eprintln!(
+                    "  [WARN] Could not read {} ({e}); the upgrade commit will name the version \"unknown\".",
+                    version_file.display()
+                );
+                "unknown".to_string()
+            }
+        };
         match commit_synced_files(&hex_dir, &synced_version) {
             Ok(true) => {
                 println!("  [OK] Committed synced files (v{synced_version}) in instance repo.");

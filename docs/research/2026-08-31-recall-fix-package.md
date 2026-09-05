@@ -1131,6 +1131,10 @@ instance-side gitignore shadowing of new harness source files.
   "already consistent"; on `Err` prints a `[FAIL]` to stderr (deploy is live but
   unrecorded in git), prints the exact manual `git` fix, and returns nonzero (S6:
   no quiet failures). Non-git or nested workspace → visible skip note, not a failure.
+  The version for the commit message is read from `.hex/version.txt` (written earlier
+  in the same run at `upgrade.rs:1461`); a missing/empty/unreadable file no longer
+  degrades silently to `"unknown"` — it emits a loud `[WARN]` to stderr first (S6),
+  while still committing so the tree stays consistent.
   `system/harness/src/upgrade.rs:1502`.
 - Documented the deployed-but-orphaned blind spot, the post-upgrade commit behavior,
   and the known instance-side gitignore shadowing of new harness source files

@@ -482,6 +482,12 @@ tracked files so the repo reflects the deployed version (`commit_synced_files` i
 - **Cannot hang.** The commit runs with `commit.gpgsign=false` and `--no-verify`
   so an unattended upgrade can never block on a GPG passphrase or a pre-commit
   hook prompt.
+- **Mid-merge/rebase caveat.** The commit is pathspec-scoped (`--only -- .hex`),
+  which git refuses during an in-progress merge or rebase ("cannot do a partial
+  commit during a merge"). If you run `hex upgrade` while the instance repo is
+  mid-merge/rebase, the post-upgrade commit fails loudly and exits nonzero — the
+  deploy is live, the tree is fine. Finish or abort the merge/rebase and run the
+  printed manual `git` fix (or re-run `hex upgrade`) to record the synced files.
 
 ### Known limitation: instance-side gitignore shadowing of new harness source
 
