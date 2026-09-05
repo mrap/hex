@@ -154,6 +154,37 @@ fn object_token_set(object: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// TRUE iff `t` is an explicit negation/polarity token. When such a token is the
+/// DIFFERENCE between two otherwise-overlapping objects, the objects may state
+/// OPPOSITE claims, so they must not be collapsed. Deliberately limited to
+/// unambiguous, standalone negations (plus common no-apostrophe contraction
+/// spellings, since `object_token_set` splits on the apostrophe). Erring toward
+/// keeping both facts is the conservative direction the spec demands.
+fn is_polarity_token(t: &str) -> bool {
+    matches!(
+        t,
+        "not" | "no"
+            | "never"
+            | "none"
+            | "cannot"
+            | "cant"
+            | "dont"
+            | "doesnt"
+            | "didnt"
+            | "wont"
+            | "wouldnt"
+            | "shouldnt"
+            | "isnt"
+            | "arent"
+            | "wasnt"
+            | "werent"
+            | "without"
+            | "neither"
+            | "nor"
+            | "nothing"
+    )
+}
+
 /// TRUE iff two objects are high-confidence near-duplicates of the SAME claim.
 ///
 /// Uses the overlap coefficient |A ∩ B| / min(|A|, |B|) over token sets. This is
@@ -164,10 +195,27 @@ fn object_token_set(object: &str) -> std::collections::BTreeSet<String> {
 /// never trigger a collapse. Conservative by construction: genuinely distinct
 /// claims sharing a subject+predicate have little token overlap and never clear
 /// the bar (pinned by `canonical_keeps_distinct_facts_sharing_subject_and_predicate`).
+///
+/// POLARITY GUARD: the raw overlap coefficient scores a strict superset 1.0 even
+/// when the extra tokens flip the claim's meaning ("use X" vs "do not use X"),
+/// which would wrongly tombstone a CONTRADICTING fact. So if the tokens that
+/// DIFFER between the two objects (their symmetric difference) include an
+/// explicit negation, the pair is never a duplicate — a token-overlap metric
+/// cannot distinguish a claim from its negation with high confidence, and the
+/// spec HARD CONSTRAINT / `conservative-collapse` verification require keeping
+/// both. Pinned by `canonical_keeps_polarity_flipped_near_superset_facts`.
 fn objects_are_near_duplicates(a: &str, b: &str) -> bool {
     let ta = object_token_set(a);
     let tb = object_token_set(b);
     if ta.is_empty() || tb.is_empty() {
+        return false;
+    }
+    // Polarity guard (conservative). A negation present in one object but not the
+    // other flips the claim; never collapse across it.
+    if ta
+        .symmetric_difference(&tb)
+        .any(|t| is_polarity_token(t.as_str()))
+    {
         return false;
     }
     let shared = ta.intersection(&tb).count();
@@ -772,6 +820,48 @@ mod tests {
             live, 2,
             "distinct facts sharing subject+predicate must both survive — \
              conservative canonicalization never collapses different claims"
+        );
+    }
+
+    /// GUARD (negative) — polarity/contradiction class. A claim and its NEGATION
+    /// share a subject+predicate, and one object is a strict superset of the
+    /// other that differs ONLY by a negation word ("use Postgres" vs "do not use
+    /// Postgres"). A naive overlap coefficient with a `min(|A|,|B|)` denominator
+    /// scores such a pair 1.0 and would collapse them — TOMBSTONING a
+    /// contradicting fact. That is exactly the dangerous class the spec HARD
+    /// CONSTRAINT ("high confidence") and the `conservative-collapse`
+    /// verification forbid: both rows must survive live.
+    #[test]
+    fn canonical_keeps_polarity_flipped_near_superset_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("memory.db");
+        let mut conn = memory::open_db(&db).unwrap();
+
+        insert_canon_fact(&conn, "pol-1", "Mike", "decided", "use Postgres", "2026-08-20");
+        insert_canon_fact(
+            &conn,
+            "pol-2",
+            "Mike",
+            "decided",
+            "do not use Postgres",
+            "2026-08-25",
+        );
+
+        let _ = run(&mut conn).unwrap();
+
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM facts
+                 WHERE subject='Mike' AND predicate='decided' AND tombstone = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live, 2,
+            "a claim and its negation must never collapse — token overlap alone \
+             is not high-confidence evidence of a duplicate when the differing \
+             tokens flip polarity"
         );
     }
 }

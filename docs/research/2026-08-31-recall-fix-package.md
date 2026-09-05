@@ -867,6 +867,20 @@ Design (all conservative by construction):
   substantive tokens. Superset-tolerant on purpose (a decision restated more
   completely scores 1.0 against its shorter form); the 2-token floor stops a
   single common word from ever triggering a collapse.
+- **Polarity guard** (added this iteration after an adversarial review found a
+  contradiction-collapse). The raw overlap coefficient scores a strict superset
+  1.0 even when the extra tokens FLIP the claim: `use Postgres` vs
+  `do not use Postgres` share `{use, postgres}`, min-length 2, overlap 1.0 — the
+  old code tombstoned the shorter as a "near-duplicate" of its own negation. So
+  before scoring, if the tokens that DIFFER between the two objects (their
+  symmetric difference) contain any explicit negation (`is_polarity_token`: not /
+  no / never / none / cannot / without / neither / nor / … plus common
+  no-apostrophe contraction spellings), the pair is never a duplicate. A
+  token-overlap metric cannot tell a claim from its negation with high
+  confidence, so the conservative choice is to keep both (spec HARD CONSTRAINT /
+  `conservative-collapse`). The guard fires only when the negation is the
+  DISTINGUISHING token — two facts that both contain `no` collapse normally on
+  their non-negation difference.
 - **Best-first leader clustering** within a group: sort by newest `updated_at`,
   then longest object, then id; a candidate is absorbed only if it is directly
   near-duplicate with the SURVIVING leader (no transitive chaining through a
@@ -885,28 +899,39 @@ Design (all conservative by construction):
 - `struct CanonFact` (loaded live-fact row) — line 108.
 - `fn canonical_subject_key` (grouping key; documents the no-rewrite rule) — line 129.
 - `fn object_token_set` (tokenizer) — line 149.
-- `fn objects_are_near_duplicates` (overlap coefficient + 2-token floor) — line 167.
-- `fn op_fact_canonicalize` (NULL-id guard, grouping, best-first leader clustering) — line 195.
-- `fn tombstone_duplicate_fact` (tombstone-not-delete + loud triple-channel log) — line 295.
+- `fn is_polarity_token` (negation/polarity token set for the collapse guard) — line 163.
+- `fn objects_are_near_duplicates` (polarity guard + overlap coefficient + 2-token floor) — line 207.
+- `fn op_fact_canonicalize` (NULL-id guard, grouping, best-first leader clustering) — line 243.
+- `fn tombstone_duplicate_fact` (tombstone-not-delete + loud triple-channel log) — line 343.
 
 ### Tests added (`system/harness/src/memory/consolidate.rs`, `mod tests`)
-The three tests were authored in the `write_red_tests` phase and drive the stable
+Three tests were authored in the `write_red_tests` phase and drive the stable
 `consolidate::run` entry point; this task's implementation turns the two positive
-ones green while keeping the negative guard green.
-- `insert_canon_fact` helper (line 563) — inserts a live fact with explicit id +
+ones green while keeping the negative guard green. A FOURTH negative test was
+added in the execute phase after an adversarial review surfaced the
+contradiction-collapse class (see the polarity guard above).
+- `insert_canon_fact` helper (line 611) — inserts a live fact with explicit id +
   timestamps.
-- `canonical_folds_fleet_coordinator_case_and_separator_spellings` (line 593) —
+- `canonical_folds_fleet_coordinator_case_and_separator_spellings` (line 641) —
   the three-spelling case: all 3 rows survive (tombstone-not-delete); the two
   pure case+separator variants (`fleet-coordinator` / `Fleet Coordinator`,
   identical object) fold to ONE live row (proves subject canonicalization, since
   the collapse rule is keyed on canonical-subject); the extra-token
   `hex-fleet-coordinator` row survives untouched.
-- `canonical_collapses_repeated_decision_near_duplicates` (line 673) — four
+- `canonical_collapses_repeated_decision_near_duplicates` (line 721) — four
   near-duplicate `Mike/decided` facts collapse to the single newest, most-complete
   wording (`dec-best`); all 4 rows still present (tombstoned, not deleted).
-- `canonical_keeps_distinct_facts_sharing_subject_and_predicate` (line 739) — the
+- `canonical_keeps_distinct_facts_sharing_subject_and_predicate` (line 787) — the
   negative guard: two genuinely distinct `Mike/works-on` claims both survive live.
   Pins conservatism (`conservative-collapse` verification).
+- `canonical_keeps_polarity_flipped_near_superset_facts` (line 835) — the
+  contradiction-class negative guard: `Mike/decided/use Postgres` and
+  `Mike/decided/do not use Postgres` share a subject+predicate and one object is a
+  strict superset of the other (overlap 1.0), yet they state OPPOSITE claims, so
+  both must survive live. Confirmed RED against the pre-guard code (the log showed
+  `use Postgres` tombstoned as a near-duplicate of `do not use Postgres`), GREEN
+  after the polarity guard. Hardens `conservative-collapse` for the highest-volume
+  `decided` predicate group.
 
 ### Backward-compatibility / default-behavior note
 This adds a NEW deterministic op to `consolidate::run`; it changes default
@@ -933,51 +958,86 @@ through consolidation, so none required updating.
   genuinely more-specific entity with high confidence — so per the spec STOP
   CONDITION on indistinguishable classes, only case+separator variants merge; a
   token-difference does not.
+- **The stored `subject` column is grouped, not rewritten** (deviation from the
+  behavior text "canonicalize … subject spellings to one canonical subject"). The
+  behavior is honored at the CONSOLIDATION boundary: case+separator variant
+  spellings are folded onto one canonical grouping key and their near-duplicate
+  facts collapse onto a single surviving row, so the fragmentation the diagnosis
+  targets is removed. But the surviving row keeps its ORIGINAL subject string —
+  the pass never issues `UPDATE facts SET subject = …`. Rewriting live subjects
+  (`Fleet Coordinator` -> `fleet-coordinator`, `Mike` -> `mike`) would destroy the
+  display/eval spellings and break the subject-exact queries the tests pin, and a
+  non-duplicate fact under a variant spelling would need its own rewrite with no
+  duplicate to anchor "canonical" — a lossy guess this pass deliberately avoids.
+  Net: spellings are unified for GROUPING and duplicates collapse; distinct facts
+  retain their as-written subject. Conservative and reversible; flagged here so a
+  validator reads it as an intentional deviation, not an omission.
+- **Contradiction-collapse guard added post-review** (see the polarity guard in
+  "What changed" and the `canonical_keeps_polarity_flipped_near_superset_facts`
+  test). Not a scope change — it strengthens the conservatism the spec HARD
+  CONSTRAINT already required — but recorded because it altered
+  `objects_are_near_duplicates` after the first execute pass.
 
 ### Operational note — verifying `canon-tests-pass` under shared-target contention
 Same infra reality as T28958xxp above: the declared `canon-tests-pass`
 verification (`cargo test --release canonical` in `system/harness`) inherits the
 BOI harness env `CARGO_TARGET_DIR=~/.boi/v2/cargo-target`, a SHARED
 release target thrashed by every sibling worktree's build lock, and the fat-LTO
+<<<<<<< HEAD
 link (`lto = true` at workspace-root `Cargo.toml:8`, release-only) of the test
 binary is the >10-minute wall that reaped prior attempts. To obtain a genuine
 exit code off that wall, this session ran the same `canonical` lib tests in a
 private, contention-free target dir CoW-cloned from the warm shared tree
 (`cp -cR ~/.boi/v2/cargo-target/debug /tmp/recallfix-t2-target/debug`,
 then `CARGO_TARGET_DIR=/tmp/recallfix-t2-target cargo test --lib canonical`).
+=======
+link (`lto = true` at workspace-root `Cargo.toml`, release-only) of the test
+binary is the >10-minute wall that reaped the earlier `validate` phase.
+>>>>>>> 56a50759 (wip: task blocked — preserving the worktree so a later `boi unblock` adopts a clean tree; MAY include the worker's in-flight/partial writes)
 
 DEVIATION FROM THE DECLARED VERIFICATION (documented per spec scope), identical in
-kind to T28958xxp: (1) DEBUG instead of `--release` — profile changes only
-optimization/link, never program logic, and debug omits the fat-LTO link that
-reaped every release attempt; (2) `--lib` instead of the bare target set. The
-`canonical` filter matches, in `tests/*.rs`, exactly ONE integration test —
-`memory_consolidate_is_the_canonical_subcommand` in
-`tests/consolidate_subcommands_removed.rs`, which asserts CLI-subcommand routing
-and is unrelated to this task's memory-DB change; `--lib` skips only that binary's
-compile, so the three fact-canonicalization tests (and the three pre-existing
-`*canonical*` lib tests) run identically. A best-effort `cargo test --release
---lib canonical` in a private CoW-cloned RELEASE target was also launched to
-obtain release-profile evidence; see the recorded result below.
+kind to T28958xxp: the genuine exit code was obtained in DEBUG (`cargo test --lib
+canonical`) rather than `--release`. Justification: (1) the release profile
+changes only optimization/link, never program logic, so a debug pass is valid
+evidence a release pass would hold; (2) the sole reason to prefer debug is that it
+omits the fat-LTO link that reaped every release attempt; (3) `--lib` skips only
+ONE integration binary — the `canonical` name filter matches, across
+`system/harness/tests/*.rs`, exactly one test, `memory_consolidate_is_the_canonical_subcommand`
+in `tests/consolidate_subcommands_removed.rs` (verified this session by
+`grep -rn 'canonical' system/harness/tests/`), which asserts CLI-subcommand
+routing and is unrelated to this task's memory-DB change — so the four
+fact-canonicalization tests and the three pre-existing `*canonical*` lib tests
+run identically under `--lib`.
 
-OBSERVED RESULT (this session, genuine green). Exact command and result:
-`CARGO_TARGET_DIR=/tmp/recallfix-t2-target cargo test --lib canonical`
-(private CoW clone of the warm shared DEBUG tree) → **exit 0**,
-`test result: ok. 6 passed; 0 failed; 0 ignored; ... 674 filtered out`
-(log `/tmp/recallfix-t2-dbg.log`, sentinel `/tmp/recallfix-t2-dbg.done`; build
-`Finished test profile ... in 1m 25s`, one `Compiling hex-harness` line — all
-warm deps reused). The 6 tests the `canonical` filter selected are the three
-fact-canonicalization tests added for this task —
-`canonical_folds_fleet_coordinator_case_and_separator_spellings`,
-`canonical_collapses_repeated_decision_near_duplicates`,
-`canonical_keeps_distinct_facts_sharing_subject_and_predicate` — plus three
-pre-existing unrelated `*canonical*` lib tests
-(`ledger_canonical_json_is_stable`,
-`maintain_sweeps_orphan_vectors_and_canonicalizes_transcript_files`,
-`github_canonical_url_is_not_flagged`), all `ok`. This turns the two
-previously-RED positive tests green and keeps the negative conservatism guard
-green. The byte-exact declared `cargo test --release canonical` command is not
-claimed observed-green in a phase budget: the release build's fat-LTO link of
-the lib test binary (`-C lto`, release-only) was still running past the point
-this verdict was recorded — the same >10-minute wall documented for T28958xxp —
-so the debug run above stands as the genuine verification, valid evidence for
-release since profile never changes program logic.
+OBSERVED RESULT (execute iteration 1, this session — genuine). All runs used the
+shared debug target `/Users/mrap/.boi/v2/cargo-target` directly (debug builds were
+already warm, so no lock contention hit them):
+
+1. Baseline (before the polarity guard): `cargo test --lib canonical` → **exit 0**,
+   `test result: ok. 6 passed; 0 failed; ... 674 filtered out` (build finished in
+   6.05s on warm deps; tests in 1.46s).
+2. RED evidence for the contradiction bug: `cargo test --lib
+   canonical_keeps_polarity_flipped_near_superset_facts` → **FAILED**
+   (`1 failed`), stderr showing `COLLAPSE tombstoning fact id=pol-1 object="use
+   Postgres" as near-duplicate of surviving fact id=pol-2 object="do not use
+   Postgres"` — the pre-guard code collapsed a claim into its own negation.
+3. GREEN after the polarity guard: `cargo test --lib canonical` → **exit 0**,
+   `test result: ok. 7 passed; 0 failed; ... 674 filtered out` (log
+   `/tmp/canon-green.log`). The 7 tests are the four fact-canonicalization tests
+   added for this task —
+   `canonical_folds_fleet_coordinator_case_and_separator_spellings`,
+   `canonical_collapses_repeated_decision_near_duplicates`,
+   `canonical_keeps_distinct_facts_sharing_subject_and_predicate`,
+   `canonical_keeps_polarity_flipped_near_superset_facts` — plus three pre-existing
+   unrelated `*canonical*` lib tests (`ledger_canonical_json_is_stable`,
+   `maintain_sweeps_orphan_vectors_and_canonicalizes_transcript_files`,
+   `github_canonical_url_is_not_flagged`), all `ok`.
+
+The byte-exact declared `cargo test --release canonical` command WAS launched this
+session (`system/harness`, shared target, exact declared string) but never reached
+the compile step: its log shows `Blocking waiting for file lock on build
+directory` with ~16 sibling cargo/rustc processes holding the shared release lock
+for their own LTO builds; it was moved to the background at the 600s tool limit
+with no exit code within the phase budget. So it is NOT claimed observed-green —
+the debug run (3) stands as the genuine verification, valid evidence for release
+since the profile never changes program logic.
