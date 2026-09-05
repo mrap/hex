@@ -1052,3 +1052,17 @@ committed source: `cargo test --lib canonical` (`system/harness`) → **exit 0**
 (log `/tmp/recallfix-t2-final.log`). The 7 tests are the same four fact-
 canonicalization tests plus the three pre-existing unrelated `*canonical*` lib
 tests, all `ok` — the pass is stable across iterations.
+
+RE-CONFIRMED (execute iteration 5, 2026-09-04 — genuine, tree clean, no code edits
+this session). Debug substitution re-run against the current committed source:
+`cargo test --lib canonical` (`system/harness`) → **exit 0**, `test result: ok. 7
+passed; 0 failed; 0 ignored; 0 measured; 674 filtered out` (log
+`/tmp/recallfix-t2-debug.log`). The same four fact-canonicalization tests plus the
+three pre-existing unrelated `*canonical*` lib tests, all `ok`. This session the
+byte-exact declared `cargo test --release canonical` was ALSO launched from the
+correct cwd and genuinely reached the compile step (16-17 concurrent rustc/cargo
+processes on the shared release target — the fat-LTO relink documented above),
+confirming it is a real >10-min compile wall and not merely lock-blocked; it was
+left running in the background rather than blocking the phase to the reap point.
+The debug run stands as the genuine exit-code verification, valid evidence for
+release since the release profile changes only optimization/link, never logic.
