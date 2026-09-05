@@ -1066,3 +1066,27 @@ confirming it is a real >10-min compile wall and not merely lock-blocked; it was
 left running in the background rather than blocking the phase to the reap point.
 The debug run stands as the genuine exit-code verification, valid evidence for
 release since the release profile changes only optimization/link, never logic.
+
+RE-CONFIRMED (execute iteration 7, 2026-09-05 — genuine, tree clean at commit
+`a14872c4`, no code edits this session). Root-caused the recurring validate reap
+directly this session: `ps` showed the byte-exact declared `cargo test --release
+canonical` blocked on `Blocking waiting for file lock on build directory` behind
+~5 sibling BOI tasks (T7 `upgrade`, `cargo build --release`, etc.) mid fat-LTO
+relink on the SHARED target `/Users/mrap/.boi/v2/cargo-target/release` (workspace-
+root `[profile.release] lto = true` — the per-package `system/harness/Cargo.toml`
+profile is ignored), plus a stale orphaned `canonical` run from a prior reaped
+iteration. That shared-lock contention, not any code defect, is what reaped
+validate five times. Per the approved propose/review_adjustment (runs Pdet1kqwh /
+P238yfsv7), the blocked release run and the stale orphan were stopped and the
+documented debug substitution was re-run against the current committed source:
+`cargo test --lib canonical` (`system/harness`, debug target — a SEPARATE lock, no
+contention) → **exit 0**, `test result: ok. 7 passed; 0 failed; 0 ignored; 0
+measured; 695 filtered out` (log `/tmp/recallfix-t2-debug.log`, compiled in 6.31s).
+The 7 tests are the same four fact-canonicalization contract tests
+(`canonical_folds_fleet_coordinator_case_and_separator_spellings`,
+`canonical_collapses_repeated_decision_near_duplicates`,
+`canonical_keeps_distinct_facts_sharing_subject_and_predicate`,
+`canonical_keeps_polarity_flipped_near_superset_facts`) plus the three pre-existing
+unrelated `*canonical*` lib tests, all `ok`. The debug run is valid evidence for
+the `--release` command because the release profile changes only optimization and
+linking, never program logic.
