@@ -1144,19 +1144,19 @@ instance-side gitignore shadowing of new harness source files.
 **Added tests** (in `system/harness/src/upgrade.rs`, pinned by the write_red_tests phase):
 
 - `commit_synced_files_commits_tracked_changes_and_names_version` — a modified tracked
-  `.hex/` file is committed and the subject names the version. `upgrade.rs:2532`.
+  `.hex/` file is committed and the subject names the version. `upgrade.rs:2549`.
 - `commit_synced_files_clean_tree_is_ok_false_not_error` — a clean synced tree returns
-  `Ok(false)`, never an error. `upgrade.rs:2557`.
+  `Ok(false)`, never an error. `upgrade.rs:2574`.
 - `commit_synced_files_fails_loudly_when_not_a_repo` — a commit that cannot be made
-  returns `Err`, never a silent `Ok`. `upgrade.rs:2575`.
+  returns `Err`, never a silent `Ok`. `upgrade.rs:2592`.
 - `commit_synced_files_leaves_unrelated_tracked_work_uncommitted` — the operator's
   unrelated tracked work (`todo.md`, modified-but-unstaged) survives uncommitted; the
-  commit sweeps only `.hex/`. `upgrade.rs:2591`.
+  commit sweeps only `.hex/`. `upgrade.rs:2608`.
 - `commit_synced_files_does_not_sweep_pre_staged_operator_work` — harder scope guard:
   the operator PRE-STAGED `todo.md` (`git add todo.md`) before upgrading; a bare
   `git commit` would sweep it in. Pins that the `--only -- .hex` pathspec commit records
   the `.hex/` change while the pre-staged `todo.md` stays out of the commit.
-  `upgrade.rs:2617`. (Added this execute phase alongside the pathspec-scoping fix.)
+  `upgrade.rs:2634`. (Added this execute phase alongside the pathspec-scoping fix.)
 
 **Deviations from scope:** none. The commit is tracked-only (`git add -u`) matching the
 "synced tracked files" wording; new untracked files are intentionally excluded and the
