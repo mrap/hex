@@ -20,7 +20,7 @@ strongest idea is the one that survives.
 
 ## When This Activates
 
-### Auto-trigger (baked-in via standing order #16)
+### Auto-trigger (baked-in via the standing order on plan, conjecture, critique)
 - The agent is about to recommend one option over alternatives
 - The domain has real consequences (architecture, strategy, process, tool selection)
 - Multiple viable approaches exist
@@ -43,10 +43,13 @@ strongest idea is the one that survives.
 | Deep | Architecture, strategy, process, or significant disagreement | 4+ | 3+ (generate + all-to-all + targeted debate) | Verdict + scorecard + killed conjectures |
 
 **Escalation rule:** If moderate-tier agents disagree significantly after
-cross-critique (no convergence on a winner), auto-escalate to deep.
+cross-critique (no convergence on a winner), deep tier would normally apply.
+Stop at moderate tier and present the disagreement to the user. Deep tier is
+not available (see Phase 5).
 
-**Calibration over time:** Track which decision types benefited from adversarial
-analysis. Feed this signal to the learning system to improve depth sizing.
+**Calibration over time:** If depth-tier selection is consistently wrong —
+moderate escalates to deep repeatedly, or a quick verdict gets revisited —
+record it in `$HEX_DIR/evolution/observations.md` per the Improvement Engine (AGENTS.md).
 
 ## Protocol
 
@@ -127,10 +130,10 @@ The main agent collects all outputs and produces:
 **Verdict-first output (default):**
 ```
 ## Verdict
-[Recommendation in 1-2 sentences]
+[Recommendation, stated plainly]
 
 ## Why This Wins
-[2-3 key reasons, drawing from cross-critique results]
+[Key reasons, drawing from cross-critique results]
 
 ## Key Criticisms That Shaped This
 [The strongest criticisms and how they influenced the verdict]
@@ -153,23 +156,10 @@ The main agent collects all outputs and produces:
 **Lesson:** [Reusable insight]
 ```
 
-### Phase 7: Feed Learning System
+### Phase 7: Capture Recurring Patterns
 
-After synthesis, produce learning artifacts:
-- **Killed conjectures** become instinct candidates with trigger and action
-- **Successful criticism patterns** become reusable evaluation criteria
-- **Depth tier appropriateness** feeds calibration
-
-Format for instinct candidate:
-```yaml
-id: [generated]
-trigger: "when recommending [domain/pattern]"
-action: "avoid [killed approach] because [reason]"
-confidence: 0.5
-domain: [decision domain]
-source: "conjecture-criticism"
-evidence: "[date] -- [decision context]"
-```
-
-Write instinct candidates to the observations queue for the learning system
-to process. Do not create instincts directly.
+Killed conjectures and the criticism that eliminated them already appear in the
+Phase 6 synthesis output. If the same killed approach or criticism pattern
+recurs across 3+ decisions, record it in `$HEX_DIR/evolution/observations.md` —
+the same Improvement Engine path every other repeated pattern uses (see
+AGENTS.md). This skill has no separate learning system.

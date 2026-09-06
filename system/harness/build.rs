@@ -1,6 +1,8 @@
 use std::process::Command;
 
 fn main() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -9,7 +11,53 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Append a "-dirty" marker when the working tree has uncommitted changes to
+    // tracked files, so harness_version distinguishes a dirty build (e.g. an
+    // uncommitted deploy) from its base commit — an uncommitted deploy read as
+    // "nothing changed" was the 8-day recall-plateau blind spot. `git status
+    // --porcelain --untracked-files=no` lists ONLY tracked-file changes (staged
+    // or unstaged); a non-empty result means dirty. Kept cheap (one status call)
+    // and infallible: if git status itself cannot run, or exits non-zero, we omit
+    // the marker and emit a loud cargo:warning (S6 — no quiet failures) rather
+    // than failing the build.
+    let git_sha = match Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            if o.stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+                format!("{git_sha}-dirty")
+            } else {
+                git_sha
+            }
+        }
+        Ok(o) => {
+            println!(
+                "cargo:warning=hex build: `git status` exited {:?} ({}); dirty marker \
+                 omitted from HEX_GIT_SHA",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            git_sha
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=hex build: could not run `git status` ({e}); dirty marker \
+                 omitted from HEX_GIT_SHA"
+            );
+            git_sha
+        }
+    };
+
     println!("cargo:rustc-env=HEX_GIT_SHA={}", git_sha);
+
+    // Watch the whole harness source tree so the dirty check above reruns on ANY
+    // tracked-source edit — not just the *.worker.rs files watched below. Without
+    // this, editing e.g. src/memory/assemble.rs would NOT rerun build.rs and the
+    // crate would recompile against a cached (possibly clean) HEX_GIT_SHA — the
+    // exact stale-version blind spot this task exists to close. A directory watch
+    // is cheap (cargo scans mtimes) and covers the motivating case.
+    println!("cargo:rerun-if-changed={manifest_dir}/src");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
@@ -65,7 +113,6 @@ fn main() {
     std::fs::write(format!("{}/personal_mods.rs", out_dir), personal_mods).unwrap();
 
     // ---- hex module discovery: recursive *.worker.rs glob → hex_modules.rs ----
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let mut roots: Vec<String> = vec![format!("{manifest_dir}/src/modules")];
     // Personal modules root (out-of-crate) only under --features personal.
     if std::env::var("CARGO_FEATURE_PERSONAL").is_ok() {

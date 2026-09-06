@@ -3,7 +3,7 @@
 You previously proposed an approach from the perspective of **{{PERSPECTIVE}}**.
 Now review the other agents' proposals and critique them.
 
-Be genuinely critical. Your job is to find flaws. Do NOT hedge. Take clear positions.
+Be genuinely critical: find real flaws and take a clear position.
 You also proposed your own approach, so you have standing to critique.
 
 ## Your Proposal
@@ -38,9 +38,9 @@ Then state your final position.
 
 **Do I still believe my approach is best?** [Yes/No]
 
-If yes: [Why, in 2-3 sentences, addressing the strongest competing proposal]
-If no: [Which approach I now prefer and why, in 2-3 sentences]
+If yes: [Why, addressing the strongest competing proposal]
+If no: [Which approach I now prefer and why]
 
 ### Best Overall
 **Winner:** [Name]
-**Why:** [2-3 sentences]
+**Why:** [The deciding factor]

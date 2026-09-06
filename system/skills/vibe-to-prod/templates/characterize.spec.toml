@@ -1,0 +1,44 @@
+title    = "Characterize: {{PROJECT_NAME}}"
+pipeline = "standard"
+delivery = "merge"
+
+[contract]
+base_branch = "main"
+workspace   = "{{PROJECT_PATH}}"
+scope       = """
+  Phase 2 of the vibe-to-production pipeline: generate characterization
+  tests that lock down the CURRENT behavior of {{MODULE_LIST}} (comma-
+  separated absolute module paths) before any refactoring. Use
+  inline-snapshot for return-value assertions; cover typical inputs,
+  boundary values (empty, None, zero, negative, large, unicode), and
+  expected exception types via pytest.raises. Write tests to
+  {{PROJECT_PATH}}/tests/characterization/test_<module_stem>.py.
+  Do NOT modify any source module under test -- only write new test files.
+"""
+must_emit = [
+  "{{PROJECT_PATH}}/tests/characterization/",
+  "{{OUTPUT_DIR}}/characterization-summary.txt",
+]
+
+[[tasks]]
+ref      = "install-tools"
+behavior = "Install inline-snapshot, approvaltests, pytest-approvaltests, and pytest; confirm the imports work."
+verifications = [
+  { name = "inline-snapshot-installed", command = "python3 -c \"from inline_snapshot import snapshot\"" },
+]
+
+[[tasks]]
+ref           = "generate-tests"
+behavior      = "For each module in {{MODULE_LIST}}, read its public functions/classes and write inline-snapshot characterization tests to tests/characterization/test_<module_stem>.py, then run pytest --inline-snapshot=fix to populate snapshots from current behavior. Do not modify any source module."
+blocked_by    = ["install-tools"]
+verifications = [
+  { name = "test-files-written", command = "count=$(ls {{PROJECT_PATH}}/tests/characterization/test_*.py 2>/dev/null | wc -l | tr -d ' '); test \"$count\" -ge 1" },
+]
+
+[[tasks]]
+ref           = "verify-tests-pass"
+behavior      = "Run tests/characterization/ without --inline-snapshot=fix and confirm every test passes; log the pass/fail summary to {{OUTPUT_DIR}}/characterization-summary.txt."
+blocked_by    = ["generate-tests"]
+verifications = [
+  { name = "all-pass", command = "cd {{PROJECT_PATH}} && python3 -m pytest tests/characterization/ --tb=no -q" },
+]

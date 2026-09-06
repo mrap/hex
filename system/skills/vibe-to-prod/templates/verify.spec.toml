@@ -1,0 +1,76 @@
+title    = "Verify: {{PROJECT_NAME}} Refactoring Results"
+pipeline = "standard"
+delivery = "merge"
+
+[contract]
+base_branch = "main"
+workspace   = "{{PROJECT_PATH}}"
+scope       = """
+  Phase 4 of the vibe-to-production pipeline: re-run the assessment suite
+  against {{PROJECT_PATH}} after refactoring, aggregate the results into
+  {{OUTPUT_DIR}}/after-metrics.json using the same nested schema as
+  {{OUTPUT_DIR}}/before-metrics.json, then diff before vs. after into
+  {{OUTPUT_DIR}}/improvement-report.md via {{SKILL_DIR}}/scripts/compare_metrics.py.
+
+  after-metrics.json schema (must match before-metrics.json field-for-field
+  so compare_metrics.py can diff them):
+  {
+    "project_path": "{{PROJECT_PATH}}",
+    "project_name": "{{PROJECT_NAME}}",
+    "timestamp": "<ISO timestamp>",
+    "phase": "after",
+    "metrics": {
+      "total_functions": <int>,
+      "max_cyclomatic_complexity": <float>,
+      "avg_cyclomatic_complexity": <float>,
+      "functions_cc_above_10": <int>,
+      "functions_cc_above_15": <int>,
+      "functions_cc_above_25": <int>,
+      "avg_maintainability_index": <float>,
+      "min_maintainability_index": <float>,
+      "modules_mi_below_20": <int>,
+      "total_modules": <int>,
+      "total_loc": <int>,
+      "total_sloc": <int>,
+      "comment_ratio": <float>,
+      "security_high_findings": <int>,
+      "security_medium_findings": <int>,
+      "dead_code_items_90pct": <int>
+    }
+  }
+  Use "phase": "after" (not "before"); use the same field names under
+  "metrics". Compute every value from the raw after-* files with
+  stdlib-only Python.
+"""
+must_emit = [
+  "{{OUTPUT_DIR}}/raw/",
+  "{{OUTPUT_DIR}}/after-metrics.json",
+  "{{OUTPUT_DIR}}/improvement-report.md",
+]
+
+[[tasks]]
+ref           = "rerun-assessment-suite"
+behavior      = "Re-run the full assessment suite against {{PROJECT_PATH}} and save raw outputs to {{OUTPUT_DIR}}/raw/ with after- prefixes: radon cc/mi/raw -> after-complexity.json / after-maintainability.json / after-raw-metrics.json, bandit -> after-security.json, vulture --min-confidence 80 -> after-dead-code.json (redirect text output if JSON isn't supported). Also run the characterization suite and the full test suite, teeing their output to {{OUTPUT_DIR}}/raw/after-char-tests.txt and {{OUTPUT_DIR}}/raw/after-full-tests.txt."
+verifications = [
+  { name = "after-raw-outputs-written", command = "test -f \"{{OUTPUT_DIR}}/raw/after-complexity.json\" && test -f \"{{OUTPUT_DIR}}/raw/after-maintainability.json\" && test -f \"{{OUTPUT_DIR}}/raw/after-security.json\"" },
+  { name = "after-test-logs-written", command = "test -f \"{{OUTPUT_DIR}}/raw/after-char-tests.txt\" && test -f \"{{OUTPUT_DIR}}/raw/after-full-tests.txt\"" },
+]
+
+[[tasks]]
+ref           = "generate-after-metrics"
+behavior      = "Read the after-* raw files in {{OUTPUT_DIR}}/raw/ and write {{OUTPUT_DIR}}/after-metrics.json using the nested schema defined in scope, phase set to \"after\", computed with stdlib-only Python."
+blocked_by    = ["rerun-assessment-suite"]
+verifications = [
+  { name = "after-metrics-written", command = "test -f \"{{OUTPUT_DIR}}/after-metrics.json\"" },
+  { name = "after-metrics-schema-valid", command = "export PATH=\"/opt/homebrew/bin:$PATH\" && python3 -c \"import json; d=json.load(open('{{OUTPUT_DIR}}/after-metrics.json')); assert d.get('phase')=='after'; m=d.get('metrics', {}); assert 'avg_cyclomatic_complexity' in m; assert 'avg_maintainability_index' in m; assert 'security_high_findings' in m\"" },
+]
+
+[[tasks]]
+ref           = "produce-improvement-report"
+behavior      = "Run {{SKILL_DIR}}/scripts/compare_metrics.py {{OUTPUT_DIR}} to diff before-metrics.json against after-metrics.json and produce {{OUTPUT_DIR}}/improvement-report.md. Then read {{OUTPUT_DIR}}/raw/after-char-tests.txt and {{OUTPUT_DIR}}/raw/after-full-tests.txt to report a final checklist: characterization tests pass, full suite passes, avg CC decreased, avg MI increased, security findings unchanged or decreased. Report any FAIL clearly enough for the engineer to investigate."
+blocked_by    = ["generate-after-metrics"]
+verifications = [
+  { name = "improvement-report-written", command = "test -f \"{{OUTPUT_DIR}}/improvement-report.md\"" },
+  { name = "report-mentions-avg-complexity", command = "count=$(grep -c 'Avg Complexity' \"{{OUTPUT_DIR}}/improvement-report.md\" 2>/dev/null); count=\"${count:-0}\"; test \"$count\" -ge 1" },
+  { name = "report-mentions-avg-maintainability", command = "count=$(grep -c 'Avg Maintainability' \"{{OUTPUT_DIR}}/improvement-report.md\" 2>/dev/null); count=\"${count:-0}\"; test \"$count\" -ge 1" },
+]

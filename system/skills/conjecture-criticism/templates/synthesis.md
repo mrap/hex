@@ -32,10 +32,10 @@
 ## Verdict-First Output
 
 ### Verdict
-[Recommendation in 1-2 sentences]
+[Recommendation, stated plainly]
 
 ### Why This Wins
-[2-3 key reasons drawing from cross-critique results]
+[Key reasons drawing from cross-critique results]
 
 ### Key Criticisms That Shaped This
 [Strongest criticisms and how they influenced the verdict]
