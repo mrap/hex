@@ -567,7 +567,7 @@ Design constraints and how each is met (an earlier draft of this task cut this
 half over these same concerns; the guards below resolve them, so it is shipped
 rather than deviated):
 1. **No hardcoded instance vocabulary.** `hex`/`mike` are ubiquitous only in
-   mrap-hex's corpus; this is foundation code shipping to every instance. The
+   the originating instance's corpus; this is foundation code shipping to every instance. The
    drop is therefore DYNAMIC — derived per query from live document frequency
    via the SAME porter-tokenized `facts_fts` the arms use (`recall.rs:219-226`)
    — so no instance-specific token is ever baked into shared code. Constants:
