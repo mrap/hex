@@ -52,6 +52,191 @@ fn chunks_recall(conn: &rusqlite::Connection, query: &str, k: usize) -> rusqlite
     super::search::search_fts_public(conn, query, k, None)
 }
 
+/// Split an identifier on internal lower->upper case transitions into lowercased
+/// word pieces. `knowsAbout` -> ["knows", "about"]; `knows` -> ["knows"];
+/// `works-on` -> ["works-on"] (no case transition). Only genuinely camelCase
+/// predicates yield 2+ pieces — which is exactly how the camelCase predicate arm
+/// distinguishes them from single-word and hyphenated predicates that unicode61
+/// already tokenizes.
+fn split_camel_words(s: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for ch in s.chars() {
+        if ch.is_uppercase() && prev_lower && !cur.is_empty() {
+            words.push(cur.to_lowercase());
+            cur = String::new();
+        }
+        cur.push(ch);
+        prev_lower = ch.is_lowercase();
+    }
+    if !cur.is_empty() {
+        words.push(cur.to_lowercase());
+    }
+    words
+}
+
+/// Generic question / filler words dropped from the OR-expanded facts FTS query.
+///
+/// OR-ing these into the query makes a natural-language question match a huge
+/// slice of the corpus and drowns the genuinely-relevant facts outside the
+/// top-K window (task T8s8bq3th, diagnosis 2026-08-31 root cause 3
+/// "generic-token flooding": a-hex-startup-skill, b-hex-project-correction-rule,
+/// c-10). They carry no retrieval signal, so dropping them narrows the OR
+/// expansion to the terms that actually discriminate.
+///
+/// NOTE on corpus-ubiquitous CONTENT tokens (e.g. `hex` in >50% of facts,
+/// `mike` in ~40% on the diagnosis snapshot): those are INSTANCE-specific and
+/// are deliberately NOT hardcoded here — this is foundation code shipping to
+/// every instance, where a different corpus makes a different set of tokens
+/// ubiquitous. A dynamic document-frequency drop was evaluated and rejected:
+/// its only guard against deleting a normal content word in a SMALL corpus is
+/// an uncalibratable corpus-size constant (with the `df > half` rule it empties
+/// the 4-fact `default_config_reproduces_legacy_facts_recall_exactly` fixture,
+/// which has no distinctive-token survivor). The entity-intersection window fix
+/// (M3/M4, this same task) and the M2 relevance blend (task Tkmz6c46q) attack
+/// the flooding from the ranking side instead. See the recall-fix package doc.
+fn is_generic_query_word(t: &str) -> bool {
+    matches!(
+        t,
+        // original stopword set (pre-T8s8bq3th)
+        "the" | "and"
+            | "for"
+            | "are"
+            | "was"
+            | "who"
+            | "what"
+            | "how"
+            | "does"
+            | "did"
+            | "is"
+            // generic question / filler words added by task T8s8bq3th
+            | "where"
+            | "when"
+            | "why"
+            | "which"
+            | "whose"
+            | "will"
+            | "can"
+            | "could"
+            | "would"
+            | "should"
+            | "have"
+            | "has"
+            | "had"
+            | "about"
+            | "here"
+            | "your"
+            | "you"
+            | "our"
+            | "this"
+            | "that"
+            | "with"
+            | "from"
+            | "into"
+    )
+}
+
+/// Minimum corpus size below which corpus-ubiquitous-token pruning is disabled.
+/// Below this, document frequency is not a stable signal (a term in "half" of a
+/// 4-fact fixture is not corpus-ubiquitous), and pruning would strip genuine
+/// content words from a small store — including the 4-fact
+/// `default_config_reproduces_legacy_facts_recall_exactly` pin, whose only hit
+/// path is the FTS arm. Real instances hold thousands of facts (3,451 on the
+/// 2026-08-31 diagnosis snapshot); the largest test fixture is 30. This floor
+/// sits above every fixture, so their FTS query stays byte-identical.
+const UBIQUITOUS_MIN_CORPUS: i64 = 50;
+
+/// A token appearing in MORE than this fraction of facts is treated as
+/// corpus-ubiquitous and dropped from the OR-expanded FTS query. 0.5 = "more
+/// than half of all facts" — the diagnosis's own threshold (`hex` in >50% of
+/// facts on the 2026-08-31 snapshot).
+const UBIQUITOUS_DF_FRACTION: f64 = 0.5;
+
+/// Hard cap on per-token document-frequency probes, so a pathological many-token
+/// query cannot issue an unbounded number of COUNT probes. Tokens past the cap
+/// are kept unprobed (a kept token only widens recall; it never empties).
+const UBIQUITOUS_MAX_PROBES: usize = 12;
+
+/// Build the surviving OR-expanded FTS token list for a facts query.
+///
+/// Three-stage filter (task T8s8bq3th, diagnosis 2026-08-31 root cause 3):
+///   1. Drop sub-3-char tokens, keeping 2-char tokens that carry a digit (v2,
+///      k8, m1) — the facts tokenizer used to drop every sub-3-char token, so a
+///      query naming a versioned entity like "v2" lost its most distinctive
+///      term (task Tkmz6c46q, case c-14). Pure 2-char alpha words (of, to, an)
+///      stay dropped.
+///   2. Drop generic question / filler words (`is_generic_query_word`): OR-ing
+///      "what"/"where"/"about"/... into the query matches a huge slice of the
+///      corpus and carries no retrieval signal.
+///   3. Drop CORPUS-UBIQUITOUS content tokens — those appearing in more than
+///      half of all facts (`hex` in >50%, cases a-hex-startup-skill / c-10).
+///      OR-ing them in makes the query match 1,300–1,900 facts and drowns the
+///      genuinely-relevant answers outside the top-K window.
+///
+/// Stage 3 is DYNAMIC and corpus-derived: no instance-specific token is ever
+/// hardcoded into this foundation code (a token ubiquitous in one instance's
+/// corpus is distinctive in another's). It is guarded twice so it can never
+/// starve retrieval: it is skipped entirely below `UBIQUITOUS_MIN_CORPUS` facts,
+/// and if dropping the ubiquitous tokens would leave NO tokens it keeps the
+/// pre-drop set (a query built only of ubiquitous terms must still retrieve
+/// something). Every probe failure is non-fatal and biased toward KEEPING the
+/// token (df read as 0), never toward silently dropping it.
+fn fts_query_tokens(conn: &rusqlite::Connection, query: &str) -> Vec<String> {
+    let lowered = query.to_lowercase();
+    let base: Vec<String> = lowered
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| {
+            let short_alnum_with_digit = t.len() == 2 && t.bytes().any(|b| b.is_ascii_digit());
+            (t.len() >= 3 || short_alnum_with_digit) && !is_generic_query_word(t)
+        })
+        .map(|t| t.to_string())
+        .collect();
+    // A single (or empty) surviving token is the query's only signal — never
+    // prune it, and skip the corpus probe entirely.
+    if base.len() <= 1 {
+        return base;
+    }
+    // Corpus-size gate: below the floor, df is not a stable signal.
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM facts WHERE tombstone = 0", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    if total < UBIQUITOUS_MIN_CORPUS {
+        return base;
+    }
+    let cutoff = (total as f64 * UBIQUITOUS_DF_FRACTION) as i64;
+    let mut kept: Vec<String> = Vec::with_capacity(base.len());
+    for (i, tok) in base.iter().enumerate() {
+        if i >= UBIQUITOUS_MAX_PROBES {
+            kept.push(tok.clone());
+            continue;
+        }
+        // Document frequency through the SAME porter-tokenized FTS the arms use,
+        // so df reflects real index matches (stemming included). A MATCH syntax
+        // error or DB error reads as df = 0, which KEEPS the token.
+        let df: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid \
+                 WHERE facts_fts MATCH ?1 AND f.tombstone = 0",
+                rusqlite::params![tok],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if df <= cutoff {
+            kept.push(tok.clone());
+        }
+    }
+    if kept.is_empty() {
+        // Every surviving token was corpus-ubiquitous: keep the pre-drop set so
+        // the query still retrieves something (zero-survivor guard).
+        base
+    } else {
+        kept
+    }
+}
+
 /// Facts retrieval: dual-weighted FTS arms + slug arm + KNN arm over
 /// `facts_vec` when the caller already holds a query embedding (hoist it from
 /// the chunk path — do NOT cold-load the model here), fused by RRF. Returns
@@ -87,30 +272,10 @@ pub(crate) fn facts_recall_with_config(
     cfg: &RecallConfig,
 ) -> rusqlite::Result<Vec<(FactHit, f64)>> {
     // FTS5 default-ANDs tokens — for natural-language queries we want any-match.
-    // Drop stopwords and OR the remaining alphanumerics so "who is alice" hits
-    // facts mentioning the slug.
-    let fts_query = query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| {
-            t.len() >= 3
-                && !matches!(
-                    *t,
-                    "the"
-                        | "and"
-                        | "for"
-                        | "are"
-                        | "was"
-                        | "who"
-                        | "what"
-                        | "how"
-                        | "does"
-                        | "did"
-                        | "is"
-                )
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    // Drop stopwords, generic question words, and corpus-ubiquitous tokens, then
+    // OR the remaining alphanumerics so "who is alice" hits facts mentioning the
+    // slug. See `fts_query_tokens` for the three-stage filter.
+    let fts_query = fts_query_tokens(conn, query).join(" OR ");
 
     // FTS arms — ranked facts rowids (bm25, then importance). The rowid is
     // the fusion key shared with the KNN arm (facts.id is a TEXT ULID, not an
@@ -156,19 +321,115 @@ pub(crate) fn facts_recall_with_config(
         if tok.len() < 3 {
             continue;
         }
-        let pattern = format!("%:{tok}%");
+        // Match the token at a real word boundary of the subject: after a
+        // separator (colon, hyphen, underscore, slash, space) so hyphen-,
+        // underscore-, slash- and space-delimited AND multi-word subjects
+        // (fleet-coordinator, hex-v2-arch, "hex project") are reachable, or the
+        // token IS the subject's first word — a leading match whose next char is
+        // a separator, or the whole subject (task Tkmz6c46q, diagnosis
+        // 2026-08-31).
+        //
+        // Two LIKE-metacharacter traps this arm must NOT fall into (review redo
+        // 2026-09-02, four rounds):
+        //   * A literal `_` separator in a LIKE pattern is a single-char
+        //     wildcard, degrading `%_tok%` into an unanchored substring match
+        //     (token "art" matched subject person:bart-smith). The `_`
+        //     separator is written `\_` with an explicit ESCAPE clause.
+        //   * A bare start-anchored `?1 || '%'` prefix-matches any longer word
+        //     (token "hex" bled into subject `hexagon`). The start-anchored
+        //     branches require the char after the token to be a separator, or
+        //     the token to equal the whole subject (`subject LIKE ?1`, no
+        //     wildcard = exact, still ASCII-case-insensitive).
+        // The query token itself is escaped (backslash, percent, underscore)
+        // and bound, so any metacharacter inside it is matched literally and
+        // there is no injection surface. LIKE is ASCII-case-insensitive, so no
+        // lowercasing of `subject` is needed.
+        let esc = tok
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let ids: Vec<i64> = conn
             .prepare(&format!(
                 "SELECT rowid FROM facts f
-                 WHERE subject LIKE ?1 AND tombstone = 0{privacy}
+                 WHERE tombstone = 0{privacy} AND (
+                     subject LIKE '%:' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE '%-' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE '%\\_' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE '% ' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE '%/' || ?1 || '%' ESCAPE '\\' OR
+                     subject LIKE ?1 ESCAPE '\\' OR
+                     subject LIKE ?1 || ':%' ESCAPE '\\' OR
+                     subject LIKE ?1 || '-%' ESCAPE '\\' OR
+                     subject LIKE ?1 || '\\_%' ESCAPE '\\' OR
+                     subject LIKE ?1 || ' %' ESCAPE '\\' OR
+                     subject LIKE ?1 || '/%' ESCAPE '\\'
+                 )
                  ORDER BY importance DESC LIMIT 3",
             ))?
-            .query_map([&pattern], |r| r.get(0))?
+            .query_map([&esc], |r| r.get(0))?
             .filter_map(Result::ok)
             .collect();
         for id in ids {
             if !slug_ids.contains(&id) {
                 slug_ids.push(id);
+            }
+        }
+    }
+
+    // camelCase predicate arm (task Tkmz6c46q). unicode61 indexes a camelCase
+    // predicate like `knowsAbout` as ONE token (`knowsabout`), so a query naming
+    // the split words (`know`, `about`) can never FTS-match it — the same class
+    // of tokenizer blind spot the slug arm handles for colon-slugs. We split
+    // each DISTINCT predicate on its internal lower->upper case transitions and,
+    // when a query term prefix-matches one of the split words, fuse that
+    // predicate's facts as their own ranked arm. Restricted to genuine
+    // case-transition predicates (2+ split words): single-token and hyphenated
+    // predicates (`decided`, `works-on`) are already unicode61-tokenized and
+    // reachable, so including them here would just re-add a flooding path.
+    //
+    // Index-side splitting was rejected deliberately: facts_fts is
+    // external-content (schema.rs:76-84), so a trigger-time transform of the
+    // predicate desyncs the 'delete'/'rebuild' paths (which read facts.predicate
+    // verbatim) and corrupts the index; and a custom SQL function referenced
+    // from the triggers would make every fact INSERT fail on any connection that
+    // had not registered it (9+ write sites). See the recall-fix package doc.
+    let qtoks: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_string())
+        .collect();
+    let mut pred_ids: Vec<i64> = Vec::new();
+    if !qtoks.is_empty() {
+        let matched_preds: Vec<String> = conn
+            .prepare("SELECT DISTINCT predicate FROM facts WHERE tombstone = 0")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .filter(|pred| {
+                let words = split_camel_words(pred);
+                words.len() >= 2
+                    && words.iter().any(|w| {
+                        w.len() >= 3
+                            && qtoks.iter().any(|q| {
+                                q == w || w.starts_with(q.as_str()) || q.starts_with(w.as_str())
+                            })
+                    })
+            })
+            .collect();
+        for pred in &matched_preds {
+            let ids: Vec<i64> = conn
+                .prepare(&format!(
+                    "SELECT rowid FROM facts f
+                     WHERE predicate = ?1 AND tombstone = 0{privacy}
+                     ORDER BY importance DESC LIMIT ?2",
+                ))?
+                .query_map(rusqlite::params![pred, (k * 3) as i64], |r| r.get(0))?
+                .filter_map(Result::ok)
+                .collect();
+            for id in ids {
+                if !pred_ids.contains(&id) {
+                    pred_ids.push(id);
+                }
             }
         }
     }
@@ -187,7 +448,7 @@ pub(crate) fn facts_recall_with_config(
 
     let slug_top1 = slug_ids.first().copied();
     let fused = super::rrf::rrf_fuse(
-        &[fts_content_ids, fts_entity_ids, slug_ids, knn_ids],
+        &[fts_content_ids, fts_entity_ids, slug_ids, pred_ids, knn_ids],
         cfg.rrf_k,
     );
 
@@ -852,6 +1113,150 @@ mod plan2_tests {
         );
     }
 
+    /// RED (task Tkmz6c46q, review redo 2026-09-02): the slug arm's underscore
+    /// branch used a LITERAL `_` in a LIKE pattern (`subject LIKE '%_' || ?1 ||
+    /// '%'`), and SQLite reads `_` as a single-character wildcard. That degrades
+    /// the branch into an unanchored substring match: query token "art" matches
+    /// subject `person:bart-smith` — the `_` wildcard eats the leading "b" of
+    /// "bart". That reintroduces the cross-subject flooding this task must
+    /// remove. Isolation: for "art", the colon/hyphen/space/slash branches see
+    /// `:bart`/`-smith` (no `:art`/`-art`), the start-anchored branch needs a
+    /// "person" prefix, and FTS (no `*`) matches the exact token "art", never
+    /// "bart" — so the buggy underscore-wildcard branch is the ONLY matcher.
+    /// After the fix escapes it (`'%\_' || ?1 || '%' ESCAPE '\'`) the branch
+    /// matches only a real underscore separator, so "art" no longer retrieves
+    /// `person:bart-smith`.
+    #[test]
+    fn slug_arm_literal_underscore_not_wildcard() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('bs','person:bart-smith','likes','strong coffee',0.9,'2026-06-11','2026-06-11')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "art", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            !hits.iter().any(|f| f.subject == "person:bart-smith"),
+            "slug-arm underscore is read as an SQLite wildcard: token 'art' matched \
+             subject person:bart-smith (unanchored substring flooding), got {:?}",
+            hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+    }
+
+    /// RED (task Tkmz6c46q, review redo 2026-09-02): the slug arm's
+    /// start-anchored branch `subject LIKE ?1 || '%'` prefix-matches any longer
+    /// word, so query token "hex" bleeds into subject `hexagon`. That branch is
+    /// meant to match a token that is the subject's FIRST WORD (e.g. `hex` in
+    /// `hex-v2-arch`), NOT an arbitrary prefix of one word. Isolation: for "hex"
+    /// the separator branches need a leading `:`/`-`/`_`/` `/`/`, and FTS (no
+    /// `*`) matches only the exact token "hex", never "hexagon" — so the
+    /// start-anchored branch is the ONLY matcher. After the fix anchors the
+    /// match so the character after the token is a separator (colon, hyphen,
+    /// underscore, space, slash) or end-of-string, "hex" no longer retrieves
+    /// `hexagon`.
+    #[test]
+    fn slug_arm_start_anchor_requires_word_boundary() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('hg','hexagon','is','a six sided polygon',0.9,'2026-06-11','2026-06-11')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "hex", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            !hits.iter().any(|f| f.subject == "hexagon"),
+            "start-anchored slug branch prefix-bled: token 'hex' matched subject \
+             hexagon, got {:?}",
+            hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+    }
+
+    /// GREEN guard (task Tkmz6c46q, review redo 2026-09-02): the operator
+    /// rejected the reviewer's alternative of DROPPING the underscore branch —
+    /// the fix must ESCAPE the underscore and KEEP the arm. This pin fails if
+    /// the branch is deleted. Subject `fleet_coordinator` (a diagnosis
+    /// fleet-coordinator spelling) is reachable by the token "coordin" ONLY via
+    /// the underscore separator branch: "coordin" is a strict PREFIX of
+    /// "coordinator" so FTS (exact token, no `*`) never matches it, and no other
+    /// slug branch has a matching separator context. Green before the fix
+    /// (`_` wildcard eats the literal `_`) and green after (`\_` matches the
+    /// literal `_`); only removing the branch turns it red.
+    #[test]
+    fn slug_arm_keeps_literal_underscore_subject() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('fc','fleet_coordinator','owns','the deploy queue',0.9,'2026-06-11','2026-06-11')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "coordin", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            hits.iter().any(|f| f.subject == "fleet_coordinator"),
+            "underscore-separated subject fleet_coordinator became unreachable by \
+             'coordin' — the underscore slug branch must be ESCAPED, not dropped, got {:?}",
+            hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+    }
+
+    /// GREEN guard (task Tkmz6c46q, review redo 2026-09-02): anchoring the
+    /// start-anchored branch to separator-or-end must NOT kill a legitimate
+    /// first-word match. Token "hex" is the whole first word of subject
+    /// `hex-v2-arch` (next char is a hyphen separator), so it must stay
+    /// retrievable. Green before and after the anchor fix; it turns red only if
+    /// the anchor over-restricts and drops exact first-word matches.
+    #[test]
+    fn slug_arm_first_word_still_matches_at_separator() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('hv','hex-v2-arch','describes','the second architecture',0.9,'2026-06-11','2026-06-11')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "hex", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            hits.iter().any(|f| f.subject == "hex-v2-arch"),
+            "legitimate first-word slug match lost: token 'hex' no longer retrieves \
+             subject hex-v2-arch after anchoring, got {:?}",
+            hits.iter().map(|f| &f.subject).collect::<Vec<_>>()
+        );
+    }
+
     /// Review 2026-08-18 regression: with exclude_private, private facts must
     /// be filtered in SQL BEFORE truncation — filtering after lets private
     /// facts fill the window and starve out the public match entirely.
@@ -1082,6 +1487,254 @@ mod plan2_tests {
         assert!(
             recall.facts.iter().any(|f| f.subject == "person:alice"),
             "expected person:alice fact in recall results"
+        );
+    }
+
+    /// Unit: `split_camel_words` splits ONLY on lower->upper case transitions,
+    /// so genuine camelCase predicates yield 2+ words while single-word and
+    /// hyphenated predicates yield exactly one (task Tkmz6c46q).
+    #[test]
+    fn split_camel_words_splits_on_case_transition_only() {
+        assert_eq!(split_camel_words("knowsAbout"), vec!["knows", "about"]);
+        assert_eq!(split_camel_words("worksOnHex"), vec!["works", "on", "hex"]);
+        assert_eq!(split_camel_words("knows"), vec!["knows"]);
+        // Hyphenated predicates have no case transition — one piece, so the
+        // camelCase arm skips them (unicode61 already tokenizes the hyphen).
+        assert_eq!(split_camel_words("works-on"), vec!["works-on"]);
+        assert_eq!(split_camel_words("blocked-by"), vec!["blocked-by"]);
+    }
+
+    /// The camelCase predicate arm makes a `knowsAbout` fact retrievable by a
+    /// query naming the split words, at the `facts_recall` layer (task
+    /// Tkmz6c46q, verification `camelcase-reachable`). The subject/object share
+    /// NO token with the query, so only the predicate arm can surface it.
+    #[test]
+    fn facts_recall_camelcase_predicate_arm_surfaces_fact() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('kc','person:dana','knowsAbout','distributed consensus protocols',0.5,'2026-06-04','2026-06-04')",
+            [],
+        )
+        .unwrap();
+
+        let hits: Vec<FactHit> = facts_recall(&c, "what do you know about this", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            hits.iter().any(|f| f.predicate == "knowsAbout"),
+            "camelCase predicate `knowsAbout` unreachable by split words `know`/`about`: {:?}",
+            hits.iter().map(|f| &f.predicate).collect::<Vec<_>>()
+        );
+
+        // Control: a query naming neither split word must not surface it.
+        let ctrl: Vec<FactHit> = facts_recall(&c, "what is the weather forecast", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            !ctrl.iter().any(|f| f.predicate == "knowsAbout"),
+            "control: camelCase arm must not fire for an unrelated query"
+        );
+    }
+
+    /// The facts tokenizer keeps digit-bearing 2-char tokens (v2), so a fact
+    /// sharing only `v2` with the query is retrievable (task Tkmz6c46q, case
+    /// c-14). Pre-fix the sub-3-char filter dropped `v2` and the fact missed.
+    #[test]
+    fn facts_recall_keeps_two_char_digit_token() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('v','project:hex','uses','the v2 arch pipeline',0.5,'2026-06-04','2026-06-04')",
+            [],
+        )
+        .unwrap();
+        let hits: Vec<FactHit> = facts_recall(&c, "what is the v2 design", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            hits.iter().any(|f| f.object.contains("v2 arch")),
+            "fact sharing only the 2-char digit token `v2` must be retrievable: {:?}",
+            hits.iter().map(|f| &f.object).collect::<Vec<_>>()
+        );
+    }
+
+    /// Generic question / filler words must be classified as droppable and
+    /// genuine content tokens must NOT be (task T8s8bq3th — flooding fix, part 1:
+    /// drop generic question words from the OR-expanded facts FTS query). This
+    /// pins the predicate directly so a future edit that widens the drop list
+    /// into content territory (or narrows it below the question vocabulary)
+    /// trips here.
+    #[test]
+    fn recall_generic_query_words_classified_droppable() {
+        for w in [
+            "what", "who", "how", "where", "when", "why", "which", "whose", "is", "are", "does",
+            "did", "will", "can", "could", "would", "should", "have", "has", "had", "about", "the",
+            "this", "that", "with", "from", "into", "your", "you",
+        ] {
+            assert!(
+                is_generic_query_word(w),
+                "`{w}` must be dropped from the OR-expanded facts FTS query as a generic word"
+            );
+        }
+        // Content tokens — including the 2-char digit token kept by the
+        // tokenizer fix — must survive.
+        for w in [
+            "preference",
+            "vector",
+            "tara",
+            "blocker",
+            "building",
+            "knows",
+            "v2",
+        ] {
+            assert!(
+                !is_generic_query_word(w),
+                "`{w}` is a content token and must NOT be dropped from the FTS query"
+            );
+        }
+    }
+
+    /// End-to-end: a natural-language question whose only content token is a
+    /// single distinctive word still retrieves the fact, and a query of PURE
+    /// generic/filler words retrieves nothing — proof the generic words are
+    /// dropped from the OR-expanded facts FTS query rather than OR-matching a
+    /// broad slice of the corpus (task T8s8bq3th).
+    #[test]
+    fn recall_generic_words_dropped_from_or_expanded_fts_query() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        c.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+             VALUES ('p','project:orbit','uses','the parallax alignment protocol',0.5,'2026-06-04','2026-06-04')",
+            [],
+        )
+        .unwrap();
+
+        // `parallax` is the only surviving content token; every other word is a
+        // generic question/filler word (or a sub-3-char token) and is dropped.
+        let hits: Vec<FactHit> =
+            facts_recall(&c, "what does this have to do with parallax", 6, None, false)
+                .unwrap()
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect();
+        assert!(
+            hits.iter().any(|f| f.object.contains("parallax")),
+            "the lone distinctive content token must still retrieve the fact: {:?}",
+            hits.iter().map(|f| &f.object).collect::<Vec<_>>()
+        );
+
+        // Pure filler: no token survives the drop, so the FTS/slug/predicate/
+        // camelCase arms all yield nothing and no fact is returned.
+        let none: Vec<FactHit> = facts_recall(&c, "what does this have to do with", 6, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            none.is_empty(),
+            "a pure generic/filler query must surface no facts (all tokens dropped); got {:?}",
+            none.iter().map(|f| &f.object).collect::<Vec<_>>()
+        );
+    }
+
+    /// Corpus-ubiquitous content tokens (a term in >50% of facts, e.g. `hex`)
+    /// are dropped from the OR-expanded FTS query ABOVE the corpus floor, while
+    /// distinctive tokens survive — and the drop is disabled below the floor and
+    /// can never empty the query (task T8s8bq3th — flooding fix, part 2:
+    /// down-weight/drop corpus-ubiquitous tokens). Foundation-safe: the drop is
+    /// derived from live document frequency, never a hardcoded token list.
+    #[test]
+    fn recall_ubiquitous_token_dropped_above_corpus_floor() {
+        crate::memory::vector::register_sqlite_vec();
+        let c = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&c).unwrap();
+        crate::memory::schema::apply_plan2(&c).unwrap();
+        // 60 facts (> UBIQUITOUS_MIN_CORPUS). `hex` appears in EVERY subject
+        // (100% > 50% -> corpus-ubiquitous). ONE fact carries the distinctive
+        // object token `parallax`; the rest carry only routine filler.
+        for i in 0..60 {
+            let obj = if i == 0 {
+                "the parallax alignment result".to_string()
+            } else {
+                format!("routine note number {i}")
+            };
+            c.execute(
+                "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+                 VALUES (?1,'project:hex','has',?2,0.5,'2026-06-04','2026-06-04')",
+                rusqlite::params![format!("f{i}"), obj],
+            )
+            .unwrap();
+        }
+
+        // Ubiquitous `hex` dropped; distinctive `parallax` kept.
+        let toks = fts_query_tokens(&c, "what does hex have about parallax");
+        assert!(
+            !toks.iter().any(|t| t == "hex"),
+            "corpus-ubiquitous token `hex` must be dropped above the corpus floor; got {toks:?}"
+        );
+        assert!(
+            toks.iter().any(|t| t == "parallax"),
+            "the distinctive content token must survive; got {toks:?}"
+        );
+
+        // End-to-end: the distinctive fact is still retrieved even though the
+        // ubiquitous term was dropped.
+        let hits: Vec<FactHit> =
+            facts_recall(&c, "what does hex have about parallax", 6, None, false)
+                .unwrap()
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect();
+        assert!(
+            hits.iter().any(|f| f.object.contains("parallax")),
+            "dropping the ubiquitous token must not lose the distinctive fact: {:?}",
+            hits.iter().map(|f| &f.object).collect::<Vec<_>>()
+        );
+
+        // Zero-survivor guard: a query built ONLY of ubiquitous tokens keeps
+        // them, so it still retrieves something rather than matching nothing.
+        let only_ubi = fts_query_tokens(&c, "hex routine");
+        assert_eq!(
+            only_ubi,
+            vec!["hex".to_string(), "routine".to_string()],
+            "a query of only-ubiquitous tokens must RESTORE the pre-drop set (zero-survivor \
+             guard fired), not be emptied and not partially dropped; got {only_ubi:?}"
+        );
+
+        // Below the corpus floor the SAME token is kept — df is not a stable
+        // signal on a tiny store, protecting small fixtures like the legacy pin.
+        let small = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&small).unwrap();
+        crate::memory::schema::apply_plan2(&small).unwrap();
+        for i in 0..4 {
+            small
+                .execute(
+                    "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at)
+                     VALUES (?1,'project:hex','has','a routine note',0.5,'2026-06-04','2026-06-04')",
+                    rusqlite::params![format!("s{i}")],
+                )
+                .unwrap();
+        }
+        let small_toks = fts_query_tokens(&small, "what does hex have about parallax");
+        assert!(
+            small_toks.iter().any(|t| t == "hex"),
+            "below the corpus floor a ubiquitous-looking token must be kept; got {small_toks:?}"
         );
     }
 }

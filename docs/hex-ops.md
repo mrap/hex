@@ -439,3 +439,78 @@ The Rust harness call sites build the arg vector via
 `claude-runs.toml` will still work — the built-in profiles apply and runs
 become lean. That IS the intended default; only opt in to re-enabling
 specific functionality, per profile.
+
+---
+
+## `hex upgrade` — instance-repo consistency
+
+### The deployed-but-orphaned blind spot
+
+`hex upgrade` syncs foundation files into the instance's `.hex/` and rebuilds the
+harness binary. Historically it stopped there: the synced source was left
+**uncommitted** in the instance repo. Because `hex upgrade`'s own change detection
+diffs the checked-out `.hex/` tree against the source, an already-synced but
+uncommitted deploy reads as "nothing changed" — so a live, running deploy can sit
+orphaned in git for days while every subsequent upgrade reports success and does
+nothing. One instance ran a deployed-but-uncommitted sync for nine days this way.
+
+### The fix: an automatic post-upgrade commit
+
+After a **successful** sync AND rebuild, `hex upgrade` now commits the synced
+tracked files so the repo reflects the deployed version (`commit_synced_files` in
+`system/harness/src/upgrade.rs`). Properties:
+
+- **Scoped to `.hex/`.** Only tracked changes under `.hex/` are staged
+  (`git add -u -- .hex`). The operator's unrelated tracked work — `todo.md`,
+  `me/`, `projects/`, `landings/` — is never swept into the upgrade commit.
+- **Tracked-only.** New, untracked files are deliberately NOT added, so runtime
+  state under `.hex/` (the per-run `.upgrade-backup-*` snapshot, `.hex/iii/data`,
+  worker `node_modules`, `memory.db`) never lands in a bookkeeping commit.
+- **Named by version.** The commit subject is
+  `chore(hex): sync harness files to v<version>`, reading the version from
+  `.hex/version.txt`.
+- **Clean tree is a no-op.** If nothing under `.hex/` changed, the step prints
+  "already consistent" and makes no commit — never an error.
+- **Own repo only.** The commit is gated on the workspace being the top level of
+  its OWN git work tree (`git rev-parse --show-toplevel` must equal `$HEX_DIR`), so
+  a workspace nested inside some parent repo is never polluted. A workspace that is
+  not a git repo at all is skipped with a visible note.
+- **Fails loudly.** If the commit cannot be made in a repo where it should have
+  succeeded, `hex upgrade` prints a `[FAIL]` to stderr stating the deploy is live
+  but unrecorded in git, prints the exact manual `git` fix, and exits nonzero
+  (Standing Order S6: no quiet failures). It is never a silent skip.
+- **Cannot hang.** The commit runs with `commit.gpgsign=false` and `--no-verify`
+  so an unattended upgrade can never block on a GPG passphrase or a pre-commit
+  hook prompt.
+- **Mid-merge/rebase caveat.** The commit is pathspec-scoped (`--only -- .hex`),
+  which git refuses during an in-progress merge or rebase ("cannot do a partial
+  commit during a merge"). If you run `hex upgrade` while the instance repo is
+  mid-merge/rebase, the post-upgrade commit fails loudly and exits nonzero — the
+  deploy is live, the tree is fine. Finish or abort the merge/rebase and run the
+  printed manual `git` fix (or re-run `hex upgrade`) to record the synced files.
+
+### Known limitation: instance-side gitignore shadowing of new harness source
+
+An instance `.gitignore` commonly carries a blanket ignore rule for
+`.hex/harness/src/` (and, in some instances, all of `.hex/`). When a foundation
+upgrade introduces **new** harness source files under a shadowed path, `git add`
+will not stage them — they are invisible to the tracked-only commit above and stay
+orphaned even though the deploy is live. This is a genuine gap the automatic commit
+cannot close on its own, because un-ignoring runtime state indiscriminately would
+sweep backups and databases into history.
+
+**Recommended policy:**
+
+- Keep the blanket ignore narrow. Ignore runtime state precisely
+  (`.hex/iii/data/`, `.hex/*.db`, `.hex/.upgrade-backup-*`, worker `node_modules`),
+  not an entire subtree that also contains synced source.
+- If `.hex/harness/src/` (or a broader `.hex/` subtree) must stay ignored, add a
+  negation for the synced source you want tracked, e.g. an allow rule that
+  re-includes `.hex/harness/src/` while the surrounding ignore stands, so new
+  source files become trackable and the post-upgrade commit can pick them up.
+- After an upgrade that adds new files, verify with
+  `git -C "$HEX_DIR" status --porcelain --ignored -- .hex` that no synced source
+  is sitting in the ignored set; if it is, adjust the ignore rule and commit the
+  files by hand.
+- Treat a first upgrade to a new version as the moment to reconcile the ignore
+  rules — new source files ship with minor/major bumps, not patch syncs.
