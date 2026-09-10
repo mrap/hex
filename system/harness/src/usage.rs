@@ -25,6 +25,9 @@ pub enum UsageCommands {
         /// Explicit local JSONL source. Defaults to $HEX_DIR/.hex/usage/codex.jsonl.
         #[arg(long)]
         source: Option<PathBuf>,
+        /// Codex home for discovery. Defaults to $HOME/.codex.
+        #[arg(long)]
+        codex_root: Option<PathBuf>,
         /// Ledger path. Defaults to $HEX_DIR/.hex/usage/usage.db.
         #[arg(long)]
         ledger: Option<PathBuf>,
@@ -182,9 +185,10 @@ pub fn run(cmd: UsageCommands) -> i32 {
     match cmd {
         UsageCommands::Collect {
             source,
+            codex_root,
             ledger,
             max_records,
-        } => collect(source, ledger, max_records),
+        } => collect(source, codex_root, ledger, max_records),
         UsageCommands::Report {
             ledger,
             output,
@@ -275,15 +279,75 @@ fn health(status: &str, detail: String) {
     }
 }
 
-fn collect(source: Option<PathBuf>, ledger: Option<PathBuf>, max_records: usize) -> i32 {
-    let source = source.unwrap_or_else(default_source);
+fn discover(codex_root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut issues = Vec::new();
+    for dir in [
+        codex_root.join("sessions"),
+        codex_root.join("archived_sessions"),
+    ] {
+        if dir.exists() {
+            paths.extend(
+                walkdir::WalkDir::new(&dir)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension().is_some_and(|x| x == "jsonl")
+                    })
+                    .map(|e| e.into_path()),
+            );
+        }
+    }
+    let state = codex_root.join("state_5.sqlite");
+    if state.exists() {
+        match rusqlite::Connection::open_with_flags(
+            &state,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(db) => match db
+                .prepare("SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL")
+            {
+                Ok(mut s) => {
+                    if let Ok(rows) = s.query_map([], |r| r.get::<_, String>(0)) {
+                        for row in rows.flatten() {
+                            let p = PathBuf::from(row);
+                            if p.is_file() {
+                                paths.push(p)
+                            } else {
+                                issues.push(format!("missing_rollout={}", p.display()))
+                            }
+                        }
+                    }
+                }
+                Err(e) => issues.push(format!("state_schema={e}")),
+            },
+            Err(e) => issues.push(format!("state_unreadable={e}")),
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    (paths, issues)
+}
+fn collect(
+    source: Option<PathBuf>,
+    codex_root: Option<PathBuf>,
+    ledger: Option<PathBuf>,
+    max_records: usize,
+) -> i32 {
+    let (sources, mut issues) = match source {
+        Some(path) => (vec![path], Vec::new()),
+        None => {
+            let root = codex_root.unwrap_or_else(|| {
+                PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
+            });
+            discover(&root)
+        }
+    };
     let ledger = ledger.unwrap_or_else(default_ledger);
-    if max_records == 0 || !source.is_file() {
-        eprintln!(
-            "usage collect: source must be an existing local file: {}",
-            source.display()
-        );
-        health("error", format!("source_unavailable={}", source.display()));
+    if max_records == 0 || sources.is_empty() {
+        eprintln!("usage collect: no local sources discovered");
+        health("error", "no_sources".into());
         return 1;
     }
     if let Some(parent) = ledger.parent() {
@@ -292,29 +356,59 @@ fn collect(source: Option<PathBuf>, ledger: Option<PathBuf>, max_records: usize)
             return 1;
         }
     }
-    match UsageLedger::open(&ledger).and_then(|mut l| {
-        l.import_jsonl(
-            &source,
-            ImportOptions {
-                max_records,
-                abort_before_commit: false,
-            },
-        )
-    }) {
-        Ok(r) => {
-            println!("usage collect: accepted={} duplicates={} conflicts={} quarantined={} backlog={} partial={}", r.accepted, r.duplicates, r.conflicts, r.quarantined, r.backlog, r.pending_partial);
+    match UsageLedger::open(&ledger) {
+        Ok(mut l) => {
+            let mut remaining = max_records;
+            let mut accepted = 0;
+            let mut backlog = false;
+            for path in sources {
+                if remaining == 0 {
+                    backlog = true;
+                    break;
+                }
+                if !path.is_file() {
+                    issues.push(format!("unreadable={}", path.display()));
+                    continue;
+                }
+                match l.import_jsonl(
+                    &path,
+                    ImportOptions {
+                        max_records: remaining,
+                        abort_before_commit: false,
+                    },
+                ) {
+                    Ok(r) => {
+                        accepted += r.accepted;
+                        backlog |= r.backlog;
+                        remaining = remaining.saturating_sub(
+                            (r.accepted + r.duplicates + r.conflicts + r.quarantined) as usize,
+                        )
+                    }
+                    Err(e) => issues.push(format!("import_failed={}: {e:?}", path.display())),
+                }
+            }
+            println!(
+                "usage collect: accepted={accepted} backlog={backlog} issues={}",
+                issues.len()
+            );
             health(
-                "ok",
+                if issues.is_empty() { "ok" } else { "error" },
                 format!(
-                    "backlog={} accepted={} bytes_read={}",
-                    r.backlog, r.accepted, r.bytes_read
+                    "backlog={} accepted={} issues={}",
+                    backlog,
+                    accepted,
+                    issues.join(";")
                 ),
             );
-            0
+            if issues.is_empty() {
+                0
+            } else {
+                1
+            }
         }
         Err(e) => {
             eprintln!("usage collect: failed: {e:?}");
-            health("error", "ledger_import_failed".into());
+            health("error", "ledger_open_failed".into());
             1
         }
     }
