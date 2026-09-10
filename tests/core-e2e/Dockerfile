@@ -40,6 +40,9 @@ COPY system/code-intel/ /code-intel/
 RUN cargo chef cook --release --recipe-path recipe.json
 # Real harness source over the warmed dep cache: only our crates recompile.
 COPY system/harness/ ./
+# Shared Rust module and its compile-time embedded scripts.
+COPY system/managed_cargo_bridge.rs /managed_cargo_bridge.rs
+COPY system/scripts/managed-cargo-gate.py system/scripts/managed-target-check.py /scripts/
 RUN cargo build --release 2>&1
 # Stamp the Cargo.toml version for runtime consistency checks (source of truth)
 RUN grep '^version' ./Cargo.toml | head -1 | cut -d'"' -f2 > /build/compiled-version.txt
