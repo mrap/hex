@@ -12,11 +12,35 @@
 
 use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
+use hex::usage_ledger::{ImportOptions, UsageLedger};
+use hex::usage_reporting;
+use serde_json::json;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum UsageCommands {
+    /// Import one local Codex JSONL source into the durable usage ledger
+    Collect {
+        /// Explicit local JSONL source. Defaults to $HEX_DIR/.hex/usage/codex.jsonl.
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Ledger path. Defaults to $HEX_DIR/.hex/usage/usage.db.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+        /// Maximum complete records committed in this run.
+        #[arg(long, default_value_t = 1_000)]
+        max_records: usize,
+    },
+    /// Write a deterministic local JSON usage summary
+    Report {
+        /// Ledger path. Defaults to $HEX_DIR/.hex/usage/usage.db.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+        /// Report path. Defaults to $HEX_DIR/.hex/usage/report.json.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Trailing-window burn rate; alert if above threshold
     Burn {
         /// Alert threshold in USD per hour
@@ -153,6 +177,12 @@ fn burn_alert_class(key: &str) -> crate::alert::AlertClass {
 
 pub fn run(cmd: UsageCommands) -> i32 {
     match cmd {
+        UsageCommands::Collect {
+            source,
+            ledger,
+            max_records,
+        } => collect(source, ledger, max_records),
+        UsageCommands::Report { ledger, output } => report(ledger, output),
         UsageCommands::Burn {
             threshold,
             window_mins,
@@ -195,6 +225,126 @@ pub fn run(cmd: UsageCommands) -> i32 {
                 );
             }
             0
+        }
+    }
+}
+
+fn usage_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HEX_DIR").unwrap_or_else(|_| ".".into()))
+        .join(".hex")
+        .join("usage")
+}
+fn default_ledger() -> PathBuf {
+    usage_dir().join("usage.db")
+}
+fn default_source() -> PathBuf {
+    usage_dir().join("codex.jsonl")
+}
+fn default_report() -> PathBuf {
+    usage_dir().join("report.json")
+}
+
+fn health(status: &str, detail: String) {
+    // Failures are coalesced locally: repeat the same last collector failure
+    // does not fill telemetry. No alert or outbound transport is invoked.
+    let repeated = status == "error"
+        && hex::telemetry::recent(50)
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|r| r.source == "usage-tracking" && r.event == "collect")
+            })
+            .map(|r| r.status == status)
+            .unwrap_or(false);
+    if !repeated {
+        let _ = hex::telemetry::record(&hex::telemetry::TelemetryEvent {
+            source: "usage-tracking".into(),
+            event: "collect".into(),
+            status: status.into(),
+            duration_ms: None,
+            exit_code: Some(if status == "ok" { 0 } else { 1 }),
+            detail: Some(detail),
+        });
+    }
+}
+
+fn collect(source: Option<PathBuf>, ledger: Option<PathBuf>, max_records: usize) -> i32 {
+    let source = source.unwrap_or_else(default_source);
+    let ledger = ledger.unwrap_or_else(default_ledger);
+    if max_records == 0 || !source.is_file() {
+        eprintln!(
+            "usage collect: source must be an existing local file: {}",
+            source.display()
+        );
+        health("error", format!("source_unavailable={}", source.display()));
+        return 1;
+    }
+    if let Some(parent) = ledger.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("usage collect: cannot create ledger directory: {e}");
+            return 1;
+        }
+    }
+    match UsageLedger::open(&ledger).and_then(|mut l| {
+        l.import_jsonl(
+            &source,
+            ImportOptions {
+                max_records,
+                abort_before_commit: false,
+            },
+        )
+    }) {
+        Ok(r) => {
+            println!("usage collect: accepted={} duplicates={} conflicts={} quarantined={} backlog={} partial={}", r.accepted, r.duplicates, r.conflicts, r.quarantined, r.backlog, r.pending_partial);
+            health(
+                "ok",
+                format!(
+                    "backlog={} accepted={} bytes_read={}",
+                    r.backlog, r.accepted, r.bytes_read
+                ),
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("usage collect: failed: {e:?}");
+            health("error", "ledger_import_failed".into());
+            1
+        }
+    }
+}
+
+fn report(ledger: Option<PathBuf>, output: Option<PathBuf>) -> i32 {
+    let ledger = ledger.unwrap_or_else(default_ledger);
+    let output = output.unwrap_or_else(default_report);
+    let result = UsageLedger::open(&ledger).and_then(|l| {
+        let rows = l.rows(100_000, 0)?;
+        let coverage = l.coverage()?;
+        Ok((rows, coverage))
+    });
+    let Ok((rows, coverage)) = result else {
+        eprintln!("usage report: ledger unavailable: {}", ledger.display());
+        return 1;
+    };
+    let end = Utc::now();
+    let start = DateTime::from_timestamp(0, 0).expect("unix epoch");
+    let report = usage_reporting::report(&rows, coverage, start, end);
+    let body=json!({"schema":"hex.usage-report.v1","cutoff":end.to_rfc3339(),"measured":{"responses":report.measured.responses,"input_tokens":report.measured.input.to_string(),"cached_input_tokens":report.measured.cached_input.to_string(),"output_tokens":report.measured.output.to_string()},"coverage":{"accepted":report.coverage.accepted,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"pending_sources":report.coverage.pending_sources},"incomplete":report.incomplete_labels,"response_ids":rows.iter().map(|r|r.response_id.as_str()).collect::<Vec<_>>()}).to_string()+"\n";
+    if let Some(parent) = output.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("usage report: cannot create output directory: {e}");
+            return 1;
+        }
+    }
+    let temp = output.with_extension("tmp");
+    match std::fs::write(&temp, body).and_then(|_| std::fs::rename(&temp, &output)) {
+        Ok(()) => {
+            println!("usage report: {}", output.display());
+            0
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            eprintln!("usage report: write failed: {e}");
+            1
         }
     }
 }
