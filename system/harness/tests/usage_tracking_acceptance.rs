@@ -323,3 +323,45 @@ fn missing_extra_counters_remain_unknown() {
     assert_eq!(row.reasoning_output_tokens, None);
     assert_eq!(row.total_tokens, None);
 }
+
+#[test]
+fn codex_token_count_without_provider_defaults_to_codex() {
+    let (_dir, mut ledger, path) = setup();
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"providerless"}}"#,
+            "\n",
+            r#"{"type":"token_count","timestamp":"2026-09-10T00:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let result = ledger.import_jsonl(&path, Default::default()).unwrap();
+    assert_eq!((result.accepted, result.quarantined), (1, 0));
+    assert_eq!(ledger.rows(1, 0).unwrap()[0].provider, "codex");
+}
+
+#[test]
+fn unrelated_events_advance_cursor_without_quarantine() {
+    let (_dir, mut ledger, path) = setup();
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"response_item","timestamp":"2026-09-10T00:00:00Z","payload":{"type":"function_call"}}"#,
+            "\n",
+            r#"{"type":"turn_context","timestamp":"2026-09-10T00:00:01Z","payload":{"model":"gpt-5.6-terra"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let result = ledger.import_jsonl(&path, Default::default()).unwrap();
+    assert_eq!((result.accepted, result.quarantined), (0, 0));
+    assert_eq!(
+        ledger
+            .import_jsonl(&path, Default::default())
+            .unwrap()
+            .bytes_read,
+        0
+    );
+}

@@ -295,6 +295,7 @@ fn import_event(
         }
     };
     match event {
+        Event::Ignore => Ok(()),
         Event::Canonical(record) => import_parsed(tx, source, offset, record_hash, record, out),
         Event::SessionMeta(meta) => {
             upsert_session(tx, source, &meta)?;
@@ -302,16 +303,8 @@ fn import_event(
         }
         Event::TurnContext(context) => {
             let Some(session_id) = active_session(tx, source)? else {
-                observe(
-                    tx,
-                    source,
-                    offset,
-                    record_hash,
-                    "quarantine",
-                    Some("missing_session_context"),
-                    None,
-                )?;
-                out.quarantined += 1;
+                // A context line before session metadata is non-candidate
+                // metadata. It advances the source cursor but is not bad usage.
                 return Ok(());
             };
             tx.execute(
@@ -410,6 +403,7 @@ struct TokenUsage {
     total: Option<i64>,
 }
 enum Event {
+    Ignore,
     Canonical(Parsed),
     SessionMeta(SessionMeta),
     TurnContext(TurnContext),
@@ -422,7 +416,9 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
     let field =
         |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     if v.get("type").and_then(Value::as_str) == Some("session_meta") {
-        let session_id = field(payload, "id").ok_or("missing_session_id")?;
+        let Some(session_id) = field(payload, "id") else {
+            return Ok(Event::Ignore);
+        };
         return Ok(Event::SessionMeta(SessionMeta {
             session_id,
             model: field(payload, "model"),
@@ -442,9 +438,7 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
             parent_thread_id: field(payload, "parent_thread_id"),
         }));
     }
-    if v.get("type").and_then(Value::as_str) == Some("event_msg")
-        && v.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
-    {
+    if v.pointer("/payload/type").and_then(Value::as_str) == Some("token_count") {
         let info = payload.get("info").ok_or("missing_usage")?;
         let usage = |name: &str| {
             let u = info.get(name).unwrap_or(&Value::Null);
@@ -475,7 +469,7 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
         }));
     }
     if v.get("type").and_then(Value::as_str) != Some("token_usage_record") {
-        return Err("unsupported_record_type".into());
+        return Ok(Event::Ignore);
     }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
     let n = |k: &str| v.get(k).and_then(Value::as_i64);
