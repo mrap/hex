@@ -2,8 +2,13 @@
 //! Publication and service ownership stay in the shared installer.
 
 use hex::app_identity::{self, CodeIntelProduct as Product, CodeIntelServiceChange, UpgradeMode};
+use hex::managed_cargo_bridge::{
+    self, Caller, CargoStatus, OutputMode, ReceiptLocation, Request, SourceState,
+};
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -53,9 +58,9 @@ trait Operations {
 struct Build {
     output: PathBuf,
     version: String,
-    // The unique owned target cannot contain a stale executable from an older
-    // invocation. Remove only this invocation's generated files on completion.
-    _target: Option<tempfile::TempDir>,
+    // The bridge allocates this target and its receipt under a checked boundary.
+    // Keep their locations for failure recovery and operator evidence.
+    _evidence: Option<managed_cargo_bridge::Evidence>,
 }
 
 fn inspect_with(ops: &impl Operations) -> io::Result<Plan> {
@@ -241,6 +246,7 @@ impl Operations for Native<'_> {
     }
     fn build(&self) -> io::Result<Build> {
         let version = cargo_version(self.source_dir)?;
+        let revision = source_revision(self.source_dir)?;
         let host_output = Command::new("rustc").arg("-vV").output()?;
         if !host_output.status.success() {
             return Err(io::Error::other("rustc host inspection failed"));
@@ -255,43 +261,87 @@ impl Operations for Native<'_> {
                         .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
             })
             .ok_or_else(|| io::Error::other("rustc host triple is invalid"))?;
-        let target = tempfile::Builder::new()
-            .prefix("hex-codeintel-build-")
-            .tempdir()?;
-        let status = Command::new("cargo")
-            .current_dir(self.source_dir)
-            .args([
-                "build",
-                "--locked",
-                "--release",
-                "--package",
-                "scipd",
-                "--bin",
-                "cq",
-                "--bin",
-                "scipd",
-                "--target",
-                host,
-                "--target-dir",
-            ])
-            .arg(target.path())
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other("code-intel Cargo build failed"));
+        let receipt = ReceiptLocation::new(
+            fs::canonicalize(self.hex_dir)?,
+            vec![".hex".into(), "managed-cargo-receipts".into()],
+        )
+        .map_err(|error| {
+            io::Error::other(format!("invalid code-intel receipt location: {error:?}"))
+        })?;
+        let result = managed_cargo_bridge::run(&Request {
+            caller: Caller::CodeIntelBuild,
+            source_revision: revision,
+            source_state: SourceState::Clean,
+            working_repo: fs::canonicalize(self.source_dir)?,
+            cargo_args: vec![
+                "--locked".into(),
+                "--release".into(),
+                "--package".into(),
+                "scipd".into(),
+                "--bin".into(),
+                "cq".into(),
+                "--bin".into(),
+                "scipd".into(),
+                "--target".into(),
+                host.into(),
+            ],
+            receipt,
+            output: OutputMode::Inherit,
+        });
+        if let Some(error) = &result.error {
+            return Err(io::Error::other(format!(
+                "code-intel managed Cargo bridge failed: {error:?}; retained evidence: {}",
+                managed_evidence(&result)
+            )));
         }
-        let output = target.path().join(host).join("release");
+        match result.cargo {
+            Some(CargoStatus::Exit(0)) => {}
+            Some(CargoStatus::Exit(code)) => {
+                return Err(io::Error::other(format!(
+                    "code-intel Cargo build failed (exit {code}); retained evidence: {}",
+                    managed_evidence(&result)
+                )))
+            }
+            Some(CargoStatus::Signal(signal)) => {
+                return Err(io::Error::other(format!(
+                    "code-intel Cargo build terminated by signal {signal}; retained evidence: {}",
+                    managed_evidence(&result)
+                )))
+            }
+            None => {
+                return Err(io::Error::other(format!(
+                "code-intel managed Cargo bridge returned no Cargo status; retained evidence: {}",
+                managed_evidence(&result)
+            )))
+            }
+        }
+        let target = result.evidence.target.clone().ok_or_else(|| {
+            io::Error::other(format!(
+                "code-intel managed Cargo bridge omitted target evidence; retained evidence: {}",
+                managed_evidence(&result)
+            ))
+        })?;
+        let output = target.join(host).join("release");
         for product in PRODUCTS {
-            let metadata = fs::symlink_metadata(output.join(name(product)))?;
-            if !metadata.is_file() || metadata.len() == 0 {
-                return Err(io::Error::other(
-                    "code-intel build did not produce the exact executable",
-                ));
+            let candidate = output.join(name(product));
+            let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+                io::Error::other(format!(
+                    "code-intel build did not produce the exact executable at {}: {error}; retained evidence: {}",
+                    candidate.display(),
+                    managed_evidence(&result)
+                ))
+            })?;
+            if !metadata.file_type().is_file() || metadata.len() == 0 || !executable(&metadata) {
+                return Err(io::Error::other(format!(
+                    "code-intel build did not produce the exact executable; retained evidence: {}",
+                    managed_evidence(&result)
+                )));
             }
         }
         Ok(Build {
             output,
             version,
-            _target: Some(target),
+            _evidence: Some(result.evidence),
         })
     }
     fn publish(&self, product: Product, build: &Build, revision: &str) -> io::Result<()> {
@@ -304,6 +354,39 @@ impl Operations for Native<'_> {
             revision,
         )
     }
+}
+
+fn executable(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+fn managed_evidence(result: &managed_cargo_bridge::Result) -> String {
+    format!(
+        "invocation={} receipt={} target={}",
+        result
+            .evidence
+            .invocation_dir
+            .as_deref()
+            .map_or("none".into(), |path| path.display().to_string()),
+        result
+            .evidence
+            .receipt
+            .as_deref()
+            .map_or("none".into(), |path| path.display().to_string()),
+        result
+            .evidence
+            .target
+            .as_deref()
+            .map_or("none".into(), |path| path.display().to_string()),
+    )
 }
 
 pub(crate) fn inspect(hex_dir: &Path, source_dir: &Path) -> io::Result<Plan> {
@@ -394,7 +477,7 @@ mod tests {
             Ok(Build {
                 output: PathBuf::new(),
                 version: "0.1.0".into(),
-                _target: None,
+                _evidence: None,
             })
         }
         fn publish(&self, p: Product, _build: &Build, revision: &str) -> io::Result<()> {

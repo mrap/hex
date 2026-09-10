@@ -113,6 +113,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 
+use crate::managed_cargo_bridge::{
+    self, Caller, CargoStatus, OutputMode, ReceiptLocation, Request, SourceState,
+};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
@@ -860,20 +863,85 @@ fn gate_clean_tree(repo_root: &Path) -> GateResult {
 /// gates for months.
 fn gate_tests(repo_root: &Path) -> GateResult {
     println!("  Running workspace tests (cargo test --workspace)...");
-    let mut cmd = Command::new("cargo");
-    cmd.args(["test", "--workspace"]).current_dir(repo_root);
-    let r = match run_checked("cargo test --workspace", &mut cmd) {
-        Ok(r) => r,
-        Err(msg) => return GateResult::Fail(msg),
+    let request = match release_test_request(repo_root) {
+        Ok(request) => request,
+        Err(message) => return GateResult::Fail(message),
     };
-    if r.code == 0 {
-        GateResult::Pass
-    } else {
-        GateResult::Fail(format!(
-            "cargo test --workspace failed (exit {}); output tail: {}",
-            r.code,
-            output_tail(&r.combined(), 400)
-        ))
+    gate_tests_result(managed_cargo_bridge::run(&request))
+}
+
+fn release_test_request(repo_root: &Path) -> std::result::Result<Request, String> {
+    let revision = git_stdout(repo_root, &["rev-parse", "--verify", "HEAD"])
+        .map_err(|error| format!("release tests cannot resolve source revision: {error:#}"))?;
+    let revision = revision.trim();
+    if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("release tests cannot resolve a valid source revision".into());
+    }
+    let common_dir = git_stdout(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map_err(|error| format!("release tests cannot resolve Git receipt boundary: {error:#}"))?;
+    let boundary = std::fs::canonicalize(common_dir.trim()).map_err(|error| {
+        format!("release tests cannot canonicalize Git receipt boundary: {error}")
+    })?;
+    let receipt = ReceiptLocation::new(boundary, vec!["managed-cargo-receipts".into()])
+        .map_err(|error| format!("release tests cannot create receipt location: {error:?}"))?;
+    Ok(Request {
+        caller: Caller::ReleaseTests,
+        source_revision: revision.into(),
+        source_state: SourceState::Clean,
+        working_repo: std::fs::canonicalize(repo_root)
+            .map_err(|error| format!("release tests cannot canonicalize repository: {error}"))?,
+        cargo_args: vec!["--workspace".into()],
+        receipt,
+        output: OutputMode::Capture,
+    })
+}
+
+fn bridge_evidence(result: &managed_cargo_bridge::Result) -> String {
+    format!(
+        "invocation={} receipt={} target={}",
+        result
+            .evidence
+            .invocation_dir
+            .as_deref()
+            .map_or("none".into(), |path| path.display().to_string()),
+        result
+            .evidence
+            .receipt
+            .as_deref()
+            .map_or("none".into(), |path| path.display().to_string()),
+        result
+            .evidence
+            .target
+            .as_deref()
+            .map_or("none".into(), |path| path.display().to_string()),
+    )
+}
+
+fn gate_tests_result(result: managed_cargo_bridge::Result) -> GateResult {
+    if let Some(error) = &result.error {
+        return GateResult::Fail(format!(
+            "cargo test --workspace failed through managed Cargo: {error:?}; retained evidence: {}",
+            bridge_evidence(&result)
+        ));
+    }
+    match result.cargo {
+        Some(CargoStatus::Exit(0)) => GateResult::Pass,
+        Some(CargoStatus::Exit(code)) => GateResult::Fail(format!(
+            "cargo test --workspace failed (exit {code}); output tail: {}",
+            output_tail(&format!("{}{}", result.stdout.text, result.stderr.text), 400)
+        )),
+        Some(CargoStatus::Signal(signal)) => GateResult::Fail(format!(
+            "cargo test --workspace: terminated by signal {signal}; retained evidence: {}",
+            bridge_evidence(&result)
+        )),
+        None => GateResult::Fail(format!(
+            "cargo test --workspace failed through managed Cargo without a Cargo status; retained evidence: {}",
+            bridge_evidence(&result)
+        )),
     }
 }
 
@@ -2845,6 +2913,202 @@ mod tests {
         assert!(t.ends_with("the death rattle"));
         assert!(t.starts_with('…'));
         assert_eq!(output_tail("short\nout", 50), "short | out");
+    }
+
+    #[test]
+    fn managed_release_exit_keeps_the_exact_legacy_combined_tail() {
+        let result = managed_cargo_bridge::Result {
+            cargo: Some(CargoStatus::Exit(9)),
+            stdout: managed_cargo_bridge::OutputTail {
+                text: format!("out-head{}out-tail", "x".repeat(1000)),
+                truncated: false,
+            },
+            stderr: managed_cargo_bridge::OutputTail {
+                text: format!("err-head{}err-tail", "y".repeat(1000)),
+                truncated: false,
+            },
+            evidence: managed_cargo_bridge::Evidence {
+                invocation_dir: None,
+                receipt: None,
+                target: None,
+            },
+            error: None,
+        };
+        let GateResult::Fail(message) = gate_tests_result(result) else {
+            panic!("expected failure")
+        };
+        let expected_tail = format!("…{}err-tail", "y".repeat(392));
+        assert_eq!(
+            message,
+            format!("cargo test --workspace failed (exit 9); output tail: {expected_tail}")
+        );
+        assert!(!message.contains("out-head") && !message.contains("err-head"));
+    }
+
+    #[test]
+    fn managed_release_signal_and_transport_failure_are_loud_with_evidence() {
+        let evidence = managed_cargo_bridge::Evidence {
+            invocation_dir: Some(PathBuf::from("/private/invocation")),
+            receipt: Some(PathBuf::from("/private/receipt.json")),
+            target: Some(PathBuf::from("/private/target")),
+        };
+        let signal = gate_tests_result(managed_cargo_bridge::Result {
+            cargo: Some(CargoStatus::Signal(15)),
+            stdout: managed_cargo_bridge::OutputTail {
+                text: String::new(),
+                truncated: false,
+            },
+            stderr: managed_cargo_bridge::OutputTail {
+                text: String::new(),
+                truncated: false,
+            },
+            evidence: evidence.clone(),
+            error: None,
+        });
+        assert!(signal.to_string().contains("terminated by signal 15"));
+        assert!(signal.to_string().contains("receipt=/private/receipt.json"));
+        let transport = gate_tests_result(managed_cargo_bridge::Result {
+            cargo: None,
+            stdout: managed_cargo_bridge::OutputTail {
+                text: String::new(),
+                truncated: false,
+            },
+            stderr: managed_cargo_bridge::OutputTail {
+                text: String::new(),
+                truncated: false,
+            },
+            evidence,
+            error: Some(managed_cargo_bridge::BridgeError::Spawn(
+                "python3: tool not found (exit 127)".into(),
+            )),
+        });
+        assert!(transport.to_string().contains("tool not found (exit 127)"));
+        assert!(transport.to_string().contains("target=/private/target"));
+    }
+
+    #[test]
+    fn managed_release_request_binds_the_repository_and_workspace_argument() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("fixture.txt"), "fixture").unwrap();
+        git(root, &["add", "fixture.txt"]);
+        commit(root, "fixture");
+        let request = release_test_request(root).unwrap();
+        assert_eq!(request.caller, Caller::ReleaseTests);
+        assert_eq!(request.source_state, SourceState::Clean);
+        assert_eq!(request.cargo_args, vec!["--workspace"]);
+        assert_eq!(request.working_repo, std::fs::canonicalize(root).unwrap());
+        assert_eq!(
+            request.receipt.boundary,
+            std::fs::canonicalize(root.join(".git")).unwrap()
+        );
+    }
+
+    #[test]
+    fn managed_release_gate_executes_the_embedded_helper_in_a_private_child() {
+        if let (Ok(root), Ok(mode)) = (
+            std::env::var("HEX_RELEASE_MANAGED_PROBE_ROOT"),
+            std::env::var("HEX_RELEASE_MANAGED_PROBE_MODE"),
+        ) {
+            let outcome = gate_tests(Path::new(&root).join("repo").as_path());
+            let text = outcome.to_string();
+            match mode.as_str() {
+                "success" => assert!(matches!(outcome, GateResult::Pass), "{text}"),
+                "negative" => {
+                    assert!(
+                        text.contains("failed (exit 7); output tail: out-tailerr-tail"),
+                        "{text}"
+                    );
+                }
+                "signal" => {
+                    assert!(text.contains("terminated by signal 15"), "{text}");
+                    assert!(text.contains("retained evidence: invocation="), "{text}");
+                }
+                "transport" => {
+                    assert!(
+                        text.contains("Python transport does not match validated Cargo status"),
+                        "{text}"
+                    );
+                    assert!(text.contains("receipt="), "{text}");
+                    assert!(text.contains("target="), "{text}");
+                }
+                _ => panic!("unknown probe mode {mode}"),
+            }
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let repo = root.join("repo");
+        let home = root.join("home");
+        let bin = root.join("bin");
+        let managed = root.join("managed");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(home.join(".boi/v2")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("fixture.txt"), "fixture").unwrap();
+        git(&repo, &["add", "fixture.txt"]);
+        commit(&repo, "fixture");
+        std::fs::write(
+            home.join(".boi/v2/daemon.toml"),
+            format!(
+                "cargo_target_dir = \"{}\"\n[managed_target_policy]\nrevision = \"fixture\"\nallowed_roots = [\"{}\"]\ndenied_roots = [\"{}\"]\n",
+                managed.display(), managed.display(), root.join("denied").display()
+            ),
+        )
+        .unwrap();
+        let cargo = bin.join("cargo");
+        std::fs::write(
+            &cargo,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_CARGO_LOG\"\nprintf out-tail\nprintf err-tail >&2\ncase \"$HEX_RELEASE_MANAGED_PROBE_MODE\" in negative) exit 7 ;; signal) kill -TERM $$ ;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let revision = git_stdout(&repo, &["rev-parse", "--verify", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        for mode in ["success", "negative", "signal", "transport"] {
+            let path = if mode == "transport" {
+                let python = bin.join("python3");
+                std::fs::write(
+                    &python,
+                    "#!/bin/sh\nreceipt=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --receipt-dir) receipt=$2; shift 2 ;; *) shift ;; esac; done\nprintf '{\\\"schema_version\\\":\\\"foundation.managed-cargo-gate.v1\\\",\\\"source_revision\\\":\\\"%s\\\",\\\"source_state\\\":\\\"clean\\\",\\\"operation\\\":\\\"test\\\",\\\"managed_target\\\":{\\\"caller_identity\\\":\\\"release-tests\\\",\\\"resolved_target\\\":\\\"%s\\\"},\\\"target_created\\\":true,\\\"outcome\\\":{\\\"state\\\":\\\"completed\\\",\\\"cargo_exit_code\\\":0}}' \"$FAKE_REVISION\" \"$FAKE_TARGET\" > \"$receipt/receipt.json\"\nchmod 600 \"$receipt/receipt.json\"\nexit 127\n",
+                )
+                .unwrap();
+                std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+                format!("{}:/usr/bin:/bin", bin.display())
+            } else {
+                format!("{}:/opt/homebrew/bin:/usr/bin:/bin", bin.display())
+            };
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "release::tests::managed_release_gate_executes_the_embedded_helper_in_a_private_child",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", path)
+                .env("FAKE_CARGO_LOG", root.join("cargo.log"))
+                .env("FAKE_REVISION", &revision)
+                .env("FAKE_TARGET", &managed)
+                .env("HEX_RELEASE_MANAGED_PROBE_ROOT", root)
+                .env("HEX_RELEASE_MANAGED_PROBE_MODE", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let log = std::fs::read_to_string(root.join("cargo.log")).unwrap();
+        assert_eq!(log, "test\n--workspace\n");
     }
 
     #[test]
