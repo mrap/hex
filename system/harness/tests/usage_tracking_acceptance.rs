@@ -249,3 +249,77 @@ fn bounded_codex_state_survives_reopen_with_context_and_cumulative_totals() {
         .iter()
         .all(|r| r.parent_response_id.as_deref() == Some("root-thread")));
 }
+
+#[test]
+fn codex_extra_counters_are_reported_once_and_resets_use_last_usage() {
+    let (_dir, mut ledger, path) = setup();
+    let snapshot = |time: &str, total: &str, last: &str| {
+        format!(
+            r#"{{"type":"event_msg","timestamp":"{time}","payload":{{"type":"token_count","info":{{"total_token_usage":{total},"last_token_usage":{last}}}}}}}"#
+        )
+    };
+    let first = r#"{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":7,"output_tokens":3,"reasoning_output_tokens":2,"total_tokens":13}"#;
+    let second = r#"{"input_tokens":15,"cached_input_tokens":3,"cache_write_input_tokens":8,"output_tokens":5,"reasoning_output_tokens":3,"total_tokens":20}"#;
+    let reset = r#"{"input_tokens":4,"cached_input_tokens":1,"cache_write_input_tokens":1,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":6}"#;
+    fs::write(&path, format!(
+        "{}\n{}\n{}\n{}\n",
+        r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"session-extra"}}"#,
+        snapshot("2026-09-10T00:00:01Z", first, first),
+        snapshot("2026-09-10T00:00:02Z", second, r#"{"input_tokens":5,"cached_input_tokens":1,"cache_write_input_tokens":1,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":7}"#),
+        snapshot("2026-09-10T00:00:03Z", reset, reset),
+    )).unwrap();
+    assert_eq!(
+        ledger
+            .import_jsonl(&path, Default::default())
+            .unwrap()
+            .accepted,
+        3
+    );
+    let rows = ledger.rows(10, 0).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.input_tokens.unwrap())
+            .sum::<i64>(),
+        19
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.output_tokens.unwrap())
+            .sum::<i64>(),
+        7
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.cache_write_input_tokens.unwrap())
+            .sum::<i64>(),
+        9
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.reasoning_output_tokens.unwrap())
+            .sum::<i64>(),
+        4
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.total_tokens.unwrap())
+            .sum::<i64>(),
+        26
+    );
+    // Cache-write and reasoning are provider-reported dimensions. They are not
+    // added to input/output totals by the ledger.
+    assert_eq!(rows[0].cache_write_input_tokens, Some(7));
+    assert_eq!(rows[0].reasoning_output_tokens, Some(2));
+    assert_eq!(rows[0].total_tokens, Some(13));
+}
+
+#[test]
+fn missing_extra_counters_remain_unknown() {
+    let (_dir, mut ledger, path) = setup();
+    fs::write(&path, format!("{}\n", line("no-extras", None, 3))).unwrap();
+    ledger.import_jsonl(&path, Default::default()).unwrap();
+    let row = ledger.rows(1, 0).unwrap().pop().unwrap();
+    assert_eq!(row.cache_write_input_tokens, None);
+    assert_eq!(row.reasoning_output_tokens, None);
+    assert_eq!(row.total_tokens, None);
+}

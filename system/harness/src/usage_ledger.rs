@@ -64,7 +64,10 @@ pub struct UsageRow {
     pub effort: Option<String>,
     pub input_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub reasoning_output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Coverage {
@@ -89,6 +92,26 @@ impl UsageLedger {
             "ALTER TABLE source_files ADD COLUMN source_mtime_ns INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        for column in [
+            "cache_write_input_tokens INTEGER",
+            "reasoning_output_tokens INTEGER",
+            "total_tokens INTEGER",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE canonical_responses ADD COLUMN {column}"),
+                [],
+            );
+        }
+        for column in [
+            "cumulative_cache_write INTEGER",
+            "cumulative_reasoning INTEGER",
+            "cumulative_total INTEGER",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE codex_session_state ADD COLUMN {column}"),
+                [],
+            );
+        }
         Ok(Self { conn })
     }
     /// Inserted observations, canonical rows, quarantine state, and cursor movement share one transaction.
@@ -186,7 +209,7 @@ impl UsageLedger {
         Ok(out)
     }
     pub fn rows(&self, limit: usize, offset: usize) -> Result<Vec<UsageRow>> {
-        let mut s=self.conn.prepare("SELECT provider,account_scope,response_id,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,output_tokens FROM canonical_responses ORDER BY event_at,response_id LIMIT ?1 OFFSET ?2")?;
+        let mut s=self.conn.prepare("SELECT provider,account_scope,response_id,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM canonical_responses ORDER BY event_at,response_id LIMIT ?1 OFFSET ?2")?;
         let rows = s
             .query_map(params![limit as i64, offset as i64], |r| {
                 Ok(UsageRow {
@@ -200,7 +223,10 @@ impl UsageLedger {
                     effort: r.get(7)?,
                     input_tokens: r.get(8)?,
                     cached_input_tokens: r.get(9)?,
-                    output_tokens: r.get(10)?,
+                    cache_write_input_tokens: r.get(10)?,
+                    output_tokens: r.get(11)?,
+                    reasoning_output_tokens: r.get(12)?,
+                    total_tokens: r.get(13)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -348,7 +374,10 @@ struct Parsed {
     effort: Option<String>,
     input: Option<i64>,
     cached: Option<i64>,
+    cache_write: Option<i64>,
     output: Option<i64>,
+    reasoning: Option<i64>,
+    total: Option<i64>,
 }
 #[derive(Default)]
 struct SessionMeta {
@@ -375,7 +404,10 @@ struct TokenCount {
 struct TokenUsage {
     input: Option<i64>,
     cached: Option<i64>,
+    cache_write: Option<i64>,
     output: Option<i64>,
+    reasoning: Option<i64>,
+    total: Option<i64>,
 }
 enum Event {
     Canonical(Parsed),
@@ -419,7 +451,10 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
             TokenUsage {
                 input: u.get("input_tokens").and_then(Value::as_i64),
                 cached: u.get("cached_input_tokens").and_then(Value::as_i64),
+                cache_write: u.get("cache_write_input_tokens").and_then(Value::as_i64),
                 output: u.get("output_tokens").and_then(Value::as_i64),
+                reasoning: u.get("reasoning_output_tokens").and_then(Value::as_i64),
+                total: u.get("total_tokens").and_then(Value::as_i64),
             }
         };
         let last = usage("last_token_usage");
@@ -455,12 +490,20 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
         effort: s("effort"),
         input: n("input_tokens"),
         cached: n("cached_input_tokens"),
+        cache_write: n("cache_write_input_tokens"),
         output: n("output_tokens"),
+        reasoning: n("reasoning_output_tokens"),
+        total: n("total_tokens"),
     }))
 }
 impl TokenUsage {
     fn any(self) -> bool {
-        self.input.is_some() || self.cached.is_some() || self.output.is_some()
+        self.input.is_some()
+            || self.cached.is_some()
+            || self.cache_write.is_some()
+            || self.output.is_some()
+            || self.reasoning.is_some()
+            || self.total.is_some()
     }
     fn complete(self) -> bool {
         self.input.is_some() && self.cached.is_some() && self.output.is_some()
@@ -500,9 +543,9 @@ fn import_token_count(
             return Ok(());
         }
     };
-    let state: Option<(Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, i64)> = tx.query_row(
-        "SELECT model,effort,root_task_family,parent_thread_id,cumulative_input,cumulative_cached,cumulative_output FROM codex_session_state WHERE source_key=?1 AND session_id=?2",
-        params![source, session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+    let state: Option<(Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, Option<i64>, i64, Option<i64>, Option<i64>)> = tx.query_row(
+        "SELECT model,effort,root_task_family,parent_thread_id,cumulative_input,cumulative_cached,cumulative_cache_write,cumulative_output,cumulative_reasoning,cumulative_total FROM codex_session_state WHERE source_key=?1 AND session_id=?2",
+        params![source, session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
     ).optional()?;
     let Some((
         model,
@@ -511,7 +554,10 @@ fn import_token_count(
         parent_thread_id,
         old_input,
         old_cached,
+        old_cache_write,
         old_output,
+        old_reasoning,
+        old_total,
     )) = state
     else {
         observe(
@@ -584,7 +630,16 @@ fn import_token_count(
         out.quarantined += 1;
         return Ok(());
     };
-    tx.execute("UPDATE codex_session_state SET cumulative_input=?1,cumulative_cached=?2,cumulative_output=?3 WHERE source_key=?4 AND session_id=?5", params![next.0,next.1,next.2,source,session_id])?;
+    let (cache_write, next_cache_write) = supplemental_delta(
+        count.total.cache_write,
+        old_cache_write,
+        count.last.cache_write,
+    );
+    let (reasoning, next_reasoning) =
+        supplemental_delta(count.total.reasoning, old_reasoning, count.last.reasoning);
+    let (provider_total, next_total) =
+        supplemental_delta(count.total.total, old_total, count.last.total);
+    tx.execute("UPDATE codex_session_state SET cumulative_input=?1,cumulative_cached=?2,cumulative_cache_write=?3,cumulative_output=?4,cumulative_reasoning=?5,cumulative_total=?6 WHERE source_key=?7 AND session_id=?8", params![next.0,next.1,next_cache_write,next.2,next_reasoning,next_total,source,session_id])?;
     if usage == (0, 0, 0) {
         return Ok(());
     }
@@ -602,9 +657,30 @@ fn import_token_count(
         effort,
         input: Some(usage.0),
         cached: Some(usage.1),
+        cache_write,
         output: Some(usage.2),
+        reasoning,
+        total: provider_total,
     };
     import_parsed(tx, source, offset, record_hash, record, out)
+}
+/// Extra provider counters remain `None` when the source did not report them.
+/// They are never reconstructed from input/output and are reset independently.
+fn supplemental_delta(
+    total: Option<i64>,
+    old: Option<i64>,
+    last: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    match total {
+        Some(value) => match old {
+            Some(previous) if value >= previous => (Some(value - previous), Some(value)),
+            _ => (last, Some(value)),
+        },
+        None => (
+            last,
+            old.zip(last).map(|(previous, delta)| previous + delta),
+        ),
+    }
 }
 fn observe(
     tx: &Transaction<'_>,
@@ -619,7 +695,7 @@ fn observe(
     Ok(())
 }
 fn insert(tx: &Transaction<'_>, r: &Parsed, hash: &str) -> Result<()> {
-    tx.execute("INSERT INTO canonical_responses(provider,account_scope,response_id,record_hash,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,output_tokens) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![r.provider,r.account_scope,r.response_id,hash,r.parent_response_id,r.root_task_family,r.event_at,r.model,r.effort,r.input,r.cached,r.output])?;
+    tx.execute("INSERT INTO canonical_responses(provider,account_scope,response_id,record_hash,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![r.provider,r.account_scope,r.response_id,hash,r.parent_response_id,r.root_task_family,r.event_at,r.model,r.effort,r.input,r.cached,r.cache_write,r.output,r.reasoning,r.total])?;
     Ok(())
 }
 fn hash(b: &[u8]) -> String {
@@ -643,6 +719,6 @@ fn file_identity(meta: &fs::Metadata) -> String {
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TEXT NOT NULL,generation INTEGER NOT NULL,path TEXT NOT NULL,prefix_hash TEXT NOT NULL,cursor INTEGER NOT NULL,source_len INTEGER NOT NULL,updated_at TEXT,source_mtime_ns INTEGER NOT NULL DEFAULT 0,UNIQUE(identity,generation));
 CREATE TABLE IF NOT EXISTS observations (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,record_hash TEXT NOT NULL,verdict TEXT NOT NULL CHECK(verdict IN ('accepted','duplicate','conflict','quarantine')),reason TEXT,provider TEXT,account_scope TEXT,response_id TEXT,PRIMARY KEY(source_key,byte_offset));
-CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_scope TEXT NOT NULL,response_id TEXT NOT NULL,record_hash TEXT NOT NULL,parent_response_id TEXT,root_task_family TEXT,event_at TEXT,model TEXT,effort TEXT,input_tokens INTEGER,cached_input_tokens INTEGER,output_tokens INTEGER,PRIMARY KEY(provider,account_scope,response_id));
-CREATE TABLE IF NOT EXISTS codex_session_state (source_key TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT,effort TEXT,root_task_family TEXT,parent_thread_id TEXT,cumulative_input INTEGER NOT NULL DEFAULT 0,cumulative_cached INTEGER NOT NULL DEFAULT 0,cumulative_output INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source_key,session_id));
+CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_scope TEXT NOT NULL,response_id TEXT NOT NULL,record_hash TEXT NOT NULL,parent_response_id TEXT,root_task_family TEXT,event_at TEXT,model TEXT,effort TEXT,input_tokens INTEGER,cached_input_tokens INTEGER,cache_write_input_tokens INTEGER,output_tokens INTEGER,reasoning_output_tokens INTEGER,total_tokens INTEGER,PRIMARY KEY(provider,account_scope,response_id));
+CREATE TABLE IF NOT EXISTS codex_session_state (source_key TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT,effort TEXT,root_task_family TEXT,parent_thread_id TEXT,cumulative_input INTEGER NOT NULL DEFAULT 0,cumulative_cached INTEGER NOT NULL DEFAULT 0,cumulative_cache_write INTEGER,cumulative_output INTEGER NOT NULL DEFAULT 0,cumulative_reasoning INTEGER,cumulative_total INTEGER,PRIMARY KEY(source_key,session_id));
 CREATE INDEX IF NOT EXISTS observations_identity ON observations(provider,account_scope,response_id);CREATE INDEX IF NOT EXISTS canonical_time ON canonical_responses(event_at);CREATE INDEX IF NOT EXISTS canonical_family ON canonical_responses(root_task_family);"#;
