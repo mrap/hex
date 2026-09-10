@@ -1,4 +1,5 @@
 import importlib.util
+from contextlib import ExitStack
 import io
 import json
 import os
@@ -82,6 +83,41 @@ class ManagedCargoGateTests(unittest.TestCase):
         return json.loads(paths[0].read_text(encoding="utf-8")), paths[0]
 
     def assert_no_cargo(self):
+        self.assertFalse(self.log.exists())
+
+    def test_help_is_successful_and_side_effect_free(self):
+        patches = [
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+            mock.patch.object(GATE, "_validate_receipt_dir", side_effect=AssertionError("receipt validation ran")),
+            mock.patch.object(GATE, "_create_receipt", side_effect=AssertionError("receipt creation ran")),
+            mock.patch.object(GATE, "_adapter_path", side_effect=AssertionError("adapter lookup ran")),
+            mock.patch.object(GATE, "_adapter_module", side_effect=AssertionError("adapter load ran")),
+            mock.patch.object(GATE, "_run_adapter", side_effect=AssertionError("adapter run ran")),
+            mock.patch.object(GATE, "_cargo_path", side_effect=AssertionError("Cargo lookup ran")),
+            mock.patch.object(GATE.subprocess, "run", side_effect=AssertionError("Cargo run ran")),
+        ]
+        with ExitStack() as stack:
+            output = stack.enter_context(patches[0])
+            for patcher in patches[1:]:
+                stack.enter_context(patcher)
+            self.assertEqual(GATE.run(["--help"]), 0)
+            self.assertEqual(GATE.run(["-h"]), 0)
+        help_text = output.getvalue()
+        self.assertIn("usage:", help_text.lower())
+        self.assertIn("--caller", help_text)
+        self.assertIn("build, test, or clippy", help_text)
+        self.assertEqual(self.receipt_paths(), [])
+        self.assertFalse((self.home / ".boi/bin/boi").exists())
+        self.assertFalse(self.log.exists())
+
+    def test_invalid_request_is_nonzero_and_side_effect_free(self):
+        with mock.patch.object(GATE, "_validate_receipt_dir", side_effect=AssertionError("receipt validation ran")):
+            with mock.patch.object(GATE, "_adapter_path", side_effect=AssertionError("adapter lookup ran")):
+                with mock.patch.object(GATE, "_cargo_path", side_effect=AssertionError("Cargo lookup ran")):
+                    with self.assertRaises(GATE.GateError) as caught:
+                        GATE.run(["--unknown"])
+        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+        self.assertEqual(self.receipt_paths(), [])
         self.assertFalse(self.log.exists())
 
     def fake_installed_checker(self, payload="", exit_code=0):

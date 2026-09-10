@@ -284,11 +284,18 @@ def _cargo_path():
 
 
 def run(argv):
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(
+        prog="managed-cargo-gate.py",
+        description="Run one supported local Cargo operation with a managed output target. OPERATION: build, test, or clippy.",
+        add_help=False,
+    )
     parser.add_argument("--caller", required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--source-state", required=True, choices=("clean", "dirty", "unavailable"))
     parser.add_argument("--receipt-dir", required=True)
+    if argv in (["--help"], ["-h"]):
+        print(parser.format_help(), end="")
+        return 0
     try:
         parsed, remaining = parser.parse_known_args(argv)
     except SystemExit:
