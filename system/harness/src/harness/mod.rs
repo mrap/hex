@@ -65,12 +65,39 @@ pub struct ResultOut {
 use crate::messages::{self, StoredMessage};
 use crate::worker::run::WorkerOutput;
 use rusqlite::Connection;
+use std::path::Path;
 
 const BUDGET: usize = 0; // 0 => assemble's default MAX_CONTEXT_CHARS
 
 /// The v1 vertical slice of submit(Event) -> Result. `worker` is injected for
 /// testability; production passes `crate::worker::run::run_worker`.
 pub fn submit<F>(conn: &Connection, e: &Event, worker: F) -> Result<ResultOut, String>
+where
+    F: Fn(&str) -> Result<WorkerOutput, String>,
+{
+    submit_inner(conn, e, worker, None)
+}
+
+/// Root-aware worker submission. This is the only worker entry point that may
+/// resolve registered authority sources, and it always applies agent privacy.
+pub fn submit_with_root<F>(
+    conn: &Connection,
+    hex_root: &Path,
+    e: &Event,
+    worker: F,
+) -> Result<ResultOut, String>
+where
+    F: Fn(&str) -> Result<WorkerOutput, String>,
+{
+    submit_inner(conn, e, worker, Some(hex_root))
+}
+
+fn submit_inner<F>(
+    conn: &Connection,
+    e: &Event,
+    worker: F,
+    hex_root: Option<&Path>,
+) -> Result<ResultOut, String>
 where
     F: Fn(&str) -> Result<WorkerOutput, String>,
 {
@@ -132,8 +159,13 @@ where
     // fresh OS process per user message and cold-loading the 522 MB nomic model
     // blows the latency budget; the embedder policy is caller-decided, not env-
     // gated, so this call site is *structurally* incapable of loading the model.
-    let ctx = crate::memory::assemble::assemble(conn, &query, false, BUDGET, None);
-    let rendered = crate::memory::assemble::render_candidates(&ctx);
+    let rendered = match hex_root {
+        Some(root) => crate::memory::recall::context_with_connection(root, conn, &query, true),
+        None => {
+            let ctx = crate::memory::assemble::assemble(conn, &query, false, BUDGET, None);
+            crate::memory::assemble::render_candidates(&ctx)
+        }
+    };
     let user_text = match &pin {
         Some(p) => p.clone(),
         None => e.body.clone().unwrap_or_default(),
@@ -187,6 +219,76 @@ fn persist_message(conn: &Connection, m: &StoredMessage) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(id: &str, body: &str) -> Event {
+        Event {
+            id: id.into(),
+            source: "test".into(),
+            kind: "request".into(),
+            body: Some(body.into()),
+            reply_to: None,
+            answer: None,
+            refs: None,
+            scope: None,
+            ts: "2026-09-10T00:00:00Z".into(),
+        }
+    }
+
+    fn worker_db() -> Connection {
+        crate::memory::vector::register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&conn).unwrap();
+        crate::memory::schema::apply_plan2(&conn).unwrap();
+        crate::memory::schema::apply_messages_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn submit_with_root_uses_authority_builder_and_agent_privacy() {
+        let root = tempfile::TempDir::new().unwrap();
+        let registry = root.path().join(".hex/config/memory-authority.toml");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        std::fs::write(
+            registry,
+            "version=1\n[[sources]]\nid='public'\npath='docs/public.md'\ntopics=['memory recall']\nauthority_status='current'\nprivate=false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("docs/public.md"),
+            "WORKER_PUBLIC_SOURCE_CANARY memory recall procedure",
+        )
+        .unwrap();
+        let conn = worker_db();
+        conn.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at,private) \
+             VALUES ('private','memory','recall','WORKER_PRIVATE_FACT_CANARY',0.9,'2026-09-10','2026-09-10',1)",
+            [],
+        )
+        .unwrap();
+        let echo = |input: &str| Ok(WorkerOutput::Answer(input.to_owned()));
+        let matched = submit_with_root(
+            &conn,
+            root.path(),
+            &request("worker-matched", "how does memory recall work"),
+            echo,
+        )
+        .unwrap();
+        assert!(matched.output.contains("WORKER_PUBLIC_SOURCE_CANARY"));
+        assert!(!matched.output.contains("WORKER_PRIVATE_FACT_CANARY"));
+
+        let unmatched = submit_with_root(
+            &conn,
+            root.path(),
+            &request(
+                "worker-unmatched",
+                "what private material does memory contain",
+            ),
+            echo,
+        )
+        .unwrap();
+        assert!(!unmatched.output.contains("WORKER_PRIVATE_FACT_CANARY"));
+    }
 
     #[test]
     fn submit_reply_pins_choice_and_persists() {

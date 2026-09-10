@@ -9,6 +9,8 @@ use std::path::Path;
 
 use super::recall_config::RecallConfig;
 
+pub(crate) mod authority;
+
 const MIN_QUERY_CHARS: usize = 12;
 /// Hard cap on the injected context block. Was 10_000 (spec §8); cut to 3_000
 /// on 2026-06-11 — injected chars are transcript ballast cache-re-read on each
@@ -23,13 +25,28 @@ const CHUNK_SNIPPET_CHARS: usize = 400;
 
 pub type Hit = super::search::SearchResult;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FactAuthority {
+    Current,
+    Historical,
+    Unverified,
+    Degraded,
+    Conflict,
+}
+
 #[derive(Debug)]
 pub struct FactHit {
+    pub(crate) id: String,
     pub subject: String,
     pub predicate: String,
     pub object: String,
     pub importance: f32,
     pub private: bool,
+    pub(crate) source_origin: Option<String>,
+    pub(crate) effective_date: Option<String>,
+    pub(crate) superseded_by: Option<String>,
+    pub(crate) authority_status: authority::AuthorityStatus,
+    pub(crate) resolved_authority: Option<FactAuthority>,
 }
 
 pub struct RecallV2 {
@@ -271,6 +288,67 @@ pub(crate) fn facts_recall_with_config(
     exclude_private: bool,
     cfg: &RecallConfig,
 ) -> rusqlite::Result<Vec<(FactHit, f64)>> {
+    facts_recall_inner(conn, query, k, query_vec, exclude_private, cfg, None)
+}
+
+pub(crate) fn facts_recall_with_authority_config(
+    conn: &rusqlite::Connection,
+    query: &str,
+    k: usize,
+    exclude_private: bool,
+    cfg: &RecallConfig,
+    intent: authority::QueryIntent,
+) -> rusqlite::Result<Vec<(FactHit, f64)>> {
+    facts_recall_inner(conn, query, k, None, exclude_private, cfg, Some(intent))
+}
+
+pub(crate) fn authority_rank_sql(intent: authority::QueryIntent, alias: &str) -> String {
+    let current = format!(
+        "{alias}.authority_status COLLATE BINARY = 'current' AND \
+         COALESCE({alias}.superseded_by, '') = ''"
+    );
+    let historical = format!(
+        "{alias}.authority_status COLLATE BINARY = 'historical' OR \
+         COALESCE({alias}.superseded_by, '') <> ''"
+    );
+    match intent {
+        authority::QueryIntent::Current => format!(
+            "CASE WHEN {current} THEN 0 \
+             WHEN COALESCE({alias}.superseded_by, '') <> '' THEN 2 \
+             WHEN {alias}.authority_status COLLATE BINARY = 'unknown' THEN 1 \
+             WHEN {historical} THEN 2 ELSE 1 END,"
+        ),
+        authority::QueryIntent::Historical => {
+            format!("CASE WHEN {historical} THEN 0 WHEN {current} THEN 1 ELSE 2 END,")
+        }
+    }
+}
+
+pub(crate) fn fact_authority_rank(fact: &FactHit, intent: authority::QueryIntent) -> u8 {
+    let superseded = fact
+        .superseded_by
+        .as_deref()
+        .is_some_and(|id| !id.is_empty());
+    match (intent, fact.authority_status, superseded) {
+        (authority::QueryIntent::Current, authority::AuthorityStatus::Current, false) => 0,
+        (authority::QueryIntent::Current, authority::AuthorityStatus::Unknown, false) => 1,
+        (authority::QueryIntent::Current, _, _) => 2,
+        (authority::QueryIntent::Historical, _, true)
+        | (authority::QueryIntent::Historical, authority::AuthorityStatus::Historical, false) => 0,
+        (authority::QueryIntent::Historical, authority::AuthorityStatus::Current, false) => 1,
+        (authority::QueryIntent::Historical, authority::AuthorityStatus::Unknown, false) => 2,
+    }
+}
+
+fn facts_recall_inner(
+    conn: &rusqlite::Connection,
+    query: &str,
+    k: usize,
+    query_vec: Option<&[f32]>,
+    exclude_private: bool,
+    cfg: &RecallConfig,
+    authority_intent: Option<authority::QueryIntent>,
+) -> rusqlite::Result<Vec<(FactHit, f64)>> {
     // FTS5 default-ANDs tokens — for natural-language queries we want any-match.
     // Drop stopwords, generic question words, and corpus-ubiquitous tokens, then
     // OR the remaining alphanumerics so "who is alice" hits facts mentioning the
@@ -293,6 +371,9 @@ pub(crate) fn facts_recall_with_config(
     } else {
         ""
     };
+    let authority_order = authority_intent
+        .map(|intent| authority_rank_sql(intent, "f"))
+        .unwrap_or_default();
     let fts_arm = |weights: &str| -> rusqlite::Result<Vec<i64>> {
         if fts_query.is_empty() {
             return Ok(Vec::new());
@@ -301,7 +382,7 @@ pub(crate) fn facts_recall_with_config(
             "SELECT facts_fts.rowid
              FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid
              WHERE facts_fts MATCH ?1 AND f.tombstone = 0{privacy}
-             ORDER BY bm25(facts_fts, {weights}), f.importance DESC LIMIT ?2",
+             ORDER BY {authority_order} bm25(facts_fts, {weights}), f.importance DESC LIMIT ?2",
         ))?
         .query_map(rusqlite::params![fts_query, (k * 3) as i64], |r| r.get(0))?
         .collect()
@@ -364,7 +445,7 @@ pub(crate) fn facts_recall_with_config(
                      subject LIKE ?1 || ' %' ESCAPE '\\' OR
                      subject LIKE ?1 || '/%' ESCAPE '\\'
                  )
-                 ORDER BY importance DESC LIMIT 3",
+                 ORDER BY {authority_order} importance DESC LIMIT 3",
             ))?
             .query_map([&esc], |r| r.get(0))?
             .filter_map(Result::ok)
@@ -421,7 +502,7 @@ pub(crate) fn facts_recall_with_config(
                 .prepare(&format!(
                     "SELECT rowid FROM facts f
                      WHERE predicate = ?1 AND tombstone = 0{privacy}
-                     ORDER BY importance DESC LIMIT ?2",
+                     ORDER BY {authority_order} importance DESC LIMIT ?2",
                 ))?
                 .query_map(rusqlite::params![pred, (k * 3) as i64], |r| r.get(0))?
                 .filter_map(Result::ok)
@@ -458,7 +539,57 @@ pub(crate) fn facts_recall_with_config(
     // appears in two FTS arms, so pure RRF can rank all of them above a
     // single-arm slug hit).
     let mut keep: Vec<(i64, f64)> = fused;
-    if let Some(top) = slug_top1 {
+    if let Some(intent) = authority_intent {
+        let mut ranks = std::collections::HashMap::new();
+        for (rowid, _) in &keep {
+            let rank = conn
+                .query_row(
+                    "SELECT authority_status, superseded_by FROM facts WHERE rowid = ?1",
+                    [rowid],
+                    |row| {
+                        let status = authority::AuthorityStatus::from_db(&row.get::<_, String>(0)?);
+                        let superseded_by: Option<String> = row.get(1)?;
+                        let rank = match (
+                            intent,
+                            status,
+                            superseded_by.as_deref().is_some_and(|id| !id.is_empty()),
+                        ) {
+                            (
+                                authority::QueryIntent::Current,
+                                authority::AuthorityStatus::Current,
+                                false,
+                            ) => 0,
+                            (
+                                authority::QueryIntent::Current,
+                                authority::AuthorityStatus::Unknown,
+                                false,
+                            ) => 1,
+                            (authority::QueryIntent::Current, _, _) => 2,
+                            (authority::QueryIntent::Historical, _, true)
+                            | (
+                                authority::QueryIntent::Historical,
+                                authority::AuthorityStatus::Historical,
+                                false,
+                            ) => 0,
+                            (
+                                authority::QueryIntent::Historical,
+                                authority::AuthorityStatus::Current,
+                                false,
+                            ) => 1,
+                            (
+                                authority::QueryIntent::Historical,
+                                authority::AuthorityStatus::Unknown,
+                                false,
+                            ) => 2,
+                        };
+                        Ok(rank)
+                    },
+                )
+                .unwrap_or(2);
+            ranks.insert(*rowid, rank);
+        }
+        keep.sort_by_key(|(rowid, _)| ranks.get(rowid).copied().unwrap_or(2));
+    } else if let Some(top) = slug_top1 {
         if keep.len() > k {
             let in_window = keep.iter().take(k).any(|(id, _)| *id == top);
             if !in_window {
@@ -477,16 +608,23 @@ pub(crate) fn facts_recall_with_config(
     let mut scored: Vec<(FactHit, f64)> = Vec::new();
     for (rowid, score) in &keep {
         let row = conn.query_row(
-            "SELECT subject, predicate, object, importance, private
+            "SELECT id, subject, predicate, object, importance, private,
+                    source_origin, effective_date, superseded_by, authority_status
              FROM facts WHERE rowid = ?1 AND tombstone = 0",
             [rowid],
             |r| {
                 Ok(FactHit {
-                    subject: r.get(0)?,
-                    predicate: r.get(1)?,
-                    object: r.get(2)?,
-                    importance: r.get(3)?,
-                    private: r.get::<_, i64>(4)? != 0,
+                    id: r.get(0)?,
+                    subject: r.get(1)?,
+                    predicate: r.get(2)?,
+                    object: r.get(3)?,
+                    importance: r.get(4)?,
+                    private: r.get::<_, i64>(5)? != 0,
+                    source_origin: r.get(6)?,
+                    effective_date: r.get(7)?,
+                    superseded_by: r.get(8)?,
+                    authority_status: authority::AuthorityStatus::from_db(&r.get::<_, String>(9)?),
+                    resolved_authority: None,
                 })
             },
         );
@@ -498,8 +636,10 @@ pub(crate) fn facts_recall_with_config(
         }
     }
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
+        authority_intent
+            .map(|intent| fact_authority_rank(&a.0, intent).cmp(&fact_authority_rank(&b.0, intent)))
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
             .then(
                 b.0.importance
                     .partial_cmp(&a.0.importance)
@@ -516,6 +656,8 @@ pub struct RecallOutcome {
     pub facts_injected: usize,
     pub chunks_injected: usize,
     pub latency_ms: u64,
+    pub authority_state: Option<String>,
+    pub authority_degraded: bool,
     /// The formatted context block, ready for `additionalContext`. Empty when
     /// `injected` is false.
     pub context: String,
@@ -569,8 +711,33 @@ pub fn recall_with_config(
     for_agent: bool,
     cfg: &RecallConfig,
 ) -> RecallOutcome {
-    let t0 = std::time::Instant::now();
+    let started = std::time::Instant::now();
+    if is_trivial(query) || is_machine(query) {
+        return recall_generic_with_config(hex_root, query, for_agent, cfg, None, started);
+    }
+    let resolution = authority::resolve(hex_root, query, for_agent);
+    if resolution.preserves_generic() {
+        recall_generic_with_config(
+            hex_root,
+            query,
+            for_agent,
+            cfg,
+            Some(resolution.kind.as_str()),
+            started,
+        )
+    } else {
+        recall_authority_with_config(hex_root, query, for_agent, cfg, resolution, started)
+    }
+}
 
+fn recall_generic_with_config(
+    hex_root: &Path,
+    query: &str,
+    for_agent: bool,
+    cfg: &RecallConfig,
+    authority_state: Option<&str>,
+    started: std::time::Instant,
+) -> RecallOutcome {
     if is_trivial(query) || is_machine(query) {
         let outcome = RecallOutcome {
             injected: false,
@@ -578,7 +745,9 @@ pub fn recall_with_config(
             result_count: 0,
             facts_injected: 0,
             chunks_injected: 0,
-            latency_ms: t0.elapsed().as_millis() as u64,
+            latency_ms: started.elapsed().as_millis() as u64,
+            authority_state: authority_state.map(str::to_owned),
+            authority_degraded: false,
             context: String::new(),
         };
         log_recall(hex_root, &outcome, &LogExtras::default());
@@ -698,7 +867,9 @@ pub fn recall_with_config(
             result_count: filtered.len() + facts.len(),
             facts_injected: facts.len(),
             chunks_injected: filtered.len(),
-            latency_ms: t0.elapsed().as_millis() as u64,
+            latency_ms: started.elapsed().as_millis() as u64,
+            authority_state: authority_state.map(str::to_owned),
+            authority_degraded: false,
             context: format_context_v2(&filtered, &facts),
         }
     } else {
@@ -708,12 +879,236 @@ pub fn recall_with_config(
             result_count: 0,
             facts_injected: 0,
             chunks_injected: 0,
-            latency_ms: t0.elapsed().as_millis() as u64,
+            latency_ms: started.elapsed().as_millis() as u64,
+            authority_state: authority_state.map(str::to_owned),
+            authority_degraded: false,
             context: String::new(),
         }
     };
     log_recall(hex_root, &outcome, &extras);
     outcome
+}
+
+fn recall_authority_with_config(
+    hex_root: &Path,
+    query: &str,
+    for_agent: bool,
+    cfg: &RecallConfig,
+    resolution: authority::Resolution,
+    started: std::time::Instant,
+) -> RecallOutcome {
+    let db = super::db_path(hex_root);
+    let conn = match super::open_db(&db) {
+        Ok(conn) => Some(conn),
+        Err(error) => {
+            eprintln!("[memory recall] cannot open {}: {error}", db.display());
+            None
+        }
+    };
+    let (context, facts, chunks, extras, fact_degraded) =
+        build_context(hex_root, conn.as_ref(), query, for_agent, cfg, &resolution);
+    let injected = !context.is_empty();
+    let outcome = RecallOutcome {
+        injected,
+        gated: false,
+        result_count: facts + chunks + resolution.sources.len(),
+        facts_injected: facts,
+        chunks_injected: chunks,
+        latency_ms: started.elapsed().as_millis() as u64,
+        authority_state: Some(resolution.kind.as_str().to_owned()),
+        authority_degraded: resolution.is_degraded() || fact_degraded,
+        context,
+    };
+    log_recall(hex_root, &outcome, &extras);
+    outcome
+}
+
+pub(crate) fn context_with_connection(
+    hex_root: &Path,
+    conn: &rusqlite::Connection,
+    query: &str,
+    for_agent: bool,
+) -> String {
+    let resolution = authority::resolve(hex_root, query, for_agent);
+    let cfg = RecallConfig::load(hex_root);
+    build_context(hex_root, Some(conn), query, for_agent, &cfg, &resolution).0
+}
+
+fn build_context(
+    _hex_root: &Path,
+    conn: Option<&rusqlite::Connection>,
+    query: &str,
+    for_agent: bool,
+    cfg: &RecallConfig,
+    resolution: &authority::Resolution,
+) -> (String, usize, usize, LogExtras, bool) {
+    if resolution.preserves_generic() {
+        let Some(conn) = conn else {
+            return (String::new(), 0, 0, LogExtras::default(), false);
+        };
+        let assembled = super::assemble::assemble(conn, query, for_agent, 0, None);
+        let facts = assembled
+            .candidates
+            .iter()
+            .filter(|candidate| matches!(&candidate.kind, super::assemble::CandidateKind::Fact(_)))
+            .count();
+        let chunks = assembled.candidates.len().saturating_sub(facts);
+        return (
+            super::assemble::render_candidates(&assembled),
+            facts,
+            chunks,
+            LogExtras::default(),
+            false,
+        );
+    }
+    let Some(conn) = conn else {
+        return (
+            format_authority_context(resolution, "", false, false),
+            0,
+            0,
+            LogExtras::default(),
+            false,
+        );
+    };
+    authority_context_with_connection(conn, query, for_agent, cfg, resolution)
+}
+
+fn authority_context_with_connection(
+    conn: &rusqlite::Connection,
+    query: &str,
+    for_agent: bool,
+    cfg: &RecallConfig,
+    resolution: &authority::Resolution,
+) -> (String, usize, usize, LogExtras, bool) {
+    let excluded_sources: std::collections::HashSet<String> = resolution
+        .sources
+        .iter()
+        .flat_map(|source| [source.id.clone(), source.path.clone()])
+        .collect();
+    let force_degraded = resolution.is_degraded();
+    let assembled = super::assemble::assemble_with_authority_config(
+        conn,
+        query,
+        for_agent,
+        MAX_CONTEXT_CHARS,
+        MAX_CHUNKS_RENDERED,
+        cfg,
+        resolution.intent,
+        &excluded_sources,
+        force_degraded,
+    );
+    let per_move_stats = assembled
+        .per_move_stats
+        .iter()
+        .map(|stats| {
+            json!({
+                "move_id": move_id_str(stats.move_id),
+                "fired": stats.fired,
+                "candidate_count": stats.candidate_count,
+                "top_native_scores": stats.top_native_scores,
+                "native_score": stats.top_native_scores.first().copied(),
+            })
+        })
+        .collect();
+    let facts = assembled
+        .candidates
+        .iter()
+        .filter(|candidate| matches!(&candidate.kind, super::assemble::CandidateKind::Fact(_)))
+        .count();
+    let chunks = assembled.candidates.len().saturating_sub(facts);
+    let (fact_conflict, fact_degraded) = super::assemble::authority_flags(&assembled);
+    let rendered = super::assemble::render_authority_candidates(&assembled, resolution.intent);
+    (
+        format_authority_context(resolution, &rendered, fact_conflict, fact_degraded),
+        facts,
+        chunks,
+        LogExtras {
+            per_move_stats,
+            ablation: serde_json::Value::Null,
+        },
+        fact_degraded,
+    )
+}
+
+fn format_authority_context(
+    resolution: &authority::Resolution,
+    database: &str,
+    fact_conflict: bool,
+    fact_degraded: bool,
+) -> String {
+    let mut out = String::from(
+        "## Relevant workspace memory\n\nAuthority-aware results for this registered topic:\n\n",
+    );
+    if let Some(notice) = &resolution.notice {
+        out.push_str(&authority_display_field(notice));
+        out.push_str("\n\n");
+    }
+    if fact_conflict {
+        out.push_str("Authority conflict: database facts disagree.\n\n");
+    }
+    if fact_degraded {
+        out.push_str("Authority degraded: database metadata could not be verified.\n\n");
+    }
+    if resolution.is_degraded() {
+        out.push_str("Database results are unverified; not accepted current authority.\n\n");
+    }
+    for source in &resolution.sources {
+        let heading = match source.status {
+            authority::AuthorityStatus::Historical => "### Historical authority",
+            authority::AuthorityStatus::Current => "### Current authority",
+            authority::AuthorityStatus::Unknown => "### Unverified authority source",
+        };
+        out.push_str(heading);
+        out.push_str("\n\n");
+        out.push_str(&format!(
+            "Source: {} ({})",
+            authority_display_field(&source.id),
+            authority_display_field(&source.path)
+        ));
+        if let Some(date) = &source.effective_date {
+            out.push_str(&format!("; effective: {}", authority_display_field(date)));
+        }
+        if let Some(target) = source
+            .superseded_by
+            .as_deref()
+            .filter(|target| !target.is_empty())
+        {
+            out.push_str(&format!(
+                "; superseded by: {}",
+                authority_display_field(target)
+            ));
+        }
+        out.push_str("\n\n");
+        for line in source.excerpt.lines() {
+            out.push_str("> ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(database);
+    truncate_context(&mut out);
+    out
+}
+
+fn truncate_context(context: &mut String) {
+    if context.len() <= MAX_CONTEXT_CHARS {
+        return;
+    }
+    let mut end = MAX_CONTEXT_CHARS;
+    while !context.is_char_boundary(end) {
+        end -= 1;
+    }
+    context.truncate(end);
+}
+
+fn authority_display_field(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('[', "&#91;")
+        .replace(']', "&#93;")
 }
 
 #[derive(Default)]
@@ -798,6 +1193,8 @@ fn log_recall(hex_root: &Path, o: &RecallOutcome, extras: &LogExtras) {
                 "injected": o.injected, "gated": o.gated,
                 "result_count": o.result_count, "latency_ms": o.latency_ms,
                 "facts_injected": o.facts_injected, "chunks_injected": o.chunks_injected,
+                "authority_state": o.authority_state.as_deref(),
+                "authority_degraded": o.authority_degraded,
                 "per_move_stats": extras.per_move_stats,
                 "ablation_without_top1": extras.ablation,
             })
@@ -817,6 +1214,248 @@ pub fn run(hex_root: &Path, query: &str, for_agent: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+
+    const RED_01: &str = "[AUTH-RED-01-FALLBACK]";
+    const RED_02: &str = "[AUTH-RED-02-RANKING]";
+    const RED_03: &str = "[AUTH-RED-03-HISTORY]";
+    const RED_04: &str = "[AUTH-RED-04-SUPERSESSION]";
+    const RED_05: &str = "[AUTH-RED-05-DB-CONFLICT]";
+    const RED_06: &str = "[AUTH-RED-06-REGISTRY-STATES]";
+    const RED_07: &str = "[AUTH-RED-07-DEDUP-BUDGET]";
+    const RED_08: &str = "[AUTH-RED-08-AGENT-PRIVACY]";
+
+    const CURRENT_REGISTRY: &str = r#"version = 1
+
+[[sources]]
+id = "memory-operations"
+path = "docs/hex-ops.md"
+heading = "Memory"
+topics = ["memory recall", "memory index"]
+authority_status = "current"
+effective_date = "2026-09-10"
+private = false
+"#;
+
+    const CURRENT_SOURCE: &str = "# Operations\n## Memory\nCURRENT_SOURCE_CANARY run memory-safe-command\n## Other\nOUTSIDE_HEADING_CANARY never include this text\n";
+
+    fn setup<T, E: std::fmt::Display>(result: Result<T, E>, case: &str, action: &str) -> T {
+        result.unwrap_or_else(|error| panic!("[AUTH-SETUP] {case}: {action}: {error}"))
+    }
+
+    fn write_fixture(root: &Path, relative: &str, bytes: &str, case: &str) {
+        let path = root.join(relative);
+        let parent = path
+            .parent()
+            .unwrap_or_else(|| panic!("[AUTH-SETUP] {case}: fixture path has no parent"));
+        setup(
+            std::fs::create_dir_all(parent),
+            case,
+            "create fixture parent",
+        );
+        setup(std::fs::write(path, bytes), case, "write fixture");
+    }
+
+    fn write_registry(root: &Path, registry: &str, case: &str) {
+        write_fixture(root, ".hex/config/memory-authority.toml", registry, case);
+    }
+
+    fn write_current_source(root: &Path, case: &str) {
+        write_registry(root, CURRENT_REGISTRY, case);
+        write_fixture(root, "docs/hex-ops.md", CURRENT_SOURCE, case);
+    }
+
+    fn authority_db(root: &Path, case: &str) -> Connection {
+        let db_path = crate::memory::db_path(root);
+        let parent = db_path
+            .parent()
+            .unwrap_or_else(|| panic!("[AUTH-SETUP] {case}: database path has no parent"));
+        setup(
+            std::fs::create_dir_all(parent),
+            case,
+            "create database parent",
+        );
+        crate::memory::vector::register_sqlite_vec();
+        let conn = setup(Connection::open(db_path), case, "open temporary database");
+        setup(
+            crate::memory::schema::apply_plan1_baseline_for_test(&conn),
+            case,
+            "apply Plan 1 test baseline",
+        );
+        setup(
+            crate::memory::schema::apply_plan2(&conn),
+            case,
+            "apply Plan 2 schema",
+        );
+        setup(
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+                    file_id UNINDEXED,
+                    source_path UNINDEXED,
+                    heading,
+                    chunk_index UNINDEXED,
+                    content,
+                    private UNINDEXED,
+                    tokenize='unicode61'
+                );",
+            ),
+            case,
+            "create temporary chunks index",
+        );
+        conn
+    }
+
+    struct AuthorityFact<'a> {
+        id: &'a str,
+        object: &'a str,
+        importance: f64,
+        source_origin: &'a str,
+        effective_date: Option<&'a str>,
+        superseded_by: Option<&'a str>,
+        authority_status: &'a str,
+    }
+
+    #[derive(Clone, Copy)]
+    struct SupersessionRow<'a> {
+        id: &'a str,
+        canary: &'a str,
+        superseded_by: Option<&'a str>,
+    }
+
+    struct SupersessionCase<'a> {
+        label: &'a str,
+        rows: &'a [SupersessionRow<'a>],
+    }
+
+    fn insert_authority_fact(conn: &Connection, case: &str, fact: AuthorityFact<'_>) {
+        setup(
+            conn.execute(
+                "INSERT INTO facts (
+                    id,subject,predicate,object,importance,created_at,updated_at,private,
+                    source_origin,effective_date,superseded_by,authority_status
+                 ) VALUES (
+                    ?1,'memory','recall',?2,?3,'2026-09-10','2026-09-10',0,?4,?5,?6,?7
+                 )",
+                rusqlite::params![
+                    fact.id,
+                    fact.object,
+                    fact.importance,
+                    fact.source_origin,
+                    fact.effective_date,
+                    fact.superseded_by,
+                    fact.authority_status,
+                ],
+            ),
+            case,
+            "insert authority fact",
+        );
+    }
+
+    fn insert_chunk(conn: &Connection, case: &str, path: &str, body: &str) {
+        setup(
+            conn.execute(
+                "INSERT INTO chunks (file_id,source_path,heading,chunk_index,content,private)
+                 VALUES (?1,?1,'Memory','0',?2,0)",
+                rusqlite::params![path, body],
+            ),
+            case,
+            "insert indexed chunk",
+        );
+    }
+
+    const FACT_STATUS_TAGS: [&str; 5] = [
+        "[current]",
+        "[historical]",
+        "[unverified]",
+        "[degraded]",
+        "[conflict]",
+    ];
+    const SOURCE_AUTHORITY_HEADINGS: [&str; 2] =
+        ["### Current authority", "### Historical authority"];
+
+    fn validate_source_authority_heading(
+        context: &str,
+        canary: &str,
+        expected: &str,
+    ) -> Result<(), String> {
+        if !SOURCE_AUTHORITY_HEADINGS.contains(&expected) {
+            return Err(format!("unsupported expected source heading `{expected}`"));
+        }
+        let lines: Vec<&str> = context.lines().collect();
+        let canary_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| line.contains(canary).then_some(index))
+            .collect();
+        if canary_lines.len() != 1 {
+            return Err(format!(
+                "expected one line containing `{canary}`, found {}",
+                canary_lines.len()
+            ));
+        }
+        let canary_line = canary_lines[0];
+        let nearest_heading = lines[..canary_line]
+            .iter()
+            .rev()
+            .copied()
+            .find(|line| SOURCE_AUTHORITY_HEADINGS.contains(line));
+        match nearest_heading {
+            Some(heading) if heading == expected => Ok(()),
+            Some(heading) => Err(format!(
+                "nearest authority heading before `{canary}` was `{heading}`, expected `{expected}`"
+            )),
+            None => Err(format!(
+                "no recognized authority heading precedes `{canary}`"
+            )),
+        }
+    }
+
+    fn assert_source_authority_heading(context: &str, canary: &str, expected: &str, marker: &str) {
+        if let Err(error) = validate_source_authority_heading(context, canary, expected) {
+            panic!("{marker}: {error}; context {context:?}");
+        }
+    }
+
+    fn validate_fact_status_line(
+        context: &str,
+        canary: &str,
+        expected: &str,
+    ) -> Result<(), String> {
+        if !FACT_STATUS_TAGS.contains(&expected) {
+            return Err(format!("unsupported expected status tag `{expected}`"));
+        }
+        let lines: Vec<&str> = context
+            .lines()
+            .filter(|line| line.contains(canary))
+            .collect();
+        if lines.len() != 1 {
+            return Err(format!(
+                "expected one line containing `{canary}`, found {}",
+                lines.len()
+            ));
+        }
+        let line = lines[0];
+        let expected_count = line.matches(expected).count();
+        if expected_count != 1 {
+            return Err(format!(
+                "expected one `{expected}` tag on `{canary}` line, found {expected_count}: {line:?}"
+            ));
+        }
+        for tag in FACT_STATUS_TAGS {
+            if tag != expected && line.contains(tag) {
+                return Err(format!(
+                    "unexpected `{tag}` tag on `{canary}` line: {line:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_fact_status_line(context: &str, canary: &str, expected: &str, marker: &str) {
+        if let Err(error) = validate_fact_status_line(context, canary, expected) {
+            panic!("{marker}: {error}; context {context:?}");
+        }
+    }
 
     #[test]
     fn trivial_prompts_are_gated() {
@@ -843,6 +1482,1161 @@ mod tests {
             false,
         );
         assert!(!o.injected);
+    }
+
+    #[test]
+    fn authority_fact_status_line_helper_accepts_one_exact_tag() {
+        let context = "Current authority\n[current] CURRENT_FACT_CANARY\n";
+        assert!(
+            validate_fact_status_line(context, "CURRENT_FACT_CANARY", "[current]").is_ok(),
+            "[AUTH-HELPER-CONTROL]: one exact expected status tag must pass",
+        );
+        let source_context = "### Current authority\nCURRENT_SOURCE_CANARY\n";
+        assert!(
+            validate_source_authority_heading(
+                source_context,
+                "CURRENT_SOURCE_CANARY",
+                "### Current authority",
+            )
+            .is_ok(),
+            "[AUTH-HELPER-CONTROL]: exact source authority heading must pass",
+        );
+    }
+
+    #[test]
+    fn authority_fact_status_line_helper_rejects_false_green_and_bad_tags() {
+        let cases = [
+            (
+                "earlier heading false-green",
+                "Current authority\nCURRENT_SOURCE_CANARY\nunverified: VALID_CURRENT_CANARY\n",
+                "VALID_CURRENT_CANARY",
+                "[current]",
+            ),
+            (
+                "wrong tag",
+                "[historical] CURRENT_FACT_CANARY\n",
+                "CURRENT_FACT_CANARY",
+                "[current]",
+            ),
+            (
+                "multiple allowed tags",
+                "[current] [historical] CURRENT_FACT_CANARY\n",
+                "CURRENT_FACT_CANARY",
+                "[current]",
+            ),
+            (
+                "missing tag",
+                "CURRENT_FACT_CANARY\n",
+                "CURRENT_FACT_CANARY",
+                "[current]",
+            ),
+            (
+                "duplicate fact lines",
+                "[current] CURRENT_FACT_CANARY\n[current] CURRENT_FACT_CANARY\n",
+                "CURRENT_FACT_CANARY",
+                "[current]",
+            ),
+            (
+                "unsupported expected tag",
+                "[current] CURRENT_FACT_CANARY\n",
+                "CURRENT_FACT_CANARY",
+                "[obsolete]",
+            ),
+        ];
+        for (label, context, canary, expected) in cases {
+            assert!(
+                validate_fact_status_line(context, canary, expected).is_err(),
+                "[AUTH-HELPER-CONTROL]: `{label}` counterexample passed",
+            );
+        }
+        let source_cases = [
+            (
+                "fact tag is not a source heading",
+                "[historical] HISTORICAL_FACT_CANARY\nHISTORICAL_SOURCE_CANARY\n",
+                "HISTORICAL_SOURCE_CANARY",
+                "### Historical authority",
+            ),
+            (
+                "wrong intervening source heading",
+                "### Current authority\n### Historical authority\nCURRENT_SOURCE_CANARY\n",
+                "CURRENT_SOURCE_CANARY",
+                "### Current authority",
+            ),
+        ];
+        for (label, context, canary, expected) in source_cases {
+            assert!(
+                validate_source_authority_heading(context, canary, expected).is_err(),
+                "[AUTH-HELPER-CONTROL]: `{label}` counterexample passed",
+            );
+        }
+    }
+
+    #[test]
+    fn authority_cross_arm_fusion_cannot_displace_current_fact() {
+        let case = "authority_cross_arm_fusion_cannot_displace_current_fact";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        let conn = authority_db(root.path(), case);
+        for index in 0..8 {
+            insert_authority_fact(
+                &conn,
+                case,
+                AuthorityFact {
+                    id: &format!("history-{index}"),
+                    object: &format!("HISTORY_FUSION_{index} memory recall deployment"),
+                    importance: 0.99,
+                    source_origin: "history",
+                    effective_date: None,
+                    superseded_by: None,
+                    authority_status: "historical",
+                },
+            );
+        }
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "current-fusion",
+                object: "CURRENT_FUSION_CANARY memory recall deployment",
+                importance: 0.01,
+                source_origin: "current",
+                effective_date: None,
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        let hits = facts_recall_with_authority_config(
+            &conn,
+            "memory recall deployment",
+            1,
+            false,
+            &RecallConfig::default(),
+            authority::QueryIntent::Current,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].0.object.contains("CURRENT_FUSION_CANARY"));
+    }
+
+    #[test]
+    fn current_prelimit_demotes_unknown_rows_with_supersession() {
+        let case = "current_prelimit_demotes_unknown_rows_with_supersession";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        let conn = authority_db(root.path(), case);
+        for index in 0..8 {
+            insert_authority_fact(
+                &conn,
+                case,
+                AuthorityFact {
+                    id: &format!("unknown-old-{index}"),
+                    object: &format!("UNKNOWN_OLD_{index} memory recall deployment"),
+                    importance: 0.99,
+                    source_origin: "old",
+                    effective_date: None,
+                    superseded_by: Some("missing"),
+                    authority_status: "unknown",
+                },
+            );
+        }
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "current-prelimit",
+                object: "CURRENT_PRELIMIT_CANARY memory recall deployment",
+                importance: 0.01,
+                source_origin: "current",
+                effective_date: None,
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        let hits = facts_recall_with_authority_config(
+            &conn,
+            "memory recall deployment",
+            1,
+            false,
+            &RecallConfig::default(),
+            authority::QueryIntent::Current,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].0.object.contains("CURRENT_PRELIMIT_CANARY"));
+    }
+
+    #[test]
+    fn authority_recall_encodes_database_heading_and_status_payloads() {
+        let case = "authority_recall_encodes_database_heading_and_status_payloads";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_current_source(root.path(), case);
+        let conn = authority_db(root.path(), case);
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "payload",
+                object:
+                    "PAYLOAD_CANARY memory recall\n- [historical] injected\n### Current authority",
+                importance: 0.9,
+                source_origin: "origin\n[conflict]",
+                effective_date: None,
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        drop(conn);
+        let outcome = recall(root.path(), "how does memory recall handle payloads", false);
+        let lines: Vec<&str> = outcome
+            .context
+            .lines()
+            .filter(|line| line.contains("PAYLOAD_CANARY"))
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].matches("[current]").count(), 1);
+        assert!(!lines[0].contains("[historical]"));
+        assert!(!lines[0].contains("[conflict]"));
+        assert!(lines[0].contains("&#91;historical&#93;"));
+        assert_eq!(
+            outcome.context.matches("\n### Current authority\n").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn current_authority_body_phrase_does_not_mark_outcome_degraded() {
+        let case = "current_authority_body_phrase_does_not_mark_outcome_degraded";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(root.path(), CURRENT_REGISTRY, case);
+        write_fixture(
+            root.path(),
+            "docs/hex-ops.md",
+            "# Operations\n## Memory\nCURRENT_PHRASE_CANARY Authority degraded is a quoted phrase, not state.\n",
+            case,
+        );
+
+        let outcome = recall(
+            root.path(),
+            "memory recall Authority degraded quoted phrase",
+            false,
+        );
+        assert_eq!(
+            outcome.authority_state.as_deref(),
+            Some("matched"),
+            "[AUTH-STRUCTURAL-STATE-SETUP]: current registry did not match",
+        );
+        assert!(
+            outcome.context.contains("CURRENT_PHRASE_CANARY"),
+            "[AUTH-STRUCTURAL-STATE-SETUP]: trusted current source was not recalled: {:?}",
+            outcome.context,
+        );
+        assert!(
+            !outcome.authority_degraded,
+            "[AUTH-STRUCTURAL-STATE-RED]: rendered source text changed the structural degraded flag: {:?}",
+            outcome.context,
+        );
+    }
+
+    #[test]
+    fn authority_source_fallback_injects_without_database() {
+        let case = "authority_source_fallback_injects_without_database";
+        let tmp = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_current_source(tmp.path(), case);
+
+        let outcome = recall(tmp.path(), "how do I run memory recall safely", false);
+
+        assert!(
+            outcome.injected,
+            "{}: registry source did not inject",
+            RED_01
+        );
+        assert!(
+            outcome.context.contains("Current authority"),
+            "{}: current-authority label is missing from {:?}",
+            RED_01,
+            outcome.context,
+        );
+        assert!(
+            outcome.context.contains("CURRENT_SOURCE_CANARY"),
+            "{}: selected source body is missing from {:?}",
+            RED_01,
+            outcome.context,
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "CURRENT_SOURCE_CANARY",
+            "### Current authority",
+            RED_01,
+        );
+        assert!(
+            !outcome.context.contains("OUTSIDE_HEADING_CANARY"),
+            "{}: source extraction escaped the selected heading",
+            RED_01,
+        );
+        assert!(
+            outcome.context.len() <= MAX_CONTEXT_CHARS,
+            "{}: context exceeded {} chars",
+            RED_01,
+            MAX_CONTEXT_CHARS,
+        );
+    }
+
+    #[test]
+    fn authority_ranking_and_unknown_labels_are_enforced() {
+        let case = "authority_ranking_and_unknown_labels_are_enforced";
+        let tmp = setup(tempfile::TempDir::new(), case, "create ranking TempDir");
+        write_current_source(tmp.path(), case);
+        let conn = authority_db(tmp.path(), case);
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "f_current",
+                object: "CURRENT_FACT_CANARY memory recall deployment procedure",
+                importance: 0.10,
+                source_origin: "database-current-origin",
+                effective_date: Some("2026-09-10"),
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        for index in 0..6 {
+            insert_authority_fact(
+                &conn,
+                case,
+                AuthorityFact {
+                    id: &format!("f_history_{index}"),
+                    object: &format!("HISTORY_CANARY_{index} memory recall deployment procedure"),
+                    importance: 0.99 - f64::from(index) * 0.01,
+                    source_origin: "historical-archive",
+                    effective_date: Some("2025-01-15"),
+                    superseded_by: None,
+                    authority_status: "historical",
+                },
+            );
+        }
+        drop(conn);
+
+        let outcome = recall(tmp.path(), "memory recall deployment procedure", false);
+        assert!(
+            outcome.context.contains("Current authority"),
+            "{}: matched query has no current-authority block: {:?}",
+            RED_02,
+            outcome.context,
+        );
+        let current_at = outcome.context.find("CURRENT_FACT_CANARY");
+        let first_history_at = outcome.context.find("HISTORY_CANARY_");
+        assert!(
+            matches!((current_at, first_history_at), (Some(current), Some(history)) if current < history),
+            "{}: current fact did not precede retained history: {:?}",
+            RED_02,
+            outcome.context,
+        );
+        assert_fact_status_line(&outcome.context, "CURRENT_FACT_CANARY", "[current]", RED_02);
+        let returned_history: Vec<String> = (0..6)
+            .map(|index| format!("HISTORY_CANARY_{index}"))
+            .filter(|canary| outcome.context.contains(canary))
+            .collect();
+        assert!(
+            !returned_history.is_empty(),
+            "{}: ranked context retained no historical fact: {:?}",
+            RED_02,
+            outcome.context,
+        );
+        for canary in returned_history {
+            assert_fact_status_line(&outcome.context, &canary, "[historical]", RED_02);
+        }
+        assert!(
+            outcome.context.len() <= MAX_CONTEXT_CHARS,
+            "{}: ranked context exceeded {} chars",
+            RED_02,
+            MAX_CONTEXT_CHARS,
+        );
+
+        let unknown = setup(tempfile::TempDir::new(), case, "create unknown TempDir");
+        write_current_source(unknown.path(), case);
+        let conn = authority_db(unknown.path(), case);
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "f_unknown",
+                object: "UNKNOWN_CANARY memory recall deployment procedure",
+                importance: 0.90,
+                source_origin: "unclassified-import",
+                effective_date: None,
+                superseded_by: None,
+                authority_status: "unknown",
+            },
+        );
+        drop(conn);
+        let outcome = recall(unknown.path(), "memory recall deployment procedure", false);
+        assert!(
+            outcome.context.contains("UNKNOWN_CANARY"),
+            "{}: selected unknown fact is absent: {:?}",
+            RED_02,
+            outcome.context,
+        );
+        assert_fact_status_line(&outcome.context, "UNKNOWN_CANARY", "[unverified]", RED_02);
+    }
+
+    #[test]
+    fn historical_authority_query_returns_labeled_history() {
+        let case = "historical_authority_query_returns_labeled_history";
+        let tmp = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(
+            tmp.path(),
+            r#"version = 1
+
+[[sources]]
+id = "memory-history"
+path = "docs/memory-history.md"
+heading = "Memory history"
+topics = ["memory recall"]
+authority_status = "historical"
+effective_date = "2025-01-15"
+private = false
+"#,
+            case,
+        );
+        write_fixture(
+            tmp.path(),
+            "docs/memory-history.md",
+            "# Archive\n## Memory history\nHISTORICAL_SOURCE_CANARY previous memory recall deployment procedure\n",
+            case,
+        );
+        let conn = authority_db(tmp.path(), case);
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "f_history",
+                object: "HISTORICAL_FACT_CANARY previous memory recall deployment procedure",
+                importance: 0.50,
+                source_origin: "database-history-origin",
+                effective_date: Some("2025-01-15"),
+                superseded_by: None,
+                authority_status: "historical",
+            },
+        );
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "f_now",
+                object: "CURRENT_QUERY_CANARY memory recall deployment procedure",
+                importance: 0.99,
+                source_origin: "database-current-origin",
+                effective_date: Some("2026-09-10"),
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        drop(conn);
+
+        let outcome = recall(
+            tmp.path(),
+            "what was the previous memory recall deployment procedure",
+            false,
+        );
+        assert!(
+            outcome.context.contains("HISTORICAL_SOURCE_CANARY"),
+            "{}: historical source is absent: {:?}",
+            RED_03,
+            outcome.context,
+        );
+        assert!(
+            outcome.context.contains("HISTORICAL_FACT_CANARY"),
+            "{}: historical fact is absent: {:?}",
+            RED_03,
+            outcome.context,
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "HISTORICAL_SOURCE_CANARY",
+            "### Historical authority",
+            RED_03,
+        );
+        assert_fact_status_line(
+            &outcome.context,
+            "HISTORICAL_FACT_CANARY",
+            "[historical]",
+            RED_03,
+        );
+        let historical_at = outcome
+            .context
+            .find("HISTORICAL_FACT_CANARY")
+            .unwrap_or_else(|| panic!("{}: historical fact canary disappeared", RED_03));
+        if let Some(current_at) = outcome.context.find("CURRENT_QUERY_CANARY") {
+            assert!(
+                historical_at < current_at,
+                "{}: historical query ranked current before history: {:?}",
+                RED_03,
+                outcome.context,
+            );
+            assert_fact_status_line(
+                &outcome.context,
+                "CURRENT_QUERY_CANARY",
+                "[current]",
+                RED_03,
+            );
+        }
+        assert!(
+            outcome.context.contains("2025-01-15"),
+            "{}: historical effective date is absent",
+            RED_03,
+        );
+    }
+
+    #[test]
+    fn authority_supersession_invalid_rows_are_explicitly_degraded() {
+        let case = "authority_supersession_invalid_rows_are_explicitly_degraded";
+
+        let valid = setup(tempfile::TempDir::new(), case, "create valid TempDir");
+        write_current_source(valid.path(), case);
+        let conn = authority_db(valid.path(), case);
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "f_old",
+                object: "VALID_OLD_CANARY memory recall deployment procedure",
+                importance: 0.99,
+                source_origin: "legacy-runbook",
+                effective_date: Some("2025-01-15"),
+                superseded_by: Some("f_current"),
+                authority_status: "current",
+            },
+        );
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "f_current",
+                object: "VALID_CURRENT_CANARY memory recall deployment procedure",
+                importance: 0.10,
+                source_origin: "database-current-origin",
+                effective_date: Some("2026-09-10"),
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        drop(conn);
+        let outcome = recall(valid.path(), "memory recall deployment procedure", false);
+        assert!(
+            outcome.context.contains("VALID_CURRENT_CANARY"),
+            "{}: valid replacement target is absent: {:?}",
+            RED_04,
+            outcome.context,
+        );
+        assert_fact_status_line(
+            &outcome.context,
+            "VALID_CURRENT_CANARY",
+            "[current]",
+            RED_04,
+        );
+        assert!(
+            outcome.context.contains("VALID_OLD_CANARY"),
+            "{}: valid superseded row is absent: {:?}",
+            RED_04,
+            outcome.context,
+        );
+        assert_fact_status_line(&outcome.context, "VALID_OLD_CANARY", "[historical]", RED_04);
+        assert!(
+            outcome.context.contains("f_current"),
+            "{}: replacement ID is absent: {:?}",
+            RED_04,
+            outcome.context,
+        );
+
+        let invalid_cases = [
+            SupersessionCase {
+                label: "missing target",
+                rows: &[SupersessionRow {
+                    id: "f_missing",
+                    canary: "MISSING_TARGET_CANARY",
+                    superseded_by: Some("absent"),
+                }],
+            },
+            SupersessionCase {
+                label: "self link",
+                rows: &[SupersessionRow {
+                    id: "f_self",
+                    canary: "SELF_LINK_CANARY",
+                    superseded_by: Some("f_self"),
+                }],
+            },
+            SupersessionCase {
+                label: "cycle",
+                rows: &[
+                    SupersessionRow {
+                        id: "f_cycle_a",
+                        canary: "CYCLE_A_CANARY",
+                        superseded_by: Some("f_cycle_b"),
+                    },
+                    SupersessionRow {
+                        id: "f_cycle_b",
+                        canary: "CYCLE_B_CANARY",
+                        superseded_by: Some("f_cycle_a"),
+                    },
+                ],
+            },
+            SupersessionCase {
+                label: "chain",
+                rows: &[
+                    SupersessionRow {
+                        id: "f_chain_a",
+                        canary: "CHAIN_A_CANARY",
+                        superseded_by: Some("f_chain_b"),
+                    },
+                    SupersessionRow {
+                        id: "f_chain_b",
+                        canary: "CHAIN_B_CANARY",
+                        superseded_by: Some("f_chain_c"),
+                    },
+                    SupersessionRow {
+                        id: "f_chain_c",
+                        canary: "CHAIN_C_CANARY",
+                        superseded_by: None,
+                    },
+                ],
+            },
+        ];
+        for invalid_case in invalid_cases {
+            let tmp = setup(tempfile::TempDir::new(), case, "create invalid TempDir");
+            write_current_source(tmp.path(), case);
+            let conn = authority_db(tmp.path(), case);
+            for row in invalid_case.rows {
+                insert_authority_fact(
+                    &conn,
+                    case,
+                    AuthorityFact {
+                        id: row.id,
+                        object: &format!("{} memory recall deployment procedure", row.canary),
+                        importance: 0.90,
+                        source_origin: "invalid-metadata-fixture",
+                        effective_date: Some("2025-01-15"),
+                        superseded_by: row.superseded_by,
+                        authority_status: "current",
+                    },
+                );
+            }
+            drop(conn);
+            let outcome = recall(tmp.path(), "memory recall deployment procedure", false);
+            assert!(
+                outcome.context.contains("Authority degraded"),
+                "{}: {} did not emit an explicit degraded result: {:?}",
+                RED_04,
+                invalid_case.label,
+                outcome.context,
+            );
+            for row in invalid_case.rows {
+                assert!(
+                    outcome.context.contains(row.id),
+                    "{}: {} degraded result omitted row `{}`: {:?}",
+                    RED_04,
+                    invalid_case.label,
+                    row.id,
+                    outcome.context,
+                );
+                assert_fact_status_line(&outcome.context, row.canary, "[degraded]", RED_04);
+            }
+        }
+    }
+
+    #[test]
+    fn authority_database_conflict_is_not_confident() {
+        let case = "authority_database_conflict_is_not_confident";
+        let tmp = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_current_source(tmp.path(), case);
+        let conn = authority_db(tmp.path(), case);
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "f_alpha",
+                object: "CONFLICT_COMMAND_ALPHA memory recall deployment procedure",
+                importance: 0.90,
+                source_origin: "runbook-alpha",
+                effective_date: Some("2026-09-10"),
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "f_beta",
+                object: "CONFLICT_COMMAND_BETA memory recall deployment procedure",
+                importance: 0.80,
+                source_origin: "runbook-beta",
+                effective_date: Some("2026-09-10"),
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        drop(conn);
+
+        let outcome = recall(tmp.path(), "memory recall deployment procedure", false);
+        assert!(
+            outcome.context.contains("Authority conflict"),
+            "{}: conflicting current facts were presented without a conflict block: {:?}",
+            RED_05,
+            outcome.context,
+        );
+        if outcome.context.contains("CONFLICT_COMMAND_ALPHA")
+            || outcome.context.contains("CONFLICT_COMMAND_BETA")
+        {
+            for token in [
+                "CONFLICT_COMMAND_ALPHA",
+                "CONFLICT_COMMAND_BETA",
+                "runbook-alpha",
+                "runbook-beta",
+            ] {
+                assert!(
+                    outcome.context.contains(token),
+                    "{}: conflict block omitted `{}`: {:?}",
+                    RED_05,
+                    token,
+                    outcome.context,
+                );
+            }
+            assert_fact_status_line(
+                &outcome.context,
+                "CONFLICT_COMMAND_ALPHA",
+                "[conflict]",
+                RED_05,
+            );
+            assert_fact_status_line(
+                &outcome.context,
+                "CONFLICT_COMMAND_BETA",
+                "[conflict]",
+                RED_05,
+            );
+        }
+    }
+
+    #[test]
+    fn authority_registry_states_are_distinct_and_closed() {
+        let case = "authority_registry_states_are_distinct_and_closed";
+
+        let invalid = setup(tempfile::TempDir::new(), case, "create invalid TempDir");
+        write_registry(
+            invalid.path(),
+            r#"version = 1
+[[sources]]
+id = "outside"
+path = "../outside.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+"#,
+            case,
+        );
+        let invalid_outcome = recall(invalid.path(), "memory recall procedure", false);
+        assert!(
+            invalid_outcome
+                .context
+                .contains("Authority degraded: invalid registry"),
+            "{}: invalid registry state is not explicit: {:?}",
+            RED_06,
+            invalid_outcome.context,
+        );
+        assert!(
+            !invalid_outcome.context.contains("Current authority"),
+            "{}: invalid registry was promoted to current",
+            RED_06,
+        );
+
+        let unsupported = setup(tempfile::TempDir::new(), case, "create unsupported TempDir");
+        write_registry(unsupported.path(), "version = 2\n", case);
+        let unsupported_outcome = recall(unsupported.path(), "memory recall procedure", false);
+        assert!(
+            unsupported_outcome
+                .context
+                .contains("Authority degraded: unsupported registry version"),
+            "{}: unsupported registry state is not explicit: {:?}",
+            RED_06,
+            unsupported_outcome.context,
+        );
+        assert!(
+            !unsupported_outcome.context.contains("Current authority"),
+            "{}: unsupported registry was promoted to current",
+            RED_06,
+        );
+
+        let private = setup(tempfile::TempDir::new(), case, "create private TempDir");
+        write_registry(
+            private.path(),
+            r#"version = 1
+[[sources]]
+id = "private-memory"
+path = "docs/private.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = true
+"#,
+            case,
+        );
+        write_fixture(
+            private.path(),
+            "docs/private.md",
+            "# Private\nPRIVATE_ONLY_BODY_CANARY memory recall procedure\n",
+            case,
+        );
+        let private_outcome = recall(private.path(), "memory recall procedure", true);
+        assert!(
+            private_outcome
+                .context
+                .contains("Authority source excluded: private"),
+            "{}: private-only registry state is not explicit: {:?}",
+            RED_06,
+            private_outcome.context,
+        );
+        assert!(
+            !private_outcome.context.contains("PRIVATE_ONLY_BODY_CANARY"),
+            "{}: private-only registry rendered its body",
+            RED_06,
+        );
+        assert!(
+            !private_outcome.context.contains("Current authority"),
+            "{}: private-only registry was promoted to current",
+            RED_06,
+        );
+
+        let conflict = setup(tempfile::TempDir::new(), case, "create conflict TempDir");
+        write_registry(
+            conflict.path(),
+            r#"version = 1
+[[sources]]
+id = "runbook-alpha"
+path = "docs/alpha.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+
+[[sources]]
+id = "runbook-beta"
+path = "docs/beta.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+"#,
+            case,
+        );
+        write_fixture(
+            conflict.path(),
+            "docs/alpha.md",
+            "# Alpha\nCONFLICT_SOURCE_ALPHA_BODY_CANARY memory recall procedure\n",
+            case,
+        );
+        write_fixture(
+            conflict.path(),
+            "docs/beta.md",
+            "# Beta\nCONFLICT_SOURCE_BETA_BODY_CANARY memory recall procedure\n",
+            case,
+        );
+        let conflict_outcome = recall(conflict.path(), "memory recall procedure", false);
+        assert!(
+            conflict_outcome.context.contains("Authority conflict")
+                && conflict_outcome.context.contains("runbook-alpha")
+                && conflict_outcome.context.contains("runbook-beta"),
+            "{}: registry conflict is not explicit: {:?}",
+            RED_06,
+            conflict_outcome.context,
+        );
+        assert!(
+            !conflict_outcome
+                .context
+                .contains("CONFLICT_SOURCE_ALPHA_BODY_CANARY")
+                && !conflict_outcome
+                    .context
+                    .contains("CONFLICT_SOURCE_BETA_BODY_CANARY"),
+            "{}: registry conflict rendered a real source-body canary",
+            RED_06,
+        );
+        assert!(
+            !conflict_outcome.context.contains("Current authority"),
+            "{}: conflicting registry was promoted to current",
+            RED_06,
+        );
+
+        let over_limit = setup(tempfile::TempDir::new(), case, "create over-limit TempDir");
+        let mut registry = String::from("version = 1\n");
+        for index in 0..65 {
+            let relative = format!("docs/over-limit-{index}.md");
+            registry.push_str(&format!(
+                "\n[[sources]]\nid = \"over-limit-{index}\"\npath = \"{relative}\"\ntopics = [\"memory recall\"]\nauthority_status = \"current\"\nprivate = false\n"
+            ));
+            write_fixture(
+                over_limit.path(),
+                &relative,
+                &format!("# Over limit\nOVER_LIMIT_BODY_CANARY_{index} memory recall procedure\n"),
+                case,
+            );
+        }
+        write_registry(over_limit.path(), &registry, case);
+        let over_limit_outcome = recall(over_limit.path(), "memory recall procedure", false);
+        assert!(
+            over_limit_outcome
+                .context
+                .contains("Authority degraded: registry entry limit"),
+            "{}: over-limit registry state is not explicit: {:?}",
+            RED_06,
+            over_limit_outcome.context,
+        );
+        assert!(
+            !over_limit_outcome
+                .context
+                .contains("OVER_LIMIT_BODY_CANARY"),
+            "{}: over-limit registry rendered a real source-body canary",
+            RED_06,
+        );
+        assert!(
+            !over_limit_outcome.context.contains("Current authority"),
+            "{}: over-limit registry was promoted to current",
+            RED_06,
+        );
+    }
+
+    #[test]
+    fn authority_direct_source_deduplicates_indexed_and_respects_context_cap() {
+        let case = "authority_direct_source_deduplicates_indexed_and_respects_context_cap";
+        let tmp = setup(tempfile::TempDir::new(), case, "create TempDir");
+        let long_body = format!(
+            "# Operations\n## Memory\nDEDUP_CANARY memory recall deployment procedure {}\n## Other\nOUTSIDE_HEADING_CANARY\n",
+            "source-detail ".repeat(350),
+        );
+        write_registry(tmp.path(), CURRENT_REGISTRY, case);
+        write_fixture(tmp.path(), "docs/hex-ops.md", &long_body, case);
+        let conn = authority_db(tmp.path(), case);
+        insert_chunk(
+            &conn,
+            case,
+            "docs/hex-ops.md",
+            "DEDUP_CANARY memory recall deployment procedure indexed duplicate",
+        );
+        for index in 0..8 {
+            insert_chunk(
+                &conn,
+                case,
+                &format!("docs/unrelated-{index}.md"),
+                &format!(
+                    "UNRELATED_CHUNK_{index} memory recall deployment procedure {}",
+                    "filler ".repeat(120),
+                ),
+            );
+        }
+        drop(conn);
+
+        let outcome = recall(tmp.path(), "memory recall deployment procedure", false);
+        assert!(
+            outcome.context.contains("Current authority"),
+            "{}: direct source did not receive the reserved current slot: {:?}",
+            RED_07,
+            outcome.context,
+        );
+        assert_eq!(
+            outcome.context.matches("DEDUP_CANARY").count(),
+            1,
+            "{}: direct and indexed authority were not deduplicated: {:?}",
+            RED_07,
+            outcome.context,
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "DEDUP_CANARY",
+            "### Current authority",
+            RED_07,
+        );
+        assert!(
+            outcome.context.contains("source-detail"),
+            "{}: direct-only source detail is absent: {:?}",
+            RED_07,
+            outcome.context,
+        );
+        assert!(
+            !outcome.context.contains("indexed duplicate"),
+            "{}: indexed-only duplicate was rendered: {:?}",
+            RED_07,
+            outcome.context,
+        );
+        assert!(
+            outcome.context.len() <= MAX_CONTEXT_CHARS,
+            "{}: deduplicated context exceeded {} chars",
+            RED_07,
+            MAX_CONTEXT_CHARS,
+        );
+        let direct_at = outcome
+            .context
+            .find("DEDUP_CANARY")
+            .unwrap_or_else(|| panic!("{}: reserved direct-source canary is absent", RED_07));
+        if let Some(generic_at) = outcome.context.find("UNRELATED_CHUNK_") {
+            assert!(
+                direct_at < generic_at,
+                "{}: generic chunk displaced the reserved direct source",
+                RED_07,
+            );
+        }
+        assert!(
+            !outcome.context.contains("OUTSIDE_HEADING_CANARY"),
+            "{}: reserved excerpt escaped the selected heading",
+            RED_07,
+        );
+    }
+
+    #[test]
+    fn for_agent_registry_fallback_excludes_private_and_unclassified() {
+        let case = "for_agent_registry_fallback_excludes_private_and_unclassified";
+        let tmp = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(
+            tmp.path(),
+            r#"version = 1
+[[sources]]
+id = "public-memory"
+path = "docs/public.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+
+[[sources]]
+id = "private-memory"
+path = "docs/private.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = true
+
+[[sources]]
+id = "unclassified-memory"
+path = "docs/unclassified.md"
+topics = ["memory recall"]
+authority_status = "current"
+"#,
+            case,
+        );
+        write_fixture(
+            tmp.path(),
+            "docs/public.md",
+            "# Public\nPUBLIC_SOURCE_CANARY memory recall procedure\n",
+            case,
+        );
+        write_fixture(
+            tmp.path(),
+            "docs/private.md",
+            "# Private\nPRIVATE_SOURCE_CANARY memory recall procedure\n",
+            case,
+        );
+        write_fixture(
+            tmp.path(),
+            "docs/unclassified.md",
+            "# Unclassified\nUNCLASSIFIED_SOURCE_CANARY memory recall procedure\n",
+            case,
+        );
+
+        let outcome = recall(tmp.path(), "memory recall procedure", true);
+        assert!(
+            outcome.context.contains("PUBLIC_SOURCE_CANARY"),
+            "{}: public source did not survive agent filtering: {:?}",
+            RED_08,
+            outcome.context,
+        );
+        assert!(
+            !outcome.context.contains("PRIVATE_SOURCE_CANARY"),
+            "{}: private source leaked into agent context",
+            RED_08,
+        );
+        assert!(
+            !outcome.context.contains("UNCLASSIFIED_SOURCE_CANARY"),
+            "{}: unclassified source leaked into agent context",
+            RED_08,
+        );
+    }
+
+    #[test]
+    fn absent_authority_registry_preserves_generic_interactive_recall() {
+        let case = "absent_authority_registry_preserves_generic_interactive_recall";
+        let tmp = setup(tempfile::TempDir::new(), case, "create TempDir");
+        let conn = authority_db(tmp.path(), case);
+        setup(
+            conn.execute(
+                "INSERT INTO facts (
+                    id,subject,predicate,object,importance,created_at,updated_at,private
+                 ) VALUES (
+                    'f_generic','project:hex','uses','GENERIC_FACT_CANARY',0.9,
+                    '2026-09-10','2026-09-10',0
+                 )",
+                [],
+            ),
+            case,
+            "insert generic fact",
+        );
+        drop(conn);
+
+        let outcome = recall(tmp.path(), "what does project hex use for memory", false);
+        assert!(
+            outcome.injected && !outcome.gated,
+            "[AUTH-CHAR-01-ABSENT]: generic fact did not inject",
+        );
+        assert_eq!(outcome.result_count, 1, "[AUTH-CHAR-01-ABSENT]");
+        assert_eq!(outcome.facts_injected, 1, "[AUTH-CHAR-01-ABSENT]");
+        assert_eq!(outcome.chunks_injected, 0, "[AUTH-CHAR-01-ABSENT]");
+        assert!(
+            outcome.context.contains("## Relevant workspace memory")
+                && outcome.context.contains("### Facts")
+                && outcome
+                    .context
+                    .contains("- **project:hex** uses GENERIC_FACT_CANARY"),
+            "[AUTH-CHAR-01-ABSENT]: generic rendering changed: {:?}",
+            outcome.context,
+        );
+        assert!(
+            !outcome.context.to_lowercase().contains("authority"),
+            "[AUTH-CHAR-01-ABSENT]: authority text appeared without a registry",
+        );
+    }
+
+    #[test]
+    fn unmatched_authority_registry_preserves_interactive_recall_bytes() {
+        let case = "unmatched_authority_registry_preserves_interactive_recall_bytes";
+        let tmp = setup(tempfile::TempDir::new(), case, "create TempDir");
+        let conn = authority_db(tmp.path(), case);
+        setup(
+            conn.execute(
+                "INSERT INTO facts (
+                    id,subject,predicate,object,importance,created_at,updated_at,private
+                 ) VALUES (
+                    'f_generic','project:hex','uses','GENERIC_FACT_CANARY',0.9,
+                    '2026-09-10','2026-09-10',0
+                 )",
+                [],
+            ),
+            case,
+            "insert generic fact",
+        );
+        drop(conn);
+
+        let before = recall(tmp.path(), "what does project hex use for memory", false);
+        write_current_source(tmp.path(), case);
+        let after = recall(tmp.path(), "what does project hex use for memory", false);
+
+        assert_eq!(
+            (
+                before.injected,
+                before.gated,
+                before.result_count,
+                before.facts_injected,
+                before.chunks_injected,
+                before.context,
+            ),
+            (
+                after.injected,
+                after.gated,
+                after.result_count,
+                after.facts_injected,
+                after.chunks_injected,
+                after.context,
+            ),
+            "[AUTH-CHAR-02-UNMATCHED]: unmatched registry changed interactive recall",
+        );
     }
 }
 
@@ -1000,8 +2794,7 @@ mod plan2_tests {
             "`ablation_without_top1` must include `dedup_keys`: {ablation}"
         );
         assert!(
-            ablation.get("total_chars").is_some()
-                || ablation.get("chars").is_some(),
+            ablation.get("total_chars").is_some() || ablation.get("chars").is_some(),
             "`ablation_without_top1` must include a char total (`total_chars` or `chars`): {ablation}"
         );
     }
