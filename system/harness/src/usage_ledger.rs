@@ -471,6 +471,36 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
     if v.get("type").and_then(Value::as_str) != Some("token_usage_record") {
         return Ok(Event::Ignore);
     }
+    // Current Codex archives place the response identity and all usage beneath
+    // `payload`; the outer envelope intentionally has no provider field.
+    if payload.is_object() {
+        let response_id = field(payload, "response_id").ok_or("missing_response_id")?;
+        let usage = payload.get("usage").unwrap_or(&Value::Null);
+        let n = |key: &str| usage.get(key).and_then(Value::as_i64);
+        let session_id = field(payload, "session_id");
+        let thread_id = field(payload, "thread_id");
+        let parent_response_id = match (thread_id, session_id) {
+            (Some(thread), Some(session)) if thread != session => Some(thread),
+            (Some(thread), None) => Some(thread),
+            _ => None,
+        };
+        return Ok(Event::Canonical(Parsed {
+            provider: "codex".into(),
+            account_scope: "unknown-local-source".into(),
+            response_id,
+            parent_response_id,
+            root_task_family: field(payload, "root_turn_id"),
+            event_at: field(&v, "timestamp"),
+            model: field(payload, "model"),
+            effort: field(payload, "effort"),
+            input: n("input_tokens"),
+            cached: n("cached_input_tokens"),
+            cache_write: n("cache_write_input_tokens"),
+            output: n("output_tokens"),
+            reasoning: n("reasoning_output_tokens"),
+            total: n("total_tokens"),
+        }));
+    }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
     let n = |k: &str| v.get(k).and_then(Value::as_i64);
     Ok(Event::Canonical(Parsed {

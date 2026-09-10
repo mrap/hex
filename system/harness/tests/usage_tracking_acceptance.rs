@@ -365,3 +365,28 @@ fn unrelated_events_advance_cursor_without_quarantine() {
         0
     );
 }
+
+#[test]
+fn payload_backed_codex_response_uses_codex_identity_and_usage() {
+    let (_dir, mut ledger, path) = setup();
+    fs::write(
+        &path,
+        concat!(
+            r#"{"ordinal":12,"timestamp":"2026-09-10T00:00:00Z","type":"token_usage_record","payload":{"response_id":"response-1","root_turn_id":"root-turn","session_id":"session-1","thread_id":"parent-thread","turn_id":"turn-1","usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":2,"total_tokens":13}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let result = ledger.import_jsonl(&path, Default::default()).unwrap();
+    assert_eq!((result.accepted, result.quarantined), (1, 0));
+    let row = ledger.rows(1, 0).unwrap().pop().unwrap();
+    assert_eq!(row.provider, "codex");
+    assert!(row.account_scope.starts_with("unknown-local-source:"));
+    assert_eq!(row.response_id, "response-1");
+    assert_eq!(row.parent_response_id.as_deref(), Some("parent-thread"));
+    assert_eq!(row.root_task_family.as_deref(), Some("root-turn"));
+    assert_eq!(row.event_at.as_deref(), Some("2026-09-10T00:00:00Z"));
+    assert_eq!(row.cache_write_input_tokens, Some(1));
+    assert_eq!(row.reasoning_output_tokens, Some(2));
+    assert_eq!(row.total_tokens, Some(13));
+}
