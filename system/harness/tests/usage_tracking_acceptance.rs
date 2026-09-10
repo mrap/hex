@@ -372,3 +372,52 @@ fn payload_response_hydrates_session_attribution_after_reopen() {
     assert_eq!(row.root_task_family.as_deref(), Some("build"));
     assert_eq!(row.parent_response_id.as_deref(), Some("parent"));
 }
+
+#[test]
+fn later_context_backfills_response_without_overwriting_explicit_model() {
+    let (dir, mut ledger, path) = setup();
+    let db = dir.path().join("usage.db");
+    fs::write(&path, concat!(
+        r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"late"}}"#, "\n",
+        r#"{"type":"token_usage_record","timestamp":"2026-09-10T00:00:01Z","payload":{"response_id":"resp-late","session_id":"late","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}}"#, "\n",
+        r#"{"type":"token_usage_record","timestamp":"2026-09-10T00:00:02Z","payload":{"response_id":"resp-explicit","session_id":"late","model":"explicit","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}}"#, "\n",
+        r#"{"type":"turn_context","timestamp":"2026-09-10T00:00:03Z","payload":{"model":"gpt-5.6-terra","effort":"medium"}}"#, "\n",
+    )).unwrap();
+    ledger
+        .import_jsonl(
+            &path,
+            ImportOptions {
+                max_records: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    drop(ledger);
+    let mut reopened = UsageLedger::open(db).unwrap();
+    reopened.import_jsonl(&path, Default::default()).unwrap();
+    let rows = reopened.rows(10, 0).unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.response_id == "resp-late")
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("gpt-5.6-terra")
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.response_id == "resp-late")
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("medium")
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.response_id == "resp-explicit")
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("explicit")
+    );
+}

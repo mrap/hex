@@ -105,6 +105,10 @@ impl UsageLedger {
                 [],
             );
         }
+        let _ = conn.execute(
+            "ALTER TABLE canonical_responses ADD COLUMN session_id TEXT",
+            [],
+        );
         for column in [
             "cumulative_cache_write INTEGER",
             "cumulative_reasoning INTEGER",
@@ -308,6 +312,7 @@ fn import_event(
         }
         Event::SessionMeta(meta) => {
             upsert_session(tx, source, &meta)?;
+            backfill_session_attribution(tx, source, &meta.session_id)?;
             Ok(())
         }
         Event::TurnContext(context) => {
@@ -320,6 +325,7 @@ fn import_event(
                 "UPDATE codex_session_state SET model=COALESCE(?1,model),effort=COALESCE(?2,effort),root_task_family=COALESCE(?3,root_task_family),parent_thread_id=COALESCE(?4,parent_thread_id) WHERE source_key=?5 AND session_id=?6",
                 params![context.model, context.effort, context.root_task_family, context.parent_thread_id, source, session_id],
             )?;
+            backfill_session_attribution(tx, source, &session_id)?;
             Ok(())
         }
         Event::TokenCount(count) => import_token_count(tx, source, offset, record_hash, count, out),
@@ -556,6 +562,17 @@ fn hydrate_from_session(tx: &Transaction<'_>, source: &str, record: &mut Parsed)
     }
     Ok(())
 }
+fn backfill_session_attribution(
+    tx: &Transaction<'_>,
+    source: &str,
+    session_id: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE canonical_responses SET model=COALESCE(model,(SELECT model FROM codex_session_state WHERE source_key=?1 AND session_id=?2)),effort=COALESCE(effort,(SELECT effort FROM codex_session_state WHERE source_key=?1 AND session_id=?2)),root_task_family=COALESCE(root_task_family,(SELECT root_task_family FROM codex_session_state WHERE source_key=?1 AND session_id=?2)),parent_response_id=COALESCE(parent_response_id,(SELECT parent_thread_id FROM codex_session_state WHERE source_key=?1 AND session_id=?2)) WHERE session_id=?2 AND account_scope=?3",
+        params![source, session_id, format!("unknown-local-source:{source}")],
+    )?;
+    Ok(())
+}
 impl TokenUsage {
     fn any(self) -> bool {
         self.input.is_some()
@@ -754,7 +771,7 @@ fn observe(
     Ok(())
 }
 fn insert(tx: &Transaction<'_>, r: &Parsed, hash: &str) -> Result<()> {
-    tx.execute("INSERT INTO canonical_responses(provider,account_scope,response_id,record_hash,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![r.provider,r.account_scope,r.response_id,hash,r.parent_response_id,r.root_task_family,r.event_at,r.model,r.effort,r.input,r.cached,r.cache_write,r.output,r.reasoning,r.total])?;
+    tx.execute("INSERT INTO canonical_responses(provider,account_scope,response_id,record_hash,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,session_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![r.provider,r.account_scope,r.response_id,hash,r.parent_response_id,r.root_task_family,r.event_at,r.model,r.effort,r.input,r.cached,r.cache_write,r.output,r.reasoning,r.total,r.session_id])?;
     Ok(())
 }
 fn hash(b: &[u8]) -> String {
@@ -778,7 +795,7 @@ fn file_identity(meta: &fs::Metadata) -> String {
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TEXT NOT NULL,generation INTEGER NOT NULL,path TEXT NOT NULL,prefix_hash TEXT NOT NULL,cursor INTEGER NOT NULL,source_len INTEGER NOT NULL,updated_at TEXT,source_mtime_ns INTEGER NOT NULL DEFAULT 0,UNIQUE(identity,generation));
 CREATE TABLE IF NOT EXISTS observations (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,record_hash TEXT NOT NULL,verdict TEXT NOT NULL CHECK(verdict IN ('accepted','duplicate','conflict','quarantine')),reason TEXT,provider TEXT,account_scope TEXT,response_id TEXT,PRIMARY KEY(source_key,byte_offset));
-CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_scope TEXT NOT NULL,response_id TEXT NOT NULL,record_hash TEXT NOT NULL,parent_response_id TEXT,root_task_family TEXT,event_at TEXT,model TEXT,effort TEXT,input_tokens INTEGER,cached_input_tokens INTEGER,cache_write_input_tokens INTEGER,output_tokens INTEGER,reasoning_output_tokens INTEGER,total_tokens INTEGER,PRIMARY KEY(provider,account_scope,response_id));
+CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_scope TEXT NOT NULL,response_id TEXT NOT NULL,record_hash TEXT NOT NULL,parent_response_id TEXT,root_task_family TEXT,event_at TEXT,model TEXT,effort TEXT,input_tokens INTEGER,cached_input_tokens INTEGER,cache_write_input_tokens INTEGER,output_tokens INTEGER,reasoning_output_tokens INTEGER,total_tokens INTEGER,session_id TEXT,PRIMARY KEY(provider,account_scope,response_id));
 CREATE TABLE IF NOT EXISTS codex_session_state (source_key TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT,effort TEXT,root_task_family TEXT,parent_thread_id TEXT,cumulative_input INTEGER NOT NULL DEFAULT 0,cumulative_cached INTEGER NOT NULL DEFAULT 0,cumulative_cache_write INTEGER,cumulative_output INTEGER NOT NULL DEFAULT 0,cumulative_reasoning INTEGER,cumulative_total INTEGER,PRIMARY KEY(source_key,session_id));
 CREATE TABLE IF NOT EXISTS codex_stream_events (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,event_at TEXT,session_id TEXT,kind TEXT NOT NULL,PRIMARY KEY(source_key,byte_offset));
 CREATE INDEX IF NOT EXISTS observations_identity ON observations(provider,account_scope,response_id);CREATE INDEX IF NOT EXISTS canonical_time ON canonical_responses(event_at);CREATE INDEX IF NOT EXISTS canonical_family ON canonical_responses(root_task_family);"#;
