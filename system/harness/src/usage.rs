@@ -40,6 +40,9 @@ pub enum UsageCommands {
         /// Report path. Defaults to $HEX_DIR/.hex/usage/report.json.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// RFC3339 UTC cutoff. Omit to use the current time.
+        #[arg(long)]
+        cutoff: Option<String>,
     },
     /// Trailing-window burn rate; alert if above threshold
     Burn {
@@ -182,7 +185,11 @@ pub fn run(cmd: UsageCommands) -> i32 {
             ledger,
             max_records,
         } => collect(source, ledger, max_records),
-        UsageCommands::Report { ledger, output } => report(ledger, output),
+        UsageCommands::Report {
+            ledger,
+            output,
+            cutoff,
+        } => report(ledger, output, cutoff),
         UsageCommands::Burn {
             threshold,
             window_mins,
@@ -313,7 +320,7 @@ fn collect(source: Option<PathBuf>, ledger: Option<PathBuf>, max_records: usize)
     }
 }
 
-fn report(ledger: Option<PathBuf>, output: Option<PathBuf>) -> i32 {
+fn report(ledger: Option<PathBuf>, output: Option<PathBuf>, cutoff: Option<String>) -> i32 {
     let ledger = ledger.unwrap_or_else(default_ledger);
     let output = output.unwrap_or_else(default_report);
     let result = UsageLedger::open(&ledger).and_then(|l| {
@@ -325,7 +332,16 @@ fn report(ledger: Option<PathBuf>, output: Option<PathBuf>) -> i32 {
         eprintln!("usage report: ledger unavailable: {}", ledger.display());
         return 1;
     };
-    let end = Utc::now();
+    let end = match cutoff {
+        Some(value) => match value.parse::<DateTime<Utc>>() {
+            Ok(time) => time,
+            Err(_) => {
+                eprintln!("usage report: cutoff must be RFC3339 UTC");
+                return 1;
+            }
+        },
+        None => Utc::now(),
+    };
     let start = DateTime::from_timestamp(0, 0).expect("unix epoch");
     let report = usage_reporting::report(&rows, coverage, start, end);
     let body=json!({"schema":"hex.usage-report.v1","cutoff":end.to_rfc3339(),"measured":{"responses":report.measured.responses,"input_tokens":report.measured.input.to_string(),"cached_input_tokens":report.measured.cached_input.to_string(),"output_tokens":report.measured.output.to_string()},"coverage":{"accepted":report.coverage.accepted,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"pending_sources":report.coverage.pending_sources},"incomplete":report.incomplete_labels,"response_ids":rows.iter().map(|r|r.response_id.as_str()).collect::<Vec<_>>()}).to_string()+"\n";

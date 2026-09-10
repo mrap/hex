@@ -34,6 +34,8 @@ fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
             ledger.to_str().unwrap(),
             "--output",
             output.to_str().unwrap(),
+            "--cutoff",
+            "2026-09-11T00:00:00Z",
         ])
         .status()
         .unwrap();
@@ -41,6 +43,23 @@ fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
     let text = fs::read_to_string(&output).unwrap();
     assert!(text.contains("\"r1\""));
     assert!(text.contains("\"accepted\":1"));
+    let first = text.clone();
+    let status = Command::new(bin())
+        .env("HEX_DIR", root.path())
+        .args([
+            "usage",
+            "report",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--cutoff",
+            "2026-09-11T00:00:00Z",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(fs::read_to_string(&output).unwrap(), first);
     let paths = hex::workers::hex_modules::module_paths();
     assert!(paths
         .iter()
