@@ -248,9 +248,6 @@ fn usage_dir() -> PathBuf {
 fn default_ledger() -> PathBuf {
     usage_dir().join("usage.db")
 }
-fn default_source() -> PathBuf {
-    usage_dir().join("codex.jsonl")
-}
 fn default_report() -> PathBuf {
     usage_dir().join("report.json")
 }

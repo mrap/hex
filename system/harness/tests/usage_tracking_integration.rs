@@ -3,6 +3,69 @@ use tempfile::TempDir;
 fn bin() -> String {
     std::env::var("CARGO_BIN_EXE_hex").expect("hex binary")
 }
+fn record(id: &str) -> String {
+    format!("{{\"type\":\"token_usage_record\",\"provider\":\"codex\",\"response_id\":\"{id}\",\"event_at\":\"2026-09-10T00:00:00Z\",\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}\n")
+}
+#[test]
+fn discovery_imports_active_archive_and_rollout_while_reporting_missing_rollout() {
+    let root = TempDir::new().unwrap();
+    let codex = root.path().join("codex");
+    let ledger = root.path().join("ledger.db");
+    let active = codex.join("sessions/a.jsonl");
+    let archive = codex.join("archived_sessions/b.jsonl");
+    let rollout = root.path().join("rollout.jsonl");
+    fs::create_dir_all(active.parent().unwrap()).unwrap();
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    fs::write(&active, record("active")).unwrap();
+    fs::write(&archive, record("archive")).unwrap();
+    fs::write(&rollout, record("rollout")).unwrap();
+    let db = rusqlite::Connection::open(codex.join("state_5.sqlite")).unwrap();
+    db.execute("CREATE TABLE threads(rollout_path TEXT)", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1)",
+        [rollout.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1)",
+        [rollout.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1)",
+        [root
+            .path()
+            .join("missing.jsonl")
+            .to_string_lossy()
+            .to_string()],
+    )
+    .unwrap();
+    drop(db);
+    let status = Command::new(bin())
+        .env("HEX_DIR", root.path())
+        .args([
+            "usage",
+            "collect",
+            "--codex-root",
+            codex.to_str().unwrap(),
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--max-records",
+            "100",
+        ])
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    let rows = hex::usage_ledger::UsageLedger::open(&ledger)
+        .unwrap()
+        .rows(10, 0)
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|r| r.response_id == "active"));
+    assert!(rows.iter().any(|r| r.response_id == "archive"));
+    assert!(rows.iter().any(|r| r.response_id == "rollout"));
+}
 #[test]
 fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
     let root = TempDir::new().unwrap();
