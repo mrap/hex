@@ -25,6 +25,7 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 MAX_MESSAGE_BYTES = 256 * 1024
 MAX_HANDSHAKE_BYTES = 16 * 1024
 MAX_PAGES = 100
+MAX_HISTORY_PAGES = 1000
 QUEUE_PAGE_SIZE = 100
 HISTORY_PAGE_SIZE = 100
 MARKER_RE = re.compile(
@@ -471,10 +472,11 @@ def _paged(
     method: str,
     params: Mapping[str, Any],
     deadline: float,
+    max_pages: int,
 ) -> Iterator[Mapping[str, Any]]:
     cursor = None
     seen = set()
-    for _page in range(MAX_PAGES):
+    for _page in range(max_pages):
         request = dict(params)
         if cursor is not None:
             request["cursor"] = cursor
@@ -519,6 +521,7 @@ def _reconcile(
         "thread/queue/list",
         {"threadId": thread_id, "limit": QUEUE_PAGE_SIZE},
         deadline,
+        MAX_PAGES,
     ):
         if (
             not isinstance(queued.get("id"), str)
@@ -545,6 +548,7 @@ def _reconcile(
             "sortDirection": "desc",
         },
         deadline,
+        MAX_HISTORY_PAGES,
     ):
         item = entry.get("item")
         turn_id = entry.get("turnId")
