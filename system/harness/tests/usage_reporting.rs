@@ -26,7 +26,10 @@ fn row(
         effort: None,
         input_tokens: input,
         cached_input_tokens: cached,
+        cache_write_input_tokens: None,
         output_tokens: output,
+        reasoning_output_tokens: None,
+        total_tokens: None,
     }
 }
 #[test]
@@ -194,6 +197,91 @@ fn ties_sort_by_key_and_unknowns_are_visible() {
         "quarantined_records",
         "source_backlog",
         "stale_source",
+    ] {
+        assert!(r.incomplete_labels.contains(label), "{label}");
+    }
+}
+
+#[test]
+fn provider_extra_dimensions_reconcile_without_double_counting() {
+    let mut first = row(
+        "first",
+        "2026-09-10T01:00:00Z",
+        Some("gpt-5.6-terra"),
+        Some("build"),
+        None,
+        Some(100),
+        Some(20),
+        Some(10),
+    );
+    first.cache_write_input_tokens = Some(7);
+    first.reasoning_output_tokens = Some(4);
+    first.total_tokens = Some(110);
+    let mut second = row(
+        "second",
+        "2026-09-10T02:00:00Z",
+        Some("gpt-5.6-terra"),
+        Some("build"),
+        None,
+        Some(50),
+        Some(5),
+        Some(5),
+    );
+    second.cache_write_input_tokens = Some(2);
+    second.reasoning_output_tokens = Some(1);
+    second.total_tokens = Some(55);
+    let r = report(
+        &[first, second],
+        Coverage::default(),
+        t("2026-09-10T00:00:00Z"),
+        t("2026-09-11T00:00:00Z"),
+    );
+    assert_eq!(r.measured.input, 150);
+    assert_eq!(r.measured.output, 15);
+    assert_eq!(r.measured.cache_write_input, 9);
+    assert_eq!(r.measured.reasoning_output, 5);
+    assert_eq!(r.measured.provider_total, Some(165));
+    assert_eq!(r.measured.total(), 165);
+    // 125 fresh * 50 + 25 cached * 5 + 15 output * 300 microcredits.
+    assert_eq!(r.modeled_credits.value, MicroUnits(10_875));
+}
+
+#[test]
+fn missing_provider_dimensions_are_labeled_unknown() {
+    let mut known = row(
+        "known",
+        "2026-09-10T01:00:00Z",
+        Some("gpt-5.6-luna"),
+        Some("build"),
+        None,
+        Some(10),
+        Some(0),
+        Some(1),
+    );
+    known.cache_write_input_tokens = Some(0);
+    known.reasoning_output_tokens = Some(0);
+    known.total_tokens = Some(11);
+    let unknown = row(
+        "unknown",
+        "2026-09-10T02:00:00Z",
+        Some("gpt-5.6-luna"),
+        Some("build"),
+        None,
+        Some(10),
+        Some(0),
+        Some(1),
+    );
+    let r = report(
+        &[known, unknown],
+        Coverage::default(),
+        t("2026-09-10T00:00:00Z"),
+        t("2026-09-11T00:00:00Z"),
+    );
+    assert_eq!(r.measured.provider_total, None);
+    for label in [
+        "missing_cache_write_input_tokens",
+        "missing_reasoning_output_tokens",
+        "missing_provider_total_tokens",
     ] {
         assert!(r.incomplete_labels.contains(label), "{label}");
     }

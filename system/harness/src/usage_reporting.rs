@@ -85,7 +85,13 @@ pub struct MeasuredTokens {
     pub input: i128,
     pub cached_input: i128,
     pub uncached_input: i128,
+    /// Provider-reported cache writes. This is separate from input.
+    pub cache_write_input: i128,
     pub output: i128,
+    /// Provider-reported reasoning. This is a subset of output, never additive.
+    pub reasoning_output: i128,
+    /// Provider-reported total, available only when every included row supplied it.
+    pub provider_total: Option<i128>,
 }
 
 impl MeasuredTokens {
@@ -100,7 +106,18 @@ impl MeasuredTokens {
         self.input += input;
         self.cached_input += cached;
         self.uncached_input += input - cached;
+        if let Some(cache_write) = row.cache_write_input_tokens {
+            self.cache_write_input += cache_write as i128;
+        }
         self.output += output;
+        if let Some(reasoning) = row.reasoning_output_tokens {
+            self.reasoning_output += reasoning as i128;
+        }
+        self.provider_total = match (self.responses, row.total_tokens, self.provider_total) {
+            (1, Some(total), _) => Some(total as i128),
+            (_, Some(total), Some(sum)) => Some(sum + total as i128),
+            _ => None,
+        };
     }
 }
 
@@ -247,6 +264,16 @@ impl Accumulator {
         }
         if row.model.is_none() {
             self.labels.insert("unknown_model".into());
+        }
+        if row.cache_write_input_tokens.is_none() {
+            self.labels
+                .insert("missing_cache_write_input_tokens".into());
+        }
+        if row.reasoning_output_tokens.is_none() {
+            self.labels.insert("missing_reasoning_output_tokens".into());
+        }
+        if row.total_tokens.is_none() {
+            self.labels.insert("missing_provider_total_tokens".into());
         }
         // The frozen ledger has no speed field. These are standard-rate comparisons,
         // so a speed multiplier cannot be represented as an account estimate.
