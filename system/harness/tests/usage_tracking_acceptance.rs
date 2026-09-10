@@ -128,3 +128,22 @@ fn duplicate_conflict_and_bad_records_are_visible() {
     let c = l.coverage().unwrap();
     assert_eq!((c.conflicts, c.quarantined), (1, 2))
 }
+
+#[test]
+fn unknown_accounts_are_source_namespaced_and_no_change_reads_no_lines() {
+    let (d, mut ledger, first) = setup();
+    let second = d.path().join("second.jsonl");
+    let record = line("same-id", None, 1).replace("\"account_scope\":\"local\",", "");
+    fs::write(&first, format!("{record}\n")).unwrap();
+    fs::write(&second, format!("{record}\n")).unwrap();
+    ledger.import_jsonl(&first, Default::default()).unwrap();
+    ledger.import_jsonl(&second, Default::default()).unwrap();
+    assert_eq!(ledger.rows(10, 0).unwrap().len(), 2);
+    assert_eq!(
+        ledger
+            .import_jsonl(&first, Default::default())
+            .unwrap()
+            .bytes_read,
+        0
+    );
+}

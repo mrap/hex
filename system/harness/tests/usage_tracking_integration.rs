@@ -43,6 +43,9 @@ fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
     let text = fs::read_to_string(&output).unwrap();
     assert!(text.contains("\"r1\""));
     assert!(text.contains("\"accepted\":1"));
+    assert!(text.contains("\"by_model\""));
+    assert!(text.contains("\"by_family\""));
+    assert!(text.contains("\"child_coordination\""));
     let first = text.clone();
     let status = Command::new(bin())
         .env("HEX_DIR", root.path())

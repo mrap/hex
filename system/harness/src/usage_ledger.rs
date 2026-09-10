@@ -85,6 +85,10 @@ impl UsageLedger {
         // journal_mode returns a row, so use query_row rather than pragma_update.
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
+        let _ = conn.execute(
+            "ALTER TABLE source_files ADD COLUMN source_mtime_ns INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self { conn })
     }
     /// Inserted observations, canonical rows, quarantine state, and cursor movement share one transaction.
@@ -96,12 +100,25 @@ impl UsageLedger {
         let path = path.as_ref();
         let meta = fs::metadata(path)?;
         let identity = file_identity(&meta);
-        let prefix = prefix_hash(path)?;
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos() as i64)
+            .unwrap_or(0);
         let path_text = path.to_string_lossy().to_string();
-        let prior:Option<(i64,i64,String)>=self.conn.query_row("SELECT generation,cursor,prefix_hash FROM source_files WHERE identity=?1 ORDER BY generation DESC LIMIT 1",params![identity],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let prior:Option<(i64,i64,String,i64,i64)>=self.conn.query_row("SELECT generation,cursor,prefix_hash,source_len,source_mtime_ns FROM source_files WHERE identity=?1 ORDER BY generation DESC LIMIT 1",params![identity],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        // No-change path reads metadata only. A body fingerprint is read only if
+        // size or mtime says the source may have changed.
+        let unchanged = matches!(&prior, Some((_, _, _, old_len, old_mtime)) if *old_len == meta.len() as i64 && *old_mtime == mtime_ns);
+        let prefix = if unchanged {
+            prior.as_ref().unwrap().2.clone()
+        } else {
+            prefix_hash(path)?
+        };
         let (generation, cursor) = match prior {
-            Some((g, c, old)) if meta.len() as i64 >= c && old == prefix => (g, c),
-            Some((g, _, _)) => (g + 1, 0),
+            Some((g, c, old, _, _)) if meta.len() as i64 >= c && old == prefix => (g, c),
+            Some((g, _, _, _, _)) => (g + 1, 0),
             None => (0, 0),
         };
         let source_key = format!("{identity}:{generation}");
@@ -139,7 +156,7 @@ impl UsageLedger {
         }
         let backlog = pending.len() >= options.max_records || (!partial && offset < meta.len());
         let tx = self.conn.transaction()?;
-        tx.execute("INSERT INTO source_files(source_key,identity,generation,path,prefix_hash,cursor,source_len,updated_at) VALUES(?1,?2,?3,?4,?5,0,?6,?7) ON CONFLICT(source_key) DO UPDATE SET path=excluded.path,source_len=excluded.source_len,updated_at=excluded.updated_at",params![source_key,identity,generation,path_text,prefix,meta.len() as i64,Utc::now().to_rfc3339()])?;
+        tx.execute("INSERT INTO source_files(source_key,identity,generation,path,prefix_hash,cursor,source_len,updated_at,source_mtime_ns) VALUES(?1,?2,?3,?4,?5,0,?6,?7,?8) ON CONFLICT(source_key) DO UPDATE SET path=excluded.path,source_len=excluded.source_len,updated_at=excluded.updated_at,source_mtime_ns=excluded.source_mtime_ns",params![source_key,identity,generation,path_text,prefix,meta.len() as i64,Utc::now().to_rfc3339(),mtime_ns])?;
         let mut out = ImportResult {
             pending_partial: partial,
             backlog,
@@ -233,7 +250,7 @@ fn import_line(
     {
         return Ok(());
     }
-    let r = match parse(line) {
+    let mut r = match parse(line) {
         Ok(r) => r,
         Err(reason) => {
             observe(tx, source, offset, &hash, "quarantine", Some(&reason), None)?;
@@ -241,6 +258,9 @@ fn import_line(
             return Ok(());
         }
     };
+    if r.account_scope == "unknown-local-source" {
+        r.account_scope = format!("unknown-local-source:{source}");
+    }
     let old:Option<String>=tx.query_row("SELECT record_hash FROM canonical_responses WHERE provider=?1 AND account_scope=?2 AND response_id=?3",params![r.provider,r.account_scope,r.response_id],|x|x.get(0)).optional()?;
     let seen: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM observations WHERE provider=?1 AND account_scope=?2 AND response_id=?3)", params![r.provider,r.account_scope,r.response_id], |x| x.get(0))?;
     match old {
@@ -338,7 +358,7 @@ fn file_identity(meta: &fs::Metadata) -> String {
     format!("{}", meta.len())
 }
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TEXT NOT NULL,generation INTEGER NOT NULL,path TEXT NOT NULL,prefix_hash TEXT NOT NULL,cursor INTEGER NOT NULL,source_len INTEGER NOT NULL,updated_at TEXT,UNIQUE(identity,generation));
+CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TEXT NOT NULL,generation INTEGER NOT NULL,path TEXT NOT NULL,prefix_hash TEXT NOT NULL,cursor INTEGER NOT NULL,source_len INTEGER NOT NULL,updated_at TEXT,source_mtime_ns INTEGER NOT NULL DEFAULT 0,UNIQUE(identity,generation));
 CREATE TABLE IF NOT EXISTS observations (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,record_hash TEXT NOT NULL,verdict TEXT NOT NULL CHECK(verdict IN ('accepted','duplicate','conflict','quarantine')),reason TEXT,provider TEXT,account_scope TEXT,response_id TEXT,PRIMARY KEY(source_key,byte_offset));
 CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_scope TEXT NOT NULL,response_id TEXT NOT NULL,record_hash TEXT NOT NULL,parent_response_id TEXT,root_task_family TEXT,event_at TEXT,model TEXT,effort TEXT,input_tokens INTEGER,cached_input_tokens INTEGER,output_tokens INTEGER,PRIMARY KEY(provider,account_scope,response_id));
 CREATE INDEX IF NOT EXISTS observations_identity ON observations(provider,account_scope,response_id);CREATE INDEX IF NOT EXISTS canonical_time ON canonical_responses(event_at);CREATE INDEX IF NOT EXISTS canonical_family ON canonical_responses(root_task_family);"#;

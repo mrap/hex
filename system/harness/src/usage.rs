@@ -323,8 +323,9 @@ fn collect(source: Option<PathBuf>, ledger: Option<PathBuf>, max_records: usize)
 fn report(ledger: Option<PathBuf>, output: Option<PathBuf>, cutoff: Option<String>) -> i32 {
     let ledger = ledger.unwrap_or_else(default_ledger);
     let output = output.unwrap_or_else(default_report);
+    const ROW_CAP: usize = 100_000;
     let result = UsageLedger::open(&ledger).and_then(|l| {
-        let rows = l.rows(100_000, 0)?;
+        let rows = l.rows(ROW_CAP, 0)?;
         let coverage = l.coverage()?;
         Ok((rows, coverage))
     });
@@ -344,7 +345,9 @@ fn report(ledger: Option<PathBuf>, output: Option<PathBuf>, cutoff: Option<Strin
     };
     let start = DateTime::from_timestamp(0, 0).expect("unix epoch");
     let report = usage_reporting::report(&rows, coverage, start, end);
-    let body=json!({"schema":"hex.usage-report.v1","cutoff":end.to_rfc3339(),"measured":{"responses":report.measured.responses,"input_tokens":report.measured.input.to_string(),"cached_input_tokens":report.measured.cached_input.to_string(),"output_tokens":report.measured.output.to_string()},"coverage":{"accepted":report.coverage.accepted,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"pending_sources":report.coverage.pending_sources},"incomplete":report.incomplete_labels,"response_ids":rows.iter().map(|r|r.response_id.as_str()).collect::<Vec<_>>()}).to_string()+"\n";
+    let truncated = rows.len() == ROW_CAP;
+    let contributor = |item: &hex::usage_reporting::Contributor| json!({"key":item.key,"tokens":item.measured.total().to_string(),"credits_micro":item.credits.value.0.to_string(),"response_ids":item.response_ids});
+    let body=json!({"schema":"hex.usage-report.v1","cutoff":end.to_rfc3339(),"measured":{"responses":report.measured.responses,"input_tokens":report.measured.input.to_string(),"cached_input_tokens":report.measured.cached_input.to_string(),"output_tokens":report.measured.output.to_string()},"coverage":{"accepted":report.coverage.accepted,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"pending_sources":report.coverage.pending_sources,"row_cap":ROW_CAP,"rows_truncated":truncated},"incomplete":report.incomplete_labels,"by_model":report.by_model.iter().map(contributor).collect::<Vec<_>>(),"by_family":report.by_family.iter().map(contributor).collect::<Vec<_>>(),"child_coordination":{"share_millionths":report.child_coordination_share_millionths,"response_ids":report.child_coordination.response_ids}}).to_string()+"\n";
     if let Some(parent) = output.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!("usage report: cannot create output directory: {e}");
