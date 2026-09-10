@@ -3072,12 +3072,28 @@ mod tests {
             .unwrap()
             .trim()
             .to_owned();
+        let transport_receipt = root.join("transport-receipt.json");
+        let receipt = serde_json::json!({
+            "schema_version": "foundation.managed-cargo-gate.v1",
+            "source_revision": revision,
+            "source_state": "clean",
+            "operation": "test",
+            "managed_target": {
+                "caller_identity": "release-tests",
+                "resolved_target": managed,
+            },
+            "target_created": true,
+            "outcome": {"state": "completed", "cargo_exit_code": 0},
+        });
+        std::fs::write(&transport_receipt, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        std::fs::set_permissions(&transport_receipt, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
         for mode in ["success", "negative", "signal", "transport"] {
             let path = if mode == "transport" {
                 let python = bin.join("python3");
                 std::fs::write(
                     &python,
-                    "#!/bin/sh\nreceipt=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --receipt-dir) receipt=$2; shift 2 ;; *) shift ;; esac; done\nprintf '{\\\"schema_version\\\":\\\"foundation.managed-cargo-gate.v1\\\",\\\"source_revision\\\":\\\"%s\\\",\\\"source_state\\\":\\\"clean\\\",\\\"operation\\\":\\\"test\\\",\\\"managed_target\\\":{\\\"caller_identity\\\":\\\"release-tests\\\",\\\"resolved_target\\\":\\\"%s\\\"},\\\"target_created\\\":true,\\\"outcome\\\":{\\\"state\\\":\\\"completed\\\",\\\"cargo_exit_code\\\":0}}' \"$FAKE_REVISION\" \"$FAKE_TARGET\" > \"$receipt/receipt.json\"\nchmod 600 \"$receipt/receipt.json\"\nexit 127\n",
+                    "#!/bin/sh\nreceipt=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --receipt-dir) receipt=$2; shift 2 ;; *) shift ;; esac; done\ncat \"$FAKE_RECEIPT_PATH\" > \"$receipt/receipt.json\"\nchmod 600 \"$receipt/receipt.json\"\nexit 127\n",
                 )
                 .unwrap();
                 std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3095,8 +3111,7 @@ mod tests {
                 .env("HOME", &home)
                 .env("PATH", path)
                 .env("FAKE_CARGO_LOG", root.join("cargo.log"))
-                .env("FAKE_REVISION", &revision)
-                .env("FAKE_TARGET", &managed)
+                .env("FAKE_RECEIPT_PATH", &transport_receipt)
                 .env("HEX_RELEASE_MANAGED_PROBE_ROOT", root)
                 .env("HEX_RELEASE_MANAGED_PROBE_MODE", mode)
                 .output()

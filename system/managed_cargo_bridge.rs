@@ -747,12 +747,29 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    fn fixture_python(environment: &[(OsString, OsString)]) -> PathBuf {
+        let path = environment
+            .iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value))
+            .expect("fixture must define a closed PATH");
+        for directory in std::env::split_paths(path) {
+            let candidate = directory.join("python3");
+            let Ok(metadata) = fs::metadata(&candidate) else {
+                continue;
+            };
+            #[cfg(unix)]
+            let executable = metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
+            #[cfg(not(unix))]
+            let executable = metadata.is_file();
+            if executable {
+                return candidate;
+            }
+        }
+        panic!("fixture PATH has no executable python3");
+    }
+
     fn run_test(request: &Request, environment: &[(OsString, OsString)]) -> Result {
-        run_with_environment(
-            request,
-            Path::new("/opt/homebrew/bin/python3"),
-            Some(environment),
-        )
+        run_with_environment(request, &fixture_python(environment), Some(environment))
     }
 
     fn actual(
