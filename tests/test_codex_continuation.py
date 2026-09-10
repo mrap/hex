@@ -487,8 +487,91 @@ class ContinuationTests(unittest.TestCase):
         self.server.connect = lambda _endpoint, _timeout: EndlessHistory(self.server)
         with self.assertRaisesRegex(CONTINUATION.UncertainDelivery, "bounded history scan"):
             self.enqueue(rpc_factory=self.server.connect, timeout=2)
-        self.assertEqual(self.server.history_calls, CONTINUATION.MAX_PAGES)
+        self.assertEqual(self.server.history_calls, CONTINUATION.MAX_HISTORY_PAGES)
         self.assertEqual(self.server.add_calls, 0)
+
+    def test_marker_after_one_hundred_history_pages_is_recovered(self):
+        rendered, _payload_hash = CONTINUATION._render_message(
+            self.kwargs["action_id"], self.kwargs["owner"], self.message
+        )
+        self.server.history_calls = 0
+
+        class LongHistory(FakeRPC):
+            def call(inner_self, method, params):
+                if method != "thread/items/list":
+                    return super().call(method, params)
+                inner_self.server.history_calls += 1
+                if inner_self.server.history_calls <= 100:
+                    return {
+                        "data": [],
+                        "nextCursor": f"page-{inner_self.server.history_calls}",
+                    }
+                return {
+                    "data": [{
+                        "turnId": "late-turn",
+                        "item": {
+                            "id": "late-user",
+                            "type": "userMessage",
+                            "clientId": self.kwargs["action_id"],
+                            "content": [{"type": "text", "text": rendered}],
+                        },
+                    }],
+                    "nextCursor": None,
+                }
+
+        self.server.connect = lambda _endpoint, _timeout: LongHistory(self.server)
+        receipt = self.enqueue(rpc_factory=self.server.connect)
+        self.assertEqual(receipt["delivery"], "history")
+        self.assertEqual(receipt["turn_id"], "late-turn")
+        self.assertEqual(self.server.history_calls, 101)
+        self.assertEqual(self.server.add_calls, 0)
+
+    def test_deep_duplicate_history_cursor_is_uncertain_and_does_not_add(self):
+        self.server.history_calls = 0
+
+        class CyclicHistory(FakeRPC):
+            def call(inner_self, method, params):
+                if method != "thread/items/list":
+                    return super().call(method, params)
+                inner_self.server.history_calls += 1
+                if inner_self.server.history_calls <= 100:
+                    return {
+                        "data": [],
+                        "nextCursor": f"page-{inner_self.server.history_calls}",
+                    }
+                return {"data": [], "nextCursor": "page-100"}
+
+        self.server.connect = lambda _endpoint, _timeout: CyclicHistory(self.server)
+        with self.assertRaisesRegex(CONTINUATION.UncertainDelivery, "invalid pagination"):
+            self.enqueue(rpc_factory=self.server.connect)
+        self.assertEqual(self.server.history_calls, 101)
+        self.assertEqual(self.server.add_calls, 0)
+
+    def test_complete_long_history_without_marker_adds_once_and_repeats(self):
+        self.server.history_calls = 0
+
+        class CompleteLongHistory(FakeRPC):
+            def call(inner_self, method, params):
+                if method != "thread/items/list":
+                    return super().call(method, params)
+                inner_self.server.history_calls += 1
+                if inner_self.server.history_calls <= 101:
+                    return {
+                        "data": [],
+                        "nextCursor": f"page-{inner_self.server.history_calls}"
+                        if inner_self.server.history_calls < 101
+                        else None,
+                    }
+                raise AssertionError("history was read after complete first scan")
+
+        self.server.connect = lambda _endpoint, _timeout: CompleteLongHistory(self.server)
+        first = self.enqueue(rpc_factory=self.server.connect)
+        second = self.enqueue(rpc_factory=self.server.connect)
+        self.assertEqual(first["delivery"], "queued")
+        self.assertEqual(first["submission_id"], "queue-1")
+        self.assertEqual(second, first)
+        self.assertEqual(self.server.history_calls, 101)
+        self.assertEqual(self.server.add_calls, 1)
 
     def test_queue_and_history_conflicts_are_definite(self):
         payload_hash = hashlib.sha256(self.message.encode()).hexdigest()

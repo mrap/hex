@@ -58,8 +58,9 @@ queue and history check.
 
 `--timeout` bounds the complete operation. It includes lock acquisition,
 connection setup, queue and history scans, submission, and read-back.
-Each queue or history scan is also limited to `100` pages. Reaching that bound
-returns uncertain without adding a message.
+Queue scans are limited to `100` pages. History scans are limited to `1000`
+pages. Reaching either bound returns uncertain without adding a message. Both
+limits remain subordinate to the complete operation's absolute timeout.
 
 The helper never blindly retries an ambiguous send. Run the same command again
 to reconcile the stable marker. If complete live state contains the action, the
