@@ -331,7 +331,7 @@ gate's environment isn't what you'd assume. Specific footguns:
 |---|---|
 | `cargo build && ...` in verify | Prepend `export PATH="/opt/homebrew/bin:$PATH" &&` before any non-coreutils binary (cargo, node, etc.). Exit 127 = command not found. |
 | `cmd 2>&1 \| tail -5 \| grep "..."` | Never pipe through `tail`/`head` before checking exit status — the tail's exit code wins. Use `cmd > /tmp/log && grep "..." /tmp/log` instead. |
-| Checking `.hex/bin/hex` after a build | That's the *deployed* binary (yesterday's). The engine injects a shared `CARGO_TARGET_DIR` (`~/.boi/v2/cargo-target`) into every verification command, so cargo artifacts do NOT land in the worktree's `target/`. Use `${CARGO_TARGET_DIR:-target}/release/hex` — the freshly built one, wherever cargo actually put it. Never symlink the worktree `target/` to the shared dir — it holds other specs' binaries, so `test -x` would false-pass. |
+| Checking `.hex/bin/hex` after a build | That's the deployed binary from an earlier build. Use the artifact path recorded by the managed Cargo gate receipt. Do not name or symlink a shared target; the policy-resolved receipt identifies the only supported local output root. |
 | Querying main-workspace state (e.g. `$HEX_DIR`-rooted commands) from worker | Worker is in a task worktree; commands that read `$HEX_DIR` (main workspace) ignore worktree edits. Check **artifacts the worker created**, not derived state. |
 | `grep -q -v "ERROR"` | Inverted flag combo. Use `! grep -q "ERROR"` instead. |
 | `... \| wc -l \| grep -q "^14$"` | macOS `wc -l` pads with whitespace (`      14`). Use `count=$(... \| wc -l \| tr -d ' '); test "$count" = "14"` instead. |
@@ -340,12 +340,11 @@ gate's environment isn't what you'd assume. Specific footguns:
 
 **Mandatory pre-dispatch step:** Before dispatching any TOML spec, run every
 `verifications.command` in a real subshell against either the current workspace
-or a representative state — with `export CARGO_TARGET_DIR="$HOME/.boi/v2/cargo-target"`
-set first if the gate touches cargo, so the local run matches the engine's
-injected environment (a bare local subshell passes `target/...` checks that the
-engine then fails). If your verify doesn't pass against known-good state, the
-worker will fail forever. Cost of running verify locally first: ~30s. Cost of a
-verify cycle through BOI: 5–15min plus restart overhead.
+or a representative state. For supported local Cargo work, invoke the managed
+Cargo gate and inspect its receipt. Do not set or document a private shared
+target path. If your verify does not pass against known-good state, the worker
+will fail forever. Cost of running verify locally first: about 30 seconds. Cost
+of a verify cycle through BOI: 5–15 minutes plus restart overhead.
 
 **Verify-gate doctrine:** Test artifacts the worker produces (files, build
 outputs in the task worktree). Don't test system state the worker can't see

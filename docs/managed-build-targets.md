@@ -19,6 +19,30 @@ selection source, policy revision, caller-supplied source revision, and the
 canonical path and SHA-256 of the caller executable. Source revision is caller
 context. It is not an attestation claim.
 
+## Local Cargo gate
+
+Use `system/scripts/managed-cargo-gate.py` for supported local Cargo work. It
+accepts only `build`, `test`, and `clippy`, invokes the adjacent target adapter,
+creates and rechecks an accepted missing target leaf, binds both Cargo output
+variables, and retains a private attempt receipt. It does not run shell text or
+an arbitrary command.
+
+The supported grammar includes `--locked`, `--offline`, manifest and package
+selection, and `--target-dir`. It accepts only `--config build.build-dir=PATH`
+for a build-dir override, which must resolve to the checked root. It rejects raw
+Cargo pass-through. `--deny-warnings` is valid only with `clippy` and maps to
+the fixed Cargo suffix `-- -D warnings`.
+
+The caller provides an existing private receipt directory. The gate requires an
+absolute, non-symlinked directory owned by the current user and not writable by
+group or others. Each invocation creates a unique mode-0600 receipt without a
+full argv, environment, or credential values. A receipt failure before Cargo
+prevents launch. A receipt update failure after Cargo reports both failures.
+Every Cargo outcome prints only its receipt path, operation, and exit status.
+
+The gate does not sandbox Cargo build scripts, govern raw terminal Cargo, or
+replace hosted CI. Format guidance is outside this output-root contract.
+
 ## Selection and validation
 
 The selected target follows this order:
@@ -44,7 +68,9 @@ evaluation to build a Cargo command.
 
 For a missing target leaf, a caller must pre-check it, create only the accepted
 path, re-check that existing path and the policy revision, and only then launch
-Cargo. This read-only CLI never creates the directory.
+Cargo. If the recheck changes target or policy, the gate does not guess whether
+the new leaf is safe to remove. It fails loudly with the retained created path.
+This read-only CLI never creates the directory.
 
 If `~/.boi/bin/boi` exists, the boundary invokes only `boi target check` and
 strictly validates its receipt. A non-executable file, dangling link, failed
@@ -89,9 +115,9 @@ commands. Shared producer/bootstrap conformance remains an adoption requirement.
 
 ## Acceptance status
 
-The boundary has synthetic Foundation tests only. Shared producer fixtures and
-independent BOI producer conformance are pending. Do not treat these tests as
-final cross-project acceptance or migrate callers until that work is accepted.
+The boundary has synthetic protocol coverage. Installed-checker authority and
+caller activation remain separate rollout checks. Do not treat local synthetic
+coverage as a substitute for installed-authority verification.
 
 The transient two-root receipt is superseded. A receipt with fields beyond the
 eight-field V1 schema is rejected. Distinct output roots need a separate
