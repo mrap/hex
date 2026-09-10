@@ -1,7 +1,11 @@
 import importlib.util
+from contextlib import ExitStack
 import io
 import json
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import stat
 import tempfile
@@ -27,6 +31,7 @@ class ManagedCargoGateTests(unittest.TestCase):
         self.denied = self.allowed / "retired"
         self.allowed.mkdir()
         self.denied.mkdir()
+        (self.allowed / "configured").mkdir(mode=0o700)
         self.receipts = self.root / "receipts"
         self.receipts.mkdir(mode=0o700)
         self.log = self.root / "cargo-log.json"
@@ -38,6 +43,8 @@ class ManagedCargoGateTests(unittest.TestCase):
             "import json, os\n"
             "from pathlib import Path\n"
             "Path(os.environ['FAKE_CARGO_LOG']).write_text(json.dumps({'argv': __import__('sys').argv[1:], 'target': os.environ.get('CARGO_TARGET_DIR'), 'build': os.environ.get('CARGO_BUILD_BUILD_DIR'), 'boi': os.environ.get('BOI_CARGO_TARGET_DIR')}), encoding='utf-8')\n"
+            "print(os.environ.get('FAKE_CARGO_STDOUT', ''), end='')\n"
+            "import sys; print(os.environ.get('FAKE_CARGO_STDERR', ''), file=sys.stderr, end='')\n"
             "raise SystemExit(int(os.environ.get('FAKE_CARGO_EXIT', '0')))\n",
             encoding="utf-8",
         )
@@ -83,6 +90,246 @@ class ManagedCargoGateTests(unittest.TestCase):
 
     def assert_no_cargo(self):
         self.assertFalse(self.log.exists())
+
+    def test_help_is_successful_and_side_effect_free(self):
+        patches = [
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+            mock.patch.object(GATE, "_validate_receipt_dir", side_effect=AssertionError("receipt validation ran")),
+            mock.patch.object(GATE, "_create_receipt", side_effect=AssertionError("receipt creation ran")),
+            mock.patch.object(GATE, "_adapter_path", side_effect=AssertionError("adapter lookup ran")),
+            mock.patch.object(GATE, "_adapter_module", side_effect=AssertionError("adapter load ran")),
+            mock.patch.object(GATE, "_run_adapter", side_effect=AssertionError("adapter run ran")),
+            mock.patch.object(GATE, "_cargo_path", side_effect=AssertionError("Cargo lookup ran")),
+            mock.patch.object(GATE.subprocess, "run", side_effect=AssertionError("Cargo run ran")),
+        ]
+        with ExitStack() as stack:
+            output = stack.enter_context(patches[0])
+            for patcher in patches[1:]:
+                stack.enter_context(patcher)
+            self.assertEqual(GATE.run(["--help"]), 0)
+            self.assertEqual(GATE.run(["-h"]), 0)
+        help_text = output.getvalue()
+        self.assertIn("usage:", help_text.lower())
+        self.assertIn("--caller", help_text)
+        self.assertIn("build, test, or clippy", help_text)
+        self.assertEqual(self.receipt_paths(), [])
+        self.assertFalse((self.home / ".boi/bin/boi").exists())
+        self.assertFalse(self.log.exists())
+
+    def test_invalid_request_is_nonzero_and_side_effect_free(self):
+        with mock.patch.object(GATE, "_validate_receipt_dir", side_effect=AssertionError("receipt validation ran")):
+            with mock.patch.object(GATE, "_adapter_path", side_effect=AssertionError("adapter lookup ran")):
+                with mock.patch.object(GATE, "_cargo_path", side_effect=AssertionError("Cargo lookup ran")):
+                    with self.assertRaises(GATE.GateError) as caught:
+                        GATE.run(["--unknown"])
+        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+        self.assertEqual(self.receipt_paths(), [])
+        self.assertFalse(self.log.exists())
+
+    def test_fresh_target_accepts_repeated_bins_and_keeps_child_outputs_bound(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(
+                GATE.run(self.argv(extra=["--fresh-target", "--quiet-summary", "--bin", "cq", "--bin", "scipd"])),
+                0,
+            )
+        observed = json.loads(self.log.read_text(encoding="utf-8"))
+        self.assertEqual(observed["argv"], ["build", "--bin", "cq", "--bin", "scipd"])
+        self.assertEqual(observed["target"], observed["build"])
+        self.assertEqual(Path(observed["target"]).parent.name, "configured")
+        self.assertEqual(output.getvalue(), "")
+
+    def test_fresh_target_rejects_explicit_build_dir_but_checks_inherited_parent(self):
+        os.environ["CARGO_BUILD_BUILD_DIR"] = str(self.allowed / "configured")
+        self.assertEqual(GATE.run(self.argv(extra=["--fresh-target"])), 0)
+        self.log.unlink()
+        with self.assertRaises(GATE.GateError) as caught:
+            GATE.run(self.argv(extra=["--fresh-target", "--config", "build.build-dir=" + str(self.allowed / "configured")]))
+        self.assertEqual(caught.exception.code, "UNSUPPORTED_CARGO_ARGUMENT")
+
+    def test_fresh_target_rejects_unsafe_parent_before_child_or_cargo(self):
+        parent = self.allowed / "configured"
+        parent.chmod(0o770)
+        try:
+            with self.assertRaises(GATE.GateError) as caught:
+                GATE.run(self.argv(extra=["--fresh-target"]))
+            self.assertEqual(caught.exception.code, "TARGET_CREATE_FAILED")
+            self.assert_no_cargo()
+        finally:
+            parent.chmod(0o700)
+
+    def test_fresh_target_rejects_precheck_policy_change(self):
+        original = GATE._run_adapter
+        calls = []
+
+        def changed_policy(*args):
+            receipt = original(*args)
+            calls.append(args[-1])
+            if len(calls) == 2:
+                receipt = dict(receipt)
+                receipt["policy_revision"] = "changed:sha256:" + "f" * 64
+            return receipt
+
+        with mock.patch.object(GATE, "_run_adapter", side_effect=changed_policy):
+            with self.assertRaises(GATE.GateError) as caught:
+                GATE.run(self.argv(extra=["--fresh-target"]))
+        self.assertEqual(caught.exception.code, "TARGET_RECHECK_FAILED")
+        self.assertEqual(len(calls), 2)
+        self.assert_no_cargo()
+
+    def test_fresh_target_refuses_create_time_collision(self):
+        collision = self.allowed / "configured" / "foundation-fixed"
+        collision.mkdir(mode=0o700)
+        with mock.patch.object(GATE.uuid, "uuid4", return_value=type("U", (), {"hex": "fixed"})()):
+            with self.assertRaises(GATE.GateError) as caught:
+                GATE.run(self.argv(extra=["--fresh-target"]))
+        self.assertEqual(caught.exception.code, "TARGET_CREATE_FAILED")
+        self.assert_no_cargo()
+
+    def test_fresh_target_refuses_competitor_between_precheck_and_mkdir(self):
+        original = GATE._run_adapter
+        competitor = {}
+
+        def inject_competitor(*args):
+            receipt = original(*args)
+            if len(competitor) == 0 and args[-1] is not None and Path(args[-1]).parent.name == "configured":
+                competitor["path"] = Path(args[-1])
+                competitor["path"].mkdir(mode=0o700)
+                (competitor["path"] / "owner-marker").write_bytes(b"competitor-owned\n")
+            return receipt
+
+        with mock.patch.object(GATE, "_run_adapter", side_effect=inject_competitor):
+            with self.assertRaises(GATE.GateError) as caught:
+                GATE.run(self.argv(extra=["--fresh-target"]))
+        self.assertEqual(caught.exception.code, "TARGET_CREATE_FAILED")
+        self.assertTrue(competitor["path"].is_dir())
+        self.assertEqual((competitor["path"] / "owner-marker").read_bytes(), b"competitor-owned\n")
+        self.assert_no_cargo()
+        self.assertEqual(self.receipt_paths(), [])
+
+    def test_fresh_target_rejects_absent_parent_without_creating_it(self):
+        parent = self.allowed / "configured"
+        shutil.rmtree(parent)
+        with self.assertRaises(GATE.GateError) as caught:
+            GATE.run(self.argv(extra=["--fresh-target"]))
+        self.assertEqual(caught.exception.code, "TARGET_CREATE_FAILED")
+        self.assertFalse(parent.exists())
+        self.assert_no_cargo()
+
+    def test_fresh_target_rejects_inherited_build_dir_mismatch(self):
+        os.environ["CARGO_BUILD_BUILD_DIR"] = str(self.allowed / "other")
+        with self.assertRaises(GATE.GateError) as caught:
+            GATE.run(self.argv(extra=["--fresh-target"]))
+        self.assertEqual(caught.exception.code, "BUILD_DIR_OVERRIDE")
+        self.assert_no_cargo()
+
+    def test_fresh_target_rejects_postcreate_identity_replacement(self):
+        original = GATE._run_adapter
+        calls = []
+
+        def replace_after_create(*args):
+            receipt = original(*args)
+            calls.append(args[-1])
+            if len(calls) == 3:
+                target = Path(args[-1])
+                target.rename(target.with_name(target.name + "-preserved-original"))
+                target.mkdir(mode=0o700)
+            return receipt
+
+        with mock.patch.object(GATE, "_run_adapter", side_effect=replace_after_create):
+            with self.assertRaises(GATE.GateError) as caught:
+                GATE.run(self.argv(extra=["--fresh-target"]))
+        self.assertEqual(caught.exception.code, "TARGET_RECHECK_FAILED")
+        self.assertEqual(len(calls), 3)
+        self.assertIn("retained created target: " + calls[-1], caught.exception.detail)
+        self.assert_no_cargo()
+
+    def test_fresh_target_rejects_postcreate_type_or_mode_replacement(self):
+        for replacement in ("file", "mode"):
+            original = GATE._run_adapter
+            calls = []
+
+            def replace_after_create(*args):
+                receipt = original(*args)
+                calls.append(args[-1])
+                if len(calls) == 3:
+                    target = Path(args[-1])
+                    if replacement == "file":
+                        target.rmdir()
+                        target.write_text("not a directory", encoding="utf-8")
+                    else:
+                        target.chmod(0o755)
+                return receipt
+
+            with mock.patch.object(GATE, "_run_adapter", side_effect=replace_after_create):
+                with self.assertRaises(GATE.GateError) as caught:
+                    GATE.run(self.argv(extra=["--fresh-target"]))
+            self.assertEqual(caught.exception.code, "TARGET_RECHECK_FAILED")
+            self.assertEqual(len(calls), 3)
+            self.assertIn("retained created target: " + calls[-1], caught.exception.detail)
+            self.assert_no_cargo()
+
+    def test_fresh_target_rejects_final_policy_or_path_change(self):
+        for changed in ("policy", "path"):
+            original = GATE._run_adapter
+            calls = []
+
+            def changed_final(*args):
+                receipt = original(*args)
+                calls.append(args[-1])
+                if len(calls) == 3:
+                    receipt = dict(receipt)
+                    if changed == "policy":
+                        receipt["policy_revision"] = "changed:sha256:" + "e" * 64
+                    else:
+                        receipt["resolved_target"] = str(self.allowed / "configured" / "other")
+                return receipt
+
+            with mock.patch.object(GATE, "_run_adapter", side_effect=changed_final):
+                with self.assertRaises(GATE.GateError) as caught:
+                    GATE.run(self.argv(extra=["--fresh-target"]))
+            self.assertEqual(caught.exception.code, "TARGET_RECHECK_FAILED")
+            self.assertEqual(len(calls), 3)
+            self.assert_no_cargo()
+
+    def test_quiet_summary_preserves_fake_cargo_stdout_and_stderr(self):
+        env = dict(os.environ)
+        env["FAKE_CARGO_STDOUT"] = "cargo stdout\n"
+        env["FAKE_CARGO_STDERR"] = "cargo stderr\n"
+        completed = subprocess.run(
+            [sys.executable, str(SOURCE)] + self.argv(self.allowed / "quiet-process", extra=["--quiet-summary"]),
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("cargo stdout", completed.stdout)
+        self.assertIn("cargo stderr", completed.stderr)
+        self.assertNotIn("exit_status=0", completed.stdout)
+
+    def test_quiet_summary_keeps_failure_status_without_footer(self):
+        os.environ["FAKE_CARGO_EXIT"] = "9"
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            result = GATE.run(self.argv(extra=["--quiet-summary"]))
+        self.assertEqual(result, 9)
+        self.assertEqual(output.getvalue(), "")
+        receipt, _ = self.receipt()
+        self.assertEqual(receipt["outcome"]["cargo_exit_code"], 9)
+
+    def test_quiet_summary_keeps_receipt_update_error_without_footer(self):
+        os.environ["FAKE_CARGO_EXIT"] = "9"
+        with mock.patch.object(
+            GATE,
+            "_update_receipt",
+            side_effect=GATE.GateError("RECEIPT_UPDATE_FAILED", "synthetic final failure"),
+        ):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                with self.assertRaises(GATE.GateError) as caught:
+                    GATE.run(self.argv(extra=["--quiet-summary"]))
+        self.assertEqual(caught.exception.code, "CARGO_RESULT_AND_RECEIPT_FAILURE")
+        self.assertIn("9", caught.exception.detail)
+        self.assertEqual(output.getvalue(), "")
 
     def fake_installed_checker(self, payload="", exit_code=0):
         checker = self.home / ".boi/bin/boi"

@@ -26,7 +26,7 @@ _BARE_FLAGS = {
     "--bins", "--examples", "--tests", "--benches",
 }
 _VALUE_FLAGS = {
-    "--manifest-path", "--package", "-p", "--target", "--features",
+    "--manifest-path", "--package", "-p", "--target", "--features", "--bin",
     "--profile", "--jobs", "--message-format",
 }
 _OPERATIONS = {"build", "test", "clippy"}
@@ -81,7 +81,14 @@ def _parse_cargo(operation, tokens):
     result = []
     target_dir = None
     build_dirs = []
-    profile = {"all_targets": False, "locked": False, "offline": False, "strict_warnings": False}
+    profile = {
+        "all_targets": False,
+        "locked": False,
+        "offline": False,
+        "strict_warnings": False,
+        "fresh_target": False,
+        "quiet_summary": False,
+    }
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -91,6 +98,14 @@ def _parse_cargo(operation, tokens):
             if operation != "clippy":
                 _fail("UNSUPPORTED_CARGO_ARGUMENT", "--deny-warnings is only valid for clippy")
             profile["strict_warnings"] = True
+            index += 1
+            continue
+        if token == "--fresh-target":
+            profile["fresh_target"] = True
+            index += 1
+            continue
+        if token == "--quiet-summary":
+            profile["quiet_summary"] = True
             index += 1
             continue
         if token == "--target-dir" or token.startswith("--target-dir="):
@@ -268,6 +283,47 @@ def _create_target_if_missing(path):
     return True
 
 
+def _validate_fresh_parent(path):
+    try:
+        details = os.lstat(str(path))
+    except OSError as exc:
+        _fail("TARGET_CREATE_FAILED", "fresh target parent is unavailable: %s" % exc)
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or details.st_mode & 0o022
+    ):
+        _fail("TARGET_CREATE_FAILED", "fresh target parent must be an owned private directory")
+    return path
+
+
+def _fresh_target_identity(path):
+    retained = "; retained created target: %s" % path
+    try:
+        details = os.lstat(str(path))
+    except OSError as exc:
+        _fail("TARGET_RECHECK_FAILED", "fresh target identity is unavailable: %s%s" % (exc, retained))
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or details.st_mode & 0o077
+    ):
+        _fail("TARGET_RECHECK_FAILED", "fresh target must remain an owned private directory%s" % retained)
+    return (details.st_dev, details.st_ino)
+
+
+def _create_fresh_target(path):
+    try:
+        os.mkdir(str(path), 0o700)
+    except FileExistsError:
+        _fail("TARGET_CREATE_FAILED", "fresh target child already exists")
+    except OSError as exc:
+        _fail("TARGET_CREATE_FAILED", "could not create fresh target child: %s" % exc)
+    return _fresh_target_identity(path)
+
+
 def _cargo_path():
     selected = shutil.which("cargo")
     if not selected:
@@ -284,11 +340,18 @@ def _cargo_path():
 
 
 def run(argv):
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(
+        prog="managed-cargo-gate.py",
+        description="Run one supported local Cargo operation with a managed output target. OPERATION: build, test, or clippy.",
+        add_help=False,
+    )
     parser.add_argument("--caller", required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--source-state", required=True, choices=("clean", "dirty", "unavailable"))
     parser.add_argument("--receipt-dir", required=True)
+    if argv in (["--help"], ["-h"]):
+        print(parser.format_help(), end="")
+        return 0
     try:
         parsed, remaining = parser.parse_known_args(argv)
     except SystemExit:
@@ -297,35 +360,60 @@ def run(argv):
         _fail("UNSUPPORTED_CARGO_OPERATION", "a Cargo operation is required")
     operation = remaining[0]
     cargo_args, requested_target, build_dirs, profile = _parse_cargo(operation, remaining[1:])
+    fresh_target = profile["fresh_target"]
+    quiet_summary = profile["quiet_summary"]
+    if fresh_target and requested_target is not None:
+        _fail("UNSUPPORTED_CARGO_ARGUMENT", "--fresh-target cannot be combined with --target-dir")
+    if fresh_target and build_dirs:
+        _fail("UNSUPPORTED_CARGO_ARGUMENT", "--fresh-target cannot be combined with explicit build.build-dir")
     receipt_dir = _validate_receipt_dir(parsed.receipt_dir)
     adapter = _adapter_path()
     adapter_module = _adapter_module(adapter)
     cargo = _cargo_path()
-    first = _run_adapter(adapter, parsed.caller, cargo, parsed.source_revision, requested_target)
+    first = _run_adapter(adapter, parsed.caller, cargo, parsed.source_revision, None if fresh_target else requested_target)
     for value in ([os.environ["CARGO_BUILD_BUILD_DIR"]] if "CARGO_BUILD_BUILD_DIR" in os.environ else []) + build_dirs:
         try:
             adapter_module.validate_same_root_build_dir(value, first["resolved_target"])
         except Exception as exc:
             _fail("BUILD_DIR_OVERRIDE", str(exc))
-    target = Path(first["resolved_target"])
-    created = _create_target_if_missing(target)
-    retained = "; retained created target: %s" % target if created else ""
-    try:
+    if fresh_target:
+        parent = _validate_fresh_parent(Path(first["resolved_target"]))
+        target = parent / ("foundation-" + uuid.uuid4().hex)
+        if os.path.lexists(str(target)):
+            _fail("TARGET_CREATE_FAILED", "fresh target child already exists")
         second = _run_adapter(adapter, parsed.caller, cargo, parsed.source_revision, str(target))
-    except GateError as exc:
-        _fail(
-            "TARGET_RECHECK_FAILED",
-            "managed target recheck refused%s: %s" % (retained, exc.detail),
-        )
-    if second["resolved_target"] != first["resolved_target"] or second["policy_revision"] != first["policy_revision"]:
-        _fail("TARGET_RECHECK_FAILED", "managed target or policy changed after target creation%s" % retained)
+        if second["policy_revision"] != first["policy_revision"] or second["resolved_target"] != str(target):
+            _fail("TARGET_RECHECK_FAILED", "fresh target precheck changed managed policy or target")
+        child_identity = _create_fresh_target(target)
+        created = True
+        retained = "; retained created target: %s" % target
+        try:
+            third = _run_adapter(adapter, parsed.caller, cargo, parsed.source_revision, str(target))
+        except GateError as exc:
+            _fail("TARGET_RECHECK_FAILED", "managed target recheck refused%s: %s" % (retained, exc.detail))
+        if third["resolved_target"] != second["resolved_target"] or third["policy_revision"] != second["policy_revision"]:
+            _fail("TARGET_RECHECK_FAILED", "managed target or policy changed after target creation%s" % retained)
+        if _fresh_target_identity(target) != child_identity:
+            _fail("TARGET_RECHECK_FAILED", "fresh target identity changed after final policy check%s" % retained)
+        second = third
+    else:
+        target = Path(first["resolved_target"])
+        created = _create_target_if_missing(target)
+        retained = "; retained created target: %s" % target if created else ""
+        try:
+            second = _run_adapter(adapter, parsed.caller, cargo, parsed.source_revision, str(target))
+        except GateError as exc:
+            _fail("TARGET_RECHECK_FAILED", "managed target recheck refused%s: %s" % (retained, exc.detail))
+        if second["resolved_target"] != first["resolved_target"] or second["policy_revision"] != first["policy_revision"]:
+            _fail("TARGET_RECHECK_FAILED", "managed target or policy changed after target creation%s" % retained)
+    receipt_profile = {key: value for key, value in profile.items() if key not in ("fresh_target", "quiet_summary")}
     prepared = {
         "schema_version": "foundation.managed-cargo-gate.v1",
         "managed_target": second,
         "source_revision": parsed.source_revision,
         "source_state": parsed.source_state,
         "operation": operation,
-        "profile": profile,
+        "profile": receipt_profile,
         "target_created": created,
         "outcome": {"state": "started"},
     }
@@ -343,18 +431,22 @@ def run(argv):
         try:
             _update_receipt(receipt_path, identity, finished)
         except GateError as exc:
-            print("managed-cargo-gate: receipt=%s operation=%s exit_status=launch_failed receipt_update=failed" % (receipt_path, operation))
+            if not quiet_summary:
+                print("managed-cargo-gate: receipt=%s operation=%s exit_status=launch_failed receipt_update=failed" % (receipt_path, operation))
             _fail("CARGO_LAUNCH_AND_RECEIPT_FAILURE", "Cargo launch and receipt update both failed: %s" % exc.detail)
-        print("managed-cargo-gate: receipt=%s operation=%s exit_status=launch_failed" % (receipt_path, operation))
+        if not quiet_summary:
+            print("managed-cargo-gate: receipt=%s operation=%s exit_status=launch_failed" % (receipt_path, operation))
         _fail("CARGO_LAUNCH_FAILED", "Cargo could not start")
     finished = dict(prepared)
     finished["outcome"] = {"state": "completed", "cargo_exit_code": completed.returncode}
     try:
         _update_receipt(receipt_path, identity, finished)
     except GateError as exc:
-        print("managed-cargo-gate: receipt=%s operation=%s exit_status=%s receipt_update=failed" % (receipt_path, operation, completed.returncode))
+        if not quiet_summary:
+            print("managed-cargo-gate: receipt=%s operation=%s exit_status=%s receipt_update=failed" % (receipt_path, operation, completed.returncode))
         _fail("CARGO_RESULT_AND_RECEIPT_FAILURE", "Cargo exited %s; receipt update failed: %s" % (completed.returncode, exc.detail))
-    print("managed-cargo-gate: receipt=%s operation=%s exit_status=%s" % (receipt_path, operation, completed.returncode))
+    if not quiet_summary:
+        print("managed-cargo-gate: receipt=%s operation=%s exit_status=%s" % (receipt_path, operation, completed.returncode))
     return completed.returncode
 
 

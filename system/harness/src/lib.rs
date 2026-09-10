@@ -24,6 +24,8 @@ pub mod ledger;
 pub mod lint_gates;
 pub mod llm_config;
 pub mod llm_cost;
+#[path = "../../managed_cargo_bridge.rs"]
+pub mod managed_cargo_bridge;
 pub mod memory;
 pub mod messages;
 pub mod module_state;

@@ -362,7 +362,10 @@ pub(crate) fn write_audit_artifact(hex_dir: &Path, body: &str) -> Result<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_child;
+    use fs2::FileExt;
     use std::fs;
+    use std::path::{Path, PathBuf};
 
     fn fake_hex_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -378,6 +381,112 @@ mod tests {
         fs::create_dir_all(&me).unwrap();
         fs::write(me.join("learnings.md"), "").unwrap();
         dir
+    }
+
+    fn fake_hex_dir_at(root: &Path) {
+        fs::write(root.join("CLAUDE.md"), "").unwrap();
+        let evo = root.join("evolution");
+        fs::create_dir_all(&evo).unwrap();
+        fs::write(evo.join("observations.md"), "").unwrap();
+        fs::write(evo.join("suggestions.md"), "").unwrap();
+        fs::write(evo.join("changelog.md"), "").unwrap();
+        fs::create_dir_all(root.join("projects")).unwrap();
+        let me = root.join("me");
+        fs::create_dir_all(&me).unwrap();
+        fs::write(me.join("learnings.md"), "").unwrap();
+    }
+
+    fn run_quick_in_exact_child(name: &str) -> bool {
+        if test_child::in_child(name) {
+            test_child::stage("consolidate:child-entry").expect("test-child stage must flush");
+            return false;
+        }
+        let home = tempfile::tempdir().expect("private consolidate HOME");
+        let fixture = tempfile::tempdir().expect("private consolidate fixture");
+        let output =
+            test_child::run_exact(name, home.path(), fixture.path(), test_child::Fault::None)
+                .unwrap_or_else(|error| panic!("private consolidate test {name} failed: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout.tail);
+        assert!(
+            stdout.contains("hex memory index: another run is in progress — skipping"),
+            "held fixture index lock must take the busy-index branch: {stdout}"
+        );
+        test_child::require_one_pass(name, output).unwrap_or_else(|error| panic!("{error}"));
+        true
+    }
+
+    struct HeldFixtureIndexLock {
+        file: std::fs::File,
+        path: PathBuf,
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
+    }
+
+    fn hold_fixture_index_lock(root: &Path) -> HeldFixtureIndexLock {
+        let db_path = crate::memory::db_path(root);
+        let lock_path = db_path.with_file_name("memory-index.lock");
+        fs::create_dir_all(lock_path.parent().expect("index lock parent")).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.try_lock_exclusive().unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held_metadata = held.metadata().unwrap();
+            let contender_metadata = contender.metadata().unwrap();
+            assert_eq!(
+                (held_metadata.dev(), held_metadata.ino()),
+                (contender_metadata.dev(), contender_metadata.ino()),
+                "the contention check must use a second descriptor for the same lock inode"
+            );
+            let error = contender
+                .try_lock_exclusive()
+                .expect_err("a second descriptor must observe the held fixture index lock");
+            let actual_errno = error.raw_os_error();
+            assert!(
+                actual_errno == Some(libc::EWOULDBLOCK) || actual_errno == Some(libc::EAGAIN),
+                "second descriptor must fail with EWOULDBLOCK/EAGAIN, got {error}"
+            );
+            HeldFixtureIndexLock {
+                file: held,
+                path: lock_path,
+                device: held_metadata.dev(),
+                inode: held_metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        unreachable!("exact fixture lock proof requires Unix")
+    }
+
+    fn assert_held_fixture_lock_is_same_inode(held: &HeldFixtureIndexLock) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let descriptor = held.file.metadata().expect("held fixture lock metadata");
+            let path = fs::metadata(&held.path).expect("fixture lock path metadata");
+            assert_eq!(
+                (descriptor.dev(), descriptor.ino()),
+                (held.device, held.inode),
+                "held fixture descriptor changed during orchestration"
+            );
+            assert_eq!(
+                (path.dev(), path.ino()),
+                (held.device, held.inode),
+                "fixture lock path changed during orchestration"
+            );
+        }
     }
 
     /// RED test for task T36af0tn0 (Phase A transcript-delta backstop).
@@ -396,26 +505,34 @@ mod tests {
     /// close that gap so corrections the live agent missed get captured.
     #[test]
     fn quick_transcript_backstop_registers_seeded_transcript_and_is_idempotent() {
-        let dir = fake_hex_dir();
-        let trans_dir = dir.path().join("raw").join("transcripts");
+        const NAME: &str =
+            "consolidate::tests::quick_transcript_backstop_registers_seeded_transcript_and_is_idempotent";
+        if run_quick_in_exact_child(NAME) {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("HEX_DIR").expect("private fixture HEX_DIR"));
+        fake_hex_dir_at(&root);
+        let index_lock = hold_fixture_index_lock(&root);
+        test_child::stage("consolidate:transcript-fixture-ready")
+            .expect("test-child stage must flush");
+        let trans_dir = root.join("raw").join("transcripts");
         fs::create_dir_all(&trans_dir).unwrap();
         let sample = trans_dir.join("2026-06-05.md");
         fs::write(
             &sample,
-            "user: please always run tests before claiming done.\n\
-             agent: noted — TDD is mandatory.\n",
+            "user: please always run tests before claiming done.\nagent: noted TDD is mandatory.\n"
+                .repeat(300),
         )
         .unwrap();
         let sample_str = sample.to_str().unwrap().to_string();
 
         // Disable LLM so extract is deferred — the backstop must still tolerate
         // this without crashing (graceful gap-tolerance per the spec).
-        std::env::remove_var("OPENROUTER_API_KEY");
-
-        let code = run(Mode::Quick, true, dir.path());
+        let code = run(Mode::Quick, true, &root);
+        assert_held_fixture_lock_is_same_inode(&index_lock);
         assert!(code == 0 || code == 1, "unexpected exit code {code}");
 
-        let db = crate::memory::db_path(dir.path());
+        let db = crate::memory::db_path(&root);
         let conn = crate::memory::open_db(&db).unwrap();
         let count: i64 = conn
             .query_row(
@@ -433,7 +550,8 @@ mod tests {
         drop(conn);
 
         // Second invocation must be a no-op — no duplicate row, no regression.
-        let code2 = run(Mode::Quick, true, dir.path());
+        let code2 = run(Mode::Quick, true, &root);
+        assert_held_fixture_lock_is_same_inode(&index_lock);
         assert!(code2 == 0 || code2 == 1, "unexpected exit code {code2}");
 
         let conn = crate::memory::open_db(&db).unwrap();
@@ -448,6 +566,32 @@ mod tests {
             count, count2,
             "second backstop run must not duplicate the transcript_files row \
              (exactly-once contract)"
+        );
+        assert_eq!(
+            crate::memory::distill::watermark::last_offset(&conn, &sample_str).unwrap(),
+            0,
+            "forced Deferred extraction must leave the transcript watermark at zero"
+        );
+        drop(conn);
+        let events = crate::telemetry::recent(64).expect("read private deferred telemetry");
+        let expected_detail = format!("path={sample_str} offset=0");
+        assert!(
+            events.iter().any(|event| {
+                event.source == "memory::distill"
+                    && event.event == "distill::slice"
+                    && event.status == "deferred"
+                    && event.detail.as_deref().is_some_and(|detail| {
+                        detail.contains(&expected_detail)
+                            && detail.contains("strikes=0")
+                            && detail.contains("reason=provider DEFERRED: forced extract Deferred")
+                            && detail.contains("HEX_DISTILL_FORCE_EXTRACT_FAIL=deferred test seam")
+                    })
+            }),
+            "forced Deferred extraction must record the memory::distill distill::slice deferred event with fixture path and forced-seam detail"
+        );
+        assert!(
+            !root.join(".fastembed_cache").exists(),
+            "busy-index fixture must not create an embedding model cache"
         );
     }
 
@@ -471,15 +615,28 @@ mod tests {
 
     #[test]
     fn quick_mode_runs_l1_and_l2_and_writes_structural_log() {
-        let dir = fake_hex_dir();
-        let code = run(Mode::Quick, true, dir.path());
+        const NAME: &str =
+            "consolidate::tests::quick_mode_runs_l1_and_l2_and_writes_structural_log";
+        if run_quick_in_exact_child(NAME) {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("HEX_DIR").expect("private fixture HEX_DIR"));
+        fake_hex_dir_at(&root);
+        let index_lock = hold_fixture_index_lock(&root);
+        test_child::stage("consolidate:structural-fixture-ready")
+            .expect("test-child stage must flush");
+        let code = run(Mode::Quick, true, &root);
+        assert_held_fixture_lock_is_same_inode(&index_lock);
         assert!(code == 0 || code == 1, "unexpected exit code {code}");
         assert!(
-            dir.path()
-                .join("evolution")
+            root.join("evolution")
                 .join("consolidation-latest.log")
                 .exists(),
             "Layer 1 must write consolidation-latest.log"
+        );
+        assert!(
+            !root.join(".fastembed_cache").exists(),
+            "busy-index fixture must not create an embedding model cache"
         );
     }
 
@@ -689,9 +846,18 @@ mod tests {
 
     #[test]
     fn quick_mode_does_not_write_audit_file() {
-        let dir = fake_hex_dir();
-        let _ = run(Mode::Quick, true, dir.path());
-        let evo = dir.path().join("evolution");
+        const NAME: &str = "consolidate::tests::quick_mode_does_not_write_audit_file";
+        if run_quick_in_exact_child(NAME) {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("HEX_DIR").expect("private fixture HEX_DIR"));
+        fake_hex_dir_at(&root);
+        let index_lock = hold_fixture_index_lock(&root);
+        test_child::stage("consolidate:no-audit-fixture-ready")
+            .expect("test-child stage must flush");
+        let _ = run(Mode::Quick, true, &root);
+        assert_held_fixture_lock_is_same_inode(&index_lock);
+        let evo = root.join("evolution");
         for entry in fs::read_dir(&evo).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             assert!(
@@ -699,5 +865,9 @@ mod tests {
                 "quick must not write LLM audit: found {name}"
             );
         }
+        assert!(
+            !root.join(".fastembed_cache").exists(),
+            "busy-index fixture must not create an embedding model cache"
+        );
     }
 }
