@@ -29,13 +29,14 @@
 
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+case "$SCRIPT_SOURCE" in
+  */*) SCRIPT_DIR="${SCRIPT_SOURCE%/*}" ;;
+  *) SCRIPT_DIR="." ;;
+esac
+SCRIPT_DIR="$(cd "$SCRIPT_DIR" && pwd -P)"
 SYSTEM_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd -P)"
 MANAGED_CARGO_GATE="$SYSTEM_DIR/scripts/managed-cargo-gate.py"
-[ -f "$MANAGED_CARGO_GATE" ] && [ ! -L "$MANAGED_CARGO_GATE" ] || {
-  echo "ERROR: managed Cargo gate is unavailable beside this installed skill." >&2
-  exit 1
-}
 
 REPO="."
 CHECK_BATCH=0
@@ -152,13 +153,18 @@ ran_anything=0
 
 if [ -f Cargo.toml ]; then
   ran_anything=1
-  source_revision_context
-  if private_receipt_dir; then
-    run_managed_cargo "cargo build" gate build --all-targets
-    run_managed_cargo "cargo test" gate test
-    run_managed_cargo "cargo clippy (report-only)" report clippy --all-targets
-  else
+  if [ ! -f "$MANAGED_CARGO_GATE" ] || [ -L "$MANAGED_CARGO_GATE" ]; then
+    echo "ERROR: managed Cargo gate is unavailable beside this installed skill." >&2
     overall_status=1
+  else
+    source_revision_context
+    if private_receipt_dir; then
+      run_managed_cargo "cargo build" gate build --all-targets
+      run_managed_cargo "cargo test" gate test
+      run_managed_cargo "cargo clippy (report-only)" report clippy --all-targets
+    else
+      overall_status=1
+    fi
   fi
 fi
 
