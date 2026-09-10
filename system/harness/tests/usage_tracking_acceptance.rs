@@ -149,7 +149,7 @@ fn unknown_accounts_are_source_namespaced_and_no_change_reads_no_lines() {
 }
 
 #[test]
-fn codex_session_token_snapshots_use_last_usage_not_cumulative_total() {
+fn codex_session_token_snapshots_are_noncanonical_stream_state() {
     let (_d, mut ledger, path) = setup();
     let snapshot = |time: &str, input: i64, cached: i64, output: i64, total: i64| {
         format!(
@@ -166,22 +166,10 @@ fn codex_session_token_snapshots_use_last_usage_not_cumulative_total() {
         ),
     )
     .unwrap();
-    assert_eq!(
-        ledger
-            .import_jsonl(&path, Default::default())
-            .unwrap()
-            .accepted,
-        2
-    );
-    let rows = ledger.rows(10, 0).unwrap();
-    assert_eq!(
-        rows.iter().map(|r| r.input_tokens.unwrap()).sum::<i64>(),
-        14
-    );
-    assert_eq!(
-        rows.iter().map(|r| r.output_tokens.unwrap()).sum::<i64>(),
-        5
-    );
+    let result = ledger.import_jsonl(&path, Default::default()).unwrap();
+    assert_eq!((result.accepted, result.noncanonical), (0, 2));
+    assert!(ledger.rows(10, 0).unwrap().is_empty());
+    assert_eq!(ledger.coverage().unwrap().noncanonical, 2);
 }
 
 #[test]
@@ -210,7 +198,7 @@ fn bounded_codex_state_survives_reopen_with_context_and_cumulative_totals() {
                 }
             )
             .unwrap()
-            .accepted,
+            .noncanonical,
         1
     );
     drop(ledger);
@@ -225,29 +213,11 @@ fn bounded_codex_state_survives_reopen_with_context_and_cumulative_totals() {
                 }
             )
             .unwrap()
-            .accepted,
+            .noncanonical,
         1
     );
-    let rows = reopened.rows(10, 0).unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows.iter().map(|r| r.input_tokens.unwrap()).sum::<i64>(),
-        15
-    );
-    assert_eq!(
-        rows.iter().map(|r| r.output_tokens.unwrap()).sum::<i64>(),
-        5
-    );
-    assert!(rows
-        .iter()
-        .all(|r| r.model.as_deref() == Some("gpt-5.6-terra")));
-    assert!(rows.iter().all(|r| r.effort.as_deref() == Some("medium")));
-    assert!(rows
-        .iter()
-        .all(|r| r.root_task_family.as_deref() == Some("build")));
-    assert!(rows
-        .iter()
-        .all(|r| r.parent_response_id.as_deref() == Some("root-thread")));
+    assert!(reopened.rows(10, 0).unwrap().is_empty());
+    assert_eq!(reopened.coverage().unwrap().noncanonical, 2);
 }
 
 #[test]
@@ -272,45 +242,11 @@ fn codex_extra_counters_are_reported_once_and_resets_use_last_usage() {
         ledger
             .import_jsonl(&path, Default::default())
             .unwrap()
-            .accepted,
+            .noncanonical,
         3
     );
-    let rows = ledger.rows(10, 0).unwrap();
-    assert_eq!(
-        rows.iter()
-            .map(|row| row.input_tokens.unwrap())
-            .sum::<i64>(),
-        19
-    );
-    assert_eq!(
-        rows.iter()
-            .map(|row| row.output_tokens.unwrap())
-            .sum::<i64>(),
-        7
-    );
-    assert_eq!(
-        rows.iter()
-            .map(|row| row.cache_write_input_tokens.unwrap())
-            .sum::<i64>(),
-        9
-    );
-    assert_eq!(
-        rows.iter()
-            .map(|row| row.reasoning_output_tokens.unwrap())
-            .sum::<i64>(),
-        4
-    );
-    assert_eq!(
-        rows.iter()
-            .map(|row| row.total_tokens.unwrap())
-            .sum::<i64>(),
-        26
-    );
-    // Cache-write and reasoning are provider-reported dimensions. They are not
-    // added to input/output totals by the ledger.
-    assert_eq!(rows[0].cache_write_input_tokens, Some(7));
-    assert_eq!(rows[0].reasoning_output_tokens, Some(2));
-    assert_eq!(rows[0].total_tokens, Some(13));
+    assert!(ledger.rows(10, 0).unwrap().is_empty());
+    assert_eq!(ledger.coverage().unwrap().noncanonical, 3);
 }
 
 #[test]
@@ -338,8 +274,11 @@ fn codex_token_count_without_provider_defaults_to_codex() {
     )
     .unwrap();
     let result = ledger.import_jsonl(&path, Default::default()).unwrap();
-    assert_eq!((result.accepted, result.quarantined), (1, 0));
-    assert_eq!(ledger.rows(1, 0).unwrap()[0].provider, "codex");
+    assert_eq!(
+        (result.accepted, result.noncanonical, result.quarantined),
+        (0, 1, 0)
+    );
+    assert!(ledger.rows(1, 0).unwrap().is_empty());
 }
 
 #[test]
@@ -389,4 +328,23 @@ fn payload_backed_codex_response_uses_codex_identity_and_usage() {
     assert_eq!(row.cache_write_input_tokens, Some(1));
     assert_eq!(row.reasoning_output_tokens, Some(2));
     assert_eq!(row.total_tokens, Some(13));
+}
+
+#[test]
+fn token_snapshot_and_later_response_do_not_double_count() {
+    let (_dir, mut ledger, path) = setup();
+    fs::write(&path, concat!(
+        r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"session-dedupe"}}"#, "\n",
+        r#"{"type":"event_msg","timestamp":"2026-09-10T00:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#, "\n",
+        r#"{"type":"token_usage_record","timestamp":"2026-09-10T00:00:02Z","payload":{"response_id":"resp_stable","session_id":"session-dedupe","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"total_tokens":13}}}"#, "\n",
+    )).unwrap();
+    let result = ledger.import_jsonl(&path, Default::default()).unwrap();
+    assert_eq!(
+        (result.accepted, result.noncanonical, result.quarantined),
+        (1, 1, 0)
+    );
+    let rows = ledger.rows(10, 0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].response_id, "resp_stable");
+    assert_eq!(rows[0].total_tokens, Some(13));
 }

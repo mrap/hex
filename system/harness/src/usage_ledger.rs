@@ -45,6 +45,8 @@ impl Default for ImportOptions {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ImportResult {
     pub accepted: u64,
+    /// Token-count snapshots retained as stream state, not canonical responses.
+    pub noncanonical: u64,
     pub duplicates: u64,
     pub conflicts: u64,
     pub quarantined: u64,
@@ -72,6 +74,7 @@ pub struct UsageRow {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Coverage {
     pub accepted: u64,
+    pub noncanonical: u64,
     pub duplicates: u64,
     pub conflicts: u64,
     pub quarantined: u64,
@@ -246,6 +249,9 @@ impl UsageLedger {
                 |r| r.get(0),
             )?;
         }
+        c.noncanonical =
+            self.conn
+                .query_row("SELECT count(*) FROM codex_stream_events", [], |r| r.get(0))?;
         c.pending_sources = self.conn.query_row(
             "SELECT count(*) FROM source_files WHERE cursor < source_len",
             [],
@@ -667,26 +673,25 @@ fn import_token_count(
     if usage == (0, 0, 0) {
         return Ok(());
     }
-    let record = Parsed {
-        provider: "codex".into(),
-        account_scope: format!("unknown-local-source:{source}"),
-        response_id: format!(
-            "codex-session:{session_id}:{}:{}:{}:{}",
-            count.event_at, next.0, next.1, next.2
-        ),
-        parent_response_id: parent_thread_id,
-        root_task_family,
-        event_at: Some(count.event_at),
+    // Snapshot IDs are synthesized and cannot safely deduplicate against the
+    // provider's stable response records. Keep only state and a noncanonical
+    // coordinate so reports can mark response coverage incomplete.
+    tx.execute(
+        "INSERT INTO codex_stream_events(source_key,byte_offset,event_at,session_id,kind) VALUES(?1,?2,?3,?4,'token_count_snapshot')",
+        params![source, offset, count.event_at, session_id],
+    )?;
+    let _ = (
+        usage,
+        cache_write,
+        reasoning,
+        provider_total,
         model,
         effort,
-        input: Some(usage.0),
-        cached: Some(usage.1),
-        cache_write,
-        output: Some(usage.2),
-        reasoning,
-        total: provider_total,
-    };
-    import_parsed(tx, source, offset, record_hash, record, out)
+        root_task_family,
+        parent_thread_id,
+    );
+    out.noncanonical += 1;
+    Ok(())
 }
 /// Extra provider counters remain `None` when the source did not report them.
 /// They are never reconstructed from input/output and are reset independently.
@@ -745,4 +750,5 @@ CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TE
 CREATE TABLE IF NOT EXISTS observations (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,record_hash TEXT NOT NULL,verdict TEXT NOT NULL CHECK(verdict IN ('accepted','duplicate','conflict','quarantine')),reason TEXT,provider TEXT,account_scope TEXT,response_id TEXT,PRIMARY KEY(source_key,byte_offset));
 CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_scope TEXT NOT NULL,response_id TEXT NOT NULL,record_hash TEXT NOT NULL,parent_response_id TEXT,root_task_family TEXT,event_at TEXT,model TEXT,effort TEXT,input_tokens INTEGER,cached_input_tokens INTEGER,cache_write_input_tokens INTEGER,output_tokens INTEGER,reasoning_output_tokens INTEGER,total_tokens INTEGER,PRIMARY KEY(provider,account_scope,response_id));
 CREATE TABLE IF NOT EXISTS codex_session_state (source_key TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT,effort TEXT,root_task_family TEXT,parent_thread_id TEXT,cumulative_input INTEGER NOT NULL DEFAULT 0,cumulative_cached INTEGER NOT NULL DEFAULT 0,cumulative_cache_write INTEGER,cumulative_output INTEGER NOT NULL DEFAULT 0,cumulative_reasoning INTEGER,cumulative_total INTEGER,PRIMARY KEY(source_key,session_id));
+CREATE TABLE IF NOT EXISTS codex_stream_events (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,event_at TEXT,session_id TEXT,kind TEXT NOT NULL,PRIMARY KEY(source_key,byte_offset));
 CREATE INDEX IF NOT EXISTS observations_identity ON observations(provider,account_scope,response_id);CREATE INDEX IF NOT EXISTS canonical_time ON canonical_responses(event_at);CREATE INDEX IF NOT EXISTS canonical_family ON canonical_responses(root_task_family);"#;
