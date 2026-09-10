@@ -307,6 +307,11 @@ fn import_event(
     match event {
         Event::Ignore => Ok(()),
         Event::Canonical(mut record) => {
+            // Payload session IDs can name the root task rather than this
+            // file's active session. The latter owns turn-context model data.
+            if record.provider == "codex" && record.account_scope == "unknown-local-source" {
+                record.session_id = active_session(tx, source)?;
+            }
             hydrate_from_session(tx, source, &mut record)?;
             import_parsed(tx, source, offset, record_hash, record, out)
         }

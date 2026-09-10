@@ -421,3 +421,18 @@ fn later_context_backfills_response_without_overwriting_explicit_model() {
         Some("explicit")
     );
 }
+
+#[test]
+fn payload_root_session_does_not_replace_active_file_context() {
+    let (_dir, mut ledger, path) = setup();
+    fs::write(&path, concat!(
+        r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"file-session"}}"#, "\n",
+        r#"{"type":"turn_context","timestamp":"2026-09-10T00:00:01Z","payload":{"model":"gpt-6-astra","effort":"high"}}"#, "\n",
+        r#"{"type":"token_usage_record","timestamp":"2026-09-10T00:00:02Z","payload":{"response_id":"resp-root","session_id":"root-session","root_turn_id":"root-turn","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}}"#, "\n",
+    )).unwrap();
+    ledger.import_jsonl(&path, Default::default()).unwrap();
+    let row = ledger.rows(1, 0).unwrap().pop().unwrap();
+    assert_eq!(row.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(row.effort.as_deref(), Some("high"));
+    assert_eq!(row.root_task_family.as_deref(), Some("root-turn"));
+}
