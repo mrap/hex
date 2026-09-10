@@ -159,7 +159,8 @@ fn codex_session_token_snapshots_use_last_usage_not_cumulative_total() {
     fs::write(
         &path,
         format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n",
+            r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"session-a"}}"#,
             snapshot("2026-09-10T00:00:00Z", 10, 2, 3, 13),
             snapshot("2026-09-10T00:01:00Z", 4, 1, 2, 19)
         ),
@@ -181,4 +182,70 @@ fn codex_session_token_snapshots_use_last_usage_not_cumulative_total() {
         rows.iter().map(|r| r.output_tokens.unwrap()).sum::<i64>(),
         5
     );
+}
+
+#[test]
+fn bounded_codex_state_survives_reopen_with_context_and_cumulative_totals() {
+    let (dir, mut ledger, path) = setup();
+    let db = dir.path().join("usage.db");
+    let snapshot = |time: &str, input: i64, cached: i64, output: i64| {
+        format!(
+            r#"{{"type":"event_msg","timestamp":"{time}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{output}}},"last_token_usage":{{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}}}}}}}}"#
+        )
+    };
+    fs::write(&path, format!(
+        "{}\n{}\n{}\n{}\n",
+        r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"session-a","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root-thread"}}}}}"#,
+        r#"{"type":"turn_context","timestamp":"2026-09-10T00:00:01Z","payload":{"model":"gpt-5.6-terra","effort":"medium","root_task_family":"build"}}"#,
+        snapshot("2026-09-10T00:00:02Z", 10, 2, 3),
+        snapshot("2026-09-10T00:00:03Z", 15, 3, 5),
+    )).unwrap();
+    assert_eq!(
+        ledger
+            .import_jsonl(
+                &path,
+                ImportOptions {
+                    max_records: 3,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .accepted,
+        1
+    );
+    drop(ledger);
+    let mut reopened = UsageLedger::open(db).unwrap();
+    assert_eq!(
+        reopened
+            .import_jsonl(
+                &path,
+                ImportOptions {
+                    max_records: 1,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .accepted,
+        1
+    );
+    let rows = reopened.rows(10, 0).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().map(|r| r.input_tokens.unwrap()).sum::<i64>(),
+        15
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.output_tokens.unwrap()).sum::<i64>(),
+        5
+    );
+    assert!(rows
+        .iter()
+        .all(|r| r.model.as_deref() == Some("gpt-5.6-terra")));
+    assert!(rows.iter().all(|r| r.effort.as_deref() == Some("medium")));
+    assert!(rows
+        .iter()
+        .all(|r| r.root_task_family.as_deref() == Some("build")));
+    assert!(rows
+        .iter()
+        .all(|r| r.parent_response_id.as_deref() == Some("root-thread")));
 }
