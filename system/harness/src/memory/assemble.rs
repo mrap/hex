@@ -1272,9 +1272,11 @@ pub(crate) fn render_authority_candidates(ctx: &AssembledContext, intent: QueryI
     let rank = |fact: &&FactHit| match (intent, fact.resolved_authority) {
         (_, Some(FactAuthority::Conflict)) => 0,
         (QueryIntent::Current, Some(FactAuthority::Current))
-        | (QueryIntent::Historical, Some(FactAuthority::Historical)) => 1,
+        | (QueryIntent::Historical, Some(FactAuthority::Historical))
+        | (QueryIntent::AmbiguousBefore, Some(FactAuthority::Current)) => 1,
         (QueryIntent::Current, Some(FactAuthority::Historical))
-        | (QueryIntent::Historical, Some(FactAuthority::Current)) => 2,
+        | (QueryIntent::Historical, Some(FactAuthority::Current))
+        | (QueryIntent::AmbiguousBefore, Some(FactAuthority::Historical)) => 2,
         (_, Some(FactAuthority::Unverified)) => 3,
         _ => 4,
     };

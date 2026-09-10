@@ -55,6 +55,7 @@ impl AuthorityStatus {
 pub(crate) enum QueryIntent {
     Current,
     Historical,
+    AmbiguousBefore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,18 +160,13 @@ struct EligibleSource {
 
 fn query_intent(query: &str) -> QueryIntent {
     let tokens = tokens(query);
-    if [
-        "history",
-        "historical",
-        "previous",
-        "former",
-        "superseded",
-        "before",
-    ]
-    .iter()
-    .any(|cue| tokens.contains(*cue))
+    if ["history", "historical", "previous", "former", "superseded"]
+        .iter()
+        .any(|cue| tokens.contains(*cue))
     {
         QueryIntent::Historical
+    } else if tokens.contains("before") {
+        QueryIntent::AmbiguousBefore
     } else {
         QueryIntent::Current
     }
@@ -429,7 +425,11 @@ pub(crate) fn resolve(hex_root: &Path, query: &str, for_agent: bool) -> Resoluti
         | (QueryIntent::Historical, AuthorityStatus::Historical) => 0,
         (QueryIntent::Current, AuthorityStatus::Unknown)
         | (QueryIntent::Historical, AuthorityStatus::Current) => 1,
-        _ => 2,
+        (QueryIntent::Current, AuthorityStatus::Historical)
+        | (QueryIntent::Historical, AuthorityStatus::Unknown) => 2,
+        (QueryIntent::AmbiguousBefore, AuthorityStatus::Current) => 0,
+        (QueryIntent::AmbiguousBefore, AuthorityStatus::Historical) => 1,
+        (QueryIntent::AmbiguousBefore, AuthorityStatus::Unknown) => 2,
     });
     if intent == QueryIntent::Current && !current_ids.is_empty() {
         eligible.retain(|entry| entry.status == AuthorityStatus::Current);

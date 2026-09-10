@@ -321,6 +321,9 @@ pub(crate) fn authority_rank_sql(intent: authority::QueryIntent, alias: &str) ->
         authority::QueryIntent::Historical => {
             format!("CASE WHEN {historical} THEN 0 WHEN {current} THEN 1 ELSE 2 END,")
         }
+        authority::QueryIntent::AmbiguousBefore => {
+            format!("CASE WHEN {current} THEN 0 WHEN {historical} THEN 1 ELSE 2 END,")
+        }
     }
 }
 
@@ -337,6 +340,14 @@ pub(crate) fn fact_authority_rank(fact: &FactHit, intent: authority::QueryIntent
         | (authority::QueryIntent::Historical, authority::AuthorityStatus::Historical, false) => 0,
         (authority::QueryIntent::Historical, authority::AuthorityStatus::Current, false) => 1,
         (authority::QueryIntent::Historical, authority::AuthorityStatus::Unknown, false) => 2,
+        (authority::QueryIntent::AmbiguousBefore, authority::AuthorityStatus::Current, false) => 0,
+        (authority::QueryIntent::AmbiguousBefore, _, true)
+        | (
+            authority::QueryIntent::AmbiguousBefore,
+            authority::AuthorityStatus::Historical,
+            false,
+        ) => 1,
+        (authority::QueryIntent::AmbiguousBefore, authority::AuthorityStatus::Unknown, false) => 2,
     }
 }
 
@@ -578,6 +589,22 @@ fn facts_recall_inner(
                             ) => 1,
                             (
                                 authority::QueryIntent::Historical,
+                                authority::AuthorityStatus::Unknown,
+                                false,
+                            ) => 2,
+                            (
+                                authority::QueryIntent::AmbiguousBefore,
+                                authority::AuthorityStatus::Current,
+                                false,
+                            ) => 0,
+                            (authority::QueryIntent::AmbiguousBefore, _, true)
+                            | (
+                                authority::QueryIntent::AmbiguousBefore,
+                                authority::AuthorityStatus::Historical,
+                                false,
+                            ) => 1,
+                            (
+                                authority::QueryIntent::AmbiguousBefore,
                                 authority::AuthorityStatus::Unknown,
                                 false,
                             ) => 2,
@@ -1731,6 +1758,594 @@ private = false
         assert!(
             !outcome.authority_degraded,
             "[AUTH-STRUCTURAL-STATE-RED]: rendered source text changed the structural degraded flag: {:?}",
+            outcome.context,
+        );
+    }
+
+    #[test]
+    fn operational_before_connective_keeps_labeled_current_authority() {
+        let case = "operational_before_connective_keeps_labeled_current_authority";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(
+            root.path(),
+            r#"version = 1
+
+[[sources]]
+id = "memory-current"
+path = "docs/current.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+
+[[sources]]
+id = "memory-history"
+path = "docs/history.md"
+topics = ["memory recall"]
+authority_status = "historical"
+private = false
+"#,
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/current.md",
+            "CURRENT_OPERATIONAL_CANARY memory recall safety checklist\n",
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/history.md",
+            "HISTORICAL_BEFORE_CANARY previous memory recall procedure\n",
+            case,
+        );
+        assert!(
+            !crate::memory::db_path(root.path()).exists(),
+            "[AUTH-TEMPORAL-SETUP]: fixture database existed before recall",
+        );
+
+        let outcome = recall(
+            root.path(),
+            "What should I check before memory recall?",
+            false,
+        );
+
+        assert_eq!(
+            outcome.authority_state.as_deref(),
+            Some("matched"),
+            "[AUTH-TEMPORAL-SETUP]: authority registry did not match",
+        );
+        assert!(
+            outcome.injected,
+            "[AUTH-TEMPORAL-SETUP]: matched authority context did not inject",
+        );
+        assert_eq!(
+            outcome
+                .context
+                .lines()
+                .filter(|line| line.contains("CURRENT_OPERATIONAL_CANARY"))
+                .count(),
+            1,
+            "[AUTH-TEMPORAL-OPERATIONAL-RED]: current source count was not one: {:?}",
+            outcome.context,
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "CURRENT_OPERATIONAL_CANARY",
+            "### Current authority",
+            "[AUTH-TEMPORAL-OPERATIONAL-RED]",
+        );
+    }
+
+    #[test]
+    fn explicit_history_before_keeps_labeled_historical_authority() {
+        let case = "explicit_history_before_keeps_labeled_historical_authority";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(
+            root.path(),
+            r#"version = 1
+
+[[sources]]
+id = "memory-current"
+path = "docs/current.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+
+[[sources]]
+id = "memory-history"
+path = "docs/history.md"
+topics = ["memory recall"]
+authority_status = "historical"
+private = false
+"#,
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/current.md",
+            "CURRENT_OPERATIONAL_CANARY memory recall safety checklist\n",
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/history.md",
+            "HISTORICAL_BEFORE_CANARY previous memory recall procedure\n",
+            case,
+        );
+        assert!(
+            !crate::memory::db_path(root.path()).exists(),
+            "[AUTH-TEMPORAL-SETUP]: fixture database existed before recall",
+        );
+
+        let outcome = recall(
+            root.path(),
+            "What did we use for memory recall before the current procedure?",
+            false,
+        );
+
+        assert_eq!(
+            outcome.authority_state.as_deref(),
+            Some("matched"),
+            "[AUTH-TEMPORAL-SETUP]: authority registry did not match",
+        );
+        assert!(
+            outcome.injected,
+            "[AUTH-TEMPORAL-SETUP]: matched authority context did not inject",
+        );
+        assert_eq!(
+            outcome
+                .context
+                .lines()
+                .filter(|line| line.contains("HISTORICAL_BEFORE_CANARY"))
+                .count(),
+            1,
+            "[AUTH-TEMPORAL-HISTORY-CONTROL]: historical source count was not one: {:?}",
+            outcome.context,
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "HISTORICAL_BEFORE_CANARY",
+            "### Historical authority",
+            "[AUTH-TEMPORAL-HISTORY-CONTROL]",
+        );
+    }
+
+    #[test]
+    fn ambiguous_before_retrospective_form_retains_labeled_sources() {
+        let case = "ambiguous_before_retrospective_form_retains_labeled_sources";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(
+            root.path(),
+            r#"version = 1
+
+[[sources]]
+id = "memory-current"
+path = "docs/current.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+
+[[sources]]
+id = "memory-history"
+path = "docs/history.md"
+topics = ["memory recall"]
+authority_status = "historical"
+private = false
+"#,
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/current.md",
+            "AMBIGUOUS_CURRENT_CANARY memory recall procedure in force\n",
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/history.md",
+            "AMBIGUOUS_HISTORY_CANARY prior memory recall procedure\n",
+            case,
+        );
+
+        let outcome = recall(
+            root.path(),
+            "What should we have used for memory recall before the current procedure?",
+            false,
+        );
+
+        assert_eq!(
+            outcome.authority_state.as_deref(),
+            Some("matched"),
+            "[AUTH-TEMPORAL-GREEN-SETUP]: retrospective fixture did not match",
+        );
+        assert!(
+            outcome.injected,
+            "[AUTH-TEMPORAL-GREEN-SETUP]: retrospective fixture did not inject",
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "AMBIGUOUS_CURRENT_CANARY",
+            "### Current authority",
+            "[AUTH-TEMPORAL-AMBIGUOUS-RETROSPECTIVE]",
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "AMBIGUOUS_HISTORY_CANARY",
+            "### Historical authority",
+            "[AUTH-TEMPORAL-AMBIGUOUS-RETROSPECTIVE]",
+        );
+        let current_at = outcome
+            .context
+            .find("AMBIGUOUS_CURRENT_CANARY")
+            .unwrap_or_else(|| {
+                panic!("[AUTH-TEMPORAL-AMBIGUOUS-RETROSPECTIVE]: current canary disappeared")
+            });
+        let history_at = outcome
+            .context
+            .find("AMBIGUOUS_HISTORY_CANARY")
+            .unwrap_or_else(|| {
+                panic!("[AUTH-TEMPORAL-AMBIGUOUS-RETROSPECTIVE]: history canary disappeared")
+            });
+        assert!(
+            current_at < history_at,
+            "[AUTH-TEMPORAL-AMBIGUOUS-RETROSPECTIVE]: current source did not precede history: {:?}",
+            outcome.context,
+        );
+    }
+
+    #[test]
+    fn ambiguous_before_source_cap_keeps_current_and_one_history() {
+        let case = "ambiguous_before_source_cap_keeps_current_and_one_history";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(
+            root.path(),
+            r#"version = 1
+
+[[sources]]
+id = "memory-history-one"
+path = "docs/history-one.md"
+topics = ["memory recall"]
+authority_status = "historical"
+private = false
+
+[[sources]]
+id = "memory-current"
+path = "docs/current.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+
+[[sources]]
+id = "memory-history-two"
+path = "docs/history-two.md"
+topics = ["memory recall"]
+authority_status = "historical"
+private = false
+"#,
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/current.md",
+            "CAP_CURRENT_CANARY memory recall preparation\n",
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/history-one.md",
+            "CAP_HISTORY_ONE_CANARY old memory recall preparation\n",
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/history-two.md",
+            "CAP_HISTORY_TWO_CANARY older memory recall preparation\n",
+            case,
+        );
+
+        let outcome = recall(root.path(), "What applies before memory recall?", false);
+
+        assert_eq!(
+            outcome.authority_state.as_deref(),
+            Some("matched"),
+            "[AUTH-TEMPORAL-GREEN-SETUP]: source-cap fixture did not match",
+        );
+        assert!(
+            outcome.injected,
+            "[AUTH-TEMPORAL-GREEN-SETUP]: source-cap fixture did not inject",
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "CAP_CURRENT_CANARY",
+            "### Current authority",
+            "[AUTH-TEMPORAL-SOURCE-CAP]",
+        );
+        let retained_history: Vec<&str> = ["CAP_HISTORY_ONE_CANARY", "CAP_HISTORY_TWO_CANARY"]
+            .into_iter()
+            .filter(|canary| outcome.context.contains(canary))
+            .collect();
+        assert_eq!(
+            retained_history.len(),
+            1,
+            "[AUTH-TEMPORAL-SOURCE-CAP]: expected one retained history source: {:?}",
+            outcome.context,
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            retained_history[0],
+            "### Historical authority",
+            "[AUTH-TEMPORAL-SOURCE-CAP]",
+        );
+        let current_at = outcome
+            .context
+            .find("CAP_CURRENT_CANARY")
+            .unwrap_or_else(|| panic!("[AUTH-TEMPORAL-SOURCE-CAP]: current canary disappeared"));
+        let history_at = outcome
+            .context
+            .find(retained_history[0])
+            .unwrap_or_else(|| {
+                panic!("[AUTH-TEMPORAL-SOURCE-CAP]: retained history canary disappeared")
+            });
+        assert!(
+            current_at < history_at,
+            "[AUTH-TEMPORAL-SOURCE-CAP]: current source did not precede retained history: {:?}",
+            outcome.context,
+        );
+        assert_eq!(
+            outcome.result_count, 2,
+            "[AUTH-TEMPORAL-SOURCE-CAP]: direct-source cap changed",
+        );
+    }
+
+    #[test]
+    fn ambiguous_before_database_rank_is_current_history_unknown() {
+        let case = "ambiguous_before_database_rank_is_current_history_unknown";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(
+            root.path(),
+            r#"version = 1
+
+[[sources]]
+id = "memory-current"
+path = "docs/current.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+
+[[sources]]
+id = "memory-history"
+path = "docs/history.md"
+topics = ["memory recall"]
+authority_status = "historical"
+private = false
+"#,
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/current.md",
+            "DATABASE_SOURCE_CURRENT_CANARY memory recall guidance\n",
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/history.md",
+            "DATABASE_SOURCE_HISTORY_CANARY prior memory recall guidance\n",
+            case,
+        );
+        let conn = authority_db(root.path(), case);
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "ambiguous_current_fact",
+                object: "AMBIGUOUS_DB_CURRENT_CANARY applies before memory recall",
+                importance: 0.10,
+                source_origin: "database-current-origin",
+                effective_date: Some("2026-09-10"),
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "ambiguous_history_fact",
+                object: "AMBIGUOUS_DB_HISTORY_CANARY applies before memory recall",
+                importance: 0.99,
+                source_origin: "database-history-origin",
+                effective_date: Some("2025-01-15"),
+                superseded_by: None,
+                authority_status: "historical",
+            },
+        );
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "ambiguous_unknown_fact",
+                object: "AMBIGUOUS_DB_UNKNOWN_CANARY applies before memory recall",
+                importance: 1.0,
+                source_origin: "database-unknown-origin",
+                effective_date: None,
+                superseded_by: None,
+                authority_status: "unknown",
+            },
+        );
+        drop(conn);
+
+        let outcome = recall(root.path(), "What applies before memory recall?", false);
+
+        assert_eq!(
+            outcome.authority_state.as_deref(),
+            Some("matched"),
+            "[AUTH-TEMPORAL-GREEN-SETUP]: database-rank fixture did not match",
+        );
+        assert!(
+            outcome.injected,
+            "[AUTH-TEMPORAL-GREEN-SETUP]: database-rank fixture did not inject",
+        );
+        for canary in [
+            "AMBIGUOUS_DB_CURRENT_CANARY",
+            "AMBIGUOUS_DB_HISTORY_CANARY",
+            "AMBIGUOUS_DB_UNKNOWN_CANARY",
+        ] {
+            assert!(
+                outcome.context.contains(canary),
+                "[AUTH-TEMPORAL-DATABASE-RANK]: {canary} is absent: {:?}",
+                outcome.context,
+            );
+        }
+        assert_fact_status_line(
+            &outcome.context,
+            "AMBIGUOUS_DB_CURRENT_CANARY",
+            "[current]",
+            "[AUTH-TEMPORAL-DATABASE-RANK]",
+        );
+        assert_fact_status_line(
+            &outcome.context,
+            "AMBIGUOUS_DB_HISTORY_CANARY",
+            "[historical]",
+            "[AUTH-TEMPORAL-DATABASE-RANK]",
+        );
+        assert_fact_status_line(
+            &outcome.context,
+            "AMBIGUOUS_DB_UNKNOWN_CANARY",
+            "[unverified]",
+            "[AUTH-TEMPORAL-DATABASE-RANK]",
+        );
+        let current_at = outcome
+            .context
+            .find("AMBIGUOUS_DB_CURRENT_CANARY")
+            .unwrap_or_else(|| panic!("[AUTH-TEMPORAL-DATABASE-RANK]: current fact disappeared"));
+        let history_at = outcome
+            .context
+            .find("AMBIGUOUS_DB_HISTORY_CANARY")
+            .unwrap_or_else(|| panic!("[AUTH-TEMPORAL-DATABASE-RANK]: history fact disappeared"));
+        let unknown_at = outcome
+            .context
+            .find("AMBIGUOUS_DB_UNKNOWN_CANARY")
+            .unwrap_or_else(|| panic!("[AUTH-TEMPORAL-DATABASE-RANK]: unknown fact disappeared"));
+        assert!(
+            current_at < history_at && history_at < unknown_at,
+            "[AUTH-TEMPORAL-DATABASE-RANK]: expected current, history, unknown ordering: {:?}",
+            outcome.context,
+        );
+    }
+
+    #[test]
+    fn strong_previous_cue_keeps_historical_source_and_fact_first() {
+        let case = "strong_previous_cue_keeps_historical_source_and_fact_first";
+        let root = setup(tempfile::TempDir::new(), case, "create TempDir");
+        write_registry(
+            root.path(),
+            r#"version = 1
+
+[[sources]]
+id = "memory-current"
+path = "docs/current.md"
+topics = ["memory recall"]
+authority_status = "current"
+private = false
+
+[[sources]]
+id = "memory-history"
+path = "docs/history.md"
+topics = ["memory recall"]
+authority_status = "historical"
+private = false
+"#,
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/current.md",
+            "STRONG_CURRENT_SOURCE_CANARY current memory recall procedure\n",
+            case,
+        );
+        write_fixture(
+            root.path(),
+            "docs/history.md",
+            "STRONG_HISTORY_SOURCE_CANARY previous memory recall procedure\n",
+            case,
+        );
+        let conn = authority_db(root.path(), case);
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "strong_current_fact",
+                object: "STRONG_CURRENT_FACT_CANARY previous memory recall procedure",
+                importance: 0.99,
+                source_origin: "strong-database-current-origin",
+                effective_date: Some("2026-09-10"),
+                superseded_by: None,
+                authority_status: "current",
+            },
+        );
+        insert_authority_fact(
+            &conn,
+            case,
+            AuthorityFact {
+                id: "strong_history_fact",
+                object: "STRONG_HISTORY_FACT_CANARY previous memory recall procedure",
+                importance: 0.10,
+                source_origin: "strong-database-history-origin",
+                effective_date: Some("2025-01-15"),
+                superseded_by: None,
+                authority_status: "historical",
+            },
+        );
+        drop(conn);
+
+        let outcome = recall(
+            root.path(),
+            "What was the previous memory recall procedure?",
+            false,
+        );
+
+        assert_eq!(
+            outcome.authority_state.as_deref(),
+            Some("matched"),
+            "[AUTH-TEMPORAL-GREEN-SETUP]: strong-history fixture did not match",
+        );
+        assert_source_authority_heading(
+            &outcome.context,
+            "STRONG_HISTORY_SOURCE_CANARY",
+            "### Historical authority",
+            "[AUTH-TEMPORAL-STRONG-HISTORY]",
+        );
+        for canary in ["STRONG_HISTORY_FACT_CANARY", "STRONG_CURRENT_FACT_CANARY"] {
+            assert!(
+                outcome.context.contains(canary),
+                "[AUTH-TEMPORAL-STRONG-HISTORY]: {canary} is absent: {:?}",
+                outcome.context,
+            );
+        }
+        assert_fact_status_line(
+            &outcome.context,
+            "STRONG_HISTORY_FACT_CANARY",
+            "[historical]",
+            "[AUTH-TEMPORAL-STRONG-HISTORY]",
+        );
+        assert_fact_status_line(
+            &outcome.context,
+            "STRONG_CURRENT_FACT_CANARY",
+            "[current]",
+            "[AUTH-TEMPORAL-STRONG-HISTORY]",
+        );
+        let history_at = outcome
+            .context
+            .find("STRONG_HISTORY_FACT_CANARY")
+            .unwrap_or_else(|| panic!("[AUTH-TEMPORAL-STRONG-HISTORY]: history fact disappeared"));
+        let current_at = outcome
+            .context
+            .find("STRONG_CURRENT_FACT_CANARY")
+            .unwrap_or_else(|| panic!("[AUTH-TEMPORAL-STRONG-HISTORY]: current fact disappeared"));
+        assert!(
+            history_at < current_at,
+            "[AUTH-TEMPORAL-STRONG-HISTORY]: history fact did not precede current fact: {:?}",
             outcome.context,
         );
     }
