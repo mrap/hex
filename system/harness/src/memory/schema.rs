@@ -19,7 +19,12 @@ CREATE TABLE IF NOT EXISTS facts (
     source_ref    TEXT,
     private       INTEGER NOT NULL DEFAULT 0,
     tombstone     INTEGER NOT NULL DEFAULT 0,
-    embedding     BLOB
+    embedding     BLOB,
+    source_origin TEXT,
+    effective_date TEXT,
+    superseded_by TEXT,
+    authority_status TEXT COLLATE BINARY NOT NULL DEFAULT 'unknown'
+        CHECK (authority_status COLLATE BINARY IN ('current','historical','unknown'))
 );
 CREATE INDEX IF NOT EXISTS facts_subject_idx     ON facts(subject);
 CREATE INDEX IF NOT EXISTS facts_predicate_idx   ON facts(predicate);
@@ -179,8 +184,166 @@ pub fn apply_tune_log_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(TUNE_LOG_DDL)
 }
 
+const AUTHORITY_SCHEMA_VERSION: i64 = 5;
+const AUTHORITY_COLUMNS: [(&str, &str); 4] = [
+    ("source_origin", "TEXT"),
+    ("effective_date", "TEXT"),
+    ("superseded_by", "TEXT"),
+    (
+        "authority_status",
+        "TEXT COLLATE BINARY NOT NULL DEFAULT 'unknown' CHECK (authority_status COLLATE BINARY IN ('current','historical','unknown'))",
+    ),
+];
+
+#[derive(Debug)]
+struct ColumnDefinition {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    default_value: Option<String>,
+    primary_key: bool,
+}
+
+fn authority_schema_error(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_SCHEMA),
+        Some(format!("authority schema: {}", message.into())),
+    )
+}
+
+fn authority_columns(conn: &Connection) -> Result<Vec<ColumnDefinition>> {
+    let mut statement = conn.prepare("PRAGMA table_info(facts)")?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok(ColumnDefinition {
+                name: row.get(1)?,
+                declared_type: row.get(2)?,
+                not_null: row.get::<_, i64>(3)? != 0,
+                default_value: row.get(4)?,
+                primary_key: row.get::<_, i64>(5)? != 0,
+            })
+        })?
+        .collect();
+    columns
+}
+
+fn validate_authority_schema(conn: &Connection) -> Result<bool> {
+    let columns = authority_columns(conn)?;
+    let mut complete = true;
+    for (name, _) in AUTHORITY_COLUMNS {
+        let Some(column) = columns.iter().find(|column| column.name == name) else {
+            complete = false;
+            continue;
+        };
+        // table_info cannot prove an existing CHECK constraint. Accept only
+        // its observable shape here, then validate every stored status below.
+        // Newly added authority_status columns use the declared CHECK above.
+        let compatible = if name == "authority_status" {
+            column.declared_type.eq_ignore_ascii_case("TEXT")
+                && column.not_null
+                && column.default_value.as_deref() == Some("'unknown'")
+                && !column.primary_key
+        } else {
+            column.declared_type.eq_ignore_ascii_case("TEXT")
+                && !column.not_null
+                && column.default_value.is_none()
+                && !column.primary_key
+        };
+        if !compatible {
+            return Err(authority_schema_error(format!(
+                "incompatible column `{name}`: {column:?}"
+            )));
+        }
+    }
+    if columns
+        .iter()
+        .any(|column| column.name == "authority_status")
+    {
+        let invalid: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM facts
+             WHERE authority_status IS NULL
+                OR authority_status COLLATE BINARY
+                   NOT IN ('current','historical','unknown')",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid != 0 {
+            return Err(authority_schema_error(format!(
+                "authority_status contains {invalid} invalid values"
+            )));
+        }
+    }
+    Ok(complete)
+}
+
+fn authority_version_present(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_version WHERE version = ?1)",
+        [AUTHORITY_SCHEMA_VERSION],
+        |row| row.get(0),
+    )
+}
+
+fn apply_authority_schema_with_step<F>(conn: &Connection, after_add: &mut F) -> Result<()>
+where
+    F: FnMut(usize) -> Result<()>,
+{
+    if validate_authority_schema(conn)? && authority_version_present(conn)? {
+        return Ok(());
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let migration = (|| -> Result<()> {
+        if validate_authority_schema(conn)? && authority_version_present(conn)? {
+            conn.execute_batch("COMMIT")?;
+            return Ok(());
+        }
+
+        let mut added = 0;
+        for (name, declaration) in AUTHORITY_COLUMNS {
+            let present = authority_columns(conn)?
+                .iter()
+                .any(|column| column.name == name);
+            if present {
+                continue;
+            }
+            conn.execute_batch(&format!(
+                "ALTER TABLE facts ADD COLUMN {name} {declaration}"
+            ))?;
+            added += 1;
+            after_add(added)?;
+        }
+
+        if !validate_authority_schema(conn)? {
+            return Err(authority_schema_error(
+                "required columns remain missing after migration",
+            ));
+        }
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?1, datetime('now'))
+             ON CONFLICT(version) DO NOTHING",
+            [AUTHORITY_SCHEMA_VERSION],
+        )?;
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+
+    if let Err(primary) = migration {
+        if let Err(rollback) = conn.execute_batch("ROLLBACK") {
+            eprintln!("[schema] authority migration rollback warning: {rollback}");
+        }
+        return Err(primary);
+    }
+    Ok(())
+}
+
+pub fn apply_authority_schema(conn: &Connection) -> Result<()> {
+    apply_authority_schema_with_step(conn, &mut |_| Ok(()))
+}
+
 pub fn apply_plan2(conn: &Connection) -> Result<()> {
     conn.execute_batch(PLAN2_DDL)?;
+    apply_authority_schema(conn)?;
     // Backfill: older DBs created before consecutive_failures was added still
     // need the column. ALTER TABLE in SQLite errors if the column already
     // exists, so we ignore that one specific error.
@@ -282,6 +445,8 @@ pub fn apply_plan1_baseline_for_test(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
+    type HistoryState = (i64, String, String, Option<String>, Option<String>, String);
+
     #[test]
     fn migration_creates_all_plan2_tables() {
         crate::memory::vector::register_sqlite_vec();
@@ -323,8 +488,8 @@ mod tests {
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 4,
-            "schema_version should record version=4 after apply_plan2"
+            version, 5,
+            "schema_version should record version=5 after apply_plan2"
         );
     }
 
@@ -883,6 +1048,456 @@ mod tests {
         assert_eq!(
             status, "unknown",
             "a private, provenance-unknown legacy fact must stay UNKNOWN, never promoted to 'current'"
+        );
+    }
+
+    #[allow(dead_code)] // Derived equality reads every field in this all-state oracle.
+    #[derive(Debug, PartialEq)]
+    struct FactState {
+        rowid: i64,
+        id: String,
+        subject: String,
+        predicate: String,
+        object: String,
+        importance: f64,
+        access_count: i64,
+        last_accessed: Option<String>,
+        created_at: String,
+        updated_at: String,
+        source_ref: Option<String>,
+        private: i64,
+        tombstone: i64,
+        embedding: Option<Vec<u8>>,
+        source_origin: Option<String>,
+        effective_date: Option<String>,
+        superseded_by: Option<String>,
+        authority_status: String,
+    }
+
+    #[allow(dead_code)] // Derived equality reads fields not asserted separately.
+    #[derive(Debug, PartialEq)]
+    struct AuthorityState {
+        facts: Vec<FactState>,
+        history: Vec<HistoryState>,
+        fts: Vec<(i64, String, String, String)>,
+        fts_matches: (i64, i64),
+        vectors: Vec<(String, Vec<u8>)>,
+        versions: Vec<i64>,
+    }
+
+    #[allow(dead_code)] // Derived equality reads every field in this all-state oracle.
+    #[derive(Debug, PartialEq)]
+    struct LegacyFactState {
+        rowid: i64,
+        id: String,
+        subject: String,
+        predicate: String,
+        object: String,
+        importance: f64,
+        access_count: i64,
+        last_accessed: Option<String>,
+        created_at: String,
+        updated_at: String,
+        source_ref: Option<String>,
+        private: i64,
+        tombstone: i64,
+        embedding: Option<Vec<u8>>,
+    }
+
+    #[allow(dead_code)] // Derived equality reads fields not asserted separately.
+    #[derive(Debug, PartialEq)]
+    struct LegacyState {
+        facts: Vec<LegacyFactState>,
+        history: Vec<HistoryState>,
+        fts: Vec<(i64, String, String, String)>,
+        fts_matches: (i64, i64),
+        vectors: Vec<(String, Vec<u8>)>,
+        versions: Vec<i64>,
+    }
+
+    fn snapshot_legacy_state(conn: &Connection) -> LegacyState {
+        let facts = conn
+            .prepare(
+                "SELECT rowid,id,subject,predicate,object,importance,access_count,last_accessed,
+                        created_at,updated_at,source_ref,private,tombstone,embedding
+                   FROM facts ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok(LegacyFactState {
+                    rowid: row.get(0)?,
+                    id: row.get(1)?,
+                    subject: row.get(2)?,
+                    predicate: row.get(3)?,
+                    object: row.get(4)?,
+                    importance: row.get(5)?,
+                    access_count: row.get(6)?,
+                    last_accessed: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    source_ref: row.get(10)?,
+                    private: row.get(11)?,
+                    tombstone: row.get(12)?,
+                    embedding: row.get(13)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let history = conn
+            .prepare("SELECT id,fact_id,op,prev_value,new_value,ts FROM fact_history ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let fts = conn
+            .prepare("SELECT rowid,subject,predicate,object FROM facts_fts ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let fts_matches = (
+            conn.query_row(
+                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH 'asterfall'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH 'mossvale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        );
+        let vectors = conn
+            .prepare("SELECT fact_id,embedding FROM facts_vec ORDER BY fact_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let versions = conn
+            .prepare("SELECT version FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        LegacyState {
+            facts,
+            history,
+            fts,
+            fts_matches,
+            vectors,
+            versions,
+        }
+    }
+
+    fn snapshot_authority_state(conn: &Connection) -> AuthorityState {
+        let facts = conn
+            .prepare(
+                "SELECT rowid,id,subject,predicate,object,importance,access_count,last_accessed,
+                        created_at,updated_at,source_ref,private,tombstone,embedding,
+                        source_origin,effective_date,superseded_by,authority_status
+                   FROM facts ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok(FactState {
+                    rowid: row.get(0)?,
+                    id: row.get(1)?,
+                    subject: row.get(2)?,
+                    predicate: row.get(3)?,
+                    object: row.get(4)?,
+                    importance: row.get(5)?,
+                    access_count: row.get(6)?,
+                    last_accessed: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    source_ref: row.get(10)?,
+                    private: row.get(11)?,
+                    tombstone: row.get(12)?,
+                    embedding: row.get(13)?,
+                    source_origin: row.get(14)?,
+                    effective_date: row.get(15)?,
+                    superseded_by: row.get(16)?,
+                    authority_status: row.get(17)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let history = conn
+            .prepare("SELECT id,fact_id,op,prev_value,new_value,ts FROM fact_history ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let fts = conn
+            .prepare("SELECT rowid,subject,predicate,object FROM facts_fts ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let fts_matches = (
+            conn.query_row(
+                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH 'asterfall'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH 'mossvale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        );
+        let vectors = conn
+            .prepare("SELECT fact_id,embedding FROM facts_vec ORDER BY fact_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let versions = conn
+            .prepare("SELECT version FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        AuthorityState {
+            facts,
+            history,
+            fts,
+            fts_matches,
+            vectors,
+            versions,
+        }
+    }
+
+    fn create_legacy_authority_fixture(conn: &Connection) {
+        apply_plan1_baseline_for_test(conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE facts (
+                id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL,
+                object TEXT NOT NULL, importance REAL NOT NULL DEFAULT 0.5,
+                access_count INTEGER NOT NULL DEFAULT 0, last_accessed TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, source_ref TEXT,
+                private INTEGER NOT NULL DEFAULT 0, tombstone INTEGER NOT NULL DEFAULT 0,
+                embedding BLOB
+             );
+             CREATE TABLE fact_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, fact_id TEXT NOT NULL,
+                op TEXT NOT NULL CHECK (op IN ('ADD','UPDATE','DELETE','FLAG')),
+                prev_value TEXT, new_value TEXT, ts TEXT NOT NULL,
+                FOREIGN KEY (fact_id) REFERENCES facts(id)
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(PLAN2_VEC_DDL).unwrap();
+        conn.execute_batch(PLAN2_FTS_DDL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO facts
+                (id,subject,predicate,object,importance,access_count,last_accessed,
+                 created_at,updated_at,source_ref,private,tombstone,embedding)
+             VALUES
+                ('f_live','Asterfall','deploy-command','run asterfallctl ship',0.8,3,
+                 '2026-02-03','2026-01-01','2026-02-02','sources/runbook.md',1,0,X'0102'),
+                ('f_old','Mossvale','deploy-command','run old-deploy.sh',0.4,0,NULL,
+                 '2025-01-01','2025-02-02','sources/history.md',0,1,X'0304');
+             INSERT INTO fact_history (fact_id,op,prev_value,new_value,ts) VALUES
+                ('f_live','ADD',NULL,'run asterfallctl ship','2026-01-01'),
+                ('f_old','FLAG','run old-deploy.sh','tombstoned','2026-03-01');",
+        )
+        .unwrap();
+        crate::memory::vector::insert_fact_vec(conn, "f_live", &[0.0; 768]).unwrap();
+        crate::memory::vector::insert_fact_vec(conn, "f_old", &[1.0; 768]).unwrap();
+    }
+
+    #[test]
+    fn authority_migration_repeat_preserves_all_state() {
+        crate::memory::vector::register_sqlite_vec();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("memory.db");
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_authority_fixture(&conn);
+        apply_plan2(&conn).unwrap();
+        conn.execute_batch(
+            "UPDATE facts SET
+                source_origin='portable/runbook', effective_date='2026-02-01',
+                authority_status='current'
+             WHERE id='f_live';
+             UPDATE facts SET
+                source_origin='portable/history', effective_date='2025-01-01',
+                superseded_by='f_live', authority_status='historical'
+             WHERE id='f_old';",
+        )
+        .unwrap();
+        let first = snapshot_authority_state(&conn);
+        drop(conn);
+
+        let conn = Connection::open(&path).unwrap();
+        apply_plan2(&conn).unwrap();
+        let repeated = snapshot_authority_state(&conn);
+        assert_eq!(
+            repeated, first,
+            "repeat migration must preserve every state value"
+        );
+        assert_eq!(
+            repeated
+                .versions
+                .iter()
+                .filter(|&&version| version == 5)
+                .count(),
+            1,
+            "schema version 5 must be recorded once"
+        );
+        assert_eq!(repeated.fts_matches, (1, 1));
+    }
+
+    #[test]
+    fn authority_migration_failure_rolls_back_and_returns_original_error() {
+        use std::cell::Cell;
+
+        crate::memory::vector::register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        create_legacy_authority_fixture(&conn);
+        let before = snapshot_legacy_state(&conn);
+        let injected = Cell::new(false);
+        let marker = "authority-test-injected-after-first-add";
+        let error = apply_authority_schema_with_step(&conn, &mut |added| {
+            assert_eq!(added, 1);
+            injected.set(true);
+            Err(rusqlite::Error::InvalidParameterName(marker.to_string()))
+        })
+        .unwrap_err();
+        assert!(
+            injected.get(),
+            "test failure must occur after one column add"
+        );
+        match error {
+            rusqlite::Error::InvalidParameterName(actual) => assert_eq!(actual, marker),
+            other => panic!("migration must return the injected original error: {other:?}"),
+        }
+        assert!(
+            conn.is_autocommit(),
+            "failed migration must leave no transaction open"
+        );
+        let authority_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('facts')
+                 WHERE name IN ('source_origin','effective_date','superseded_by','authority_status')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authority_columns, 0, "all authority DDL must roll back");
+        let version: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_version WHERE version=5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 0, "failed migration must not record version 5");
+        let after = snapshot_legacy_state(&conn);
+        assert_eq!(
+            after, before,
+            "rollback must preserve every legacy state value"
+        );
+    }
+
+    #[test]
+    fn authority_migration_rejects_case_variant_under_nocase_collation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT
+             );
+             CREATE TABLE facts (
+                id TEXT PRIMARY KEY,
+                source_origin TEXT,
+                effective_date TEXT,
+                superseded_by TEXT,
+                authority_status TEXT COLLATE NOCASE NOT NULL DEFAULT 'unknown'
+             );
+             INSERT INTO facts (id,authority_status) VALUES ('f_case','CURRENT');",
+        )
+        .unwrap();
+
+        let error = apply_authority_schema(&conn).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("authority_status contains 1 invalid values"),
+            "case variant must return the authority-specific invalid-value error: {error}"
+        );
+        let stored: String = conn
+            .query_row(
+                "SELECT authority_status FROM facts WHERE id='f_case'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "CURRENT", "rejection must not rewrite the value");
+        let version: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_version WHERE version=5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 0, "rejection must not record version 5");
+
+        conn.execute(
+            "UPDATE facts SET authority_status='current' WHERE id='f_case'",
+            [],
+        )
+        .unwrap();
+        apply_authority_schema(&conn).unwrap();
+        let accepted: (String, i64) = conn
+            .query_row(
+                "SELECT authority_status,
+                        (SELECT COUNT(*) FROM schema_version WHERE version=5)
+                   FROM facts WHERE id='f_case'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            accepted,
+            ("current".to_string(), 1),
+            "exact lowercase status must remain compatible and record version 5"
         );
     }
 }

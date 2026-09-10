@@ -320,7 +320,7 @@ mod tests {
         // by checking the function runs without panic
         print_table(&report);
         // schema_version is set by apply_plan2
-        assert_eq!(report.schema_version, Some(4));
+        assert_eq!(report.schema_version, Some(5));
     }
 
     #[test]
