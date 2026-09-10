@@ -348,3 +348,27 @@ fn token_snapshot_and_later_response_do_not_double_count() {
     assert_eq!(rows[0].response_id, "resp_stable");
     assert_eq!(rows[0].total_tokens, Some(13));
 }
+
+#[test]
+fn payload_response_hydrates_session_attribution_after_reopen() {
+    let (dir, mut ledger, path) = setup();
+    let db = dir.path().join("usage.db");
+    fs::write(&path, concat!(
+        r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"session-attr","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}"#, "\n",
+        r#"{"type":"turn_context","timestamp":"2026-09-10T00:00:01Z","payload":{"model":"gpt-5.6-terra","effort":"medium","root_task_family":"build"}}"#, "\n",
+    )).unwrap();
+    ledger.import_jsonl(&path, Default::default()).unwrap();
+    drop(ledger);
+    fs::write(&path, concat!(
+        r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"session-attr","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}"#, "\n",
+        r#"{"type":"turn_context","timestamp":"2026-09-10T00:00:01Z","payload":{"model":"gpt-5.6-terra","effort":"medium","root_task_family":"build"}}"#, "\n",
+        r#"{"type":"token_usage_record","timestamp":"2026-09-10T00:00:02Z","payload":{"response_id":"resp_attr","session_id":"session-attr","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}"#, "\n",
+    )).unwrap();
+    let mut reopened = UsageLedger::open(db).unwrap();
+    reopened.import_jsonl(&path, Default::default()).unwrap();
+    let row = reopened.rows(1, 0).unwrap().pop().unwrap();
+    assert_eq!(row.model.as_deref(), Some("gpt-5.6-terra"));
+    assert_eq!(row.effort.as_deref(), Some("medium"));
+    assert_eq!(row.root_task_family.as_deref(), Some("build"));
+    assert_eq!(row.parent_response_id.as_deref(), Some("parent"));
+}

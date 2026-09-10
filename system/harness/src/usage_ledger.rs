@@ -302,7 +302,10 @@ fn import_event(
     };
     match event {
         Event::Ignore => Ok(()),
-        Event::Canonical(record) => import_parsed(tx, source, offset, record_hash, record, out),
+        Event::Canonical(mut record) => {
+            hydrate_from_session(tx, source, &mut record)?;
+            import_parsed(tx, source, offset, record_hash, record, out)
+        }
         Event::SessionMeta(meta) => {
             upsert_session(tx, source, &meta)?;
             Ok(())
@@ -377,6 +380,7 @@ struct Parsed {
     output: Option<i64>,
     reasoning: Option<i64>,
     total: Option<i64>,
+    session_id: Option<String>,
 }
 #[derive(Default)]
 struct SessionMeta {
@@ -485,7 +489,7 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
         let n = |key: &str| usage.get(key).and_then(Value::as_i64);
         let session_id = field(payload, "session_id");
         let thread_id = field(payload, "thread_id");
-        let parent_response_id = match (thread_id, session_id) {
+        let parent_response_id = match (thread_id, session_id.clone()) {
             (Some(thread), Some(session)) if thread != session => Some(thread),
             (Some(thread), None) => Some(thread),
             _ => None,
@@ -505,6 +509,7 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
             output: n("output_tokens"),
             reasoning: n("reasoning_output_tokens"),
             total: n("total_tokens"),
+            session_id,
         }));
     }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
@@ -524,7 +529,32 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
         output: n("output_tokens"),
         reasoning: n("reasoning_output_tokens"),
         total: n("total_tokens"),
+        session_id: None,
     }))
+}
+fn hydrate_from_session(tx: &Transaction<'_>, source: &str, record: &mut Parsed) -> Result<()> {
+    let Some(session_id) = record.session_id.as_deref() else {
+        return Ok(());
+    };
+    let state: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = tx.query_row(
+        "SELECT model,effort,root_task_family,parent_thread_id FROM codex_session_state WHERE source_key=?1 AND session_id=?2",
+        params![source, session_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional()?;
+    if let Some((model, effort, root, parent)) = state {
+        if record.model.is_none() {
+            record.model = model;
+        }
+        if record.effort.is_none() {
+            record.effort = effort;
+        }
+        if record.root_task_family.is_none() {
+            record.root_task_family = root;
+        }
+        if record.parent_response_id.is_none() {
+            record.parent_response_id = parent;
+        }
+    }
+    Ok(())
 }
 impl TokenUsage {
     fn any(self) -> bool {
