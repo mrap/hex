@@ -3077,7 +3077,7 @@ fn run_messages(command: MessagesCommands) -> i32 {
             hex::messages::build_reply_event(question_id, &ids, text.clone())
         }
     };
-    match hex::harness::submit(&conn, &event, hex::worker::run::run_worker) {
+    match hex::harness::submit_with_root(&conn, &hex_dir, &event, hex::worker::run::run_worker) {
         Ok(r) => {
             if let Some(p) = &r.prompt {
                 println!("hex asks (question {}): {}", p.id, p.text);

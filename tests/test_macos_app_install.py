@@ -849,34 +849,120 @@ class FinalBoundaryTests(unittest.TestCase):
         self.assertEqual(error.exception.errno, errno.EIO)
         observe.assert_called_once_with(12345, 0)
 
-    def test_normal_leader_exit_does_not_leave_held_pipe_descendant(self):
+    def _assert_pipe_holding_child_cleaned(self, name, cancellation):
         import fcntl
-        with tempfile.TemporaryDirectory() as td:
-            lock = Path(td) / "child.lock"
-            helper = Path(td) / "descendant.py"
-            helper.write_text("import os,fcntl,time\nr,w=os.pipe()\npid=os.fork()\nif pid == 0:\n os.close(r)\n f=open(" + repr(str(lock)) + ", 'w')\n fcntl.flock(f,fcntl.LOCK_EX)\n os.write(w,b'1');os.close(w)\n time.sleep(4)\n os._exit(0)\nos.close(w);os.read(r,1);os.close(r)\nprint('{}',flush=True)\n")
-            self.assertEqual(run_owned(helper, timeout=2), {})
-            with lock.open('r') as stream:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        import signal
+        base = Path(tempfile.mkdtemp(prefix=f"hex-final-boundary-{name}-")).resolve()
+        evidence_lock = base / "child.lock"
+        release_lock = base / "release.lock"
+        helper = base / f"{name}.py"
+        gate = None
+        gate_locked = False
+        primary = None
+        complete = False
+        try:
+            base.chmod(0o700)
+            release_lock.touch(mode=0o600)
+            gate = release_lock.open("r+")
+            fcntl.flock(gate, fcntl.LOCK_EX)
+            gate_locked = True
+            after_readiness = (
+                "os.kill(" + str(os.getpid()) + ",signal.SIGINT)\n"
+                "g=open(" + repr(str(release_lock)) + ",'r+')\n"
+                "fcntl.flock(g,fcntl.LOCK_EX)\n"
+                if cancellation
+                else "print('{}',flush=True)\n"
+            )
+            helper.write_text(
+                "import os,fcntl,signal\n"
+                "r,w=os.pipe()\n"
+                "pid=os.fork()\n"
+                "if pid == 0:\n"
+                " os.close(r)\n"
+                " f=open(" + repr(str(evidence_lock)) + ",'w')\n"
+                " fcntl.flock(f,fcntl.LOCK_EX)\n"
+                " os.write(w,b'1');os.close(w)\n"
+                " g=open(" + repr(str(release_lock)) + ",'r+')\n"
+                " fcntl.flock(g,fcntl.LOCK_EX)\n"
+                " os._exit(0)\n"
+                "os.close(w)\n"
+                "ready=os.read(r,1);os.close(r)\n"
+                "if ready != b'1': raise RuntimeError('[FINAL-BOUNDARY-SETUP] child readiness failed')\n"
+                + after_readiness,
+                encoding="utf-8",
+            )
+            if cancellation:
+                previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+                operation_primary = None
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        run_owned(helper)
+                except BaseException as error:
+                    operation_primary = error
+                    raise
+                finally:
+                    try:
+                        signal.signal(signal.SIGINT, previous)
+                    except BaseException as error:
+                        if operation_primary is None:
+                            raise
+                        print(
+                            f"secondary signal restoration failure: {error!r}",
+                            file=sys.stderr,
+                        )
+            else:
+                self.assertEqual(run_owned(helper), {})
+            with evidence_lock.open("r+") as stream:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise AssertionError(
+                        "[FINAL-BOUNDARY-CLEANUP] child still holds evidence lock"
+                    ) from error
+            complete = True
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            secondary = []
+            if gate_locked:
+                try:
+                    fcntl.flock(gate, fcntl.LOCK_UN)
+                except BaseException as error:
+                    secondary.append(error)
+            if gate is not None:
+                try:
+                    gate.close()
+                except BaseException as error:
+                    secondary.append(error)
+            if primary is not None or secondary or not complete:
+                print(f"final-boundary fixture retained: {base}", file=sys.stderr)
+            if primary is not None:
+                for error in secondary:
+                    print(
+                        f"secondary fixture gate release failure: {error!r}",
+                        file=sys.stderr,
+                    )
+            elif secondary:
+                for error in secondary[1:]:
+                    print(
+                        f"secondary fixture gate release failure: {error!r}",
+                        file=sys.stderr,
+                    )
+                raise secondary[0]
+            elif complete:
+                try:
+                    shutil.rmtree(base)
+                except BaseException:
+                    print(f"final-boundary fixture retained: {base}", file=sys.stderr)
+                    raise
+
+    def test_normal_leader_exit_does_not_leave_held_pipe_descendant(self):
+        self._assert_pipe_holding_child_cleaned("normal", cancellation=False)
 
 
     def test_cancellation_cleans_actual_pipe_holding_child(self):
-        import fcntl
-        import signal
-        with tempfile.TemporaryDirectory() as td:
-            lock = Path(td) / "cancel-child.lock"
-            helper = Path(td) / "cancel.py"
-            # The fake helper signals this exact live test process only after its
-            # real child holds the lock. READY cannot trigger this cancellation.
-            helper.write_text("import os,fcntl,time,signal\nr,w=os.pipe()\npid=os.fork()\nif pid == 0:\n os.close(r)\n f=open(" + repr(str(lock)) + ", 'w')\n fcntl.flock(f,fcntl.LOCK_EX)\n os.write(w,b'1');os.close(w)\n time.sleep(10)\n os._exit(0)\nos.close(w);os.read(r,1);os.close(r)\nos.kill(" + str(os.getpid()) + ",signal.SIGINT)\ntime.sleep(10)\n")
-            previous = signal.signal(signal.SIGINT, signal.default_int_handler)
-            try:
-                with self.assertRaises(KeyboardInterrupt):
-                    run_owned(helper, timeout=4)
-                with lock.open('r') as stream:
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            finally:
-                signal.signal(signal.SIGINT, previous)
+        self._assert_pipe_holding_child_cleaned("cancellation", cancellation=True)
 
     def test_stderr_bound_and_secret_environment_removal(self):
         from unittest.mock import patch
