@@ -75,6 +75,8 @@ mod test_env {
         assert_eq!(std::env::var_os("HEX_DIR"), previous);
     }
 }
+#[cfg(test)]
+mod test_child;
 // Personal overlay (discovered, never named here). build.rs globs
 // $HEX_DIR/.hex/harness-personal/integration_*.rs → OUT_DIR/personal_mods.rs,
 // exposing `probe_registry() -> Vec<(&'static str, ProbeFn)>`.
