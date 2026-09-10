@@ -147,3 +147,38 @@ fn unknown_accounts_are_source_namespaced_and_no_change_reads_no_lines() {
         0
     );
 }
+
+#[test]
+fn codex_session_token_snapshots_use_last_usage_not_cumulative_total() {
+    let (_d, mut ledger, path) = setup();
+    let snapshot = |time: &str, input: i64, cached: i64, output: i64, total: i64| {
+        format!(
+            r#"{{"type":"event_msg","timestamp":"{time}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{output},"total_tokens":{total}}},"total_token_usage":{{"input_tokens":999,"output_tokens":999}}}}}}}}"#
+        )
+    };
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            snapshot("2026-09-10T00:00:00Z", 10, 2, 3, 13),
+            snapshot("2026-09-10T00:01:00Z", 4, 1, 2, 19)
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        ledger
+            .import_jsonl(&path, Default::default())
+            .unwrap()
+            .accepted,
+        2
+    );
+    let rows = ledger.rows(10, 0).unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.input_tokens.unwrap()).sum::<i64>(),
+        14
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.output_tokens.unwrap()).sum::<i64>(),
+        5
+    );
+}

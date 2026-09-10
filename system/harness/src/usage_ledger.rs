@@ -304,6 +304,53 @@ struct Parsed {
 }
 fn parse(line: &str) -> std::result::Result<Parsed, String> {
     let v: Value = serde_json::from_str(line).map_err(|_| "malformed_json".to_string())?;
+    if v.get("type").and_then(Value::as_str) == Some("event_msg")
+        && v.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
+    {
+        let payload = v.get("payload").ok_or("missing_payload")?;
+        let info = payload.get("info").ok_or("missing_usage")?;
+        let usage = info.get("last_token_usage").ok_or("missing_last_usage")?;
+        let n = |key: &str| usage.get(key).and_then(Value::as_i64);
+        let input = n("input_tokens");
+        let cached = n("cached_input_tokens");
+        let output = n("output_tokens");
+        if input.is_none() && cached.is_none() && output.is_none() {
+            return Err("unknown_usage".into());
+        }
+        let total = n("total_tokens").or_else(|| n("total_token_usage"));
+        let event_at = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or("missing_timestamp")?;
+        let response_id = info
+            .get("response_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("event:{}:{}", event_at, total.unwrap_or(-1)));
+        return Ok(Parsed {
+            provider: "codex".into(),
+            account_scope: "unknown-local-source".into(),
+            response_id,
+            parent_response_id: payload
+                .pointer("/context/parent_thread_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            root_task_family: payload
+                .pointer("/context/root_task_family")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            event_at: Some(event_at),
+            model: payload
+                .pointer("/info/model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            effort: None,
+            input,
+            cached,
+            output,
+        });
+    }
     if v.get("type").and_then(Value::as_str) != Some("token_usage_record") {
         return Err("unsupported_record_type".into());
     }
