@@ -46,16 +46,9 @@ fn example_claude_runs_config_exists_and_parses() {
         body.contains("[defaults]") && body.contains("[runs."),
         "example config should demonstrate the [defaults] and [runs.*] schema, got:\n{body}"
     );
-    // Validate as TOML via python3 tomllib (matches spec verification).
-    let status = std::process::Command::new("python3")
-        .arg("-c")
-        .arg(format!(
-            "import tomllib,sys; tomllib.load(open(r'{}','rb'))",
-            path.display()
-        ))
-        .status()
-        .expect("python3 available for TOML parse check");
-    assert!(status.success(), "example config must parse as valid TOML");
+    // Parse in-process so this release test does not depend on whichever
+    // `python3` happens to be first on the operator's PATH.
+    toml::from_str::<toml::Value>(&body).expect("example config must parse as valid TOML");
 }
 
 #[test]
