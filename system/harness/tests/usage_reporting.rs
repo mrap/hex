@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use hex::usage_ledger::{Coverage, UsageRow};
 use hex::usage_reporting::{
     contributor_detail, report, report_summary, ContributorDimension, EstimateUnit, MicroUnits,
-    AUDITED_RATE_VERSION,
+    ReportAccumulator, AUDITED_RATE_VERSION,
 };
 
 fn t(s: &str) -> DateTime<Utc> {
@@ -368,4 +368,25 @@ fn missing_provider_dimensions_are_labeled_unknown() {
     ] {
         assert!(r.incomplete_labels.contains(label), "{label}");
     }
+}
+
+#[test]
+fn incremental_pages_keep_half_open_window_boundaries_and_preceding_change() {
+    let start = t("2026-09-10T00:00:00Z");
+    let end = t("2026-09-11T00:00:00Z");
+    let rows = vec![
+        row("before", "2026-09-08T23:59:59Z", Some("gpt-5.6-luna"), Some("x"), None, Some(1), Some(0), Some(1)),
+        row("preceding", "2026-09-09T00:00:00Z", Some("gpt-5.6-luna"), Some("x"), None, Some(2), Some(0), Some(1)),
+        row("current-start", "2026-09-10T00:00:00Z", Some("gpt-5.6-luna"), Some("x"), None, Some(3), Some(0), Some(1)),
+        row("current-end", "2026-09-11T00:00:00Z", Some("gpt-5.6-luna"), Some("x"), None, Some(5), Some(0), Some(1)),
+    ];
+    let mut accumulator = ReportAccumulator::new(Coverage::default(), start, end, false);
+    accumulator.extend(&rows[..2]);
+    accumulator.extend(&rows[2..]);
+    let report = accumulator.finish();
+    assert_eq!(report.measured.total(), 4);
+    assert_eq!(report.preceding_measured.total(), 3);
+    assert_eq!(report.preceding_change_tokens, Some(1));
+    assert_eq!(report.start, start);
+    assert_eq!(report.end, end);
 }

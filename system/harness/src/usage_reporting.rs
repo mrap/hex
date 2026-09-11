@@ -201,7 +201,65 @@ pub fn report_summary(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> UsageReport {
-    report_inner(rows, coverage, start, end, false)
+    let mut accumulator = ReportAccumulator::new(coverage, start, end, false);
+    accumulator.extend(rows);
+    accumulator.finish()
+}
+
+/// Incrementally builds a summary from bounded ledger pages. Rows outside the
+/// current or immediately preceding half-open windows are ignored, so callers
+/// never need to retain an unbounded result set.
+pub struct ReportAccumulator {
+    coverage: Coverage,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    previous_start: DateTime<Utc>,
+    include_ids: bool,
+    current: Accumulator,
+    previous: Accumulator,
+}
+
+impl ReportAccumulator {
+    pub fn new(
+        coverage: Coverage,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        include_ids: bool,
+    ) -> Self {
+        Self {
+            coverage,
+            start,
+            end,
+            previous_start: start - (end - start),
+            include_ids,
+            current: Accumulator::default(),
+            previous: Accumulator::default(),
+        }
+    }
+
+    pub fn extend(&mut self, rows: &[UsageRow]) {
+        for row in rows {
+            match parse_time(row) {
+                Some(time) if time >= self.start && time < self.end => {
+                    self.current.add(row, self.include_ids)
+                }
+                Some(time) if time >= self.previous_start && time < self.start => {
+                    self.previous.add(row, false)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn finish(self) -> UsageReport {
+        report_from_accumulators(
+            self.coverage,
+            self.start,
+            self.end,
+            self.current,
+            self.previous,
+        )
+    }
 }
 
 fn report_inner(
@@ -211,16 +269,18 @@ fn report_inner(
     end: DateTime<Utc>,
     include_ids: bool,
 ) -> UsageReport {
-    let previous_start = start - (end - start);
-    let mut current = Accumulator::default();
-    let mut previous = Accumulator::default();
-    for row in rows {
-        match parse_time(row) {
-            Some(time) if time >= start && time < end => current.add(row, include_ids),
-            Some(time) if time >= previous_start && time < start => previous.add(row, false),
-            _ => {}
-        }
-    }
+    let mut accumulator = ReportAccumulator::new(coverage, start, end, include_ids);
+    accumulator.extend(rows);
+    accumulator.finish()
+}
+
+fn report_from_accumulators(
+    coverage: Coverage,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    current: Accumulator,
+    previous: Accumulator,
+) -> UsageReport {
     let mut labels = current.labels.clone();
     if coverage.conflicts > 0 {
         labels.insert("conflicting_usage_records".into());

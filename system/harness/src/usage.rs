@@ -10,7 +10,7 @@
 //! Recurring cadence: the `hex-burn-guard` worker runs `hex usage burn` every 10m.
 //! Future metrics (daily totals, by-model, by-session) belong in this namespace.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use clap::Subcommand;
 use hex::usage_ledger::{ImportOptions, UsageLedger};
 use hex::usage_reporting;
@@ -446,17 +446,7 @@ fn report(
 ) -> i32 {
     let ledger = ledger.unwrap_or_else(default_ledger);
     let output = output.unwrap_or_else(default_report);
-    const ROW_CAP: usize = 100_000;
-    let result = UsageLedger::open(&ledger).and_then(|l| {
-        let rows = l.rows(ROW_CAP, 0)?;
-        let coverage = l.coverage()?;
-        Ok((rows, coverage))
-    });
-    let Ok((rows, coverage)) = result else {
-        eprintln!("usage report: ledger unavailable: {}", ledger.display());
-        return 1;
-    };
-    let end = match cutoff {
+    let cutoff = match cutoff {
         Some(value) => match value.parse::<DateTime<Utc>>() {
             Ok(time) => time,
             Err(_) => {
@@ -466,44 +456,82 @@ fn report(
         },
         None => Utc::now(),
     };
-    let start = DateTime::from_timestamp(0, 0).expect("unix epoch");
+    let end = Utc.from_utc_datetime(
+        &cutoff.date_naive().and_hms_opt(0, 0, 0).expect("midnight is valid"),
+    );
+    let start = end - Duration::days(1);
+    let preceding_start = start - Duration::days(1);
     if detail_limit > 1_000 {
         eprintln!("usage report: detail limit must not exceed 1000");
         return 1;
     }
     let detail_dimension = match detail_dimension.as_deref() {
         None => None,
-        Some("model") => Some(usage_reporting::ContributorDimension::Model),
-        Some("family") => Some(usage_reporting::ContributorDimension::Family),
-        Some("child") => Some(usage_reporting::ContributorDimension::Child),
+        Some("model") => Some(hex::usage_ledger::ContributorDimension::Model),
+        Some("family") => Some(hex::usage_ledger::ContributorDimension::Family),
+        Some("child") => Some(hex::usage_ledger::ContributorDimension::Child),
         Some(_) => {
             eprintln!("usage report: detail dimension must be model, family, or child");
             return 1;
         }
     };
-    let detail = match detail_dimension {
-        Some(dimension) => match usage_reporting::contributor_detail(
-            &rows,
-            start,
-            end,
-            dimension,
-            detail_key.as_deref(),
-            detail_offset,
-            detail_limit,
-        ) {
-            Ok(detail) => Some(detail),
-            Err(message) => {
-                eprintln!("usage report: {message}");
-                return 1;
+    let result = UsageLedger::open(&ledger).and_then(|mut ledger| {
+        let coverage = ledger.coverage()?;
+        let read = ledger.frozen_read([
+            hex::usage_ledger::HalfOpenUtcWindow { start, end },
+            hex::usage_ledger::HalfOpenUtcWindow { start: preceding_start, end: start },
+        ])?;
+        let mut accumulator = usage_reporting::ReportAccumulator::new(coverage, start, end, false);
+        for window in [hex::usage_ledger::FrozenWindow::First, hex::usage_ledger::FrozenWindow::Second] {
+            read.for_each_window_page(window, 1_000, |rows| {
+                accumulator.extend(rows);
+                Ok(())
+            })?;
+        }
+        let detail = match detail_dimension {
+            None => None,
+            Some(dimension) => {
+                let key = match (dimension, detail_key.as_deref()) {
+                    (hex::usage_ledger::ContributorDimension::Child, None) => None,
+                    (_, Some(key)) => Some(key),
+                    _ => return Err(hex::usage_ledger::LedgerError::InvalidWindow),
+                };
+                let mut after = None;
+                let mut skipped = 0usize;
+                let mut response_ids = Vec::new();
+                let (total_matches, has_more) = loop {
+                    let page = read.contributor_detail_page(hex::usage_ledger::FrozenWindow::First, dimension, key, after.as_ref(), 1_000)?;
+                    let mut page_has_unreturned_rows = false;
+                    for row in &page.rows {
+                        if skipped < detail_offset {
+                            skipped += 1;
+                        } else if response_ids.len() < detail_limit {
+                            response_ids.push(row.response_id.clone());
+                        } else {
+                            page_has_unreturned_rows = true;
+                            break;
+                        }
+                    }
+                    if response_ids.len() == detail_limit {
+                        break (page.total_matches, page_has_unreturned_rows || page.next_cursor().is_some());
+                    }
+                    let Some(next) = page.next_cursor() else { break (page.total_matches, false) };
+                    after = Some(next);
+                };
+                Some(json!({"dimension": match dimension { hex::usage_ledger::ContributorDimension::Model => "model", hex::usage_ledger::ContributorDimension::Family => "family", hex::usage_ledger::ContributorDimension::Child => "child" }, "key": key.unwrap_or("child_responses"), "total_matches": total_matches, "offset": detail_offset, "response_ids": response_ids, "has_more": has_more}))
             }
-        },
-        None => None,
+        };
+        Ok((accumulator.finish(), detail))
+    });
+    let Ok((report, detail)) = result else {
+        eprintln!("usage report: ledger unavailable: {}", ledger.display());
+        return 1;
     };
-    let report = usage_reporting::report_summary(&rows, coverage, start, end);
-    let truncated = rows.len() == ROW_CAP;
     let contributor = |item: &hex::usage_reporting::Contributor| json!({"key":item.key,"tokens":item.measured.total().to_string(),"credits_micro":item.credits.value.0.to_string()});
-    let detail = detail.map(|item| json!({"dimension":match item.dimension { usage_reporting::ContributorDimension::Model => "model", usage_reporting::ContributorDimension::Family => "family", usage_reporting::ContributorDimension::Child => "child" },"key":item.key,"total_matches":item.total_matches,"offset":item.offset,"response_ids":item.response_ids}));
-    let body=json!({"schema":"hex.usage-report.v1","cutoff":end.to_rfc3339(),"measured":{"responses":report.measured.responses,"input_tokens":report.measured.input.to_string(),"cached_input_tokens":report.measured.cached_input.to_string(),"output_tokens":report.measured.output.to_string()},"modeled_credits":{"unit":"credit_equivalent","rate_version":report.modeled_credits.rate_version,"rate_source":report.modeled_credits.rate_source,"total_micro":report.modeled_credits.value.0.to_string(),"fresh_micro":report.modeled_credit_components.fresh.0.to_string(),"cached_micro":report.modeled_credit_components.cached.0.to_string(),"output_micro":report.modeled_credit_components.output.0.to_string(),"incomplete":report.modeled_credits.incomplete,"labels":report.modeled_credits.labels},"actual_billed_debited":"unavailable","preceding_change_tokens":report.preceding_change_tokens.map(|x|x.to_string()),"coverage":{"accepted":report.coverage.accepted,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"pending_sources":report.coverage.pending_sources,"row_cap":ROW_CAP,"rows_truncated":truncated},"incomplete":report.incomplete_labels,"by_model":report.by_model.iter().map(contributor).collect::<Vec<_>>(),"by_family":report.by_family.iter().map(contributor).collect::<Vec<_>>(),"child_coordination":{"share_millionths":report.child_coordination_share_millionths},"contributor_detail":detail}).to_string()+"\n";
+    let optional_total = |value: i128, missing: &str| (!report.incomplete_labels.contains(missing)).then(|| value.to_string());
+    let measured = |measured: &hex::usage_reporting::MeasuredTokens| json!({"responses":measured.responses,"input_tokens":measured.input.to_string(),"cached_input_tokens":measured.cached_input.to_string(),"output_tokens":measured.output.to_string(),"cache_write_input_tokens":optional_total(measured.cache_write_input,"missing_cache_write_input_tokens"),"reasoning_output_tokens":optional_total(measured.reasoning_output,"missing_reasoning_output_tokens"),"provider_total_tokens":measured.provider_total.map(|value|value.to_string())});
+    let unknown_fields = report.incomplete_labels.iter().filter(|label| label.starts_with("unknown_")).cloned().collect::<Vec<_>>();
+    let body=json!({"schema":"hex.usage-report.v2","cutoff":cutoff.to_rfc3339(),"windows":{"current":{"start":report.start.to_rfc3339(),"end":report.end.to_rfc3339(),"measured":measured(&report.measured)},"preceding":{"start":preceding_start.to_rfc3339(),"end":start.to_rfc3339(),"measured":measured(&report.preceding_measured)},"change_tokens":report.preceding_change_tokens.map(|value|value.to_string())},"modeled_credits":{"unit":"credit_equivalent","rate_version":report.modeled_credits.rate_version,"rate_source":report.modeled_credits.rate_source,"total_micro":report.modeled_credits.value.0.to_string(),"fresh_micro":report.modeled_credit_components.fresh.0.to_string(),"cached_micro":report.modeled_credit_components.cached.0.to_string(),"output_micro":report.modeled_credit_components.output.0.to_string(),"incomplete":report.modeled_credits.incomplete,"labels":report.modeled_credits.labels},"actual_billed_debited":{"value":serde_json::Value::Null,"unit":"api_usd","labels":report.actual_billed_debited.labels},"coverage":{"accepted":report.coverage.accepted,"noncanonical":report.coverage.noncanonical,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"source_backlog":report.coverage.pending_sources,"stale_sources":report.coverage.stale_sources,"unknown_fields":unknown_fields},"completeness":if report.incomplete_labels.is_empty(){"complete"}else{"incomplete"},"incomplete":report.incomplete_labels,"by_model":report.by_model.iter().map(contributor).collect::<Vec<_>>(),"by_family":report.by_family.iter().map(contributor).collect::<Vec<_>>(),"child_coordination":{"share_millionths":report.child_coordination_share_millionths},"contributor_detail":detail}).to_string()+"\n";
     if let Some(parent) = output.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!("usage report: cannot create output directory: {e}");
