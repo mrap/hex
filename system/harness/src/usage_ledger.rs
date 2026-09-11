@@ -3,8 +3,8 @@
 //! This module stores normalized accounting metadata and source coordinates only.
 //! It never stores JSONL payloads, prompts, tool output, or credentials.
 
-use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -15,6 +15,8 @@ use std::path::Path;
 pub enum LedgerError {
     Sql(rusqlite::Error),
     Io(std::io::Error),
+    RebuildRequired,
+    InvalidWindow,
 }
 impl From<rusqlite::Error> for LedgerError {
     fn from(e: rusqlite::Error) -> Self {
@@ -27,6 +29,194 @@ impl From<std::io::Error> for LedgerError {
     }
 }
 pub type Result<T> = std::result::Result<T, LedgerError>;
+
+/// Stable namespace for one local Codex history collection. Active, archived,
+/// and indexed copies of the same response intentionally share this scope.
+pub const LOCAL_CODEX_COLLECTION_SCOPE: &str = "local-codex-history";
+const LEDGER_FORMAT_VERSION: &str = "local-codex-collection-v2";
+pub const MAX_CONTRIBUTOR_DETAIL_PAGE: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HalfOpenUtcWindow {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrozenWindow {
+    First,
+    Second,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContributorDimension {
+    Model,
+    Family,
+    Child,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributorDetailPage {
+    pub total_matches: u64,
+    pub rows: Vec<UsageRow>,
+    next: Option<ContributorDetailCursor>,
+}
+
+impl ContributorDetailPage {
+    pub fn next_cursor(&self) -> Option<ContributorDetailCursor> {
+        self.next.clone()
+    }
+}
+
+/// An opaque stable composite key returned by contributor-detail pagination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributorDetailCursor {
+    event_at: String,
+    provider: String,
+    account_scope: String,
+    response_id: String,
+}
+
+struct UsageRowPage {
+    total_matches: u64,
+    rows: Vec<UsageRow>,
+    next: Option<ContributorDetailCursor>,
+}
+
+/// A SQLite read transaction pinned to one snapshot for both supplied windows.
+pub struct FrozenUsageRead<'ledger> {
+    transaction: Transaction<'ledger>,
+    windows: [HalfOpenUtcWindow; 2],
+}
+
+impl FrozenUsageRead<'_> {
+    pub fn for_each_window_page<F>(
+        &self,
+        window: FrozenWindow,
+        page_size: usize,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[UsageRow]) -> Result<()>,
+    {
+        if page_size == 0 || page_size > MAX_CONTRIBUTOR_DETAIL_PAGE {
+            return Err(LedgerError::InvalidWindow);
+        }
+        let mut after = None;
+        loop {
+            let page = self.page(window, None, after.as_ref(), page_size)?;
+            if page.rows.is_empty() {
+                return Ok(());
+            }
+            visit(&page.rows)?;
+            after = page.rows.last().map(row_cursor);
+            if page.rows.len() < page_size {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn contributor_detail_page(
+        &self,
+        window: FrozenWindow,
+        dimension: ContributorDimension,
+        key: &str,
+        after: Option<&ContributorDetailCursor>,
+        limit: usize,
+    ) -> Result<ContributorDetailPage> {
+        let page = self.page(window, Some((dimension, key)), after, limit)?;
+        Ok(ContributorDetailPage {
+            total_matches: page.total_matches,
+            rows: page.rows,
+            next: page.next,
+        })
+    }
+
+    fn page(
+        &self,
+        selected: FrozenWindow,
+        contributor: Option<(ContributorDimension, &str)>,
+        after: Option<&ContributorDetailCursor>,
+        limit: usize,
+    ) -> Result<UsageRowPage> {
+        if limit == 0 || limit > MAX_CONTRIBUTOR_DETAIL_PAGE {
+            return Err(LedgerError::InvalidWindow);
+        }
+        let window = self.windows[match selected {
+            FrozenWindow::First => 0,
+            FrozenWindow::Second => 1,
+        }];
+        let (field, key) = match contributor {
+            Some((ContributorDimension::Model, key)) => (Some("model"), Some(key)),
+            Some((ContributorDimension::Family, key)) => (Some("root_task_family"), Some(key)),
+            Some((ContributorDimension::Child, key)) => (Some("parent_response_id"), Some(key)),
+            None => (None, None),
+        };
+        let filter = field.map(|field| format!(" AND {field}=?3")).unwrap_or_default();
+        let total_matches: u64 = match key {
+            Some(key) => self.transaction.query_row(
+                &format!("SELECT count(*) FROM canonical_responses WHERE event_at >= ?1 AND event_at < ?2{filter}"),
+                params![window.start.to_rfc3339(), window.end.to_rfc3339(), key],
+                |row| row.get(0),
+            )?,
+            None => self.transaction.query_row(
+                "SELECT count(*) FROM canonical_responses WHERE event_at >= ?1 AND event_at < ?2",
+                params![window.start.to_rfc3339(), window.end.to_rfc3339()],
+                |row| row.get(0),
+            )?,
+        };
+        let select = "SELECT provider,account_scope,response_id,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM canonical_responses";
+        let order = " ORDER BY event_at,provider,account_scope,response_id LIMIT ";
+        let keyset = " AND (event_at>?4 OR (event_at=?4 AND (provider>?5 OR (provider=?5 AND (account_scope>?6 OR (account_scope=?6 AND response_id>?7))))))";
+        let rows: Vec<UsageRow> = match (key, after) {
+            (Some(key), Some(after)) => {
+                let sql = format!("{select} WHERE event_at>=?1 AND event_at<?2{filter}{keyset}{order}?8");
+                let mut statement = self.transaction.prepare(&sql)?;
+                let page = statement.query_map(params![window.start.to_rfc3339(),window.end.to_rfc3339(),key,after.event_at,after.provider,after.account_scope,after.response_id,limit as i64], usage_row)?.collect::<std::result::Result<_, _>>()?;
+                page
+            }
+            (Some(key), None) => {
+                let sql = format!("{select} WHERE event_at>=?1 AND event_at<?2{filter}{order}?4");
+                let mut statement = self.transaction.prepare(&sql)?;
+                let page = statement.query_map(params![window.start.to_rfc3339(),window.end.to_rfc3339(),key,limit as i64], usage_row)?.collect::<std::result::Result<_, _>>()?;
+                page
+            }
+            (None, Some(after)) => {
+                let sql = format!("{select} WHERE event_at>=?1 AND event_at<?2{keyset}{order}?8");
+                let mut statement = self.transaction.prepare(&sql)?;
+                let page = statement.query_map(params![window.start.to_rfc3339(),window.end.to_rfc3339(),"",after.event_at,after.provider,after.account_scope,after.response_id,limit as i64], usage_row)?.collect::<std::result::Result<_, _>>()?;
+                page
+            }
+            (None, None) => {
+                let sql = format!("{select} WHERE event_at>=?1 AND event_at<?2{order}?3");
+                let mut statement = self.transaction.prepare(&sql)?;
+                let page = statement.query_map(params![window.start.to_rfc3339(),window.end.to_rfc3339(),limit as i64], usage_row)?.collect::<std::result::Result<_, _>>()?;
+                page
+            }
+        };
+        let next = (rows.len() == limit).then(|| rows.last().map(row_cursor)).flatten();
+        Ok(UsageRowPage { total_matches, rows, next })
+    }
+}
+
+fn usage_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
+    Ok(UsageRow {
+        provider: row.get(0)?, account_scope: row.get(1)?, response_id: row.get(2)?,
+        parent_response_id: row.get(3)?, root_task_family: row.get(4)?, event_at: row.get(5)?,
+        model: row.get(6)?, effort: row.get(7)?, input_tokens: row.get(8)?,
+        cached_input_tokens: row.get(9)?, cache_write_input_tokens: row.get(10)?,
+        output_tokens: row.get(11)?, reasoning_output_tokens: row.get(12)?, total_tokens: row.get(13)?,
+    })
+}
+
+fn row_cursor(row: &UsageRow) -> ContributorDetailCursor {
+    ContributorDetailCursor {
+        event_at: row.event_at.clone().expect("frozen window rows have event_at"),
+        provider: row.provider.clone(),
+        account_scope: row.account_scope.clone(),
+        response_id: row.response_id.clone(),
+    }
+}
 
 /// A bounded importer never consumes a partial trailing JSONL line.
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +285,14 @@ impl UsageLedger {
             "ALTER TABLE source_files ADD COLUMN source_mtime_ns INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE source_files ADD COLUMN source_ctime_ns INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE source_files ADD COLUMN source_content_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         for column in [
             "cache_write_input_tokens INTEGER",
             "reasoning_output_tokens INTEGER",
@@ -119,7 +317,35 @@ impl UsageLedger {
                 [],
             );
         }
+        let has_rows: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM canonical_responses LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )?;
+        let format: Option<String> = conn
+            .query_row(
+                "SELECT value FROM ledger_metadata WHERE key='format_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if format.is_none() {
+            conn.execute(
+                "INSERT INTO ledger_metadata(key,value) VALUES('format_version',?1)",
+                [if has_rows { "rebuild-required" } else { LEDGER_FORMAT_VERSION }],
+            )?;
+        }
         Ok(Self { conn })
+    }
+
+    /// A pre-collection file-scoped ledger is intentionally never rewritten.
+    /// Operators must rebuild it into a fresh collection-scoped database.
+    pub fn requires_rebuild(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT value='rebuild-required' FROM ledger_metadata WHERE key='format_version'",
+            [],
+            |row| row.get(0),
+        ).optional()?.unwrap_or(true))
     }
     /// Inserted observations, canonical rows, quarantine state, and cursor movement share one transaction.
     pub fn import_jsonl(
@@ -127,6 +353,9 @@ impl UsageLedger {
         path: impl AsRef<Path>,
         options: ImportOptions,
     ) -> Result<ImportResult> {
+        if self.requires_rebuild()? {
+            return Err(LedgerError::RebuildRequired);
+        }
         const PRETRANSACTION_CHUNK: usize = 1_024;
         if options.max_records > PRETRANSACTION_CHUNK {
             let mut remaining = options.max_records;
@@ -140,6 +369,7 @@ impl UsageLedger {
                     },
                 )?;
                 total.accepted += part.accepted;
+                total.noncanonical += part.noncanonical;
                 total.duplicates += part.duplicates;
                 total.conflicts += part.conflicts;
                 total.quarantined += part.quarantined;
@@ -165,19 +395,25 @@ impl UsageLedger {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|value| value.as_nanos() as i64)
             .unwrap_or(0);
+        let ctime_ns = source_change_ns(&meta);
         let path_text = path.to_string_lossy().to_string();
-        let prior:Option<(i64,i64,String,i64,i64)>=self.conn.query_row("SELECT generation,cursor,prefix_hash,source_len,source_mtime_ns FROM source_files WHERE identity=?1 ORDER BY generation DESC LIMIT 1",params![identity],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-        // No-change path reads metadata only. A body fingerprint is read only if
-        // size or mtime says the source may have changed.
-        let unchanged = matches!(&prior, Some((_, _, _, old_len, old_mtime)) if *old_len == meta.len() as i64 && *old_mtime == mtime_ns);
-        let prefix = if unchanged {
-            prior.as_ref().unwrap().2.clone()
+        let prior:Option<(i64,i64,String,i64,i64,i64,String)>=self.conn.query_row("SELECT generation,cursor,prefix_hash,source_len,source_mtime_ns,source_ctime_ns,source_content_hash FROM source_files WHERE identity=?1 ORDER BY generation DESC LIMIT 1",params![identity],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+        // No-change reads rely on file metadata only. A changed ctime detects
+        // same-size, preserved-mtime replacement; then full content provenance
+        // distinguishes a tail replacement from a true unchanged source.
+        let unchanged = matches!(&prior, Some((_, _, _, old_len, old_mtime, old_ctime, _)) if *old_len == meta.len() as i64 && *old_mtime == mtime_ns && *old_ctime == ctime_ns);
+        let (prefix, content_hash) = if unchanged {
+            let prior = prior.as_ref().unwrap();
+            (prior.2.clone(), prior.6.clone())
         } else {
-            prefix_hash(path)?
+            (prefix_hash(path)?, file_hash(path)?)
         };
         let (generation, cursor) = match prior {
-            Some((g, c, old, _, _)) if meta.len() as i64 >= c && old == prefix => (g, c),
-            Some((g, _, _, _, _)) => (g + 1, 0),
+            Some((g, c, old_prefix, old_len, _, _, old_hash))
+                if meta.len() as i64 >= c
+                    && old_prefix == prefix
+                    && (meta.len() as i64 > old_len || old_hash == content_hash) => (g, c),
+            Some((g, _, _, _, _, _, _)) => (g + 1, 0),
             None => (0, 0),
         };
         let source_key = format!("{identity}:{generation}");
@@ -219,7 +455,7 @@ impl UsageLedger {
         }
         let backlog = pending.len() >= options.max_records || (!partial && offset < meta.len());
         let tx = self.conn.transaction()?;
-        tx.execute("INSERT INTO source_files(source_key,identity,generation,path,prefix_hash,cursor,source_len,updated_at,source_mtime_ns) VALUES(?1,?2,?3,?4,?5,0,?6,?7,?8) ON CONFLICT(source_key) DO UPDATE SET path=excluded.path,source_len=excluded.source_len,updated_at=excluded.updated_at,source_mtime_ns=excluded.source_mtime_ns",params![source_key,identity,generation,path_text,prefix,meta.len() as i64,Utc::now().to_rfc3339(),mtime_ns])?;
+        tx.execute("INSERT INTO source_files(source_key,identity,generation,path,prefix_hash,cursor,source_len,updated_at,source_mtime_ns,source_ctime_ns,source_content_hash) VALUES(?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10) ON CONFLICT(source_key) DO UPDATE SET path=excluded.path,source_len=excluded.source_len,updated_at=excluded.updated_at,source_mtime_ns=excluded.source_mtime_ns,source_ctime_ns=excluded.source_ctime_ns,source_content_hash=excluded.source_content_hash",params![source_key,identity,generation,path_text,prefix,meta.len() as i64,Utc::now().to_rfc3339(),mtime_ns,ctime_ns,content_hash])?;
         let mut out = ImportResult {
             pending_partial: partial,
             backlog,
@@ -247,7 +483,7 @@ impl UsageLedger {
         Ok(out)
     }
     pub fn rows(&self, limit: usize, offset: usize) -> Result<Vec<UsageRow>> {
-        let mut s=self.conn.prepare("SELECT provider,account_scope,response_id,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM canonical_responses ORDER BY event_at,response_id LIMIT ?1 OFFSET ?2")?;
+        let mut s=self.conn.prepare("SELECT provider,account_scope,response_id,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM canonical_responses ORDER BY event_at,provider,account_scope,response_id LIMIT ?1 OFFSET ?2")?;
         let rows = s
             .query_map(params![limit as i64, offset as i64], |r| {
                 Ok(UsageRow {
@@ -269,6 +505,25 @@ impl UsageLedger {
             })?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// Pins both requested windows to one SQLite snapshot. The reader exposes
+    /// only bounded keyset pages, so report aggregation cannot retain a window.
+    pub fn frozen_read(
+        &mut self,
+        windows: [HalfOpenUtcWindow; 2],
+    ) -> Result<FrozenUsageRead<'_>> {
+        if self.requires_rebuild()? {
+            return Err(LedgerError::RebuildRequired);
+        }
+        if windows.iter().any(|window| window.start >= window.end) {
+            return Err(LedgerError::InvalidWindow);
+        }
+        let transaction = self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // Establish the SQLite snapshot now, rather than on the caller's first
+        // page, so both windows observe the same committed point in time.
+        let _: i64 = transaction.query_row("SELECT count(*) FROM canonical_responses", [], |row| row.get(0))?;
+        Ok(FrozenUsageRead { transaction, windows })
     }
     pub fn coverage(&self) -> Result<Coverage> {
         let mut c = Coverage::default();
@@ -340,7 +595,7 @@ fn import_event(
         Event::Canonical(mut record) => {
             // Payload session IDs can name the root task rather than this
             // file's active session. The latter owns turn-context model data.
-            if record.provider == "codex" && record.account_scope == "unknown-local-source" {
+            if record.provider == "codex" && record.account_scope == LOCAL_CODEX_COLLECTION_SCOPE {
                 record.session_id = active_session(tx, source)?;
             }
             hydrate_from_session(tx, source, &mut record)?;
@@ -373,12 +628,9 @@ fn import_parsed(
     source: &str,
     offset: i64,
     record_hash: &str,
-    mut r: Parsed,
+    r: Parsed,
     out: &mut ImportResult,
 ) -> Result<()> {
-    if r.account_scope == "unknown-local-source" {
-        r.account_scope = format!("unknown-local-source:{source}");
-    }
     let old:Option<String>=tx.query_row("SELECT record_hash FROM canonical_responses WHERE provider=?1 AND account_scope=?2 AND response_id=?3",params![r.provider,r.account_scope,r.response_id],|x|x.get(0)).optional()?;
     let seen: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM observations WHERE provider=?1 AND account_scope=?2 AND response_id=?3)", params![r.provider,r.account_scope,r.response_id], |x| x.get(0))?;
     match old {
@@ -538,7 +790,7 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
         };
         return Ok(Event::Canonical(Parsed {
             provider: "codex".into(),
-            account_scope: "unknown-local-source".into(),
+            account_scope: LOCAL_CODEX_COLLECTION_SCOPE.into(),
             response_id,
             parent_response_id,
             root_task_family: field(payload, "root_turn_id"),
@@ -558,7 +810,7 @@ fn parse_event(line: &str) -> std::result::Result<Event, String> {
     let n = |k: &str| v.get(k).and_then(Value::as_i64);
     Ok(Event::Canonical(Parsed {
         provider: s("provider").ok_or("missing_provider")?,
-        account_scope: s("account_scope").unwrap_or_else(|| "unknown-local-source".into()),
+        account_scope: s("account_scope").unwrap_or_else(|| LOCAL_CODEX_COLLECTION_SCOPE.into()),
         response_id: s("response_id").ok_or("missing_response_id")?,
         parent_response_id: s("parent_response_id"),
         root_task_family: s("root_task_family"),
@@ -605,7 +857,7 @@ fn backfill_session_attribution(
 ) -> Result<()> {
     tx.execute(
         "UPDATE canonical_responses SET model=COALESCE(model,(SELECT model FROM codex_session_state WHERE source_key=?1 AND session_id=?2)),effort=COALESCE(effort,(SELECT effort FROM codex_session_state WHERE source_key=?1 AND session_id=?2)),root_task_family=COALESCE(root_task_family,(SELECT root_task_family FROM codex_session_state WHERE source_key=?1 AND session_id=?2)),parent_response_id=COALESCE(parent_response_id,(SELECT parent_thread_id FROM codex_session_state WHERE source_key=?1 AND session_id=?2)) WHERE session_id=?2 AND account_scope=?3",
-        params![source, session_id, format!("unknown-local-source:{source}")],
+        params![source, session_id, LOCAL_CODEX_COLLECTION_SCOPE],
     )?;
     Ok(())
 }
@@ -819,6 +1071,28 @@ fn prefix_hash(path: &Path) -> Result<String> {
     let n = f.read(&mut b)?;
     Ok(hash(&b[..n]))
 }
+fn file_hash(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+#[cfg(unix)]
+fn source_change_ns(meta: &fs::Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ctime().saturating_mul(1_000_000_000).saturating_add(meta.ctime_nsec())
+}
+#[cfg(not(unix))]
+fn source_change_ns(_meta: &fs::Metadata) -> i64 {
+    0
+}
 #[cfg(unix)]
 fn file_identity(meta: &fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
@@ -829,7 +1103,8 @@ fn file_identity(meta: &fs::Metadata) -> String {
     format!("{}", meta.len())
 }
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TEXT NOT NULL,generation INTEGER NOT NULL,path TEXT NOT NULL,prefix_hash TEXT NOT NULL,cursor INTEGER NOT NULL,source_len INTEGER NOT NULL,updated_at TEXT,source_mtime_ns INTEGER NOT NULL DEFAULT 0,UNIQUE(identity,generation));
+CREATE TABLE IF NOT EXISTS ledger_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TEXT NOT NULL,generation INTEGER NOT NULL,path TEXT NOT NULL,prefix_hash TEXT NOT NULL,cursor INTEGER NOT NULL,source_len INTEGER NOT NULL,updated_at TEXT,source_mtime_ns INTEGER NOT NULL DEFAULT 0,source_ctime_ns INTEGER NOT NULL DEFAULT 0,source_content_hash TEXT NOT NULL DEFAULT '',UNIQUE(identity,generation));
 CREATE TABLE IF NOT EXISTS observations (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,record_hash TEXT NOT NULL,verdict TEXT NOT NULL CHECK(verdict IN ('accepted','duplicate','conflict','quarantine')),reason TEXT,provider TEXT,account_scope TEXT,response_id TEXT,PRIMARY KEY(source_key,byte_offset));
 CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_scope TEXT NOT NULL,response_id TEXT NOT NULL,record_hash TEXT NOT NULL,parent_response_id TEXT,root_task_family TEXT,event_at TEXT,model TEXT,effort TEXT,input_tokens INTEGER,cached_input_tokens INTEGER,cache_write_input_tokens INTEGER,output_tokens INTEGER,reasoning_output_tokens INTEGER,total_tokens INTEGER,session_id TEXT,PRIMARY KEY(provider,account_scope,response_id));
 CREATE TABLE IF NOT EXISTS codex_session_state (source_key TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT,effort TEXT,root_task_family TEXT,parent_thread_id TEXT,cumulative_input INTEGER NOT NULL DEFAULT 0,cumulative_cached INTEGER NOT NULL DEFAULT 0,cumulative_cache_write INTEGER,cumulative_output INTEGER NOT NULL DEFAULT 0,cumulative_reasoning INTEGER,cumulative_total INTEGER,PRIMARY KEY(source_key,session_id));

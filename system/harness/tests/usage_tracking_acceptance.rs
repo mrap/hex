@@ -1,4 +1,8 @@
-use hex::usage_ledger::{ImportOptions, UsageLedger};
+use chrono::{DateTime, Utc};
+use hex::usage_ledger::{
+    ContributorDimension, FrozenWindow, HalfOpenUtcWindow, ImportOptions, LedgerError,
+    UsageLedger,
+};
 use std::fs;
 use tempfile::TempDir;
 fn line(id: &str, parent: Option<&str>, output: i64) -> String {
@@ -130,7 +134,7 @@ fn duplicate_conflict_and_bad_records_are_visible() {
 }
 
 #[test]
-fn unknown_accounts_are_source_namespaced_and_no_change_reads_no_lines() {
+fn local_codex_collection_dedupes_copied_history_and_no_change_reads_no_lines() {
     let (d, mut ledger, first) = setup();
     let second = d.path().join("second.jsonl");
     let record = line("same-id", None, 1).replace("\"account_scope\":\"local\",", "");
@@ -138,7 +142,7 @@ fn unknown_accounts_are_source_namespaced_and_no_change_reads_no_lines() {
     fs::write(&second, format!("{record}\n")).unwrap();
     ledger.import_jsonl(&first, Default::default()).unwrap();
     ledger.import_jsonl(&second, Default::default()).unwrap();
-    assert_eq!(ledger.rows(10, 0).unwrap().len(), 2);
+    assert_eq!(ledger.rows(10, 0).unwrap().len(), 1);
     assert_eq!(
         ledger
             .import_jsonl(&first, Default::default())
@@ -146,6 +150,72 @@ fn unknown_accounts_are_source_namespaced_and_no_change_reads_no_lines() {
             .bytes_read,
         0
     );
+}
+
+#[test]
+fn chunked_import_sums_noncanonical_outcomes() {
+    let (_dir, mut ledger, path) = setup();
+    let mut fixture = String::from(
+        r#"{"type":"session_meta","timestamp":"2026-09-10T00:00:00Z","payload":{"id":"chunked"}}"#,
+    );
+    fixture.push('\n');
+    for index in 0..1_025 {
+        fixture.push_str(&format!(r#"{{"type":"event_msg","timestamp":"2026-09-10T00:{:02}:00Z","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}}}}}}}"#, index % 60));
+        fixture.push('\n');
+    }
+    fs::write(&path, fixture).unwrap();
+    let result = ledger.import_jsonl(&path, ImportOptions { max_records: 2_000, ..Default::default() }).unwrap();
+    assert_eq!(result.noncanonical, 1_025);
+    assert_eq!(ledger.coverage().unwrap().noncanonical, 1_025);
+}
+
+#[test]
+fn same_size_preserved_mtime_replacement_starts_new_generation() {
+    let (_dir, mut ledger, path) = setup();
+    fs::write(&path, format!("{}\n", line("one", None, 1))).unwrap();
+    ledger.import_jsonl(&path, Default::default()).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, format!("{}\n", line("two", None, 1))).unwrap();
+    fs::File::open(&path).unwrap().set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+    assert_eq!(ledger.import_jsonl(&path, Default::default()).unwrap().accepted, 1);
+    assert_eq!(ledger.rows(10, 0).unwrap().len(), 2);
+}
+
+#[test]
+fn legacy_file_scoped_ledger_requires_visible_rebuild() {
+    let (dir, mut ledger, path) = setup();
+    let db = dir.path().join("usage.db");
+    fs::write(&path, format!("{}\n", line("old", None, 1))).unwrap();
+    ledger.import_jsonl(&path, Default::default()).unwrap();
+    drop(ledger);
+    rusqlite::Connection::open(&db).unwrap().execute("DELETE FROM ledger_metadata", []).unwrap();
+    let mut reopened = UsageLedger::open(&db).unwrap();
+    assert!(reopened.requires_rebuild().unwrap());
+    assert!(matches!(reopened.import_jsonl(&path, Default::default()), Err(LedgerError::RebuildRequired)));
+}
+
+#[test]
+fn frozen_reader_streams_two_windows_and_stable_detail_keysets() {
+    let (_dir, mut ledger, path) = setup();
+    let at = |id: &str, time: &str| line(id, None, 1).replace("2026-09-10T12:00:00Z", time);
+    fs::write(&path, format!("{}\n{}\n{}\n", at("b", "2026-09-10T01:00:00Z"), at("a", "2026-09-10T01:00:00Z"), at("later", "2026-09-11T01:00:00Z"))).unwrap();
+    ledger.import_jsonl(&path, Default::default()).unwrap();
+    let utc = |value: &str| value.parse::<DateTime<Utc>>().unwrap();
+    let frozen = ledger.frozen_read([
+        HalfOpenUtcWindow { start: utc("2026-09-10T00:00:00Z"), end: utc("2026-09-11T00:00:00Z") },
+        HalfOpenUtcWindow { start: utc("2026-09-11T00:00:00Z"), end: utc("2026-09-12T00:00:00Z") },
+    ]).unwrap();
+    let mut first = Vec::new();
+    frozen.for_each_window_page(FrozenWindow::First, 1, |page| { first.extend(page.iter().map(|row| row.response_id.clone())); Ok(()) }).unwrap();
+    assert_eq!(first, ["a", "b"]);
+    let detail = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Family, "build", None, 1).unwrap();
+    assert_eq!(detail.total_matches, 2);
+    assert_eq!(detail.rows[0].response_id, "a");
+    let next = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Family, "build", detail.next_cursor().as_ref(), 1).unwrap();
+    assert_eq!(next.rows[0].response_id, "b");
+    let mut second = Vec::new();
+    frozen.for_each_window_page(FrozenWindow::Second, 10, |page| { second.extend(page.iter().map(|row| row.response_id.clone())); Ok(()) }).unwrap();
+    assert_eq!(second, ["later"]);
 }
 
 #[test]
@@ -351,7 +421,7 @@ fn payload_backed_codex_response_uses_codex_identity_and_usage() {
     assert_eq!((result.accepted, result.quarantined), (1, 0));
     let row = ledger.rows(1, 0).unwrap().pop().unwrap();
     assert_eq!(row.provider, "codex");
-    assert!(row.account_scope.starts_with("unknown-local-source:"));
+    assert_eq!(row.account_scope, "local-codex-history");
     assert_eq!(row.response_id, "response-1");
     assert_eq!(row.parent_response_id.as_deref(), Some("parent-thread"));
     assert_eq!(row.root_task_family.as_deref(), Some("root-turn"));
