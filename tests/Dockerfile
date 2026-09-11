@@ -17,9 +17,9 @@ COPY system/scripts/managed-cargo-gate.py system/scripts/managed-target-check.py
 RUN cargo build -p hex-harness 2>&1
 
 # Stage 2: Test runner
-FROM python:3.10-slim
+FROM rust:1-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends git && \
+RUN apt-get update && apt-get install -y --no-install-recommends git python3 python3-pip && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir pytest
 
