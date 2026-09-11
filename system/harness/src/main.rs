@@ -1168,11 +1168,13 @@ fn main() {
                     memory::search::run(&hex_dir, &args)
                 }
                 MemoryCommands::Index { full, stats, max } => {
-                    // --stats is a cheap read; only throttle the heavy index path.
-                    if !*stats {
-                        throttle::apply("memory index", *max);
-                    }
-                    memory::index::run(&hex_dir, *full, *stats)
+                    // KTD7: the throttle decision now lives behind
+                    // memory::index::run_index_cli's pending-file pre-pass
+                    // (via memory::index::run). `throttle::apply` is passed
+                    // in as a fn pointer because `memory` is a lib-crate
+                    // module and `throttle` is a bin-crate-only module (see
+                    // the doc comment on memory::index::run_index_cli).
+                    memory::index::run(&hex_dir, *full, *stats, *max, throttle::apply)
                 }
                 MemoryCommands::ParseTranscripts {
                     file,

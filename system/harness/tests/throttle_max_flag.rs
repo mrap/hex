@@ -73,3 +73,28 @@ fn consolidate_quick_help_lists_max_flag() {
         "`hex memory consolidate quick --help` must list `--max` flag; got:\n{help}"
     );
 }
+
+// Regression guard (task Sw... KTD7, U4): `--max` on `hex memory index` is not
+// new behavior — it predates the backlog-escalation work — but it is now the
+// CLI surface that forces `Escalation::Normal` in
+// `memory::index::escalation_decision` (via the `throttle: fn(&str, bool)`
+// injection wired through `memory::index::run` → `run_index_cli`). This just
+// confirms the flag stays advertised on that arm.
+#[test]
+fn index_help_lists_max_flag() {
+    let bin = env!("CARGO_BIN_EXE_hex");
+    let out = Command::new(bin)
+        .args(["memory", "index", "--help"])
+        .output()
+        .expect("run hex memory index --help");
+    assert!(
+        out.status.success(),
+        "`hex memory index --help` must succeed. stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("--max"),
+        "`hex memory index --help` must list `--max` flag; got:\n{help}"
+    );
+}
