@@ -149,6 +149,29 @@ fn unknown_accounts_are_source_namespaced_and_no_change_reads_no_lines() {
 }
 
 #[test]
+fn one_large_invocation_drains_multiple_pretransaction_chunks() {
+    let (_d, mut ledger, path) = setup();
+    let mut fixture = String::new();
+    for index in 0..1_025 {
+        fixture.push_str(&line(&format!("chunk-{index}"), None, 1));
+        fixture.push('\n');
+    }
+    fs::write(&path, fixture).unwrap();
+    let result = ledger
+        .import_jsonl(
+            &path,
+            ImportOptions {
+                max_records: 2_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(result.accepted, 1_025);
+    assert!(!result.backlog);
+    assert_eq!(ledger.rows(2_000, 0).unwrap().len(), 1_025);
+}
+
+#[test]
 fn codex_session_token_snapshots_are_noncanonical_stream_state() {
     let (_d, mut ledger, path) = setup();
     let snapshot = |time: &str, input: i64, cached: i64, output: i64, total: i64| {
