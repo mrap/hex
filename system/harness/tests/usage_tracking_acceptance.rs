@@ -172,6 +172,14 @@ fn one_large_invocation_drains_multiple_pretransaction_chunks() {
 }
 
 #[test]
+fn ordered_window_read_has_composite_event_index() {
+    let (dir, _ledger, _path) = setup();
+    let db = rusqlite::Connection::open(dir.path().join("usage.db")).unwrap();
+    let plan: String = db.query_row("EXPLAIN QUERY PLAN SELECT response_id FROM canonical_responses WHERE event_at >= ?1 AND event_at < ?2 ORDER BY event_at,response_id", ["2026-09-10T00:00:00Z", "2026-09-11T00:00:00Z"], |r| r.get(3)).unwrap();
+    assert!(plan.contains("canonical_time_response"), "{plan}");
+}
+
+#[test]
 fn codex_session_token_snapshots_are_noncanonical_stream_state() {
     let (_d, mut ledger, path) = setup();
     let snapshot = |time: &str, input: i64, cached: i64, output: i64, total: i64| {
