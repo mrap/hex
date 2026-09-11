@@ -300,6 +300,24 @@ fn health(status: &str, detail: String) {
     }
 }
 
+/// A failed bounded collection makes the ledger's next report visibly stale
+/// until a later successful collection replaces that health event. This keeps
+/// the report honest even when the underlying source file remains readable.
+fn collector_is_stale() -> bool {
+    let status = hex::telemetry::recent(50)
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|row| row.source == "usage-tracking" && row.event == "collect")
+        })
+        .map(|row| row.status);
+    collector_status_is_stale(status.as_deref())
+}
+
+fn collector_status_is_stale(status: Option<&str>) -> bool {
+    status.is_some_and(|status| status != "ok")
+}
+
 fn discover(codex_root: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut paths = Vec::new();
     let mut issues = Vec::new();
@@ -544,10 +562,14 @@ fn report(
         };
         Ok((accumulator.finish(), detail))
     });
-    let Ok((report, detail)) = result else {
+    let Ok((mut report, detail)) = result else {
         eprintln!("usage report: ledger unavailable: {}", ledger.display());
         return 1;
     };
+    if collector_is_stale() {
+        report.coverage.stale_sources = report.coverage.stale_sources.saturating_add(1);
+        report.incomplete_labels.insert("collector_failure".into());
+    }
     let contributor = |item: &hex::usage_reporting::Contributor| json!({"key":item.key,"tokens":item.measured.total().to_string(),"credits_micro":item.credits.value.0.to_string()});
     let optional_total = |value: i128, missing: &str| (!report.incomplete_labels.contains(missing)).then(|| value.to_string());
     let measured = |measured: &hex::usage_reporting::MeasuredTokens| json!({"responses":measured.responses,"input_tokens":measured.input.to_string(),"cached_input_tokens":measured.cached_input.to_string(),"output_tokens":measured.output.to_string(),"cache_write_input_tokens":optional_total(measured.cache_write_input,"missing_cache_write_input_tokens"),"reasoning_output_tokens":optional_total(measured.reasoning_output,"missing_reasoning_output_tokens"),"provider_total_tokens":measured.provider_total.map(|value|value.to_string())});
@@ -701,6 +723,14 @@ mod tests {
             AlertClass::Default,
             "the misconfig alert stays Default (all other notify calls unchanged)"
         );
+    }
+
+    #[test]
+    fn failed_collector_makes_report_stale_until_success() {
+        assert!(!collector_status_is_stale(None));
+        assert!(collector_status_is_stale(Some("error")));
+        assert!(collector_status_is_stale(Some("alert")));
+        assert!(!collector_status_is_stale(Some("ok")));
     }
 
     /// Models are priced per their own table; synthetic/unknown rows skipped.
