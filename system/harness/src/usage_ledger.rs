@@ -33,6 +33,8 @@ pub type Result<T> = std::result::Result<T, LedgerError>;
 /// Stable namespace for one local Codex history collection. Active, archived,
 /// and indexed copies of the same response intentionally share this scope.
 pub const LOCAL_CODEX_COLLECTION_SCOPE: &str = "local-codex-history";
+/// Explicit selector equivalent to omitting a key for child detail.
+pub const ALL_CHILDREN: &str = "all-children";
 const LEDGER_FORMAT_VERSION: &str = "local-codex-collection-v2";
 pub const MAX_CONTRIBUTOR_DETAIL_PAGE: usize = 1_000;
 
@@ -120,7 +122,7 @@ impl FrozenUsageRead<'_> {
         &self,
         window: FrozenWindow,
         dimension: ContributorDimension,
-        key: &str,
+        key: Option<&str>,
         after: Option<&ContributorDetailCursor>,
         limit: usize,
     ) -> Result<ContributorDetailPage> {
@@ -135,7 +137,7 @@ impl FrozenUsageRead<'_> {
     fn page(
         &self,
         selected: FrozenWindow,
-        contributor: Option<(ContributorDimension, &str)>,
+        contributor: Option<(ContributorDimension, Option<&str>)>,
         after: Option<&ContributorDetailCursor>,
         limit: usize,
     ) -> Result<UsageRowPage> {
@@ -146,13 +148,14 @@ impl FrozenUsageRead<'_> {
             FrozenWindow::First => 0,
             FrozenWindow::Second => 1,
         }];
-        let (field, key) = match contributor {
-            Some((ContributorDimension::Model, key)) => (Some("model"), Some(key)),
-            Some((ContributorDimension::Family, key)) => (Some("root_task_family"), Some(key)),
-            Some((ContributorDimension::Child, key)) => (Some("parent_response_id"), Some(key)),
-            None => (None, None),
+        let (filter, key) = match contributor {
+            Some((ContributorDimension::Model, Some(key))) => (String::from(" AND model=?3"), Some(key)),
+            Some((ContributorDimension::Family, Some(key))) => (String::from(" AND root_task_family=?3"), Some(key)),
+            Some((ContributorDimension::Model | ContributorDimension::Family, None)) => return Err(LedgerError::InvalidWindow),
+            Some((ContributorDimension::Child, None | Some(ALL_CHILDREN))) => (String::from(" AND parent_response_id IS NOT NULL"), None),
+            Some((ContributorDimension::Child, Some(_))) => return Err(LedgerError::InvalidWindow),
+            None => (String::new(), None),
         };
-        let filter = field.map(|field| format!(" AND {field}=?3")).unwrap_or_default();
         let total_matches: u64 = match key {
             Some(key) => self.transaction.query_row(
                 &format!("SELECT count(*) FROM canonical_responses WHERE event_at >= ?1 AND event_at < ?2{filter}"),
@@ -160,7 +163,7 @@ impl FrozenUsageRead<'_> {
                 |row| row.get(0),
             )?,
             None => self.transaction.query_row(
-                "SELECT count(*) FROM canonical_responses WHERE event_at >= ?1 AND event_at < ?2",
+                &format!("SELECT count(*) FROM canonical_responses WHERE event_at >= ?1 AND event_at < ?2{filter}"),
                 params![window.start.to_rfc3339(), window.end.to_rfc3339()],
                 |row| row.get(0),
             )?,
@@ -182,13 +185,13 @@ impl FrozenUsageRead<'_> {
                 page
             }
             (None, Some(after)) => {
-                let sql = format!("{select} WHERE event_at>=?1 AND event_at<?2{keyset}{order}?8");
+                let sql = format!("{select} WHERE event_at>=?1 AND event_at<?2{filter}{keyset}{order}?8");
                 let mut statement = self.transaction.prepare(&sql)?;
                 let page = statement.query_map(params![window.start.to_rfc3339(),window.end.to_rfc3339(),"",after.event_at,after.provider,after.account_scope,after.response_id,limit as i64], usage_row)?.collect::<std::result::Result<_, _>>()?;
                 page
             }
             (None, None) => {
-                let sql = format!("{select} WHERE event_at>=?1 AND event_at<?2{order}?3");
+                let sql = format!("{select} WHERE event_at>=?1 AND event_at<?2{filter}{order}?3");
                 let mut statement = self.transaction.prepare(&sql)?;
                 let page = statement.query_map(params![window.start.to_rfc3339(),window.end.to_rfc3339(),limit as i64], usage_row)?.collect::<std::result::Result<_, _>>()?;
                 page

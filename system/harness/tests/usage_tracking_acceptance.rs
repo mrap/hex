@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use hex::usage_ledger::{
-    ContributorDimension, FrozenWindow, HalfOpenUtcWindow, ImportOptions, LedgerError,
+    ContributorDimension, FrozenWindow, HalfOpenUtcWindow, ImportOptions, LedgerError, ALL_CHILDREN,
     UsageLedger,
 };
 use std::fs;
@@ -198,7 +198,8 @@ fn legacy_file_scoped_ledger_requires_visible_rebuild() {
 fn frozen_reader_streams_two_windows_and_stable_detail_keysets() {
     let (_dir, mut ledger, path) = setup();
     let at = |id: &str, time: &str| line(id, None, 1).replace("2026-09-10T12:00:00Z", time);
-    fs::write(&path, format!("{}\n{}\n{}\n", at("b", "2026-09-10T01:00:00Z"), at("a", "2026-09-10T01:00:00Z"), at("later", "2026-09-11T01:00:00Z"))).unwrap();
+    let child = line("child", Some("root"), 1).replace("2026-09-10T12:00:00Z", "2026-09-10T01:00:00Z");
+    fs::write(&path, format!("{}\n{}\n{}\n{}\n", at("b", "2026-09-10T01:00:00Z"), at("a", "2026-09-10T01:00:00Z"), child, at("later", "2026-09-11T01:00:00Z"))).unwrap();
     ledger.import_jsonl(&path, Default::default()).unwrap();
     let utc = |value: &str| value.parse::<DateTime<Utc>>().unwrap();
     let frozen = ledger.frozen_read([
@@ -207,12 +208,17 @@ fn frozen_reader_streams_two_windows_and_stable_detail_keysets() {
     ]).unwrap();
     let mut first = Vec::new();
     frozen.for_each_window_page(FrozenWindow::First, 1, |page| { first.extend(page.iter().map(|row| row.response_id.clone())); Ok(()) }).unwrap();
-    assert_eq!(first, ["a", "b"]);
-    let detail = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Family, "build", None, 1).unwrap();
-    assert_eq!(detail.total_matches, 2);
+    assert_eq!(first, ["a", "b", "child"]);
+    let detail = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Family, Some("build"), None, 1).unwrap();
+    assert_eq!(detail.total_matches, 3);
     assert_eq!(detail.rows[0].response_id, "a");
-    let next = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Family, "build", detail.next_cursor().as_ref(), 1).unwrap();
+    let next = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Family, Some("build"), detail.next_cursor().as_ref(), 1).unwrap();
     assert_eq!(next.rows[0].response_id, "b");
+    let children = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Child, None, None, 1).unwrap();
+    assert_eq!(children.total_matches, 1);
+    assert_eq!(children.rows[0].response_id, "child");
+    let explicit_children = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Child, Some(ALL_CHILDREN), None, 1).unwrap();
+    assert_eq!(explicit_children.rows[0].response_id, "child");
     let mut second = Vec::new();
     frozen.for_each_window_page(FrozenWindow::Second, 10, |page| { second.extend(page.iter().map(|row| row.response_id.clone())); Ok(()) }).unwrap();
     assert_eq!(second, ["later"]);
