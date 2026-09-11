@@ -482,12 +482,8 @@ fn report(
             hex::usage_ledger::HalfOpenUtcWindow { start: preceding_start, end: start },
         ])?;
         let mut accumulator = usage_reporting::ReportAccumulator::new(coverage, start, end, false);
-        for window in [hex::usage_ledger::FrozenWindow::First, hex::usage_ledger::FrozenWindow::Second] {
-            read.for_each_window_page(window, 1_000, |rows| {
-                accumulator.extend(rows);
-                Ok(())
-            })?;
-        }
+        accumulator.extend_summary_groups(&read.summary_groups(hex::usage_ledger::FrozenWindow::First)?, false);
+        accumulator.extend_summary_groups(&read.summary_groups(hex::usage_ledger::FrozenWindow::Second)?, true);
         let detail = match detail_dimension {
             None => None,
             Some(dimension) => {

@@ -79,6 +79,17 @@ pub struct ContributorDetailCursor {
     response_id: String,
 }
 
+/// One SQL-aggregated summary group. This deliberately contains no response
+/// coordinates, so a summary read never decodes every ledger row.
+#[derive(Debug, Clone)]
+pub struct UsageSummaryGroup {
+    pub model: Option<String>, pub family: Option<String>, pub child: bool,
+    pub complete: i64, pub input: i64, pub cached: i64, pub output: i64,
+    pub cache_write: i64, pub reasoning: i64, pub provider_total: i64,
+    pub invalid: i64, pub missing_cache_write: i64, pub missing_reasoning: i64,
+    pub missing_provider_total: i64,
+}
+
 struct UsageRowPage {
     total_matches: u64,
     rows: Vec<UsageRow>,
@@ -92,6 +103,14 @@ pub struct FrozenUsageRead<'ledger> {
 }
 
 impl FrozenUsageRead<'_> {
+    pub fn summary_groups(&self, window: FrozenWindow) -> Result<Vec<UsageSummaryGroup>> {
+        let w = self.windows[match window { FrozenWindow::First => 0, FrozenWindow::Second => 1 }];
+        let valid = "input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL AND output_tokens IS NOT NULL AND input_tokens>=cached_input_tokens AND cached_input_tokens>=0 AND output_tokens>=0";
+        let sql = format!("SELECT model,root_task_family,parent_response_id IS NOT NULL, SUM(CASE WHEN {valid} THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN {valid} THEN input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN cached_input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN output_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(cache_write_input_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(reasoning_output_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(total_tokens,0) ELSE 0 END),0), SUM(CASE WHEN {valid} THEN 0 ELSE 1 END), SUM(CASE WHEN {valid} AND cache_write_input_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND reasoning_output_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND total_tokens IS NULL THEN 1 ELSE 0 END) FROM canonical_responses WHERE event_at>=?1 AND event_at<?2 GROUP BY model,root_task_family,parent_response_id IS NOT NULL");
+        let mut statement = self.transaction.prepare(&sql)?;
+        let groups = statement.query_map(params![w.start.to_rfc3339(), w.end.to_rfc3339()], |r| Ok(UsageSummaryGroup { model:r.get(0)?, family:r.get(1)?, child:r.get(2)?, complete:r.get(3)?, input:r.get(4)?, cached:r.get(5)?, output:r.get(6)?, cache_write:r.get(7)?, reasoning:r.get(8)?, provider_total:r.get(9)?, invalid:r.get(10)?, missing_cache_write:r.get(11)?, missing_reasoning:r.get(12)?, missing_provider_total:r.get(13)? }))?.collect::<std::result::Result<_,_>>()?;
+        Ok(groups)
+    }
     pub fn for_each_window_page<F>(
         &self,
         window: FrozenWindow,

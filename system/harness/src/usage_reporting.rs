@@ -5,6 +5,7 @@
 //! calls an estimate an invoice or an account debit.
 
 use crate::usage_ledger::{Coverage, UsageRow};
+use crate::usage_ledger::UsageSummaryGroup;
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -250,6 +251,12 @@ impl ReportAccumulator {
             }
         }
     }
+    pub fn extend_summary_groups(&mut self, groups: &[UsageSummaryGroup], preceding: bool) {
+        for group in groups {
+            let target = if preceding { &mut self.previous } else { &mut self.current };
+            target.add_group(group, self.include_ids);
+        }
+    }
 
     /// Summary callers pass `include_ids = false`, so page rows do not remain
     /// owned after aggregation. This exposes the retained optional detail IDs
@@ -362,6 +369,15 @@ struct Accumulator {
 }
 
 impl Accumulator {
+    fn add_group(&mut self, g: &UsageSummaryGroup, include_ids: bool) {
+        if g.invalid > 0 { self.labels.insert("missing_or_invalid_usage".into()); self.invalid_usage = true; }
+        if g.complete == 0 { return; }
+        let add = |m: &mut MeasuredTokens| { let first=m.responses==0; m.responses+=g.complete as u64; m.input+=g.input as i128; m.cached_input+=g.cached as i128; m.uncached_input+=(g.input-g.cached) as i128; m.output+=g.output as i128; m.cache_write_input+=g.cache_write as i128; m.reasoning_output+=g.reasoning as i128; m.provider_total=if g.missing_provider_total>0 {None} else if first {Some(g.provider_total as i128)} else {m.provider_total.map(|v|v+g.provider_total as i128)}; };
+        add(&mut self.measured); self.credits.add_summary(g);
+        let model=g.model.clone().unwrap_or_else(||"unknown".into()); let family=g.family.clone().unwrap_or_else(||"unknown".into());
+        add_bucket_group(self.models.entry(model).or_default(),g,include_ids); add_bucket_group(self.families.entry(family).or_default(),g,include_ids); if g.child { add_bucket_group(&mut self.children,g,include_ids); }
+        if g.model.is_none(){self.labels.insert("unknown_model".into());} if g.missing_cache_write>0 {self.labels.insert("missing_cache_write_input_tokens".into());} if g.missing_reasoning>0 {self.labels.insert("missing_reasoning_output_tokens".into());} if g.missing_provider_total>0 {self.labels.insert("missing_provider_total_tokens".into());} self.labels.insert("speed_unavailable_standard_rate_only".into());
+    }
     fn add(&mut self, row: &UsageRow, include_ids: bool) {
         if !complete(row) {
             self.labels.insert("missing_or_invalid_usage".into());
@@ -418,6 +434,7 @@ impl Accumulator {
         contributor("child_responses", &self.children)
     }
 }
+fn add_bucket_group(bucket:&mut Bucket,g:&UsageSummaryGroup,_:bool){ if g.complete==0{return}; let first=bucket.measured.responses==0; bucket.measured.responses+=g.complete as u64; bucket.measured.input+=g.input as i128; bucket.measured.cached_input+=g.cached as i128; bucket.measured.uncached_input+=(g.input-g.cached) as i128; bucket.measured.output+=g.output as i128; bucket.measured.cache_write_input+=g.cache_write as i128; bucket.measured.reasoning_output+=g.reasoning as i128; bucket.measured.provider_total=if g.missing_provider_total>0{None}else if first{Some(g.provider_total as i128)}else{bucket.measured.provider_total.map(|v|v+g.provider_total as i128)}; bucket.credits.add_summary(g); }
 
 fn add_bucket(bucket: &mut Bucket, row: &UsageRow, include_ids: bool) {
     bucket.measured.add(row);
@@ -502,6 +519,7 @@ struct CreditAccumulator {
 }
 
 impl CreditAccumulator {
+    fn add_summary(&mut self,g:&UsageSummaryGroup){ let Some(model)=g.model.as_deref() else {self.labels.insert("unknown_model_rate".into());return}; let Some(r)=rate(model) else {self.labels.insert(format!("unknown_model_rate:{model}"));return}; self.components.fresh.0+=(g.input-g.cached) as i128*r.fresh as i128; self.components.cached.0+=g.cached as i128*r.cached as i128; self.components.output.0+=g.output as i128*r.output as i128; if g.invalid>0 {self.labels.insert("missing_or_invalid_usage".into());} }
     fn add(&mut self, row: &UsageRow) {
         let Some(model) = row.model.as_deref() else {
             self.labels.insert("unknown_model_rate".into());
