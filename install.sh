@@ -532,7 +532,7 @@ _resolve_git_tag() {
     refs=$(git ls-remote "$repo" "refs/tags/$tag^{}" "refs/tags/$tag" 2>/dev/null) || return 1
     sha=$(printf '%s\n' "$refs" | awk -v peeled="refs/tags/$tag^{}" -v direct="refs/tags/$tag" '$2 == peeled { print $1; exit }')
     [ -n "$sha" ] || sha=$(printf '%s\n' "$refs" | awk -v direct="refs/tags/$tag" '$2 == direct { print $1; exit }')
-    /usr/bin/python3 -I -B -c 'import re,sys; raise SystemExit(0 if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sys.argv[1] or "") else 1)' "$sha" || return 1
+    python3 -I -B -c 'import re,sys; raise SystemExit(0 if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sys.argv[1] or "") else 1)' "$sha" || return 1
     printf '%s\n' "$sha"
 }
 
