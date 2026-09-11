@@ -7,7 +7,7 @@ fn record(id: &str) -> String {
     format!("{{\"type\":\"token_usage_record\",\"provider\":\"codex\",\"response_id\":\"{id}\",\"event_at\":\"2026-09-10T00:00:00Z\",\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}\n")
 }
 #[test]
-fn discovery_imports_active_archive_and_rollout_while_reporting_missing_rollout() {
+fn discovery_imports_active_archive_and_rollout_while_skipping_missing_rollout() {
     let root = TempDir::new().unwrap();
     let codex = root.path().join("codex");
     let ledger = root.path().join("ledger.db");
@@ -56,7 +56,7 @@ fn discovery_imports_active_archive_and_rollout_while_reporting_missing_rollout(
         ])
         .status()
         .unwrap();
-    assert!(!status.success());
+    assert!(status.success());
     let rows = hex::usage_ledger::UsageLedger::open(&ledger)
         .unwrap()
         .rows(10, 0)

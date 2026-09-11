@@ -336,7 +336,11 @@ fn discover(codex_root: &Path) -> (Vec<PathBuf>, Vec<String>) {
                             if p.is_file() {
                                 paths.push(p)
                             } else {
-                                issues.push(format!("missing_rollout={}", p.display()))
+                                // state_5.sqlite can retain a rollout path after Codex
+                                // removes the session. This is a normal discovery race, not
+                                // a collector failure. Keep it visible without making the
+                                // scheduled worker unhealthy.
+                                eprintln!("usage collect: skipped missing rollout={}", p.display());
                             }
                         }
                     }
