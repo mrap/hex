@@ -266,6 +266,21 @@ fn small_append_probes_only_bounded_source_fingerprints() {
 }
 
 #[test]
+fn longer_rewrite_with_same_prefix_starts_new_generation() {
+    let (_dir, mut ledger, path) = setup();
+    let mut lines = (0..100)
+        .map(|index| line(&format!("history-{index:04}"), None, 1))
+        .collect::<Vec<_>>();
+    fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+    ledger.import_jsonl(&path, Default::default()).unwrap();
+    lines[95] = line("rewrite-0095", None, 1);
+    fs::write(&path, format!("{}\n{}\n", lines.join("\n"), line("appended", None, 1))).unwrap();
+    let result = ledger.import_jsonl(&path, Default::default()).unwrap();
+    assert_eq!(result.accepted, 2);
+    assert_eq!(result.duplicates, 99);
+}
+
+#[test]
 fn ordered_window_read_has_composite_event_index() {
     let (dir, _ledger, _path) = setup();
     let db = rusqlite::Connection::open(dir.path().join("usage.db")).unwrap();

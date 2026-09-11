@@ -413,11 +413,22 @@ impl UsageLedger {
             let (tail, tail_bytes) = tail_hash(path, meta.len())?;
             (prefix, tail, prefix_bytes + tail_bytes)
         };
+        // For a longer source, compare the previously stored old-end checkpoint
+        // at its original offset. This distinguishes an append from a rewrite
+        // that preserves the opening fingerprint without reading old history.
+        let (append_checkpoint_matches, append_checkpoint_bytes) = match &prior {
+            Some((_, _, _, old_len, _, _, old_checkpoint)) if meta.len() as i64 > *old_len => {
+                let (checkpoint, bytes) = tail_hash_at(path, *old_len as u64)?;
+                (checkpoint == *old_checkpoint, bytes)
+            }
+            _ => (true, 0),
+        };
+        let probe_bytes = probe_bytes + append_checkpoint_bytes;
         let (generation, cursor) = match prior {
             Some((g, c, old_prefix, old_len, _, _, _))
                 if meta.len() as i64 >= c
                     && old_prefix == prefix
-                    && (meta.len() as i64 > old_len || unchanged) => (g, c),
+                    && ((meta.len() as i64 > old_len && append_checkpoint_matches) || unchanged) => (g, c),
             Some((g, _, _, _, _, _, _)) => (g + 1, 0),
             None => (0, 0),
         };
@@ -1077,9 +1088,12 @@ fn prefix_hash(path: &Path) -> Result<(String, u64)> {
     Ok((hash(&b[..n]), n as u64))
 }
 fn tail_hash(path: &Path, length: u64) -> Result<(String, u64)> {
+    tail_hash_at(path, length)
+}
+fn tail_hash_at(path: &Path, end: u64) -> Result<(String, u64)> {
     let mut file = File::open(path)?;
-    let count = length.min(4096);
-    file.seek(SeekFrom::Start(length - count))?;
+    let count = end.min(4096);
+    file.seek(SeekFrom::Start(end - count))?;
     let mut buffer = vec![0; count as usize];
     file.read_exact(&mut buffer)?;
     Ok((hash(&buffer), count))
