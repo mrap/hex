@@ -32,7 +32,8 @@ mod test_env {
     static HEX_DIR_LOCK: Mutex<()> = Mutex::new(());
 
     pub(crate) struct HexDirGuard {
-        previous: Option<OsString>,
+        previous_hex_dir: Option<OsString>,
+        previous_home: Option<OsString>,
         _root: tempfile::TempDir,
         _lock: MutexGuard<'static, ()>,
     }
@@ -40,10 +41,15 @@ mod test_env {
     pub(crate) fn isolate_hex_dir() -> HexDirGuard {
         let lock = HEX_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("HEX_DIR");
+        let previous_hex_dir = std::env::var_os("HEX_DIR");
+        let previous_home = std::env::var_os("HOME");
         std::env::set_var("HEX_DIR", root.path());
+        // App-identity preflight reads HOME for signing evidence. Tests that
+        // exercise isolated upgrade fixtures must not inherit a real policy.
+        std::env::set_var("HOME", root.path());
         HexDirGuard {
-            previous,
+            previous_hex_dir,
+            previous_home,
             _root: root,
             _lock: lock,
         }
@@ -51,28 +57,34 @@ mod test_env {
 
     impl Drop for HexDirGuard {
         fn drop(&mut self) {
-            match &self.previous {
+            match &self.previous_hex_dir {
                 Some(value) => std::env::set_var("HEX_DIR", value),
                 None => std::env::remove_var("HEX_DIR"),
+            }
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
             }
         }
     }
 
     #[test]
     fn guard_serializes_and_restores_environment_on_unwind() {
-        let previous = {
+        let (previous_hex_dir, previous_home) = {
             let _lock = HEX_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            std::env::var_os("HEX_DIR")
+            (std::env::var_os("HEX_DIR"), std::env::var_os("HOME"))
         };
         let result = std::panic::catch_unwind(|| {
             let guard = isolate_hex_dir();
             assert!(HEX_DIR_LOCK.try_lock().is_err());
             assert_eq!(std::env::var_os("HEX_DIR"), Some(guard._root.path().into()));
+            assert_eq!(std::env::var_os("HOME"), Some(guard._root.path().into()));
             panic!("exercise environment restoration during unwinding");
         });
         assert!(result.is_err());
         let _lock = HEX_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(std::env::var_os("HEX_DIR"), previous);
+        assert_eq!(std::env::var_os("HEX_DIR"), previous_hex_dir);
+        assert_eq!(std::env::var_os("HOME"), previous_home);
     }
 }
 #[cfg(test)]

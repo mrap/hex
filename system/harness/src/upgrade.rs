@@ -2897,6 +2897,7 @@ mod tests {
         {
             return;
         }
+        let _env = crate::test_env::isolate_hex_dir();
         test_child::stage("upgrade:preflight-noop-body").expect("test-child stage must flush");
         let (_tmp, source, instance) = binary_preflight_fixture();
         assert!(!binary_is_stale(&instance, &source).unwrap());
@@ -3653,6 +3654,7 @@ mod tests {
         {
             return;
         }
+        let _env = crate::test_env::isolate_hex_dir();
         test_child::stage("upgrade:sync-health-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -3830,6 +3832,7 @@ mod tests {
         ) {
             return;
         }
+        let _env = crate::test_env::isolate_hex_dir();
         test_child::stage("upgrade:sync-preserve-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
 
@@ -4049,6 +4052,7 @@ CUSTOM_INSTANCE_PIN=abc123
         ) {
             return;
         }
+        let _env = crate::test_env::isolate_hex_dir();
         test_child::stage("upgrade:sync-kind-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
