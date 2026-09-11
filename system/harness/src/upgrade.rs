@@ -594,8 +594,53 @@ fn get_source_dir(args: &Args, hex_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
+    // The cache refresh above succeeded (pulled or freshly cloned). Best-effort
+    // sweep of any `.upgrade-cache.corrupt-*` residue a prior clear_cache_dir()
+    // left behind — never lets residue block or fail this upgrade.
+    let _ = sweep_corrupt_cache_residue(hex_dir);
+
     println!("  [OK] Source ready");
     Ok(cache_dir)
+}
+
+/// Remove any `.upgrade-cache.corrupt-*` directories under `<hex_dir>/.hex`
+/// left behind by a prior `clear_cache_dir()` move-aside. Best-effort: a
+/// directory that can't be removed (e.g. OS-protected) is logged with a WARN
+/// and returned in `failed`, never turned into an upgrade failure. The live
+/// `.upgrade-cache` dir itself is never touched — only names starting with
+/// `.upgrade-cache.corrupt-` match.
+fn sweep_corrupt_cache_residue(hex_dir: &Path) -> (usize, Vec<PathBuf>) {
+    let dot_hex = hex_dir.join(".hex");
+    let mut removed = 0usize;
+    let mut failed = Vec::new();
+
+    let entries = match fs::read_dir(&dot_hex) {
+        Ok(e) => e,
+        Err(_) => return (removed, failed),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_residue = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(".upgrade-cache.corrupt-"))
+            .unwrap_or(false);
+        if !is_residue {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        } else {
+            println!(
+                "  [WARN] Could not remove upgrade-cache residue at {}",
+                path.display()
+            );
+            failed.push(path);
+        }
+    }
+
+    (removed, failed)
 }
 
 /// A cache is healthy iff it owns its own git directory — i.e.
@@ -3641,6 +3686,76 @@ mod tests {
             !cache_is_healthy(&corrupt),
             "a headless .git shell must be unhealthy (must not resolve up-tree)"
         );
+    }
+
+    /// A removable `.upgrade-cache.corrupt-*` residue directory is swept away
+    /// and counted as removed. The live `.upgrade-cache` dir itself is left
+    /// untouched.
+    #[test]
+    fn sweep_removes_removable_residue_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hex_dir = tmp.path();
+        let dot_hex = hex_dir.join(".hex");
+        let residue = dot_hex.join(".upgrade-cache.corrupt-0");
+        write_file(&residue.join("CLAUDE.md"), "stale");
+        let live_cache = dot_hex.join(".upgrade-cache");
+        write_file(&live_cache.join(".git/config"), "[core]\n");
+
+        let (removed, failed) = sweep_corrupt_cache_residue(hex_dir);
+
+        assert_eq!(removed, 1);
+        assert!(failed.is_empty());
+        assert!(!residue.exists(), "residue dir must be gone");
+        assert!(live_cache.exists(), "live cache dir must be untouched");
+    }
+
+    /// A residue dir that cannot be removed is collected into `failed`
+    /// without panicking. Reproduced by stripping write permission on the
+    /// residue's parent (`.hex`), which blocks unlinking the directory entry
+    /// even though its contents are still readable — the same shape as an
+    /// OS-protected residue dir on the live instance.
+    #[test]
+    fn sweep_collects_unremovable_residue_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hex_dir = tmp.path();
+        let dot_hex = hex_dir.join(".hex");
+        let residue = dot_hex.join(".upgrade-cache.corrupt-0");
+        write_file(&residue.join("CLAUDE.md"), "stale");
+
+        let mut perms = fs::metadata(&dot_hex).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&dot_hex, perms).unwrap();
+
+        // Confirm the restriction actually bites in this test environment.
+        // Running as root (a CI container, a release runner) ignores
+        // directory write permission entirely, which would make a hard
+        // `removed == 0` assertion below false-fail rather than test
+        // anything. Mirrors the `test_cache_is_healthy` pattern of gating an
+        // environment-dependent assertion on a live probe.
+        let probe = dot_hex.join("root-write-probe");
+        let enforced = fs::write(&probe, b"probe").is_err();
+        let _ = fs::remove_file(&probe);
+
+        let (removed, failed) = sweep_corrupt_cache_residue(hex_dir);
+
+        // Restore write perms so the tempdir can clean itself up on drop.
+        let mut perms = fs::metadata(&dot_hex).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dot_hex, perms).unwrap();
+
+        // The one guarantee this test makes regardless of environment: a
+        // removal failure is collected, never panics.
+        if enforced {
+            assert_eq!(removed, 0);
+            assert_eq!(failed, vec![residue]);
+        } else {
+            assert_eq!(
+                removed, 1,
+                "permission restriction unenforced in this env (likely root); \
+                 residue should have been removed instead"
+            );
+            assert!(failed.is_empty());
+        }
     }
 
     /// The binary step must report health honestly: an up-to-date skip is
