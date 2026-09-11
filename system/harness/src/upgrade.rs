@@ -34,6 +34,7 @@ struct SourceDirs {
     /// deployed copies hold runtime state (`.hex/iii/data`, worker `node_modules`).
     iii: PathBuf,
     templates: PathBuf,
+    managed_cargo_bridge: PathBuf,
     version_txt: Option<PathBuf>,
 }
 
@@ -114,6 +115,7 @@ fn source_dirs_for_layout(layout: &str, source_root: &Path) -> Option<SourceDirs
             hooks: source_root.join("system/hooks"),
             iii: source_root.join("system/iii"),
             templates: source_root.join("system/templates"),
+            managed_cargo_bridge: source_root.join("system/managed_cargo_bridge.rs"),
             version_txt: Some(source_root.join("system/version.txt")),
         }),
         _ => None,
@@ -2301,6 +2303,19 @@ pub fn run(args: &[String]) -> i32 {
         let message = format!("could not set script permissions: {e}");
         eprintln!("  [FAIL] {message}");
         failures.push(message);
+    }
+
+    // The harness imports this sibling module by path. It must be staged before
+    // rebuilding, or a source upgrade can leave managed files updated but the
+    // binary stale.
+    if src_dirs.managed_cargo_bridge.exists() {
+        let dst = hex_dot_dir.join("managed_cargo_bridge.rs");
+        match fs::read(&src_dirs.managed_cargo_bridge)
+            .and_then(|bytes| copy_file_with_perms(&src_dirs.managed_cargo_bridge, &dst, &bytes))
+        {
+            Ok(()) => { owned_paths.entry(dst.clone()).or_insert(None); applied += 1; }
+            Err(e) => { let message = format!("sync failed for managed cargo bridge: {e}"); eprintln!("  [FAIL] {message}"); failures.push(message); }
+        }
     }
 
     // Update version.txt for v2 layout
