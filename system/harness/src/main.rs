@@ -2239,6 +2239,7 @@ fn run_failures(window: i64, alert: bool) -> i32 {
         }
     };
     let sigs = hex::failures::failure_signatures(now, window).unwrap_or_default();
+    let storms = hex::failures::storm_signatures(now, window).unwrap_or_default();
     let dups = hex::failures::duplicate_fires(&exp, now).unwrap_or_default();
     let compiled = hex::failures::compiled_module_basenames();
     let not_landed = hex::failures::modules_not_landed(&hex_dir, &compiled);
@@ -2333,6 +2334,37 @@ fn run_failures(window: i64, alert: bool) -> i32 {
                 s.first_seen,
                 s.last_seen
             );
+        }
+    }
+    if !storms.is_empty() {
+        bad = true;
+        println!(
+            "\nFAILURE STORMS (same error across {}+ distinct workers):",
+            hex::failures::STORM_MIN_WORKERS
+        );
+        for s in &storms {
+            println!(
+                "  {}x across {} workers  {}  first {}  last {}  e.g. {}",
+                s.total_rows,
+                s.distinct_fids,
+                s.head,
+                s.first_ts,
+                s.last_ts,
+                s.sample_fids.join(", ")
+            );
+            if alert {
+                hex::alert::notify_with_class(
+                    &hex::failures::alert_key("storm", &s.head),
+                    "hex failure storm — same error across multiple workers",
+                    &format!(
+                        "{} across {} workers: {}",
+                        s.head,
+                        s.distinct_fids,
+                        s.sample_fids.join(", ")
+                    ),
+                    hex::alert::AlertClass::HarnessDown,
+                );
+            }
         }
     }
     if !dups.is_empty() {
