@@ -88,6 +88,15 @@ class MacAppInstallTests(unittest.TestCase):
         self.source = Path(self.temp.name) / "boi-source"
         self.source.write_bytes(b"candidate bytes")
         self.signer = FakeSigner()
+        # FakeSigner.stage() copies opaque bytes into the candidate executable, so a
+        # real self-check subprocess would always fail here. Default it to a clean
+        # pass; tests of the self-check itself override this patch.
+        from unittest.mock import patch
+        self._self_check_patch = patch.object(
+            INSTALL, "_run_self_check",
+            return_value=subprocess.CompletedProcess(args=["cli", "--version"], returncode=0, stdout="ok\n", stderr=""))
+        self._self_check_patch.start()
+        self.addCleanup(self._self_check_patch.stop)
         self.addCleanup(self.temp.cleanup)
 
     def install(self):
@@ -148,6 +157,91 @@ class MacAppInstallTests(unittest.TestCase):
             INSTALL._atomic_swap = original_swap
         self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
         self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_happy_path_reports_not_failed(self):
+        result = self.install()
+        self.assertFalse(result["self_check_failed"])
+        paths = INSTALL.product_paths("boi", self.root)
+        self.assertFalse(json.loads(paths.state.read_text())["self_check_failed"])
+
+    def test_self_check_nonzero_exit_restores_previous_app_and_cli(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        old_app_hash = INSTALL._tree_sha256(paths.app)
+        old_cli_target = os.readlink(paths.cli)
+        failing = subprocess.CompletedProcess(args=["cli", "--version"], returncode=1, stdout="", stderr="boom")
+        with patch.object(INSTALL, "_run_self_check", return_value=failing):
+            with self.assertRaisesRegex(INSTALL.InstallError, "self-check failed") as caught:
+                self.install()
+        # Self-check runs after every swap (KTD1), so unlike a staging-time failure
+        # this transaction did touch public state before rolling back -- published
+        # stays true, matching every other post-swap failure path in this function.
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertTrue(caught.exception.published)
+        self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
+        self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_times_out_twice_restores_previous_app(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        old_app_hash = INSTALL._tree_sha256(paths.app)
+        old_cli_target = os.readlink(paths.cli)
+        timeout_exc = subprocess.TimeoutExpired(cmd=["cli", "--version"], timeout=10)
+        with patch.object(INSTALL, "_run_self_check", side_effect=timeout_exc), \
+                patch.object(INSTALL, "_self_check_sleep") as sleep_mock:
+            with self.assertRaisesRegex(INSTALL.InstallError, "timed out twice") as caught:
+                self.install()
+        sleep_mock.assert_called_once()
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
+        self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_times_out_once_then_succeeds(self):
+        from unittest.mock import patch
+        timeout_exc = subprocess.TimeoutExpired(cmd=["cli", "--version"], timeout=10)
+        ok = subprocess.CompletedProcess(args=["cli", "--version"], returncode=0, stdout="ok\n", stderr="")
+        with patch.object(INSTALL, "_run_self_check", side_effect=[timeout_exc, ok]), \
+                patch.object(INSTALL, "_self_check_sleep") as sleep_mock:
+            result = self.install()
+        sleep_mock.assert_called_once()
+        self.assertFalse(result["self_check_failed"])
+
+    def test_self_check_skips_product_without_cli_path(self):
+        # No current product configures cli_relative=None (Product.cli_relative is not
+        # Optional), so this exercises the guard directly rather than through install().
+        from unittest.mock import patch
+        with patch.object(INSTALL, "_run_self_check") as run_mock:
+            INSTALL._self_check_published_cli(None)
+        run_mock.assert_not_called()
+
+    def test_install_error_payload_reports_self_check_failed(self):
+        from unittest.mock import patch
+        self.install()
+        failing = subprocess.CompletedProcess(args=["cli", "--version"], returncode=1, stdout="", stderr="boom")
+        with patch.object(INSTALL, "_run_self_check", return_value=failing):
+            with self.assertRaises(INSTALL.InstallError) as caught:
+                self.install()
+        self.assertTrue(INSTALL._install_error_payload(caught.exception)["self_check_failed"])
+
+        # An unrelated rollback failure (not a self-check) must report False.
+        original_swap = INSTALL._atomic_swap
+        calls = {"count": 0}
+
+        def fail_cli(parent_fd, source, destination):
+            calls["count"] += 1
+            if calls["count"] == 4:
+                raise INSTALL.InstallError("injected compatibility swap failure")
+            return original_swap(parent_fd, source, destination)
+
+        INSTALL._atomic_swap = fail_cli
+        try:
+            with self.assertRaises(INSTALL.InstallError) as unrelated:
+                self.install()
+        finally:
+            INSTALL._atomic_swap = original_swap
+        self.assertFalse(INSTALL._install_error_payload(unrelated.exception)["self_check_failed"])
 
     def test_rollback_refuses_actor_replacement(self):
         self.install()
@@ -545,7 +639,12 @@ class MacAppInstallCLITests(unittest.TestCase):
         self.policy.parent.mkdir(parents=True)
         self.policy.write_text(json.dumps({"schema_version": 1, "certificate_sha1": "A" * 40, "team_id": "TEAM123456"}), encoding="utf-8")
         self.source = base / "source"
-        self.source.write_bytes(b"cli candidate")
+        # This flows straight through the fake signing CLI into the published
+        # bin/<product> symlink target below, and the real install() now runs that
+        # published binary as a post-publish self-check -- so it must actually be
+        # able to execute, unlike the in-process FakeSigner fixtures above.
+        self.source.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.source.chmod(0o755)
         self.script = base / "macos-app-install.py"
         shutil.copy2(SOURCE, self.script)
         helper = base / "macos-signing.py"

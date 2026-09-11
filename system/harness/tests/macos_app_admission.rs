@@ -75,7 +75,13 @@ if __name__ == '__main__':
     );
     fs::write(&signer, signer_source).unwrap();
     let source_bin = source.join("hex-source");
-    fs::write(&source_bin, b"fixture hex executable").unwrap();
+    // The installer now runs the published CLI (`--version`) as a post-install
+    // self-check, so the fixture source must be a real executable.
+    fs::write(&source_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&source_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let output = Command::new("/usr/bin/python3")
         .args([
             "-I",

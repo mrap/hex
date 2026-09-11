@@ -51,9 +51,10 @@ SCIPD_LAUNCHD_LABEL = "com.hex.scipd"
 class InstallError(RuntimeError):
     """A bounded, operator-facing install or recovery failure."""
 
-    def __init__(self, message: str, *, published: Optional[bool] = None):
+    def __init__(self, message: str, *, published: Optional[bool] = None, self_check_failed: Optional[bool] = None):
         super().__init__(message)
         self.published = published
+        self.self_check_failed = self_check_failed
 
 
 class Signer(Protocol):
@@ -1057,6 +1058,62 @@ def abandon_staging(product: str, root: Path) -> dict[str, Any]:
         raise StagingRecoveryError(str(exc), archive) from exc
 
 
+SELF_CHECK_TIMEOUT_ENV = "HEX_APP_INSTALL_SELF_CHECK_TIMEOUT_SECS"
+SELF_CHECK_DEFAULT_TIMEOUT_SECS = 10.0
+SELF_CHECK_RETRY_PAUSE_SECS = 5.0
+
+
+def _self_check_timeout_secs() -> float:
+    """KTD2: 10s default. Overridable so a slow first Gatekeeper launch can be tuned without a code change."""
+    raw = os.environ.get(SELF_CHECK_TIMEOUT_ENV)
+    if raw is None:
+        return SELF_CHECK_DEFAULT_TIMEOUT_SECS
+    try:
+        value = float(raw)
+    except ValueError:
+        return SELF_CHECK_DEFAULT_TIMEOUT_SECS
+    return value if value > 0 else SELF_CHECK_DEFAULT_TIMEOUT_SECS
+
+
+def _run_self_check(cli: Path, timeout: float) -> subprocess.CompletedProcess:
+    """Spawn the just-published CLI's --version. Tests patch this so no real binary runs."""
+    return subprocess.run([str(cli), "--version"], capture_output=True, text=True, timeout=timeout)
+
+
+def _self_check_sleep(seconds: float) -> None:
+    """The KTD2 retry pause, isolated so tests can patch it and run fast."""
+    time.sleep(seconds)
+
+
+def _self_check_published_cli(cli: Optional[Path]) -> None:
+    """R1/R2: confirm the just-published CLI can execute before the journal commits.
+
+    One retry after a pause, on timeout only (KTD2) -- a freshly signed app's first
+    launch can stall on Gatekeeper validation. A second timeout or a non-zero exit
+    raises InstallError(self_check_failed=True); the caller's existing
+    `except Exception` handler turns that into a full rollback. A product with no
+    CLI path is skipped.
+    """
+    if cli is None:
+        return
+    timeout = _self_check_timeout_secs()
+    try:
+        result = _run_self_check(cli, timeout)
+    except subprocess.TimeoutExpired:
+        _self_check_sleep(SELF_CHECK_RETRY_PAUSE_SECS)
+        try:
+            result = _run_self_check(cli, timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise InstallError(f"self-check timed out twice after {timeout}s: {cli} --version", self_check_failed=True) from exc
+        except OSError as exc:
+            raise InstallError(f"self-check could not execute {cli}: {exc}", self_check_failed=True) from exc
+    except OSError as exc:
+        raise InstallError(f"self-check could not execute {cli}: {exc}", self_check_failed=True) from exc
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise InstallError(f"self-check failed: {cli} --version exited {result.returncode}: {stderr}", self_check_failed=True)
+
+
 def install(product: str, root: Path, source: Path, signer: Signer, *, policy_path: Optional[Path] = None, helper_provenance: Optional[Mapping[str, Any]] = None, helper_sources: Optional[Mapping[str, Path]] = None, source_revision: Optional[str] = None, version: str = "1.0.0") -> dict[str, Any]:
     """Stage and publish one complete app. The caller owns no service action."""
     item = PRODUCTS.get(product)
@@ -1212,7 +1269,7 @@ def install(product: str, root: Path, source: Path, signer: Signer, *, policy_pa
                     _atomic_new(cli_fd, alias_candidate, paths.alias)
                     published_alias = _entry_identity(paths.alias)
                     published.append((cli_fd, paths.alias, "previous-alias", False, published_alias, None))
-            state = {"schema_version": STATE_SCHEMA_VERSION, "product": product, "mode": "signed-current", "bundle_identifier": item.bundle_identifier, "bundle_path": str(paths.app.absolute()), "executable_path": str(paths.executable.absolute()), "compatibility_path": str(paths.cli.absolute()), "generation": transaction_id, "transaction_id": transaction_id, "version": verified["version"], "bundle_sha256": _tree_sha256(paths.app), "executable_sha256": _sha256(paths.executable), "previous_compatibility": old_cli, "team_id": verified.get("team_id"), "certificate_sha1": verified.get("certificate_sha1"), "designated_requirements": verified.get("designated_requirements"), "mach_o_uuids": verified.get("mach_o_uuids"), "source_revision": source_revision, "signer_helper_sha256": verified.get("signer_helper_sha256"), "helpers": dict(helper_provenance or {})}
+            state = {"schema_version": STATE_SCHEMA_VERSION, "product": product, "mode": "signed-current", "bundle_identifier": item.bundle_identifier, "bundle_path": str(paths.app.absolute()), "executable_path": str(paths.executable.absolute()), "compatibility_path": str(paths.cli.absolute()), "generation": transaction_id, "transaction_id": transaction_id, "version": verified["version"], "bundle_sha256": _tree_sha256(paths.app), "executable_sha256": _sha256(paths.executable), "previous_compatibility": old_cli, "team_id": verified.get("team_id"), "certificate_sha1": verified.get("certificate_sha1"), "designated_requirements": verified.get("designated_requirements"), "mach_o_uuids": verified.get("mach_o_uuids"), "source_revision": source_revision, "signer_helper_sha256": verified.get("signer_helper_sha256"), "helpers": dict(helper_provenance or {}), "self_check_failed": False}
             state_temp = paths.state.with_name(paths.state.name + f".tmp-{transaction_id}")
             _write_private(state_temp, (json.dumps(state, sort_keys=True, indent=2) + "\n").encode())
             journal["phase"] = "state-swap"
@@ -1236,6 +1293,7 @@ def install(product: str, root: Path, source: Path, signer: Signer, *, policy_pa
             with _open_dir(rollback) as rollback_fd:
                 for directory_fd in (helper_fd, cli_fd, rollback_fd, app_fd):
                     _fsync_dir(directory_fd)
+            _self_check_published_cli(paths.cli)
             journal["phase"] = "committed"
             _write_journal(paths, journal)
             _clear_journal(paths, transaction_id)
@@ -1266,7 +1324,8 @@ def install(product: str, root: Path, source: Path, signer: Signer, *, policy_pa
                 detail += "; " + staging_evidence_error
             if rollback_errors:
                 detail += "; rollback failed: " + "; ".join(rollback_errors)
-            raise InstallError(detail, published=bool(published) or bool(rollback_errors)) from exc
+            raise InstallError(detail, published=bool(published) or bool(rollback_errors),
+                                self_check_failed=bool(getattr(exc, "self_check_failed", False))) from exc
 
 
 # Private entrypoints remain in this provenance-checked helper. No environment
@@ -1810,6 +1869,14 @@ def _emit(value: Mapping[str, Any]) -> int:
     return 0
 
 
+def _install_error_payload(exc: InstallError) -> dict[str, Any]:
+    """The JSON body main() prints to stderr for an InstallError. Exposed so tests can
+    check self_check_failed threading without a full signed install through main()."""
+    return {"schema_version": STATE_SCHEMA_VERSION, "error": str(exc),
+            "published": bool(exc.published) if exc.published is not None else False,
+            "self_check_failed": bool(getattr(exc, "self_check_failed", False))}
+
+
 def _validate_lock_fd(fd: int, paths: Paths) -> None:
     try:
         actual = os.fstat(fd)
@@ -2123,7 +2190,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(dict(exc.result, error=str(exc))), file=sys.stderr)
         return 1
     except InstallError as exc:
-        print(json.dumps({"schema_version": STATE_SCHEMA_VERSION, "error": str(exc), "published": bool(exc.published) if exc.published is not None else False}), file=sys.stderr)
+        print(json.dumps(_install_error_payload(exc)), file=sys.stderr)
         return 1
 
 
