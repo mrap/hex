@@ -52,6 +52,9 @@ fn exact_fixed_point_credit_math_and_rate_provenance() {
     );
     // 1,000,000 fresh * 100 + cached * 10 + output * 500 microcredits.
     assert_eq!(r.modeled_credits.value, MicroUnits(100_001_010));
+    assert_eq!(r.modeled_credit_components.fresh, MicroUnits(100_000_000));
+    assert_eq!(r.modeled_credit_components.cached, MicroUnits(10));
+    assert_eq!(r.modeled_credit_components.output, MicroUnits(1_000));
     assert_eq!(r.modeled_credits.rate_version, AUDITED_RATE_VERSION);
     assert_eq!(r.modeled_credits.unit, EstimateUnit::CreditEquivalent);
     assert!(r

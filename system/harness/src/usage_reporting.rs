@@ -130,6 +130,12 @@ pub struct Estimate {
     pub incomplete: bool,
     pub labels: BTreeSet<String>,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CreditComponents {
+    pub fresh: MicroUnits,
+    pub cached: MicroUnits,
+    pub output: MicroUnits,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contributor {
@@ -145,6 +151,7 @@ pub struct UsageReport {
     pub end: DateTime<Utc>,
     pub measured: MeasuredTokens,
     pub modeled_credits: Estimate,
+    pub modeled_credit_components: CreditComponents,
     /// Always unavailable for the audited credit-only rate facts.
     pub modeled_api_usd: Estimate,
     /// The ledger has no provider statement/debit interface.
@@ -202,6 +209,7 @@ pub fn report(
         end,
         measured: current.measured.clone(),
         modeled_credits: current.estimate(EstimateUnit::CreditEquivalent),
+        modeled_credit_components: credit_components(&current.rows),
         modeled_api_usd: unavailable(
             EstimateUnit::ApiUsd,
             "api_usd_rate_not_defined_by_audited_facts",
@@ -370,6 +378,23 @@ fn estimate_rows(rows: &[UsageRow], unit: EstimateUnit) -> Estimate {
         incomplete: !labels.is_empty(),
         labels,
     }
+}
+fn credit_components(rows: &[UsageRow]) -> CreditComponents {
+    let mut out = CreditComponents::default();
+    for row in rows {
+        let (Some(model), true) = (row.model.as_deref(), complete(row)) else {
+            continue;
+        };
+        let Some(r) = rate(model) else {
+            continue;
+        };
+        let input = row.input_tokens.unwrap() as i128;
+        let cached = row.cached_input_tokens.unwrap() as i128;
+        out.fresh.0 += (input - cached) * r.fresh as i128;
+        out.cached.0 += cached * r.cached as i128;
+        out.output.0 += row.output_tokens.unwrap() as i128 * r.output as i128;
+    }
+    out
 }
 fn unavailable(unit: EstimateUnit, label: &str) -> Estimate {
     let mut labels = BTreeSet::new();
