@@ -211,6 +211,29 @@ if [ -n "$HEX_BIN" ]; then
     assert_fail "env.sh rejection output exposed a secret filename: $GWS_OUT"
   fi
 
+  # Simulate GNU stat writing a partial value before rejecting the BSD form.
+  # env.sh must discard that output and use the GNU form instead.
+  STAT_DIR="$INSTALL_BASE/stat-bin"
+  mkdir -p "$STAT_DIR"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$1" = "-f" ]; then' \
+    '  printf "partial-mode"' \
+    '  exit 1' \
+    'fi' \
+    'exec /usr/bin/stat "$@"' > "$STAT_DIR/stat"
+  chmod 700 "$STAT_DIR/stat"
+  FALLBACK_OUT=$(env -u GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND \
+    HEX_DIR="$INSTALL_DIR" PATH="$STAT_DIR:$(dirname "$HEX_BIN"):$PATH" \
+    bash -c "source '$INSTALL_DIR/.hex/scripts/env.sh'; printf 'allowed=%s rejected=%s\\n' \"\$ENV_SH_ALLOWED\" \"\${ENV_SH_REJECTED:-missing}\"" 2>&1)
+  if echo "$FALLBACK_OUT" | grep -q 'allowed=loaded rejected=missing' && \
+     echo "$FALLBACK_OUT" | grep -q 'ERROR: refusing to load secret file: group or other permissions are set' && \
+     ! echo "$FALLBACK_OUT" | grep -q 'partial-mode\|shared.env'; then
+    assert_pass "env.sh safely falls back when BSD stat emits output before failing"
+  else
+    assert_fail "env.sh did not safely handle a failed BSD stat probe: $FALLBACK_OUT"
+  fi
+
   GWS_OVERRIDE=$(GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=keyring \
     HEX_DIR="$INSTALL_DIR" PATH="$(dirname "$HEX_BIN"):$PATH" \
     bash -c "source '$INSTALL_DIR/.hex/scripts/env.sh'; printf '%s' \"\$GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND\"" 2>/dev/null)

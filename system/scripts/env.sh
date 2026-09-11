@@ -30,7 +30,12 @@ fi
 if [[ -d "$HEX_DIR/.hex/secrets" ]]; then
   for _sf in "$HEX_DIR"/.hex/secrets/*.env; do
     [[ -e "$_sf" ]] || continue
-    _mode="$(stat -f '%Lp' "$_sf" 2>/dev/null || stat -c '%a' "$_sf" 2>/dev/null)"
+    # Do not combine these probes with `||` in one command substitution.
+    # Some GNU stat variants write output for the unsupported form before
+    # returning failure, which corrupts the fallback mode value.
+    if ! _mode="$(stat -f '%Lp' "$_sf" 2>/dev/null)" || ! [[ "$_mode" =~ ^[0-7]{3,4}$ ]]; then
+      _mode="$(stat -c '%a' "$_sf" 2>/dev/null)" || _mode=""
+    fi
     if [[ -z "$_mode" ]] || (( (8#$_mode & 0077) != 0 )); then
       echo "ERROR: refusing to load secret file: group or other permissions are set" >&2
       continue
