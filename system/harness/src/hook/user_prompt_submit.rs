@@ -1,62 +1,90 @@
-//! Claude Code `UserPromptSubmit` hook — injects relevant workspace memory as
-//! `additionalContext`. This is the consumer that retires V1's zero-consumers
-//! failure. Fail-open: any error → emit nothing, exit 0, never block the turn.
+//! Claude Code `UserPromptSubmit` hook. It injects relevant workspace memory as
+//! `additionalContext` and fails open without blocking the turn.
 
 use serde_json::{json, Value};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
-fn emit_context(context: &str) {
-    let out = json!({
+fn emit_context(mut output: impl Write, context: &str) -> std::io::Result<()> {
+    let value = json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": context,
         }
     });
-    println!("{out}");
+    writeln!(output, "{value}")
+}
+
+fn run_with_io<F>(
+    mut input: impl Read,
+    output: impl Write,
+    mut error_output: impl Write,
+    root_lookup: F,
+) where
+    F: FnOnce() -> Option<PathBuf>,
+{
+    let mut raw = String::new();
+    if let Err(error) = input.read_to_string(&mut raw) {
+        let _ = writeln!(
+            error_output,
+            "[hook/user-prompt-submit] read hook input: {error}"
+        );
+        return;
+    }
+    let input: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = writeln!(
+                error_output,
+                "[hook/user-prompt-submit] parse hook input: {error}"
+            );
+            return;
+        }
+    };
+    let Some(prompt) = input.get("prompt").and_then(Value::as_str) else {
+        let _ = writeln!(
+            error_output,
+            "[hook/user-prompt-submit] hook input has no string prompt"
+        );
+        return;
+    };
+    let Some(hex_dir) = root_lookup() else {
+        let _ = writeln!(
+            error_output,
+            "[hook/user-prompt-submit] HEX_DIR/CLAUDE_PROJECT_DIR not set; memory injection disabled"
+        );
+        return;
+    };
+
+    let outcome = crate::memory::recall::recall(&hex_dir, prompt, false);
+    if outcome.injected {
+        if let Err(error) = emit_context(output, &outcome.context) {
+            let _ = writeln!(
+                error_output,
+                "[hook/user-prompt-submit] write hook output: {error}"
+            );
+        }
+    }
 }
 
 pub fn run() {
-    // Read the hook's stdin JSON; `prompt` carries the user's text.
-    let mut raw = String::new();
-    if std::io::stdin().read_to_string(&mut raw).is_err() {
-        std::process::exit(0);
-    }
-    let input: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => std::process::exit(0),
-    };
-    let prompt = match input.get("prompt").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => std::process::exit(0),
-    };
-
-    let hex_dir = match std::env::var("HEX_DIR")
-        .ok()
-        .or_else(|| std::env::var("CLAUDE_PROJECT_DIR").ok())
-        .map(PathBuf::from)
-    {
-        Some(d) => d,
-        None => {
-            // S6 — a missing HEX_DIR is a config bug, not input noise: be loud.
-            eprintln!(
-                "[hook/user-prompt-submit] HEX_DIR/CLAUDE_PROJECT_DIR not set — memory injection disabled"
-            );
-            std::process::exit(0);
-        }
-    };
-
-    // Mike's interactive session — not a fleet agent — so for_agent = false.
-    let outcome = crate::memory::recall::recall(&hex_dir, prompt, false);
-    if outcome.injected {
-        emit_context(&outcome.context);
-    }
-    std::process::exit(0);
+    run_with_io(
+        std::io::stdin(),
+        std::io::stdout(),
+        std::io::stderr(),
+        || {
+            std::env::var("HEX_DIR")
+                .ok()
+                .or_else(|| std::env::var("CLAUDE_PROJECT_DIR").ok())
+                .map(PathBuf::from)
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[test]
     fn emit_context_is_valid_hook_json() {
@@ -69,5 +97,53 @@ mod tests {
             }
         });
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
+    }
+
+    #[test]
+    fn actual_hook_path_keeps_interactive_private_recall() {
+        let root = tempfile::TempDir::new().unwrap();
+        let registry = root.path().join(".hex/config/memory-authority.toml");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        std::fs::write(
+            registry,
+            "version=1\n[[sources]]\nid='hook-public'\npath='docs/hook.md'\ntopics=['memory recall']\nauthority_status='current'\nprivate=false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("docs/hook.md"),
+            "HOOK_PUBLIC_SOURCE_CANARY memory recall",
+        )
+        .unwrap();
+        let db = crate::memory::db_path(root.path());
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        crate::memory::vector::register_sqlite_vec();
+        let conn = Connection::open(db).unwrap();
+        crate::memory::schema::apply_plan1_baseline_for_test(&conn).unwrap();
+        crate::memory::schema::apply_plan2(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO facts (id,subject,predicate,object,importance,created_at,updated_at,private) \
+             VALUES ('private-hook','memory','recall','HOOK_PRIVATE_CANARY',0.9,'2026-09-10','2026-09-10',1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let input = br#"{"prompt":"what does memory recall contain privately"}"#;
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        run_with_io(&input[..], &mut output, &mut errors, || {
+            Some(root.path().to_path_buf())
+        });
+        assert!(errors.is_empty());
+        let value: Value = serde_json::from_slice(&output).unwrap();
+        assert!(value["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("HOOK_PRIVATE_CANARY"));
+        assert!(value["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("HOOK_PUBLIC_SOURCE_CANARY"));
     }
 }

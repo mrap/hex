@@ -2481,57 +2481,264 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use crate::test_child::{self, Fault as PrivateChildFault};
     use std::fs;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::io::Write;
     #[cfg(target_os = "macos")]
     use std::os::unix::fs::MetadataExt;
+    use std::thread;
+    use std::time::Duration;
 
     fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
     }
 
-    static UPGRADE_FIXTURE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    /// Serializes and restores every process-global input used by upgrade
-    /// identity preflight. Synthetic legacy fixtures must not inherit a real
-    /// managed app policy from the developer's home directory.
-    struct UpgradeFixtureEnv {
-        previous_home: Option<OsString>,
-        previous_hex_dir: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
+    fn private_upgrade_child(
+        test_name: &str,
+        home: &Path,
+    ) -> std::result::Result<test_child::ChildOutput, String> {
+        private_upgrade_child_with_fault(test_name, home, PrivateChildFault::None)
     }
 
-    impl UpgradeFixtureEnv {
-        fn for_instance(home: &Path, hex_dir: &Path) -> Self {
-            let lock = UPGRADE_FIXTURE_ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous_home = std::env::var_os("HOME");
-            let previous_hex_dir = std::env::var_os("HEX_DIR");
-            std::env::set_var("HOME", home);
-            std::env::set_var("HEX_DIR", hex_dir);
-            Self {
-                previous_home,
-                previous_hex_dir,
-                _lock: lock,
-            }
-        }
+    fn private_upgrade_child_with_fault(
+        test_name: &str,
+        home: &Path,
+        fault: PrivateChildFault,
+    ) -> std::result::Result<test_child::ChildOutput, String> {
+        test_child::run_exact(test_name, home, home, fault)
     }
 
-    impl Drop for UpgradeFixtureEnv {
-        fn drop(&mut self) {
-            match &self.previous_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.previous_hex_dir {
-                Some(value) => std::env::set_var("HEX_DIR", value),
-                None => std::env::remove_var("HEX_DIR"),
-            }
+    fn private_upgrade_test_success(
+        test_name: &str,
+        output: test_child::ChildOutput,
+    ) -> std::result::Result<(), String> {
+        test_child::require_one_pass(test_name, output)
+    }
+
+    /// Legacy upgrade fixtures run only in an exact child with a disposable
+    /// HOME and HEX_DIR. The parent never inherits fixture environment state.
+    fn in_private_upgrade_test(test_name: &str) -> bool {
+        if test_child::in_child(test_name) {
+            test_child::stage("upgrade:child-entry").expect("test-child stage must flush");
+            return false;
         }
+        let home = tempfile::tempdir().expect("private test HOME");
+        let output = private_upgrade_child(test_name, home.path())
+            .unwrap_or_else(|error| panic!("private upgrade test {test_name} failed: {error}"));
+        private_upgrade_test_success(test_name, output).unwrap_or_else(|error| panic!("{error}"));
+        true
+    }
+
+    #[test]
+    fn private_upgrade_runner_rejects_missing_selector() {
+        let home = tempfile::tempdir().unwrap();
+        let output =
+            private_upgrade_child("upgrade::tests::missing_private_fixture", home.path()).unwrap();
+        assert!(output.status.success());
+        let error = private_upgrade_test_success("upgrade::tests::missing_private_fixture", output)
+            .expect_err("a zero-test selector must be rejected");
+        assert!(error.contains("did not prove one exact passing test"));
+        assert!(error.contains("running 0 tests"));
+    }
+
+    #[test]
+    fn private_upgrade_runner_retains_over_cap_output_tails() {
+        const NAME: &str = "upgrade::tests::private_upgrade_runner_retains_over_cap_output_tails";
+        const STDOUT_HEAD: &str = "OVERCAP_STDOUT_HEAD_ONLY";
+        const STDOUT_TAIL: &str = "OVERCAP_STDOUT_TAIL_SENTINEL";
+        const STDERR_HEAD: &str = "OVERCAP_STDERR_HEAD_ONLY";
+        const STDERR_TAIL: &str = "OVERCAP_STDERR_TAIL_SENTINEL";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:over-cap-control-entered")
+                .expect("over-cap control stage must flush");
+            print!(
+                "{STDOUT_HEAD}{}{}",
+                "x".repeat(test_child::OUTPUT_TAIL_BYTES + 128),
+                STDOUT_TAIL
+            );
+            eprint!(
+                "{STDERR_HEAD}{}{}",
+                "y".repeat(test_child::OUTPUT_TAIL_BYTES + 128),
+                STDERR_TAIL
+            );
+            std::io::stdout()
+                .flush()
+                .expect("over-cap stdout must flush");
+            std::io::stderr()
+                .flush()
+                .expect("over-cap stderr must flush");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let output =
+            private_upgrade_child(NAME, home.path()).expect("over-cap owned child must complete");
+        assert!(
+            output.stdout.total_bytes > test_child::OUTPUT_TAIL_BYTES && output.stdout.truncated,
+            "stdout must retain total bytes and truncation after its cap"
+        );
+        assert!(
+            output.stderr.total_bytes > test_child::OUTPUT_TAIL_BYTES && output.stderr.truncated,
+            "stderr must retain total bytes and truncation after its cap"
+        );
+        let stdout_tail = String::from_utf8_lossy(&output.stdout.tail);
+        let stderr_tail = String::from_utf8_lossy(&output.stderr.tail);
+        assert!(stdout_tail.contains(STDOUT_TAIL) && !stdout_tail.contains(STDOUT_HEAD));
+        assert!(stderr_tail.contains(STDERR_TAIL) && !stderr_tail.contains(STDERR_HEAD));
+        assert!(
+            output.status.success(),
+            "over-cap child must exit successfully"
+        );
+        assert!(
+            stdout_tail.contains(&format!("test {NAME} ... ok"))
+                && stdout_tail.contains("test result: ok. 1 passed"),
+            "the retained stdout tail must prove the exact child passed even though its leading count was trimmed"
+        );
+    }
+
+    #[test]
+    fn private_upgrade_runner_reaps_timed_out_owned_group() {
+        const NAME: &str = "upgrade::tests::private_upgrade_runner_reaps_timed_out_owned_group";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:timeout-control-entered")
+                .expect("timeout control stage must flush");
+            let previous = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+            assert_ne!(
+                previous,
+                libc::SIG_ERR,
+                "timeout control must install its child-only SIGTERM disposition"
+            );
+            println!("TIMEOUT_SIGTERM_IGNORED");
+            println!("TIMEOUT_STDOUT_SENTINEL");
+            eprintln!("TIMEOUT_STDERR_SENTINEL");
+            std::io::stdout()
+                .flush()
+                .expect("timeout stdout must flush");
+            std::io::stderr()
+                .flush()
+                .expect("timeout stderr must flush");
+            thread::sleep(Duration::from_secs(60));
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let error = private_upgrade_child(NAME, home.path())
+            .expect_err("the private child must hit its absolute deadline");
+        println!("TIMEOUT_CONTROL_EXPECTED_ERROR:{error}");
+        assert!(error.contains("exceeded 15 seconds"));
+        assert!(error.contains("HEX_TEST_CHILD_STAGE:upgrade:timeout-control-entered"));
+        assert!(error.contains("TIMEOUT_SIGTERM_IGNORED"));
+        assert!(error.contains("TIMEOUT_STDOUT_SENTINEL"));
+        assert!(error.contains("TIMEOUT_STDERR_SENTINEL"));
+        assert!(error.contains("direct child wait: success"));
+        assert!(error.contains("cleanup elapsed_ms="));
+        assert!(error.contains("grace wait: expired/still-running before group KILL"));
+        assert!(error.contains("root child exit does not prove descendant"));
+    }
+
+    #[test]
+    fn private_upgrade_runner_cleans_owned_child_on_pipe_setup_failure() {
+        const NAME: &str =
+            "upgrade::tests::private_upgrade_runner_cleans_owned_child_on_pipe_setup_failure";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:pipe-setup-control-entered")
+                .expect("pipe setup control stage must flush");
+            println!("PIPE_SETUP_STDOUT_SENTINEL");
+            eprintln!("PIPE_SETUP_STDERR_SENTINEL");
+            std::io::stdout()
+                .flush()
+                .expect("pipe setup stdout must flush");
+            std::io::stderr()
+                .flush()
+                .expect("pipe setup stderr must flush");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let stdout_error = private_upgrade_child_with_fault(
+            NAME,
+            home.path(),
+            PrivateChildFault::BeforeStdoutReader,
+        )
+        .expect_err("the controlled stdout setup failure must clean the child");
+        assert!(stdout_error.contains("controlled stdout pipe setup failure"));
+        assert!(stdout_error.contains("owned root child reaped"));
+        assert!(stdout_error.contains("direct child wait: success"));
+        assert!(stdout_error.contains("cleanup elapsed_ms="));
+
+        let error = private_upgrade_child_with_fault(
+            NAME,
+            home.path(),
+            PrivateChildFault::BeforeStderrReader,
+        )
+        .expect_err("the controlled pipe setup failure must fail after spawning the child");
+        assert!(error.contains("controlled stderr pipe setup failure"));
+        assert!(error.contains("owned root child reaped"));
+        assert!(error.contains("stdout reader: bytes="));
+        assert!(!error.contains("stdout reader was not started"));
+        assert!(error.contains("stderr reader was not started"));
+        assert!(error.contains("cleanup elapsed_ms="));
+    }
+
+    #[test]
+    fn private_upgrade_runner_joins_both_readers_before_reader_failure() {
+        const NAME: &str =
+            "upgrade::tests::private_upgrade_runner_joins_both_readers_before_reader_failure";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:reader-join-control-entered")
+                .expect("reader join control stage must flush");
+            println!("READER_STDOUT_SENTINEL");
+            eprintln!("READER_STDERR_SENTINEL");
+            std::io::stdout().flush().expect("reader stdout must flush");
+            std::io::stderr().flush().expect("reader stderr must flush");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let error = private_upgrade_child_with_fault(
+            NAME,
+            home.path(),
+            PrivateChildFault::BothReadersFailAfterRead,
+        )
+        .expect_err("the controlled reader failures must be reported");
+        assert!(error.contains("stdout reader failed: controlled stdout reader failure"));
+        assert!(error.contains("stderr reader failed: controlled stderr reader failure"));
+        assert!(error.contains("HEX_TEST_CHILD_STAGE:upgrade:reader-join-control-entered"));
+        assert!(error.contains("READER_STDOUT_SENTINEL"));
+        assert!(error.contains("READER_STDERR_SENTINEL"));
+        assert!(error.contains("stdout reader: bytes="));
+        assert!(error.contains("stderr reader: bytes="));
+    }
+
+    #[test]
+    fn private_upgrade_runner_admission_is_bounded_and_releases_after_failure() {
+        const NAME: &str =
+            "upgrade::tests::private_upgrade_runner_admission_is_bounded_and_releases_after_failure";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:admission-control-entered")
+                .expect("admission control stage must flush");
+            println!("ADMISSION_STDOUT_SENTINEL");
+            return;
+        }
+
+        let held = test_child::acquire_default_admission()
+            .expect("the initial test-only admission acquisition must succeed");
+        let admission_error = test_child::acquire_admission(Duration::from_secs(1))
+            .expect_err("a held test-only admission guard must fail within its own deadline");
+        assert!(admission_error.contains("admission exceeded 1 seconds before child spawn"));
+        drop(held);
+
+        let home = tempfile::tempdir().unwrap();
+        let cleanup_error = private_upgrade_child_with_fault(
+            NAME,
+            home.path(),
+            PrivateChildFault::BeforeStderrReader,
+        )
+        .expect_err("the real setup failure must release admission after cleanup");
+        assert!(cleanup_error.contains("owned root child reaped"));
+        assert!(cleanup_error.contains("cleanup elapsed_ms="));
+
+        let output = private_upgrade_child(NAME, home.path())
+            .expect("admission must release after the cleanup error");
+        private_upgrade_test_success(NAME, output)
+            .expect("released admission must run the real child");
     }
 
     #[test]
@@ -2624,9 +2831,36 @@ mod tests {
 
     #[test]
     fn preflight_binary_metadata_preserves_true_noop() {
-        let (tmp, source, instance) = binary_preflight_fixture();
-        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &instance);
+        if in_private_upgrade_test("upgrade::tests::preflight_binary_metadata_preserves_true_noop")
+        {
+            return;
+        }
+        test_child::stage("upgrade:preflight-noop-body").expect("test-child stage must flush");
+        let (_tmp, source, instance) = binary_preflight_fixture();
         assert!(!binary_is_stale(&instance, &source).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synthetic_managed_policy_evidence_fails_loudly_in_private_home() {
+        if in_private_upgrade_test(
+            "upgrade::tests::synthetic_managed_policy_evidence_fails_loudly_in_private_home",
+        ) {
+            return;
+        }
+        let (_tmp, source, instance) = binary_preflight_fixture();
+        let home = PathBuf::from(std::env::var_os("HOME").expect("private HOME"));
+        write_file(
+            &home.join("Library/Application Support/Hex/build-signing/policy.json"),
+            "{}",
+        );
+        let error = binary_is_stale(&instance, &source)
+            .expect_err("synthetic managed evidence must preflight");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "synthetic evidence must fail loudly through source preflight: {error}"
+        );
     }
 
     #[test]
@@ -2669,10 +2903,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn preflight_reconciles_stale_versions_pin_when_other_inputs_match() {
+        if in_private_upgrade_test(
+            "upgrade::tests::preflight_reconciles_stale_versions_pin_when_other_inputs_match",
+        ) {
+            return;
+        }
+        test_child::stage("upgrade:stale-pin-body").expect("test-child stage must flush");
+        let _env = crate::test_env::isolate_hex_dir();
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
         let instance = tmp.path().join("instance");
-        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &instance);
         let source_files = [
             "system/scripts/a.sh",
             "system/skills/s/SKILL.md",
@@ -2706,8 +2946,12 @@ mod tests {
             &source.join("system/harness/Cargo.toml"),
             "[package]\nname = \"hex-harness\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
         );
+        test_child::stage("upgrade:stale-pin-fixture-ready")
+            .expect("stale-pin fixture-ready stage must flush");
         init_test_repo(&source);
         seed_commit(&source, "stale versions preflight fixture");
+        test_child::stage("upgrade:stale-pin-git-ready")
+            .expect("stale-pin git-ready stage must flush");
 
         write_file(&instance.join("AGENTS.md"), "# test instance\n");
         write_file(
@@ -2727,13 +2971,19 @@ mod tests {
 
         std::env::set_var("HEX_DIR", &instance);
         let args = vec!["--local".to_string(), source.to_string_lossy().into_owned()];
+        test_child::stage("upgrade:stale-pin-before-run")
+            .expect("stale-pin before-run stage must flush");
         let exit = run(&args);
+        test_child::stage("upgrade:stale-pin-after-run")
+            .expect("stale-pin after-run stage must flush");
         assert_eq!(exit, 0);
         let versions = fs::read_to_string(instance.join("VERSIONS")).unwrap();
         assert_eq!(versions.matches("HEX_FOUNDATION_VERSION=").count(), 1);
         assert!(versions.contains("HEX_FOUNDATION_VERSION=v1.0.0"));
         assert!(versions.contains("# keep this comment"));
         assert!(versions.contains("OTHER_PIN=v9"));
+        test_child::stage("upgrade:stale-pin-assertions-complete")
+            .expect("stale-pin assertions-complete stage must flush");
     }
 
     // The wrapper block's guard is the function signature "claude() {".
@@ -3289,12 +3539,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sync_versions_file_returns_binary_step_health() {
+        if in_private_upgrade_test("upgrade::tests::sync_versions_file_returns_binary_step_health")
+        {
+            return;
+        }
+        test_child::stage("upgrade:sync-health-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hex_dir = tmp.path().join("hex");
         let source_dir = tmp.path().join("source");
         let backup_dir = tmp.path().join("backup");
-        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &hex_dir);
         fs::create_dir_all(&backup_dir).unwrap();
         write_file(&hex_dir.join("VERSIONS"), "HEX_FOUNDATION_VERSION=v0.1.0\n");
         write_file(
@@ -3449,13 +3703,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sync_versions_file_preserves_boi_version_and_comments() {
+        if in_private_upgrade_test(
+            "upgrade::tests::sync_versions_file_preserves_boi_version_and_comments",
+        ) {
+            return;
+        }
+        test_child::stage("upgrade:sync-preserve-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
         let hex_dir = tmp.path().join("hex");
         let source_dir = tmp.path().join("source");
         let backup_dir = tmp.path().join("backup");
-        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &hex_dir);
         fs::create_dir_all(&hex_dir).unwrap();
         fs::create_dir_all(&source_dir).unwrap();
         fs::create_dir_all(&backup_dir).unwrap();
@@ -3663,12 +3922,17 @@ CUSTOM_INSTANCE_PIN=abc123
     #[cfg(unix)]
     #[test]
     fn sync_versions_file_return_type_carries_the_failure_kind() {
+        if in_private_upgrade_test(
+            "upgrade::tests::sync_versions_file_return_type_carries_the_failure_kind",
+        ) {
+            return;
+        }
+        test_child::stage("upgrade:sync-kind-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hex_dir = tmp.path().join("hex");
         let source_dir = tmp.path().join("source");
         let backup_dir = tmp.path().join("backup");
-        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &hex_dir);
         fs::create_dir_all(&backup_dir).unwrap();
         write_file(&hex_dir.join("VERSIONS"), "HEX_FOUNDATION_VERSION=v0.1.0\n");
         write_file(

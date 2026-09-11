@@ -1,206 +1,277 @@
 #!/usr/bin/env bash
-# Audits path references in all system/skills/*/SKILL.md files.
-# Installs hex to a temp dir and checks that referenced paths exist post-install.
-# Exits 0 if all required paths resolve. Exits 1 if any are missing.
-set -uo pipefail
+# Audits install-relative SKILL.md references against their source-layout owner.
+# This checker deliberately does not execute install.sh. The installer can build
+# companions and modify the operator environment, which is outside a static
+# reference audit's contract.
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SKILLS_DIR="$REPO_ROOT/system/skills"
-INSTALL_DIR="/tmp/hex-skillref-test-$$"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+case "$SCRIPT_PATH" in
+    /*) ;;
+    *) SCRIPT_PATH="$PWD/$SCRIPT_PATH" ;;
+esac
+SCRIPT_DIR="${SCRIPT_PATH%/*}"
+REPO_ROOT="${SCRIPT_DIR%/tests}"
 
-cleanup() {
-    rm -rf "$INSTALL_DIR"
-}
-trap cleanup EXIT
+# Use the system interpreter directly so a hostile PATH cannot turn this
+# source-only audit into an invocation of a repository or operator command.
+exec /usr/bin/python3 -I -B - "$REPO_ROOT" <<'PYEOF'
+from __future__ import annotations
 
-echo "Installing hex to $INSTALL_DIR for reference audit..."
-if ! bash "$REPO_ROOT/install.sh" "$INSTALL_DIR" >/dev/null 2>&1; then
-    echo "FAIL: install.sh failed — cannot audit refs"
-    exit 1
-fi
-echo "Install complete. Auditing path references..."
-echo ""
-
-python3 - "$SKILLS_DIR" "$INSTALL_DIR" <<'PYEOF'
-import sys
-import os
 import re
+import sys
+from pathlib import Path, PurePosixPath
 
-skills_dir = sys.argv[1]
-install_root = sys.argv[2]
+repo_root = Path(sys.argv[1]).resolve()
+skills_dir = repo_root / "system" / "skills"
 
-# Template/wildcard patterns to skip
 SKIP_PATTERNS = re.compile(
-    r'\*|'           # glob wildcards
-    r'\{[^}]+\}|'   # {placeholder}
-    r'YYYY|HHMMSS|' # date templates
-    r'<[^>]+>|'     # <placeholder>
-    r'NNN|'          # numeric placeholder
-    r'WXX'           # week template
+    r"\*|"             # glob wildcards
+    r"\{[^}]+\}|"      # placeholders
+    r"YYYY|HHMMSS|NNN|WXX|"  # date and numeric templates
+    r"<[^>]+>"          # placeholders
 )
-
-# Path prefixes that indicate install-relative paths
-HEX_DIR_PREFIX = re.compile(r'^\$HEX_DIR/')
-
-# Only check paths that look like they reference known install-relative directories
+HEX_DIR_PREFIX = re.compile(r"^\$\{?HEX_DIR\}?/")
 KNOWN_PREFIXES = (
-    '.hex/',
-    '.claude/',
-    '.agents/',
-    'me/',
-    'evolution/',
-    'projects/',
-    'people/',
-    'landings/',
-    'raw/',
-    'specs/',
-    'todo.md',
-    'CLAUDE.md',
-    'AGENTS.md',
+    ".hex/", ".agents/", ".claude/", "me/", "evolution/", "projects/", "people/",
+    "landings/", "raw/", "specs/",
 )
+ROOT_FILES = {"todo.md", "CLAUDE.md", "AGENTS.md"}
 
-def normalize_path(path):
-    """Strip $HEX_DIR/ prefix; return path relative to install root."""
-    path = path.strip().strip('"\'')
-    path = HEX_DIR_PREFIX.sub('', path)
-    # Remove leading ./
-    if path.startswith('./'):
-        path = path[2:]
-    return path
+# These paths are created by the installer or during normal operation. They are
+# intentionally reported as optional, never treated as source files.
+OPTIONAL_PREFIXES = (
+    ".hex/.upgrade-cache/", ".hex/memory/",
+    "projects/", "people/", "landings/", "raw/", "specs/",
+)
+OPTIONAL_PATHS = {
+    ".hex/", ".hex/llm-preference", ".hex/memory.db", ".hex/migrate-from",
+    ".hex/settings.local.json", ".hex/upgrade.json", "evolution/", "me/",
+}
 
-def should_skip(path):
-    """True if path is a template, wildcard, or clearly not checkable."""
-    if SKIP_PATTERNS.search(path):
-        return True
-    # Skip if no slash (single-word tokens aren't paths)
-    if '/' not in path and path not in ('todo.md', 'CLAUDE.md', 'AGENTS.md'):
-        return True
-    return False
+# install.sh builds this binary from the harness crate and copies it into the
+# installed layout. A generated binary is valid only when both declarations
+# remain present in source; it is not a blanket exception for missing files.
+GENERATED = {
+    ".hex/bin/hex": (
+        "system/harness/Cargo.toml",
+        "install.sh",
+    ),
+}
 
-def extract_paths_from_skill(skill_md_path):
-    """Extract candidate path references from a SKILL.md file."""
-    with open(skill_md_path, 'r') as f:
-        content = f.read()
 
-    paths = []
+def normalize_path(path: str) -> str:
+    path = path.strip().strip("\"'")
+    path = HEX_DIR_PREFIX.sub("", path)
+    return path[2:] if path.startswith("./") else path
 
-    # 1. Inline backtick code: `some/path`
-    inline_codes = re.findall(r'`([^`\n]+)`', content)
-    for code in inline_codes:
-        code = code.strip()
-        # Strip shell command prefix (bash, python3, etc.)
-        code = re.sub(r'^(bash|python3|sh)\s+', '', code)
-        # Strip $HEX_DIR/ prefix
-        code = HEX_DIR_PREFIX.sub('', code)
-        # Strip arguments (space onwards)
-        code = code.split()[0] if ' ' in code else code
-        # Strip leading ./
-        if code.startswith('./'):
-            code = code[2:]
-        if '/' in code or code in ('todo.md', 'CLAUDE.md', 'AGENTS.md'):
+
+def should_skip(path: str) -> bool:
+    return bool(SKIP_PATTERNS.search(path)) or (
+        "/" not in path and path not in ROOT_FILES
+    )
+
+
+def extract_paths(skill_md: Path) -> list[str]:
+    content = skill_md.read_text(encoding="utf-8")
+    paths: list[str] = []
+    for code in re.findall(r"`([^`\n]+)`", content):
+        code = re.sub(r"^(?:bash|python3|sh)\s+", "", code.strip())
+        code = code.split()[0] if " " in code else code
+        if "/" in code or code in ROOT_FILES:
             paths.append(code)
-
-    # 2. Code block commands: bash $HEX_DIR/... or python3 $HEX_DIR/...
-    code_blocks = re.findall(r'```[^\n]*\n(.*?)```', content, re.DOTALL)
-    for block in code_blocks:
+    for block in re.findall(r"```[^\n]*\n(.*?)```", content, re.DOTALL):
         for line in block.splitlines():
             line = line.strip()
-            # Skip comments
-            if line.startswith('#'):
+            if line.startswith("#"):
                 continue
-            # Find $HEX_DIR/ paths in code block lines
-            matches = re.findall(r'\$HEX_DIR/(\S+)', line)
-            for m in matches:
-                m = m.rstrip('.,;:)\'"')
-                paths.append(m)
-            # Find .hex/ paths
-            matches = re.findall(r'(?:^|\s)(\.hex/\S+)', line)
-            for m in matches:
-                m = m.rstrip('.,;:)\'"')
-                paths.append(m)
+            paths.extend(re.findall(r"\$\{?HEX_DIR\}?/(\S+)", line))
+            paths.extend(re.findall(r"(?:^|\s)((?:\.hex|\.agents|\.claude)/\S+)", line))
+    return [path.rstrip(".,;:)\'\"") for path in paths]
 
-    return paths
+
+def safe_relative(path: str) -> PurePosixPath | None:
+    pure = PurePosixPath(path.rstrip("/"))
+    if not path or pure.is_absolute() or ".." in pure.parts:
+        return None
+    return pure
+
+
+def is_bounded(root: Path, candidate: Path) -> bool:
+    """Allow only files whose resolved path stays under the declared source root."""
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def source_path(path: str) -> tuple[Path, str] | None:
+    """Map an installed reference to its authoritative source owner."""
+    pure = safe_relative(path)
+    if pure is None:
+        return None
+    parts = pure.parts
+    if path.startswith(".hex/"):
+        return repo_root / "system" / Path(*parts[1:]), "system"
+    if path.startswith(".agents/skills/"):
+        return repo_root / "system" / "skills" / Path(*parts[2:]), "system/skills"
+    if path.startswith(".claude/commands/"):
+        return repo_root / "system" / "commands" / Path(*parts[2:]), "system/commands"
+    if path == "AGENTS.md" or path == "CLAUDE.md":
+        return repo_root / "templates" / "AGENTS.md", "templates/AGENTS.md"
+    if path == "todo.md":
+        return repo_root / "templates" / "todo.md", "templates/todo.md"
+    if path == "me/me.md":
+        return repo_root / "templates" / "me.md", "templates/me.md"
+    if path == "evolution/observations.md":
+        return repo_root / "templates" / "observations.md", "templates/observations.md"
+    return None
+
+
+def uncommented(line: str) -> str:
+    """Return a TOML or shell line with an unquoted comment removed."""
+    quote = ""
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote == '"':
+            escaped = True
+        elif char in ("'", '"'):
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+        elif char == "#" and not quote:
+            return line[:index]
+    return line
+
+
+def cargo_declares_hex(manifest: Path) -> bool:
+    in_binary = False
+    for raw_line in manifest.read_text(encoding="utf-8").splitlines():
+        line = uncommented(raw_line).strip()
+        if line == "[[bin]]":
+            in_binary = True
+            continue
+        if line.startswith("["):
+            in_binary = False
+            continue
+        if in_binary and re.fullmatch(r'name\s*=\s*"hex"', line):
+            return True
+    return False
+
+
+def installer_publishes_hex(installer: Path) -> bool:
+    statement = re.compile(r'cp\s+"\$built"\s+"\$TARGET_DIR/\.hex/bin/hex"\s*')
+    return any(
+        statement.fullmatch(uncommented(raw_line).strip())
+        for raw_line in installer.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def generated_is_declared(path: str) -> bool:
+    declaration = GENERATED.get(path)
+    if declaration is None:
+        return False
+    source_file, installer_file = declaration
+    source = repo_root / source_file
+    installer = repo_root / installer_file
+    return (
+        is_bounded(repo_root, source)
+        and is_bounded(repo_root, installer)
+        and source.is_file()
+        and installer.is_file()
+        and cargo_declares_hex(source)
+        and installer_publishes_hex(installer)
+    )
+
 
 errors = 0
 warnings = 0
 checked = 0
-missing_required = []
-missing_optional = []
-
-for skill_name in sorted(os.listdir(skills_dir)):
-    skill_path = os.path.join(skills_dir, skill_name)
-    if not os.path.isdir(skill_path):
-        continue
-
-    skill_md = os.path.join(skill_path, 'SKILL.md')
-    if not os.path.exists(skill_md):
-        continue
-
-    checked += 1
-    raw_paths = extract_paths_from_skill(skill_md)
-    checked_for_skill = set()
-
-    for raw_path in raw_paths:
-        path = normalize_path(raw_path)
-
-        if should_skip(path):
+if not is_bounded(repo_root, skills_dir):
+    print("  ERROR skills: system/skills  [skill root escapes repository]")
+    errors += 1
+elif not skills_dir.is_dir():
+    print("  ERROR skills: system/skills  [missing skill root]")
+    errors += 1
+else:
+    for skill_path in sorted(skills_dir.iterdir()):
+        if not is_bounded(repo_root, skill_path):
+            print(f"  ERROR {skill_path.name}: skill directory escapes repository")
+            errors += 1
             continue
-
-        # Only audit paths that start with known install-relative prefixes
-        if not any(path.startswith(p) for p in KNOWN_PREFIXES):
+        if not skill_path.is_dir():
             continue
-
-        if path in checked_for_skill:
+        skill_md = skill_path / "SKILL.md"
+        if not is_bounded(repo_root, skill_md):
+            print(f"  ERROR {skill_path.name}: SKILL.md escapes repository")
+            errors += 1
             continue
-        checked_for_skill.add(path)
-
-        full_path = os.path.join(install_root, path)
-        # For wildcard-like endings, check the directory instead
-        check_path = full_path
-        if full_path.endswith('/'):
-            check_path = full_path.rstrip('/')
-
-        if os.path.exists(check_path):
-            print(f"  OK    {skill_name}: {path}")
-        else:
-            # Script/python files are required; data files are optional
-            ext = os.path.splitext(path)[1]
-            if ext in ('.sh', '.py'):
-                print(f"  ERROR {skill_name}: {path}  [NOT FOUND]")
-                missing_required.append((skill_name, path))
+        if not skill_md.is_file():
+            continue
+        checked += 1
+        seen: set[str] = set()
+        for raw_path in extract_paths(skill_md):
+            path = normalize_path(raw_path)
+            if should_skip(path) or (not path.startswith(KNOWN_PREFIXES) and path not in ROOT_FILES):
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            if safe_relative(path) is None:
+                print(f"  ERROR {skill_path.name}: {path}  [unsafe install-relative path]")
                 errors += 1
-            else:
-                print(f"  WARN  {skill_name}: {path}  [not found — may be runtime-created]")
-                missing_optional.append((skill_name, path))
+                continue
+            if path in GENERATED:
+                if generated_is_declared(path):
+                    print(f"  OK    {skill_path.name}: {path}  [generated from declared source]")
+                else:
+                    print(f"  ERROR {skill_path.name}: {path}  [generated artifact declaration missing]")
+                    errors += 1
+                continue
+            if path in OPTIONAL_PATHS or path.startswith(OPTIONAL_PREFIXES):
+                if path.endswith((".py", ".sh")):
+                    print(f"  ERROR {skill_path.name}: {path}  [missing required script]")
+                    errors += 1
+                    continue
+                print(f"  WARN  {skill_path.name}: {path}  [runtime-created or optional]")
                 warnings += 1
+                continue
+            mapped = source_path(path)
+            if mapped is not None:
+                candidate, owner = mapped
+                required_file = (
+                    bool(PurePosixPath(path.rstrip("/")).suffix)
+                    or path.startswith(".hex/bin/")
+                )
+                if not is_bounded(repo_root, candidate):
+                    print(f"  ERROR {skill_path.name}: {path}  [source escapes repository]")
+                    errors += 1
+                elif not candidate.exists():
+                    print(f"  ERROR {skill_path.name}: {path}  [missing source: {candidate.relative_to(repo_root)}]")
+                    errors += 1
+                elif required_file and not candidate.is_file():
+                    print(f"  ERROR {skill_path.name}: {path}  [required source is not a file]")
+                    errors += 1
+                else:
+                    print(f"  OK    {skill_path.name}: {path}  [{owner}]")
+                continue
+            # A supported install-relative path must have a source mapping. This
+            # keeps a missing script or binary from being hidden as an optional path.
+            print(f"  ERROR {skill_path.name}: {path}  [no source-layout mapping]")
+            errors += 1
+
+if checked == 0:
+    print("  ERROR skills: no readable SKILL.md files found")
+    errors += 1
 
 print()
 print(f"Checked: {checked} SKILL.md files  |  Errors: {errors}  |  Warnings: {warnings}")
-
-if missing_required:
-    print()
-    print("Missing required paths (scripts/binaries):")
-    for skill, path in missing_required:
-        print(f"  {skill}: {path}")
-
-if missing_optional:
-    print()
-    print("Missing optional paths (runtime-created or optional):")
-    for skill, path in missing_optional:
-        print(f"  {skill}: {path}")
-
-if errors > 0:
-    sys.exit(1)
-sys.exit(0)
+if errors:
+    print("FAIL: skill reference audit found invalid source references")
+    raise SystemExit(1)
+print("PASS: skill reference audit succeeded")
 PYEOF
-
-exit_code=$?
-
-if [ $exit_code -eq 0 ]; then
-    echo "PASS: skill reference audit succeeded"
-else
-    echo "FAIL: skill reference audit found missing required paths"
-fi
-
-exit $exit_code

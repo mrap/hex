@@ -25,6 +25,7 @@ impl Fixture {
         let source = temp.path().join("source");
         let hex = temp.path().join("hex");
         let bin = temp.path().join("bin");
+        let managed = temp.path().join("managed-target");
         write(&source.join("templates/AGENTS.md"), "fixture");
         write(
             &source.join("system/code-intel/Cargo.toml"),
@@ -81,6 +82,15 @@ else: raise AssertionError(args)
             &home.join("Library/Application Support/Hex/build-signing/policy.json"),
             "{}",
         );
+        fs::create_dir_all(home.join(".boi/v2")).unwrap();
+        fs::create_dir_all(&managed).unwrap();
+        write(
+            &home.join(".boi/v2/daemon.toml"),
+            format!(
+                "cargo_target_dir = \"{}\"\n[managed_target_policy]\nrevision = \"fixture\"\nallowed_roots = [\"{}\"]\ndenied_roots = [\"{}\"]\n",
+                managed.display(), managed.display(), temp.path().join("denied").display()
+            ),
+        );
         for args in [
             vec!["init", "-q"],
             vec!["add", "."],
@@ -123,12 +133,18 @@ else: raise AssertionError(args)
 import pathlib,sys,os,json
 home=pathlib.Path.home();state=json.loads((home/'fixture.json').read_text());args=sys.argv[1:]
 with (home/'calls').open('a') as f:f.write('cargo\n')
-assert args[:4]==['build','--locked','--release','--package'];assert args[4]=='scipd'
-target=pathlib.Path(args[args.index('--target-dir')+1]);host=args[args.index('--target')+1]
-assert target.is_absolute(); assert host=='aarch64-apple-darwin'
+assert args==['build','--locked','--release','--package','scipd','--bin','cq','--bin','scipd','--target','aarch64-apple-darwin'],args
+target=pathlib.Path(os.environ['CARGO_TARGET_DIR']);host=args[args.index('--target')+1]
+assert target.is_absolute(); assert host=='aarch64-apple-darwin'; assert os.environ['CARGO_BUILD_BUILD_DIR']==str(target)
 if state.get('fail')=='build':raise SystemExit(9)
 out=target/('wrong-target' if state.get('fail')=='wrong-target' else host)/'release';out.mkdir(parents=True)
-for name in ('cq','scipd'):(out/name).write_text(name)
+for name in ('cq','scipd'):
+    path=out/name; path.write_text(name)
+    path.chmod(0o755)
+if state.get('fail')=='empty':(out/'cq').write_text('')
+if state.get('fail')=='nonexec':(out/'cq').chmod(0o644)
+if state.get('fail')=='symlink':
+    (out/'cq').unlink(); (out/'cq').symlink_to(out/'scipd')
 "#,
         );
         for name in ["cargo", "rustc"] {
@@ -143,16 +159,31 @@ for name in ('cq','scipd'):(out/name).write_text(name)
         }
     }
     fn run(&self) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_hex"))
+        self.command().output().unwrap()
+    }
+    fn run_with_inherited_build_dir(&self) -> Output {
+        self.command()
+            .env(
+                "CARGO_BUILD_BUILD_DIR",
+                self.home.join("wrong-inherited-build-dir"),
+            )
+            .output()
+            .unwrap()
+    }
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hex"));
+        command
             .args(["upgrade", "--local"])
             .arg(&self.source)
             .env_clear()
             .env("HOME", &self.home)
             .env("HEX_DIR", &self.hex)
-            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
-            .env("CARGO_BUILD_TARGET", "wrong-inherited-target")
-            .output()
-            .unwrap()
+            .env(
+                "PATH",
+                format!("{}:/opt/homebrew/bin:/usr/bin:/bin", self.bin.display()),
+            )
+            .env("CARGO_BUILD_TARGET", "wrong-inherited-target");
+        command
     }
     fn state(&self) -> serde_json::Value {
         serde_json::from_slice(&fs::read(self.home.join("fixture.json")).unwrap()).unwrap()
@@ -210,14 +241,35 @@ fn actual_cli_resumes_companions_without_versions_or_hex_build() {
 
 #[test]
 fn actual_cli_build_failures_never_publish_or_record_success() {
-    for failure in ["build", "wrong-target"] {
+    for failure in ["build", "wrong-target", "empty", "nonexec", "symlink"] {
         let fixture = Fixture::new();
         fixture.fail(failure);
         let result = fixture.run();
         assert!(!result.status.success(), "{failure}");
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            output.contains("retained evidence: invocation="),
+            "{failure}: {output}"
+        );
+        assert!(output.contains("receipt="), "{failure}: {output}");
+        assert!(output.contains("target="), "{failure}: {output}");
         assert!(!fixture.calls().contains("install code-intel"));
         assert!(!fixture.hex.join(".hex/upgrade.json").exists());
     }
+}
+
+#[test]
+fn actual_cli_rejects_inherited_build_selection_before_fake_cargo() {
+    let fixture = Fixture::new();
+    let result = fixture.run_with_inherited_build_dir();
+    assert!(!result.status.success());
+    assert!(!fixture.calls().contains("cargo"));
+    assert!(!fixture.calls().contains("install code-intel"));
+    assert!(!fixture.hex.join(".hex/upgrade.json").exists());
 }
 
 #[test]

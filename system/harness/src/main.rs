@@ -75,6 +75,8 @@ mod test_env {
         assert_eq!(std::env::var_os("HEX_DIR"), previous);
     }
 }
+#[cfg(test)]
+mod test_child;
 // Personal overlay (discovered, never named here). build.rs globs
 // $HEX_DIR/.hex/harness-personal/integration_*.rs → OUT_DIR/personal_mods.rs,
 // exposing `probe_registry() -> Vec<(&'static str, ProbeFn)>`.
@@ -3075,7 +3077,7 @@ fn run_messages(command: MessagesCommands) -> i32 {
             hex::messages::build_reply_event(question_id, &ids, text.clone())
         }
     };
-    match hex::harness::submit(&conn, &event, hex::worker::run::run_worker) {
+    match hex::harness::submit_with_root(&conn, &hex_dir, &event, hex::worker::run::run_worker) {
         Ok(r) => {
             if let Some(p) = &r.prompt {
                 println!("hex asks (question {}): {}", p.id, p.text);

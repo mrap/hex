@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # test_env_resolution.sh — E2E tests for env.sh, path resolution, and native hex commands.
 #
-# Validates the current (post-rustification) installed shape:
-#   1. env.sh exists after install and is executable
+# Validates the current (post-rustification) environment shape:
+#   1. env.sh exists in an assembled fixture and is executable
 #   2. HEX_DIR / AGENT_DIR are set after sourcing env.sh
 #   3. PATH composition is delegated to `hex env path` correctly
 #   4. hex binary is installed and functional (replaces hex-agent-spawn.sh)
@@ -12,8 +12,8 @@
 #   8. Version is reconciled — Cargo.toml is the canonical source
 #
 # Usage:
-#   bash test_env_resolution.sh                   # Run against local checkout
-#   docker build -f tests/Dockerfile.env -t hex-env-test . && docker run hex-env-test
+#   HEX_ENV_TEST_BIN=/absolute/path/to/hex bash tests/test_env_resolution.sh
+#   docker build -f tests/Dockerfile.env -t hex-env-test . && docker run --rm --network none hex-env-test
 
 set -uo pipefail
 
@@ -29,37 +29,109 @@ bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 assert_pass() { PASS=$((PASS + 1)); green "$1"; }
 assert_fail() { FAIL=$((FAIL + 1)); red "$1"; }
 
-# Locate the hex binary: prefer the installed copy, fall back to system PATH.
-find_hex() {
-  local install_dir="$1"
-  if [ -x "$install_dir/.hex/bin/hex" ]; then
-    echo "$install_dir/.hex/bin/hex"
-  elif type -P hex &>/dev/null; then
-    type -P hex
+fatal() {
+  red "$*"
+  exit 2
+}
+
+sha256_file() {
+  if [ -x /usr/bin/shasum ]; then
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+  elif [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum "$1" | /usr/bin/awk '{print $1}'
   else
-    echo ""
+    return 1
   fi
 }
 
-# ── Setup: run install to a temp dir ────────────────────────────────────────
-INSTALL_BASE=$(mktemp -d /tmp/hex-env-test-XXXXXX)
+if [ "${1:-}" != "--inner" ]; then
+  TEST_BIN="${HEX_ENV_TEST_BIN:-}"
+  [ -n "$TEST_BIN" ] || fatal "HEX_ENV_TEST_BIN must name an absolute executable"
+  case "$TEST_BIN" in
+    /*) ;;
+    *) fatal "HEX_ENV_TEST_BIN must be absolute" ;;
+  esac
+  [ ! -L "$TEST_BIN" ] || fatal "HEX_ENV_TEST_BIN must not be a symlink"
+  [ -f "$TEST_BIN" ] || fatal "HEX_ENV_TEST_BIN must be a regular file"
+  [ -x "$TEST_BIN" ] || fatal "HEX_ENV_TEST_BIN must be executable"
+
+  TEST_BIN_DIR="$(cd -P "$(dirname "$TEST_BIN")" && pwd)" || fatal "cannot resolve HEX_ENV_TEST_BIN parent"
+  TEST_BIN="$TEST_BIN_DIR/$(basename "$TEST_BIN")"
+  INSTALL_BASE="$(mktemp -d /tmp/hex-env-test-XXXXXX)" || fatal "cannot create fixture root"
+  cleanup() {
+    rm -rf -- "$INSTALL_BASE"
+  }
+  trap cleanup EXIT HUP INT TERM
+  mkdir -p "$INSTALL_BASE/home"
+
+  env -i \
+    HOME="$INSTALL_BASE/home" \
+    LANG=C \
+    LC_ALL=C \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    HEX_ENV_TEST_BIN="$TEST_BIN" \
+    HEX_ENV_TEST_FIXTURE_ROOT="$INSTALL_BASE" \
+    HEX_ENV_TEST_REPO="$REPO_DIR" \
+    bash "$SCRIPT_DIR/$(basename "$0")" --inner
+  exit $?
+fi
+
+REPO_DIR="${HEX_ENV_TEST_REPO:?missing fixture repository root}"
+INSTALL_BASE="${HEX_ENV_TEST_FIXTURE_ROOT:?missing fixture root}"
+TEST_BIN="${HEX_ENV_TEST_BIN:?missing fixture binary}"
 INSTALL_DIR="$INSTALL_BASE/hex"
-trap 'rm -rf "$INSTALL_BASE"' EXIT
+
+case "$HOME" in
+  "$INSTALL_BASE"/*) ;;
+  *) fatal "inner HOME is outside the owned fixture root" ;;
+esac
+[ -z "${ENV_RESOLUTION_SENTINEL+x}" ] || fatal "outer environment leaked into fixture"
+
+mkdir -p "$INSTALL_DIR/.hex/bin" "$INSTALL_DIR/.hex/scripts" "$INSTALL_DIR/.hex/secrets"
+cp "$TEST_BIN" "$INSTALL_DIR/.hex/bin/hex" || fatal "cannot stage hex binary"
+cp "$REPO_DIR/system/scripts/env.sh" "$INSTALL_DIR/.hex/scripts/env.sh" || fatal "cannot stage env.sh"
+chmod +x "$INSTALL_DIR/.hex/bin/hex" "$INSTALL_DIR/.hex/scripts/env.sh"
+cp "$REPO_DIR/templates/AGENTS.md" "$INSTALL_DIR/AGENTS.md" || fatal "cannot stage AGENTS.md"
+ln -s AGENTS.md "$INSTALL_DIR/CLAUDE.md" || fatal "cannot stage CLAUDE.md link"
+cp "$REPO_DIR/system/version.txt" "$INSTALL_DIR/.hex/version.txt" || fatal "cannot stage version.txt"
+
+HEX_BIN="$INSTALL_DIR/.hex/bin/hex"
+TEST_BIN_SHA256="$(sha256_file "$TEST_BIN")" || fatal "cannot hash HEX_ENV_TEST_BIN"
+HEX_BIN_SHA256="$(sha256_file "$HEX_BIN")" || fatal "cannot hash staged hex binary"
 
 bold "══ hex Environment Resolution Tests ══"
-echo "Install dir: $INSTALL_DIR"
+echo "Fixture dir: $INSTALL_DIR"
 echo ""
 
-# ── Test 0: Install succeeds ────────────────────────────────────────────────
-bold "── Install ──"
-if bash "$REPO_DIR/install.sh" "$INSTALL_DIR" 2>&1 | tail -5; then
-  assert_pass "install.sh completed without errors"
+# ── Test 0: Fixture matches its explicit inputs ────────────────────────────
+bold "── Fixture ──"
+if [ "$TEST_BIN_SHA256" = "$HEX_BIN_SHA256" ]; then
+  assert_pass "fixture binary SHA-256 matches HEX_ENV_TEST_BIN"
 else
-  assert_fail "install.sh failed"
+  assert_fail "fixture binary SHA-256 differs from HEX_ENV_TEST_BIN"
+fi
+if cmp -s "$REPO_DIR/system/scripts/env.sh" "$INSTALL_DIR/.hex/scripts/env.sh"; then
+  assert_pass "fixture env.sh matches source"
+else
+  assert_fail "fixture env.sh differs from source"
+fi
+if cmp -s "$REPO_DIR/templates/AGENTS.md" "$INSTALL_DIR/AGENTS.md" && \
+   [ -L "$INSTALL_DIR/CLAUDE.md" ] && [ "$(readlink "$INSTALL_DIR/CLAUDE.md")" = "AGENTS.md" ]; then
+  assert_pass "fixture agent template matches source"
+else
+  assert_fail "fixture agent template differs from source"
+fi
+if cmp -s "$REPO_DIR/system/version.txt" "$INSTALL_DIR/.hex/version.txt"; then
+  assert_pass "fixture version.txt matches source"
+else
+  assert_fail "fixture version.txt differs from source"
+fi
+if [ "$HEX_BIN" = "$INSTALL_DIR/.hex/bin/hex" ] && [ -x "$HEX_BIN" ]; then
+  assert_pass "HEX_BIN is bound to the staged fixture binary"
+else
+  assert_fail "HEX_BIN is not bound to the staged fixture binary"
 fi
 echo ""
-
-HEX_BIN="$(find_hex "$INSTALL_DIR")"
 
 # ── Test 1: env.sh exists and is executable ─────────────────────────────────
 bold "── env.sh ──"
@@ -171,7 +243,7 @@ if [ -n "$HEX_BIN" ]; then
     assert_fail "hex env path returned empty string"
   fi
 
-  # hex bin dir is created by install.sh (mkdir -p) and included by hex env path
+  # The fixture hex bin directory must be included by hex env path.
   if echo "$PATH_OUT" | grep -q "$INSTALL_DIR/.hex/bin"; then
     assert_pass "PATH includes \$INSTALL_DIR/.hex/bin"
   else
@@ -232,7 +304,7 @@ if [ -n "$HEX_BIN" ]; then
     assert_pass "hex agent subcommand correctly absent (fleet teardown)"
   fi
 else
-  assert_fail "hex binary not found — check install or Docker multi-stage build"
+  assert_fail "hex binary not found in fixture"
 fi
 
 # ── Test 5: CLAUDE.md template references binaries not paths ────────────────
@@ -257,7 +329,7 @@ if [ -f "$CLAUDE_MD" ]; then
     assert_fail "CLAUDE.md doesn't mention env.sh"
   fi
 else
-  assert_fail "CLAUDE.md not found in install"
+  assert_fail "CLAUDE.md not found in fixture"
 fi
 
 # ── Test 6: hex doctor native command works ──────────────────────────────────

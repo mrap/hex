@@ -536,6 +536,115 @@ _resolve_git_tag() {
     printf '%s\n' "$sha"
 }
 
+# Read-only consumer for the one-root managed Cargo target contract. It is used
+# only by the existing managed macOS source-build paths below. The adapter owns
+# policy parsing, alias resolution, and installed-checker receipt validation.
+# That receipt is not installed-checker provenance attestation; the rollout
+# owner verifies installed authority separately. This consumer owns the
+# create/recheck boundary immediately before Cargo.
+_managed_target_receipt() {
+    local requested_target=$1 source_revision=$2
+    local python_bin="${MANAGED_TARGET_PYTHON:-/usr/bin/python3}"
+    local adapter="$SCRIPT_DIR/system/scripts/managed-target-check.py"
+    local receipt parsed
+    local -a adapter_args
+    [ -f "$adapter" ] || { echo "ERROR: managed target adapter is missing: $adapter" >&2; return 1; }
+    adapter_args=(--caller foundation-install --executable "$SCRIPT_DIR/install.sh" --source-revision "$source_revision")
+    [ -z "$requested_target" ] || adapter_args+=(--target "$requested_target")
+    receipt=$("$python_bin" -I -B "$adapter" "${adapter_args[@]}") || {
+        echo "ERROR: managed target first or recheck was rejected" >&2
+        return 1
+    }
+    parsed=$("$python_bin" -I -B -c '
+import hashlib,json,os,re,sys
+executable, source_revision, requested_target = sys.argv[1:]
+try:
+    value=json.loads(sys.stdin.read())
+    canonical=os.path.realpath(executable)
+    with open(canonical,"rb") as handle: digest=hashlib.sha256(handle.read()).hexdigest()
+    required={"schema_version","status","caller_identity","executable_identity","resolved_target","policy_revision","source_revision","selection_source"}
+    identity=value.get("executable_identity")
+    expected_selection=("ARGUMENT" if requested_target else ("CARGO_TARGET_DIR" if "CARGO_TARGET_DIR" in os.environ else ("BOI_CARGO_TARGET_DIR" if "BOI_CARGO_TARGET_DIR" in os.environ else "DAEMON_TOML")))
+    valid=(isinstance(value,dict) and set(value)==required and value.get("schema_version")=="boi.managed-target-check.v1" and value.get("status")=="accepted" and value.get("caller_identity")=="foundation-install" and value.get("source_revision")==source_revision and value.get("selection_source")==expected_selection and isinstance(identity,dict) and set(identity)=={"canonical_path","sha256"} and identity.get("canonical_path")==canonical and identity.get("sha256")==digest and isinstance(value.get("resolved_target"),str) and os.path.isabs(value["resolved_target"]) and isinstance(value.get("policy_revision"),str) and re.fullmatch(r".+:sha256:[0-9a-f]{64}",value["policy_revision"],re.S))
+    if not valid or any(char in value["resolved_target"] for char in "\t\r\n") or any(char in value["policy_revision"] for char in "\t\r\n"):
+        raise ValueError("receipt does not bind this installer request")
+    print(value["resolved_target"]+"\t"+value["policy_revision"])
+except Exception as exc:
+    raise SystemExit("invalid managed target receipt: %s" % exc)
+' "$SCRIPT_DIR/install.sh" "$source_revision" "$requested_target" <<< "$receipt") || {
+        echo "ERROR: managed target receipt is invalid" >&2
+        return 1
+    }
+    printf '%s\n' "$parsed"
+}
+
+_managed_cargo_target_precheck() {
+    local requested_target=$1 source_revision=$2 internal_build_dir="${3:-false}"
+    local python_bin="${MANAGED_TARGET_PYTHON:-/usr/bin/python3}"
+    local adapter="$SCRIPT_DIR/system/scripts/managed-target-check.py"
+    local first first_target first_policy caller_build_dir
+    first=$(_managed_target_receipt "$requested_target" "$source_revision") || return 1
+    IFS=$'\t' read -r first_target first_policy <<< "$first"
+    if [ -n "${CARGO_BUILD_BUILD_DIR+x}" ] && [ "$internal_build_dir" != true ]; then
+        caller_build_dir="$CARGO_BUILD_BUILD_DIR"
+        "$python_bin" -I -B -c '
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location("managed_target_check",sys.argv[1])
+module=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.validate_same_root_build_dir(sys.argv[2],sys.argv[3])
+' "$adapter" "$caller_build_dir" "$first_target" || {
+            echo "ERROR: caller CARGO_BUILD_BUILD_DIR does not match the accepted target" >&2
+            return 1
+        }
+    fi
+    MANAGED_CARGO_TARGET="$first_target"
+    MANAGED_CARGO_POLICY_REVISION="$first_policy"
+}
+
+_managed_cargo_target() {
+    local requested_target=$1 source_revision=$2 internal_build_dir="${3:-false}" require_new="${4:-false}"
+    local second first_target first_policy second_target second_policy created=false
+    _managed_cargo_target_precheck "$requested_target" "$source_revision" "$internal_build_dir" || return 1
+    first_target="$MANAGED_CARGO_TARGET"
+    first_policy="$MANAGED_CARGO_POLICY_REVISION"
+    if [ -e "$first_target" ]; then
+        [ "$require_new" != true ] || {
+            echo "ERROR: installer-owned managed target already exists: $first_target" >&2
+            return 1
+        }
+    else
+        mkdir "$first_target" || { echo "ERROR: could not create accepted managed target: $first_target" >&2; return 1; }
+        created=true
+    fi
+    second=$(_managed_target_receipt "$first_target" "$source_revision") || {
+        if [ "$created" = true ]; then
+            if rmdir "$first_target"; then
+                echo "ERROR: managed target recheck failed; removed empty created target" >&2
+            else
+                echo "ERROR: managed target recheck failed; retained created target: $first_target" >&2
+            fi
+        fi
+        return 1
+    }
+    IFS=$'\t' read -r second_target second_policy <<< "$second"
+    if [ "$second_target" != "$first_target" ] || [ "$second_policy" != "$first_policy" ]; then
+        if [ "$created" = true ]; then
+            if rmdir "$first_target"; then
+                echo "ERROR: managed target changed during recheck; removed empty created target" >&2
+            else
+                echo "ERROR: managed target changed during recheck; retained created target: $first_target" >&2
+            fi
+        fi
+        echo "ERROR: managed target changed during recheck" >&2
+        return 1
+    fi
+    MANAGED_CARGO_TARGET="$second_target"
+    export CARGO_TARGET_DIR="$second_target"
+    export CARGO_BUILD_BUILD_DIR="$second_target"
+    MANAGED_CARGO_BUILD_DIR_INTERNAL=true
+}
+
 # BOI — parallel worker dispatch (boi-v2: the canonical TOML engine).
 # Builds in a MACHINE-OWNED clone under ~/.boi/src/boi and never touches a
 # developer checkout (e.g. ~/github.com/mrap/boi). The previous version ran
@@ -565,24 +674,8 @@ install_or_upgrade_boi() {
         return 1
     fi
     local boi_managed_at_start="$MACOS_APP_MANAGED"
+    local boi_target_dir=""
     local pinned_boi_revision=""
-    if [ "$boi_managed_at_start" = true ]; then
-        pinned_boi_revision=$(_resolve_git_tag "$BOI_REPO" "$BOI_VERSION") || {
-            echo "ERROR: managed BOI install requires a resolvable pinned source tag $BOI_VERSION; refusing raw fallback" >&2
-            return 1
-        }
-    fi
-    mkdir -p "$HOME/.boi/bin" "$HOME/.boi/pids" "$HOME/.boi/logs" \
-             "$HOME/.boi/worktrees" "$HOME/.boi/src"
-
-    # TRIPWIRE (2026-06-05): record who triggers the boi rebuild/symlink loop.
-    # Kept: it identified the OBS-033 resetter (codex-parity tests → install.sh).
-    {
-        echo "[$(date '+%F %T')] install_or_upgrade_boi BOI_VERSION=$BOI_VERSION pid=$$ ppid=$PPID"
-        ps -o pid,ppid,command -p "$PPID" 2>/dev/null || true
-        echo "  args: $0 $*"
-    } >> "$HOME/.boi/install-tripwire.log" 2>&1 || true
-
     # Fast path: the machine-owned build already provides the pinned version.
     # (Also makes repeated install.sh runs — e.g. from test suites — no-ops.)
     # Raw installs use a real-file copy via atomic rename so a rebuild never
@@ -593,6 +686,13 @@ install_or_upgrade_boi() {
         local fast_path=false current=""
         if [ "$MACOS_APP_MANAGED" = true ]; then
             if [ "$MACOS_APP_MODE" = signed-current ]; then
+                local precheck_revision
+                precheck_revision=$(git -C "$SCRIPT_DIR" rev-parse HEAD) || return 1
+                _managed_cargo_target_precheck "${CARGO_TARGET_DIR:-}" "$precheck_revision" || return 1
+                pinned_boi_revision=$(_resolve_git_tag "$BOI_REPO" "$BOI_VERSION") || {
+                    echo "ERROR: managed BOI install requires a resolvable pinned source tag $BOI_VERSION; refusing raw fallback" >&2
+                    return 1
+                }
                 local verified_revision verified_version verified_metadata verified_fields
                 verified_metadata="$(_macos_app_verify_current boi "$HOME/.boi")" || {
                     echo "ERROR: signed BOI installation failed verify-current; refusing raw fast path" >&2
@@ -629,6 +729,31 @@ print("%s\t%s" % (revision, version))
             return 0
         fi
     fi
+
+    if [ "$boi_managed_at_start" = true ]; then
+        local caller_status caller_revision requested_boi_target
+        caller_status=$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=all) || return 1
+        [ -z "$caller_status" ] || { echo "ERROR: source checkout is dirty; refusing managed BOI build" >&2; return 1; }
+        caller_revision=$(git -C "$SCRIPT_DIR" rev-parse HEAD) || return 1
+        requested_boi_target="${CARGO_TARGET_DIR:-}"
+        _managed_cargo_target "$requested_boi_target" "$caller_revision" || return 1
+        boi_target_dir="$MANAGED_CARGO_TARGET"
+        pinned_boi_revision=$(_resolve_git_tag "$BOI_REPO" "$BOI_VERSION") || {
+            echo "ERROR: managed BOI install requires a resolvable pinned source tag $BOI_VERSION; refusing raw fallback" >&2
+            return 1
+        }
+    fi
+
+    mkdir -p "$HOME/.boi/bin" "$HOME/.boi/pids" "$HOME/.boi/logs" \
+             "$HOME/.boi/worktrees" "$HOME/.boi/src"
+
+    # TRIPWIRE (2026-06-05): record who triggers the boi rebuild/symlink loop.
+    # Kept: it identified the OBS-033 resetter (codex-parity tests → install.sh).
+    {
+        echo "[$(date '+%F %T')] install_or_upgrade_boi BOI_VERSION=$BOI_VERSION pid=$$ ppid=$PPID"
+        ps -o pid,ppid,command -p "$PPID" 2>/dev/null || true
+        echo "  args: $0 $*"
+    } >> "$HOME/.boi/install-tripwire.log" 2>&1 || true
 
     # Update the machine-owned build checkout (detached at the tag). A repo
     # that cannot reach the pin (corrupt clone, force-moved tag) self-heals by
@@ -669,9 +794,11 @@ print("%s\t%s" % (revision, version))
     if command -v cargo &>/dev/null; then
         echo "  Building BOI binary..."
         local build_log="$HOME/.boi/logs/boi-build.log"
-        local boi_target_dir="${CARGO_TARGET_DIR:-$HOME/.boi/cargo-target}"
-        if [[ "$boi_target_dir" != /* ]]; then boi_target_dir="$boi_build/$boi_target_dir"; fi
-        boi_target_dir="$(mkdir -p "$boi_target_dir" && cd "$boi_target_dir" && pwd -P)" || return 1
+        if [ "$boi_managed_at_start" != true ]; then
+            boi_target_dir="${CARGO_TARGET_DIR:-$HOME/.boi/cargo-target}"
+            if [[ "$boi_target_dir" != /* ]]; then boi_target_dir="$boi_build/$boi_target_dir"; fi
+            boi_target_dir="$(mkdir -p "$boi_target_dir" && cd "$boi_target_dir" && pwd -P)" || return 1
+        fi
         ( cd "$boi_build" && CARGO_TARGET_DIR="$boi_target_dir" cargo build --release ) > "$build_log" 2>&1 || {
             echo "  BOI: cargo build failed — last 20 lines of $build_log:" >&2
             tail -20 "$build_log" >&2 || true
@@ -783,8 +910,13 @@ _harness_build_from_source() {
     source_revision=$(git -C "$SCRIPT_DIR" rev-parse HEAD) || return 1
     echo "  Building hex from source..."
     local hex_target_dir="${CARGO_TARGET_DIR:-$TARGET_DIR/.hex/cargo-target}"
-    if [[ "$hex_target_dir" != /* ]]; then hex_target_dir="$SCRIPT_DIR/$hex_target_dir"; fi
-    hex_target_dir="$(mkdir -p "$hex_target_dir" && cd "$hex_target_dir" && pwd -P)" || return 1
+    if [ "$hex_managed_at_start" = true ]; then
+        _managed_cargo_target "${CARGO_TARGET_DIR:-}" "$source_revision" || return 1
+        hex_target_dir="$MANAGED_CARGO_TARGET"
+    else
+        if [[ "$hex_target_dir" != /* ]]; then hex_target_dir="$SCRIPT_DIR/$hex_target_dir"; fi
+        hex_target_dir="$(mkdir -p "$hex_target_dir" && cd "$hex_target_dir" && pwd -P)" || return 1
+    fi
     ( cd "$SCRIPT_DIR/system/harness" && CARGO_TARGET_DIR="$hex_target_dir" cargo build --release 2>&1 ) || return 1
     local source_revision_after source_status_after
     source_status_after=$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=all) || return 1
@@ -880,8 +1012,16 @@ _code_intel_build_and_deploy() {
     fi
     local build_target
     local host_target
-    mkdir -p "$target_dir" || return 1
-    build_target=$(mktemp -d "$target_dir/code-intel-build.XXXXXX") || return 1
+    if [ "$cli_managed" = true ] || [ "$daemon_managed" = true ]; then
+        _managed_cargo_target "$target_dir" "$source_revision" || return 1
+        target_dir="$MANAGED_CARGO_TARGET"
+        build_target="$target_dir/code-intel-build.$$.${RANDOM}"
+        _managed_cargo_target "$build_target" "$source_revision" true true || return 1
+        build_target="$MANAGED_CARGO_TARGET"
+    else
+        mkdir -p "$target_dir" || return 1
+        build_target=$(mktemp -d "$target_dir/code-intel-build.XXXXXX") || return 1
+    fi
     host_target=$(rustc -vV | awk '/^host: / {print $2}') || { rm -rf -- "$build_target"; return 1; }
     case "$host_target" in
         ""|*/*|*" "*)

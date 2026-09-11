@@ -11,6 +11,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY system/harness/ system/harness/
 COPY system/code-intel/ system/code-intel/
+# Shared Rust module and its compile-time embedded scripts.
+COPY system/managed_cargo_bridge.rs system/managed_cargo_bridge.rs
+COPY system/scripts/managed-cargo-gate.py system/scripts/managed-target-check.py system/scripts/
 RUN cargo build -p hex-harness 2>&1
 
 # Stage 2: Test runner
