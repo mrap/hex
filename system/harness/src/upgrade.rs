@@ -6,6 +6,7 @@
 //! Drift bug fix: the bash shim omitted hooks sync for v2 layout. This
 //! implementation syncs hooks unconditionally.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -33,7 +34,24 @@ struct SourceDirs {
     /// deployed copies hold runtime state (`.hex/iii/data`, worker `node_modules`).
     iii: PathBuf,
     templates: PathBuf,
+    /// A source file with a fixed managed destination. It participates in the
+    /// same inventory as directory trees; it is not a build-only side copy.
+    managed_cargo_bridge: PathBuf,
     version_txt: Option<PathBuf>,
+}
+
+struct ManagedFile<'a> {
+    source: &'a Path,
+    destination: PathBuf,
+    label: &'a str,
+}
+
+fn managed_files<'a>(sources: &'a SourceDirs, hex_dir: &Path) -> Vec<ManagedFile<'a>> {
+    vec![ManagedFile {
+        source: &sources.managed_cargo_bridge,
+        destination: hex_dir.join(".hex/managed_cargo_bridge.rs"),
+        label: "managed_cargo_bridge.rs",
+    }]
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -113,26 +131,33 @@ fn source_dirs_for_layout(layout: &str, source_root: &Path) -> Option<SourceDirs
             hooks: source_root.join("system/hooks"),
             iii: source_root.join("system/iii"),
             templates: source_root.join("system/templates"),
+            managed_cargo_bridge: source_root.join("system/managed_cargo_bridge.rs"),
             version_txt: Some(source_root.join("system/version.txt")),
         }),
         _ => None,
     }
 }
 
-/// Walk a directory recursively, yielding all file paths (skipping __pycache__).
-fn walk_files(dir: &Path) -> impl Iterator<Item = PathBuf> {
+fn walk_files_checked(dir: &Path) -> io::Result<Vec<PathBuf>> {
     WalkDir::new(dir)
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let is_file = e.file_type().is_file();
-            let in_pycache = e
+        .filter_entry(|entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "target" | "node_modules" | "__pycache__")
+            )
+        })
+        .map(|entry| {
+            let entry = entry.map_err(io::Error::other)?;
+            let is_file = entry.file_type().is_file();
+            let in_pycache = entry
                 .path()
                 .components()
                 .any(|c| c.as_os_str() == "__pycache__");
-            is_file && !in_pycache
+            Ok((is_file && !in_pycache).then(|| entry.path().to_path_buf()))
         })
-        .map(|e| e.path().to_path_buf())
+        .filter_map(|result| result.transpose())
+        .collect()
 }
 
 fn files_differ(a: &Path, b: &Path) -> bool {
@@ -142,11 +167,11 @@ fn files_differ(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn copy_file_with_perms(src: &Path, dst: &Path) -> io::Result<()> {
+fn copy_file_with_perms(src: &Path, dst: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(src, dst)?;
+    fs::write(dst, bytes)?;
     let src_mode = fs::metadata(src)?.permissions().mode();
     if src_mode & 0o111 != 0 {
         let mut perms = fs::metadata(dst)?.permissions();
@@ -156,22 +181,52 @@ fn copy_file_with_perms(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn read_file_state(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn backup_path(
+    backup_dir: &Path,
+    dst_dir: &Path,
+    relative: &Path,
+    scope_root: Option<&Path>,
+) -> PathBuf {
+    let scope = scope_root
+        .and_then(|root| dst_dir.strip_prefix(root).ok())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            backup_dir
+                .parent()
+                .and_then(|root| dst_dir.strip_prefix(root).ok())
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+        })
+        .or_else(|| dst_dir.file_name().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("scope"));
+    backup_dir.join(scope).join(relative)
+}
+
 /// Detect which files in src_dir differ from dst_dir.
 /// Returns (changed, new_count, unchanged, log_lines).
 fn detect_changes(
     src_dir: &Path,
     dst_dir: &Path,
     label: &str,
-) -> (usize, usize, usize, Vec<String>) {
+) -> io::Result<(usize, usize, usize, Vec<String>)> {
     if !src_dir.exists() {
-        return (0, 0, 0, vec![]);
+        return Ok((0, 0, 0, vec![]));
     }
     let mut changed = 0;
     let mut new_count = 0;
     let mut unchanged = 0;
     let mut log = Vec::new();
 
-    for src_file in walk_files(src_dir) {
+    for src_file in walk_files_checked(src_dir)? {
         let rel = match src_file.strip_prefix(src_dir) {
             Ok(r) => r,
             Err(_) => continue,
@@ -191,17 +246,141 @@ fn detect_changes(
             unchanged += 1;
         }
     }
-    (changed, new_count, unchanged, log)
+    Ok((changed, new_count, unchanged, log))
+}
+
+/// Count stale files for a managed destination during preflight. Additive
+/// runtime trees intentionally skip this check because they are not pruned.
+fn detect_stale_changes(
+    src_dir: &Path,
+    dst_dir: &Path,
+    label: &str,
+) -> io::Result<(usize, Vec<String>)> {
+    // A missing source means this scope is not present in the selected
+    // layout. The apply deletion pass has the same policy and must not let
+    // preflight claim work that apply will skip.
+    if !src_dir.exists() || !dst_dir.exists() {
+        return Ok((0, vec![]));
+    }
+    let mut stale = 0;
+    let mut log = Vec::new();
+    for dst_file in walk_files_checked(dst_dir)? {
+        let rel = match dst_file.strip_prefix(dst_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if rel.to_string_lossy().contains("settings.local.json") {
+            continue;
+        }
+        if !src_dir.join(rel).exists() {
+            stale += 1;
+            log.push(format!("  - {label}/{}", rel.to_string_lossy()));
+        }
+    }
+    Ok((stale, log))
+}
+
+fn detect_managed_changes(
+    src_dir: &Path,
+    dst_dir: &Path,
+    label: &str,
+    prune: bool,
+) -> io::Result<(usize, usize, usize, Vec<String>)> {
+    let (mut changed, new_count, unchanged, mut log) = detect_changes(src_dir, dst_dir, label)?;
+    if prune {
+        let (stale, stale_log) = detect_stale_changes(src_dir, dst_dir, label)?;
+        changed += stale;
+        log.extend(stale_log);
+    }
+    Ok((changed, new_count, unchanged, log))
+}
+
+fn detect_managed_file(file: &ManagedFile<'_>) -> io::Result<(usize, usize, usize, Vec<String>)> {
+    if !file.source.exists() {
+        return Ok((0, 0, 0, vec![]));
+    }
+    if !file.destination.exists() {
+        return Ok((0, 1, 0, vec![format!("  + {}", file.label)]));
+    }
+    if files_differ(file.source, &file.destination) {
+        return Ok((1, 0, 0, vec![format!("  ~ {}", file.label)]));
+    }
+    Ok((0, 0, 1, vec![]))
+}
+
+fn apply_managed_file_protected(
+    file: &ManagedFile<'_>,
+    backup_dir: Option<&Path>,
+    protection: Option<(&Path, &UpgradeGitSnapshot)>,
+    mut owned: Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> io::Result<usize> {
+    if !file.source.exists() {
+        return Ok(0);
+    }
+    if let Some((workspace, snapshot)) = protection {
+        protect_sync_path(
+            workspace,
+            &file.destination,
+            Some(file.source),
+            snapshot,
+            owned.as_deref(),
+        )?;
+    }
+    if file.destination.exists() && files_differ(file.source, &file.destination) {
+        if let Some(backup_dir) = backup_dir {
+            let relative = file.destination.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed destination has no filename",
+                )
+            })?;
+            let backup = backup_path(
+                backup_dir,
+                file.destination.parent().unwrap(),
+                Path::new(relative),
+                protection.map(|(root, _)| root),
+            );
+            if let Some(parent) = backup.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if !owned
+                .as_deref()
+                .is_some_and(|paths| paths.contains_key(&file.destination))
+            {
+                fs::copy(&file.destination, backup)?;
+            }
+        }
+    }
+    if !file.destination.exists() || files_differ(file.source, &file.destination) {
+        let bytes = fs::read(file.source)?;
+        copy_file_with_perms(file.source, &file.destination, &bytes)?;
+        if let Some(paths) = owned.as_deref_mut() {
+            paths.insert(file.destination.clone(), Some(bytes));
+        }
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 /// Sync src_dir into dst_dir. Backs up overwritten files into backup_dir if provided.
 /// Returns count of files written.
+#[cfg(test)]
 pub fn apply_sync(src_dir: &Path, dst_dir: &Path, backup_dir: Option<&Path>) -> io::Result<usize> {
+    apply_sync_protected(src_dir, dst_dir, backup_dir, None, None)
+}
+
+fn apply_sync_protected(
+    src_dir: &Path,
+    dst_dir: &Path,
+    backup_dir: Option<&Path>,
+    protection: Option<(&Path, &UpgradeGitSnapshot)>,
+    mut owned: Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> io::Result<usize> {
     if !src_dir.exists() {
         return Ok(0);
     }
     let mut count = 0;
-    for src_file in walk_files(src_dir) {
+    for src_file in walk_files_checked(src_dir)? {
         let rel = match src_file.strip_prefix(src_dir) {
             Ok(r) => r,
             Err(_) => continue,
@@ -210,17 +389,39 @@ pub fn apply_sync(src_dir: &Path, dst_dir: &Path, backup_dir: Option<&Path>) -> 
             continue;
         }
         let dst_file = dst_dir.join(rel);
+        if let Some((workspace, snapshot)) = protection {
+            protect_sync_path(
+                workspace,
+                &dst_file,
+                Some(&src_file),
+                snapshot,
+                owned.as_deref(),
+            )?;
+        }
         if let Some(bak) = backup_dir {
             if dst_file.exists() && files_differ(&src_file, &dst_file) {
-                let bak_file = bak.join(rel);
+                let bak_file = backup_path(bak, dst_dir, rel, protection.map(|(root, _)| root));
                 if let Some(p) = bak_file.parent() {
                     fs::create_dir_all(p)?;
                 }
-                fs::copy(&dst_file, &bak_file)?;
+                if !owned
+                    .as_deref()
+                    .is_some_and(|paths| paths.contains_key(&dst_file))
+                {
+                    let mut backup = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&bak_file)?;
+                    io::copy(&mut fs::File::open(&dst_file)?, &mut backup)?;
+                }
             }
         }
         if !dst_file.exists() || files_differ(&src_file, &dst_file) {
-            copy_file_with_perms(&src_file, &dst_file)?;
+            let source_bytes = fs::read(&src_file)?;
+            copy_file_with_perms(&src_file, &dst_file, &source_bytes)?;
+            if let Some(paths) = owned.as_deref_mut() {
+                paths.insert(dst_file.clone(), Some(source_bytes));
+            }
             count += 1;
         }
     }
@@ -228,23 +429,49 @@ pub fn apply_sync(src_dir: &Path, dst_dir: &Path, backup_dir: Option<&Path>) -> 
 }
 
 /// Remove files in dst_dir that are absent from src_dir. Backs them up first.
+#[cfg(test)]
 pub fn deletion_pass(dst_dir: &Path, src_dir: &Path, backup_dir: &Path) -> io::Result<usize> {
+    deletion_pass_protected(dst_dir, src_dir, backup_dir, None, None)
+}
+
+fn deletion_pass_protected(
+    dst_dir: &Path,
+    src_dir: &Path,
+    backup_dir: &Path,
+    protection: Option<(&Path, &UpgradeGitSnapshot)>,
+    mut owned: Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> io::Result<usize> {
     if !dst_dir.exists() || !src_dir.exists() {
         return Ok(0);
     }
     let mut deleted = 0;
-    for dst_file in walk_files(dst_dir) {
+    for dst_file in walk_files_checked(dst_dir)? {
         let rel = match dst_file.strip_prefix(dst_dir) {
             Ok(r) => r,
             Err(_) => continue,
         };
         if !src_dir.join(rel).exists() {
-            let bak_file = backup_dir.join(rel);
+            if let Some((workspace, snapshot)) = protection {
+                protect_sync_path(workspace, &dst_file, None, snapshot, owned.as_deref())?;
+            }
+            let bak_file = backup_path(backup_dir, dst_dir, rel, protection.map(|(root, _)| root));
             if let Some(p) = bak_file.parent() {
                 fs::create_dir_all(p)?;
             }
-            fs::copy(&dst_file, &bak_file)?;
+            if !owned
+                .as_deref()
+                .is_some_and(|paths| paths.contains_key(&dst_file))
+            {
+                let mut backup = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&bak_file)?;
+                io::copy(&mut fs::File::open(&dst_file)?, &mut backup)?;
+            }
             fs::remove_file(&dst_file)?;
+            if let Some(paths) = owned.as_deref_mut() {
+                paths.insert(dst_file.clone(), None);
+            }
             println!("  → rm (not in foundation): {}", rel.display());
             deleted += 1;
         }
@@ -286,16 +513,22 @@ fn atomic_install_binary(src: &Path, dst: &Path) -> io::Result<()> {
     result
 }
 
-fn make_scripts_executable(dir: &Path) {
-    for f in walk_files(dir) {
-        if f.extension().and_then(|e| e.to_str()) == Some("sh") {
-            if let Ok(meta) = fs::metadata(&f) {
-                let mut perms = meta.permissions();
-                perms.set_mode(perms.mode() | 0o111);
-                let _ = fs::set_permissions(&f, perms);
+fn make_scripts_executable(owned: &HashMap<PathBuf, Option<Vec<u8>>>) -> io::Result<()> {
+    for (path, expected) in owned {
+        if expected.is_some() && path.extension().and_then(|e| e.to_str()) == Some("sh") {
+            if read_file_state(path)? != *expected {
+                return Err(io::Error::other(format!(
+                    "operator edit before chmod: {}",
+                    path.display()
+                )));
             }
+            let meta = fs::metadata(path)?;
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            fs::set_permissions(path, perms)?;
         }
     }
+    Ok(())
 }
 
 fn get_source_dir(args: &Args, hex_dir: &Path) -> Result<PathBuf, String> {
@@ -483,7 +716,13 @@ fn load_config_repo(config_file: &Path) -> Option<String> {
     v.get("repo")?.as_str().map(|s| s.to_string())
 }
 
-fn record_upgrade_sha(config_file: &Path, source_dir: &Path, repo_url: &str) {
+fn record_upgrade_sha(
+    config_file: &Path,
+    source_dir: &Path,
+    repo_url: &str,
+    protection: Option<(&Path, &UpgradeGitSnapshot)>,
+    owned: Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> Result<(), String> {
     let sha = Command::new("git")
         .arg("-C")
         .arg(source_dir)
@@ -498,29 +737,49 @@ fn record_upgrade_sha(config_file: &Path, source_dir: &Path, repo_url: &str) {
             }
         });
 
-    let Some(sha) = sha else { return };
+    let Some(sha) = sha else {
+        return Err(format!(
+            "could not read source SHA from {}",
+            source_dir.display()
+        ));
+    };
 
     let mut data: serde_json::Value = if config_file.exists() {
-        fs::read_to_string(config_file)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(serde_json::json!({}))
+        let content = fs::read_to_string(config_file)
+            .map_err(|e| format!("could not read {}: {e}", config_file.display()))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("could not parse {}: {e}", config_file.display()))?
     } else {
         serde_json::json!({ "repo": repo_url })
     };
 
     data["last_remote_sha"] = serde_json::Value::String(sha.clone());
     let tmp = config_file.with_extension("tmp");
-    if let Ok(s) = serde_json::to_string_pretty(&data) {
-        if fs::write(&tmp, s + "\n").is_ok() {
-            let _ = fs::rename(&tmp, config_file);
-            // `sha` is `git rev-parse HEAD` output — hex ASCII, every byte a char boundary.
-            #[allow(clippy::string_slice)]
-            {
-                println!("  → Recorded upgrade SHA: {}...", &sha[..sha.len().min(8)]);
-            }
-        }
+    let s = serde_json::to_string_pretty(&data)
+        .map_err(|e| format!("could not encode {}: {e}", config_file.display()))?;
+    let serialized = format!("{s}\n");
+    if let Some((workspace, snapshot)) = protection {
+        protect_generated_path(
+            workspace,
+            config_file,
+            serialized.as_bytes(),
+            snapshot,
+            owned.as_deref(),
+        )
+        .map_err(|e| format!("upgrade.json operator edit conflict: {e}"))?;
     }
+    fs::write(&tmp, &serialized).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, config_file)
+        .map_err(|e| format!("could not install {}: {e}", config_file.display()))?;
+    if let Some(paths) = owned {
+        paths.insert(config_file.to_path_buf(), Some(serialized.into_bytes()));
+    }
+    // `sha` is `git rev-parse HEAD` output — hex ASCII, every byte a char boundary.
+    #[allow(clippy::string_slice)]
+    {
+        println!("  → Recorded upgrade SHA: {}...", &sha[..sha.len().min(8)]);
+    }
+    Ok(())
 }
 
 /// Pure decision: is the installed binary stale relative to source?
@@ -550,59 +809,148 @@ fn binary_needs_rebuild(
     version_mismatch || sha_mismatch
 }
 
+/// Parse the package field, not an arbitrary line beginning with `version`.
+fn read_cargo_version(path: &Path) -> io::Result<String> {
+    let content = fs::read_to_string(path)?;
+    let manifest: toml::Value =
+        toml::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    manifest
+        .get("package")
+        .and_then(|p| p.get("version"))
+        .and_then(toml::Value::as_str)
+        .filter(|version| !version.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing package.version in {}", path.display()),
+            )
+        })
+}
+
+/// An absent binary needs installation. A failed probe cannot prove freshness.
+fn read_installed_version(path: &Path) -> io::Result<Option<String>> {
+    let output = match Command::new(path).arg("--version").output() {
+        Ok(output) => output,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{} --version failed with {}",
+            path.display(),
+            output.status
+        )));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut words = text.split_whitespace();
+    if words.next() != Some("hex") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid hex version output",
+        ));
+    }
+    words
+        .next()
+        .map(|version| Some(version.to_owned()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing installed hex version"))
+}
+
+/// Read optional installed metadata without confusing an I/O failure with
+/// an intentionally absent file. An installed SHA is optional for prebuilt
+/// binaries, but a present unreadable file is an upgrade failure.
+fn read_optional_utf8(path: &Path) -> io::Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(|text| Some(text.trim().to_owned()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read the source commit used to prove the rebuilt binary's provenance.
+fn read_source_sha(source_dir: &Path) -> io::Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(source_dir)
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git rev-parse HEAD failed with {}",
+            output.status
+        )));
+    }
+    let sha = String::from_utf8(output.stdout)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        .trim()
+        .to_owned();
+    if sha.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "git rev-parse HEAD returned no commit",
+        ));
+    }
+    Ok(sha)
+}
+
 /// Gather inputs and decide whether the binary is stale. Returns false
 /// ("nothing to do") when VERSIONS or Cargo.toml is absent, matching
 /// `sync_versions_file`'s own preconditions — if those are missing the
 /// rebuild step no-ops anyway, so the gate shouldn't proceed on its account.
-fn binary_is_stale(hex_dir: &Path, source_dir: &Path) -> bool {
+fn binary_is_stale(hex_dir: &Path, source_dir: &Path) -> io::Result<bool> {
     let versions_file = hex_dir.join("VERSIONS");
     let cargo_toml = source_dir.join("system/harness/Cargo.toml");
     if !versions_file.exists() || !cargo_toml.exists() {
-        return false;
+        return Ok(false);
     }
-    let cargo_ver = fs::read_to_string(&cargo_toml).ok().and_then(|c| {
-        c.lines()
-            .find(|l| l.starts_with("version"))
-            .and_then(|l| l.split_once('"').map(|x| x.1))
-            .and_then(|s| s.split('"').next())
-            .map(|s| s.to_string())
-    });
-    let Some(cargo_ver) = cargo_ver else {
-        return false;
-    };
-
+    let signing_mode = hex::app_identity::prepare_upgrade(hex_dir, source_dir)?;
+    if signing_mode == hex::app_identity::UpgradeMode::Migrate {
+        return Ok(true);
+    }
+    // VERSIONS is required by the apply step even when every selected file
+    // is unchanged. Validate it before allowing the no-op fast path.
+    fs::read_to_string(&versions_file)?;
+    let cargo_ver = read_cargo_version(&cargo_toml)?;
     let hex_dot_dir = hex_dir.join(".hex");
-    let installed_ver = Command::new(hex_dot_dir.join("bin/hex"))
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8(o.stdout)
-                .ok()
-                .and_then(|s| s.split_whitespace().nth(1).map(|v| v.to_string()))
-        });
-    let installed_sha = fs::read_to_string(hex_dot_dir.join("bin/hex.sha"))
-        .ok()
-        .map(|s| s.trim().to_string());
-    let source_sha = Command::new("git")
-        .arg("-C")
-        .arg(source_dir)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        });
-    binary_needs_rebuild(
+    let installed_ver = read_installed_version(&hex_dot_dir.join("bin/hex"))?;
+    let installed_sha = match signing_mode {
+        hex::app_identity::UpgradeMode::Signed(revision) => Some(revision),
+        _ => read_optional_utf8(&hex_dot_dir.join("bin/hex.sha"))?,
+    };
+    let source_sha = read_source_sha(source_dir)?;
+    Ok(binary_needs_rebuild(
         installed_ver.as_deref(),
         &cargo_ver,
         installed_sha.as_deref(),
-        source_sha.as_deref(),
-    )
+        Some(&source_sha),
+    ))
+}
+
+/// Report whether the managed foundation pin needs reconciliation. This is a
+/// metadata-only change and must not force a binary rebuild, but it must keep
+/// the no-op preflight from skipping the VERSIONS sync.
+fn versions_pin_is_stale(hex_dir: &Path, source_dir: &Path) -> io::Result<bool> {
+    let versions_file = hex_dir.join("VERSIONS");
+    let cargo_toml = source_dir.join("system/harness/Cargo.toml");
+    if !versions_file.exists() || !cargo_toml.exists() {
+        return Ok(false);
+    }
+    let existing = fs::read_to_string(&versions_file)?;
+    let cargo_ver = read_cargo_version(&cargo_toml)?;
+    let expected = format!("HEX_FOUNDATION_VERSION=v{cargo_ver}");
+    let mut found = 0;
+    for line in existing.lines() {
+        if line.trim_start().starts_with("HEX_FOUNDATION_VERSION=") {
+            found += 1;
+            if line.trim() != expected {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(found != 1)
 }
 
 /// True if the user has a personal overlay that `build.rs` compiles under
@@ -619,10 +967,21 @@ fn detect_personal_overlay(hex_dot_dir: &Path) -> bool {
 /// after this run (sync failure, cargo build failure, install failure). The
 /// caller MUST fail the whole upgrade on `false` — printing "Upgrade
 /// complete." over a stale binary is the OBS-017 deploy black hole.
+#[cfg(test)]
 fn sync_versions_file(
     hex_dir: &Path,
     source_dir: &Path,
     backup_dir: &Path,
+) -> Result<(), BinaryStepFailure> {
+    sync_versions_file_protected(hex_dir, source_dir, backup_dir, None, None)
+}
+
+fn sync_versions_file_protected(
+    hex_dir: &Path,
+    source_dir: &Path,
+    backup_dir: &Path,
+    protection: Option<(&Path, &UpgradeGitSnapshot)>,
+    mut owned: Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>,
 ) -> Result<(), BinaryStepFailure> {
     let versions_file = hex_dir.join("VERSIONS");
     if !versions_file.exists() {
@@ -632,24 +991,14 @@ fn sync_versions_file(
     if !cargo_toml.exists() {
         return Ok(());
     }
-    let cargo_content = match fs::read_to_string(&cargo_toml) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("  [WARN] Could not read Cargo.toml");
-            return Err(BinaryStepFailure::Build);
-        }
-    };
-    let cargo_ver = cargo_content
-        .lines()
-        .find(|l| l.starts_with("version"))
-        .and_then(|l| l.split_once('"').map(|x| x.1))
-        .and_then(|s| s.split('"').next())
-        .map(|s| s.to_string());
-
-    let Some(cargo_ver) = cargo_ver else {
-        eprintln!("  [WARN] Could not parse version from Cargo.toml");
-        return Err(BinaryStepFailure::Build);
-    };
+    let cargo_ver = read_cargo_version(&cargo_toml).map_err(|e| {
+        eprintln!("  [FAIL] Could not read package version from Cargo.toml: {e}");
+        BinaryStepFailure::Build
+    })?;
+    let signing_mode = hex::app_identity::prepare_upgrade(hex_dir, source_dir).map_err(|e| {
+        eprintln!("  [FAIL] App identity preflight failed: {e}");
+        BinaryStepFailure::Build
+    })?;
 
     // Preserve every existing line — comments, blank lines, and any
     // KEY=VALUE we do not manage (BOI_VERSION, custom instance pins,
@@ -658,7 +1007,10 @@ fn sync_versions_file(
     // rewrote the file with only HEX_FOUNDATION_VERSION, destroying
     // unmanaged pins like BOI_VERSION that install.sh parity reads
     // (2026-07-16 audit).
-    let existing = fs::read_to_string(&versions_file).unwrap_or_default();
+    let existing = fs::read_to_string(&versions_file).map_err(|e| {
+        eprintln!("  [FAIL] Could not read VERSIONS: {e}");
+        BinaryStepFailure::Build
+    })?;
     let managed_key = "HEX_FOUNDATION_VERSION";
     let managed_line = format!("{managed_key}=v{cargo_ver}");
     let mut replaced = false;
@@ -682,44 +1034,59 @@ fn sync_versions_file(
     let mut new_content = lines.join("\n");
     new_content.push('\n');
 
-    let tmp = versions_file.with_extension("tmp");
-    if fs::write(&tmp, &new_content).is_ok() {
-        let _ = fs::rename(&tmp, &versions_file);
+    // Do not mutate a managed destination until the candidate binary builds.
+    // The source tree below includes every build input, including the bridge
+    // module, so a failed build leaves the instance source and VERSIONS intact.
+    let install_versions = |owned: &mut Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>| -> Result<(), BinaryStepFailure> {
+        let tmp = versions_file.with_extension("tmp");
+        if let Some((workspace, snapshot)) = protection {
+            protect_generated_path(workspace, &versions_file, new_content.as_bytes(), snapshot, owned.as_deref())
+                .map_err(|e| {
+                    eprintln!("  [FAIL] VERSIONS operator edit conflict: {e}");
+                    BinaryStepFailure::Build
+                })?;
+        }
+        fs::write(&tmp, &new_content).map_err(|e| {
+            eprintln!("  [FAIL] Could not write {}: {e}", tmp.display());
+            BinaryStepFailure::Build
+        })?;
+        fs::rename(&tmp, &versions_file).map_err(|e| {
+            eprintln!("  [FAIL] Could not install {}: {e}", versions_file.display());
+            BinaryStepFailure::Build
+        })?;
+        if let Some(paths) = owned.as_deref_mut() {
+            paths.insert(versions_file.clone(), Some(new_content.clone().into_bytes()));
+        }
         println!("  [OK] VERSIONS → HEX_FOUNDATION_VERSION=v{cargo_ver}");
-    }
+        Ok(())
+    };
 
     // Rebuild hex binary if version or commit SHA changed
     let hex_dot_dir = hex_dir.join(".hex");
     let installed_bin = hex_dot_dir.join("bin/hex");
     let installed_sha_file = hex_dot_dir.join("bin/hex.sha");
 
-    let installed_ver = Command::new(&installed_bin)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8(o.stdout)
-                .ok()
-                .and_then(|s| s.split_whitespace().nth(1).map(|v| v.to_string()))
-        });
+    let installed_ver = if signing_mode == hex::app_identity::UpgradeMode::Migrate {
+        None
+    } else {
+        read_installed_version(&installed_bin).map_err(|e| {
+            eprintln!("  [FAIL] Could not read installed hex version: {e}");
+            BinaryStepFailure::Build
+        })?
+    };
 
-    let installed_sha = fs::read_to_string(&installed_sha_file)
-        .ok()
-        .map(|s| s.trim().to_string());
-
-    let source_sha = Command::new("git")
-        .arg("-C")
-        .arg(source_dir)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        });
+    let installed_sha = if let hex::app_identity::UpgradeMode::Signed(ref revision) = signing_mode {
+        Some(revision.clone())
+    } else {
+        read_optional_utf8(&installed_sha_file).map_err(|e| {
+            eprintln!("  [FAIL] Could not read installed SHA: {e}");
+            BinaryStepFailure::Build
+        })?
+    };
+    let source_sha = Some(read_source_sha(source_dir).map_err(|e| {
+        eprintln!("  [FAIL] Could not read source SHA: {e}");
+        BinaryStepFailure::Build
+    })?);
 
     // `version_mismatch` drives the human-readable reason below; the actual
     // rebuild decision is `binary_needs_rebuild` (shared with the upstream gate).
@@ -731,7 +1098,7 @@ fn sync_versions_file(
         installed_sha.as_deref(),
         source_sha.as_deref(),
     ) {
-        let harness_dst = hex_dot_dir.join("harness");
+        let harness_dst = source_dir.join("system/harness");
         let reason = if version_mismatch {
             format!(
                 "version mismatch ({} → {cargo_ver})",
@@ -745,45 +1112,9 @@ fn sync_versions_file(
             )
         };
         println!("  → hex binary {reason} — rebuilding...");
-        let harness_src = source_dir.join("system/harness");
-        if let Err(e) = apply_sync(&harness_src, &harness_dst, None) {
-            eprintln!("  [FAIL] Failed to sync harness source: {e}");
-            return Err(BinaryStepFailure::Build);
-        }
-        // Deletion pass scoped to src/ and tests/ only — never touches target/ or Cargo.lock.
-        for sub in &["src", "tests"] {
-            let dst_sub = harness_dst.join(sub);
-            let src_sub = harness_src.join(sub);
-            if dst_sub.exists() && src_sub.exists() {
-                if let Err(e) = deletion_pass(&dst_sub, &src_sub, backup_dir) {
-                    eprintln!("  [WARN] Harness deletion pass on {sub}/ failed: {e}");
-                }
-            }
-        }
-
-        // The harness depends on scipd via `scipd = { path = "../code-intel" }`
-        // (system/code-intel, workspace sibling). Sync it to .hex/code-intel —
-        // sibling of .hex/harness — BEFORE the cargo build, or the path dep
-        // cannot resolve and the rebuild fails. Same mechanism as the harness
-        // sync above: full-dir apply_sync + deletion pass scoped to src/ and
-        // tests/ only (never target/ or generated Cargo.lock).
-        let codeintel_src = source_dir.join("system/code-intel");
-        let codeintel_dst = hex_dot_dir.join("code-intel");
-        if codeintel_src.exists() {
-            if let Err(e) = apply_sync(&codeintel_src, &codeintel_dst, None) {
-                eprintln!("  [FAIL] Failed to sync code-intel source: {e}");
-                return Err(BinaryStepFailure::Build);
-            }
-            for sub in &["src", "tests"] {
-                let dst_sub = codeintel_dst.join(sub);
-                let src_sub = codeintel_src.join(sub);
-                if dst_sub.exists() && src_sub.exists() {
-                    if let Err(e) = deletion_pass(&dst_sub, &src_sub, backup_dir) {
-                        eprintln!("  [WARN] code-intel deletion pass on {sub}/ failed: {e}");
-                    }
-                }
-            }
-        }
+        // Build directly from the selected source checkout. Its sibling
+        // code-intel crate and bridge module are therefore staged together
+        // without writing into the live instance before cargo succeeds.
 
         // Detect a personal overlay and build with --features personal (and set
         // HEX_DIR so build.rs can find it). Keyed on overlay PRESENCE — a
@@ -792,9 +1123,9 @@ fn sync_versions_file(
         // added/removed/re-homed (e.g. release.rs leaving the binary).
         let use_personal = detect_personal_overlay(&hex_dot_dir);
         let mut build_args = vec!["build", "--release"];
-        // --target-dir is always set to harness_dst/target so the output location is
-        // deterministic regardless of workspace nesting (fixes OBS-017).
-        let target_dir = harness_dst.join("target");
+        // Build output is private staging, so a failed build cannot mutate the
+        // installed harness source tree.
+        let target_dir = backup_dir.join("harness-build-target");
         let target_dir_str = target_dir.to_string_lossy().into_owned();
         build_args.extend_from_slice(&["--target-dir", &target_dir_str]);
         if use_personal {
@@ -809,22 +1140,71 @@ fn sync_versions_file(
         match build_status {
             Ok(s) if s.success() => {
                 // --target-dir guarantees the binary is always here.
-                let release_bin = harness_dst.join("target/release/hex");
-                match atomic_install_binary(&release_bin, &installed_bin) {
+                let release_bin = target_dir.join("release/hex");
+                // Re-check after compilation. A newly configured or previously
+                // signed app must not fall through to legacy raw installation.
+                let final_mode =
+                    hex::app_identity::prepare_upgrade(hex_dir, source_dir).map_err(|e| {
+                        eprintln!("  [FAIL] App install preflight failed: {e}");
+                        BinaryStepFailure::Build
+                    })?;
+                if signing_mode != hex::app_identity::UpgradeMode::Legacy
+                    && final_mode == hex::app_identity::UpgradeMode::Legacy
+                {
+                    eprintln!("  [FAIL] Signed installation evidence disappeared during build");
+                    return Err(BinaryStepFailure::Build);
+                }
+                let managed = final_mode != hex::app_identity::UpgradeMode::Legacy;
+                let installed = if managed {
+                    hex::app_identity::install_build(
+                        hex_dir,
+                        source_dir,
+                        &release_bin,
+                        &cargo_ver,
+                        source_sha.as_deref().ok_or(BinaryStepFailure::Build)?,
+                    )
+                } else {
+                    atomic_install_binary(&release_bin, &installed_bin)
+                };
+                match installed {
                     Ok(()) => {
                         println!("  [OK] hex binary rebuilt and swapped (atomic): v{cargo_ver}");
-                        if let Some(ref sha) = source_sha {
+                        if let Some(sha) = source_sha.as_ref().filter(|_| !managed) {
+                            if let Some((workspace, snapshot)) = protection {
+                                protect_generated_path(
+                                    workspace,
+                                    &installed_sha_file,
+                                    sha.as_bytes(),
+                                    snapshot,
+                                    owned.as_deref(),
+                                )
+                                .map_err(|e| {
+                                    eprintln!("  [FAIL] Installed SHA conflict: {e}");
+                                    BinaryStepFailure::Build
+                                })?;
+                            }
                             let sha_tmp = installed_sha_file.with_extension("tmp");
-                            if fs::write(&sha_tmp, sha).is_ok() {
-                                let _ = fs::rename(&sha_tmp, &installed_sha_file);
-                                // `sha` is `git rev-parse HEAD` output — hex ASCII, every byte a char boundary.
-                                #[allow(clippy::string_slice)]
-                                {
-                                    println!(
-                                        "  → Recorded installed SHA: {}...",
-                                        &sha[..sha.len().min(8)]
-                                    );
-                                }
+                            fs::write(&sha_tmp, sha).map_err(|e| {
+                                eprintln!("  [FAIL] Could not write installed SHA: {e}");
+                                BinaryStepFailure::Build
+                            })?;
+                            fs::rename(&sha_tmp, &installed_sha_file).map_err(|e| {
+                                eprintln!("  [FAIL] Could not install installed SHA: {e}");
+                                BinaryStepFailure::Build
+                            })?;
+                            if let Some(paths) = owned.as_deref_mut() {
+                                paths.insert(
+                                    installed_sha_file.clone(),
+                                    Some(sha.as_bytes().to_vec()),
+                                );
+                            }
+                            // `sha` is `git rev-parse HEAD` output — hex ASCII, every byte a char boundary.
+                            #[allow(clippy::string_slice)]
+                            {
+                                println!(
+                                    "  → Recorded installed SHA: {}...",
+                                    &sha[..sha.len().min(8)]
+                                );
                             }
                         }
                         // The binary changed, but the long-running harness
@@ -841,7 +1221,7 @@ fn sync_versions_file(
                         // regardless of the restart outcome so the only deltas a
                         // restart failure introduces are the nonzero exit and the
                         // distinct message below.
-                        build_and_install_code_intel(&hex_dot_dir);
+                        build_and_install_code_intel(&hex_dot_dir, managed);
                         // The binary WAS swapped. If the harness restart failed,
                         // the running harness still holds the OLD binary in memory
                         // — propagate that as a DISTINCT failure kind so run()
@@ -851,7 +1231,7 @@ fn sync_versions_file(
                         if let Err(e) = restart_result {
                             return Err(BinaryStepFailure::RestartFailed(e));
                         }
-                        Ok(())
+                        install_versions(&mut owned)
                     }
                     Err(e) => {
                         eprintln!("  [FAIL] atomic binary install failed: {e}");
@@ -885,7 +1265,7 @@ fn sync_versions_file(
         } else {
             println!("  [OK] hex binary already at v{cargo_ver} (SHA matches) — no rebuild needed");
         }
-        Ok(())
+        install_versions(&mut owned)
     }
 }
 
@@ -895,7 +1275,11 @@ fn sync_versions_file(
 /// location is deterministic regardless of workspace nesting (OBS-017), and
 /// `atomic_install_binary` for the swap (codesign + rename, never mutates the
 /// live inode). Best-effort: warns loudly on failure, never fails the upgrade.
-fn build_and_install_code_intel(hex_dot_dir: &Path) {
+fn build_and_install_code_intel(hex_dot_dir: &Path, preserve_identity: bool) {
+    if preserve_identity {
+        // Managed companions have a separate required, resumable step in run().
+        return;
+    }
     let codeintel_dst = hex_dot_dir.join("code-intel");
     if !codeintel_dst.join("Cargo.toml").exists() {
         return; // code-intel not synced (older foundation) — nothing to build
@@ -966,7 +1350,11 @@ fn binary_step_failure_message(failure: &BinaryStepFailure) -> String {
 /// the developer's real harness). When no LaunchAgent is installed there is
 /// nothing to restart — success forever, and `restart_fn` is NOT invoked.
 /// Otherwise the restart action's `Result` propagates unchanged.
-fn restart_harness_with<F>(hex_dir: &Path, agent_installed: bool, restart_fn: F) -> Result<(), String>
+fn restart_harness_with<F>(
+    hex_dir: &Path,
+    agent_installed: bool,
+    restart_fn: F,
+) -> Result<(), String>
 where
     F: FnOnce(&Path) -> Result<(), String>,
 {
@@ -1212,95 +1600,363 @@ fn configure_hooks_path(workspace: &Path) {
     }
 }
 
-/// After a successful sync + rebuild, commit the synced tracked files under
-/// `.hex/` in the instance workspace so the repo reflects the deployed version.
-/// This closes the "deployed-but-orphaned" blind spot (a live deploy left
-/// uncommitted that git — and `hex upgrade`'s own change detection — reads as
-/// "nothing changed").
+/// Paths already dirty when the upgrade started are never eligible for the
+/// upgrade bookkeeping commit. This snapshot is intentionally small: it
+/// records only porcelain paths under `.hex`, including untracked operator
+/// files, and leaves their index/worktree state untouched.
+#[derive(Debug, Default)]
+struct UpgradeGitSnapshot {
+    preexisting_paths: HashSet<PathBuf>,
+    baseline_content: HashMap<PathBuf, Option<Vec<u8>>>,
+}
+
+#[cfg(test)]
+fn upgrade_git_snapshot(workspace: &Path) -> Result<UpgradeGitSnapshot, String> {
+    let mut planned = Vec::new();
+    for root in [workspace.join(".hex"), workspace.join(".claude/commands")] {
+        if root.exists() {
+            planned.extend(walk_files_checked(&root).map_err(|e| e.to_string())?);
+        }
+    }
+    planned.push(workspace.join("VERSIONS"));
+    upgrade_git_snapshot_for(workspace, &planned)
+}
+
+fn upgrade_dirty_paths(workspace: &Path) -> Result<HashSet<PathBuf>, String> {
+    let output = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+            "--",
+            ".hex",
+            "VERSIONS",
+            ".claude/commands",
+        ])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| format!("could not run git status in {}: {e}", workspace.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed in {}: {}",
+            workspace.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut paths = HashSet::new();
+    for record in output.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        if record.len() < 4 {
+            return Err("git status returned a malformed porcelain record".to_string());
+        }
+        let path = std::str::from_utf8(&record[3..])
+            .map_err(|_| "git status returned a non-UTF-8 path".to_string())?;
+        let relative = PathBuf::from(path);
+        paths.insert(relative);
+    }
+    Ok(paths)
+}
+
+/// Read only the exact destinations admitted by the operation inventory.
+/// Explicit absence is a baseline; an unknown path is never assumed absent.
+fn upgrade_git_snapshot_for(
+    workspace: &Path,
+    planned_paths: &[PathBuf],
+) -> Result<UpgradeGitSnapshot, String> {
+    let preexisting_paths = upgrade_dirty_paths(workspace)?;
+    let mut baseline_content = HashMap::new();
+    for path in planned_paths {
+        let relative = path
+            .strip_prefix(workspace)
+            .map_err(|_| format!("snapshot path escaped workspace: {}", path.display()))?;
+        baseline_content.insert(
+            relative.to_path_buf(),
+            read_file_state(path)
+                .map_err(|e| format!("could not snapshot {}: {e}", path.display()))?,
+        );
+    }
+    Ok(UpgradeGitSnapshot {
+        preexisting_paths,
+        baseline_content,
+    })
+}
+
+/// Enumerate source-selected writes and only the established deletion scopes.
+/// Additive runtime directories are never traversed on the destination side.
+fn planned_upgrade_paths(
+    workspace: &Path,
+    source_dir: &Path,
+    sources: &SourceDirs,
+) -> io::Result<Vec<PathBuf>> {
+    let hex = workspace.join(".hex");
+    let pairs = [
+        (sources.scripts.clone(), hex.join("scripts"), true),
+        (sources.skills.clone(), hex.join("skills"), true),
+        (sources.commands.clone(), hex.join("commands"), true),
+        (sources.hooks.clone(), hex.join("hooks"), true),
+        (sources.iii.clone(), hex.join("iii"), false),
+        (sources.templates.clone(), hex.join("templates"), false),
+        (
+            sources.commands.clone(),
+            workspace.join(".claude/commands"),
+            true,
+        ),
+        (
+            source_dir.join("system/harness"),
+            hex.join("harness"),
+            false,
+        ),
+        (
+            source_dir.join("system/code-intel"),
+            hex.join("code-intel"),
+            false,
+        ),
+    ];
+    let mut paths = HashSet::new();
+    for (source, destination, prune) in &pairs {
+        if !source.exists() {
+            continue;
+        }
+        for file in walk_files_checked(source)? {
+            let relative = file.strip_prefix(source).map_err(io::Error::other)?;
+            if !relative.to_string_lossy().contains("settings.local.json") {
+                paths.insert(destination.join(relative));
+            }
+        }
+        let deletion_roots = if *prune {
+            vec![(source.clone(), destination.clone())]
+        } else if *destination == hex.join("harness") || *destination == hex.join("code-intel") {
+            ["src", "tests"]
+                .iter()
+                .map(|sub| (source.join(sub), destination.join(sub)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (source_root, destination_root) in deletion_roots {
+            if !source_root.exists() || !destination_root.exists() {
+                continue;
+            }
+            for file in walk_files_checked(&destination_root)? {
+                let relative = file
+                    .strip_prefix(&destination_root)
+                    .map_err(io::Error::other)?;
+                if !source_root.join(relative).exists() {
+                    paths.insert(file);
+                }
+            }
+        }
+    }
+    for file in managed_files(sources, workspace) {
+        if file.source.exists() {
+            paths.insert(file.destination);
+        }
+    }
+    paths.extend([
+        hex.join("version.txt"),
+        hex.join("bin/hex.sha"),
+        hex.join("upgrade.json"),
+        workspace.join("VERSIONS"),
+    ]);
+    let mut paths: Vec<_> = paths.into_iter().collect();
+    paths.sort();
+    Ok(paths)
+}
+
+fn protect_sync_path(
+    workspace: &Path,
+    path: &Path,
+    desired: Option<&Path>,
+    snapshot: &UpgradeGitSnapshot,
+    owned: Option<&HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> io::Result<()> {
+    let desired = desired.map(fs::read).transpose()?;
+    protect_write(workspace, path, desired.as_deref(), snapshot, owned)
+}
+
+fn protect_write(
+    workspace: &Path,
+    path: &Path,
+    desired: Option<&[u8]>,
+    snapshot: &UpgradeGitSnapshot,
+    owned: Option<&HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> io::Result<()> {
+    let relative = path.strip_prefix(workspace).map_err(io::Error::other)?;
+    let original = snapshot.baseline_content.get(relative).ok_or_else(|| {
+        io::Error::other(format!("unplanned upgrade destination: {}", path.display()))
+    })?;
+    let prior_owned = owned.and_then(|paths| paths.get(path));
+    let before = prior_owned.unwrap_or(original);
+    if read_file_state(path)? != *before {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("operator edit changed during upgrade: {}", path.display()),
+        ));
+    }
+    if snapshot.preexisting_paths.contains(relative) {
+        protect_sync_bytes(path, desired, original)?;
+    }
+    Ok(())
+}
+
+fn protect_sync_bytes(
+    path: &Path,
+    desired: Option<&[u8]>,
+    before: &Option<Vec<u8>>,
+) -> io::Result<()> {
+    match desired {
+        Some(bytes) if Some(bytes.to_vec()) == *before => Ok(()),
+        None if before.is_none() => Ok(()),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("upgrade would overwrite operator edit: {}", path.display()),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("upgrade would delete operator edit: {}", path.display()),
+        )),
+    }
+}
+
+fn protect_generated_path(
+    workspace: &Path,
+    path: &Path,
+    generated: &[u8],
+    snapshot: &UpgradeGitSnapshot,
+    owned: Option<&HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> io::Result<()> {
+    protect_write(workspace, path, Some(generated), snapshot, owned)
+}
+
+/// After a successful sync + rebuild, commit only files changed by this
+/// upgrade under `.hex` in the instance workspace. Pre-existing dirty paths
+/// are excluded, so the upgrade never consumes operator work.
+///
+/// The snapshot must be taken before any sync writes occur. A path that was
+/// already dirty is left in the index/worktree exactly as the operator left
+/// it. The scoped `git add` and `git commit --only` preserve unrelated staged
+/// paths as well.
 ///
 /// Returns:
 ///   Ok(true)  — a commit was made.
 ///   Ok(false) — the synced tree was already clean (no-op success, NOT an error).
 ///   Err(msg)  — the commit could not be made; the caller MUST surface this
 ///               LOUDLY (S6: no quiet failures), never a silent skip.
-///
-/// Scope: only tracked changes under `.hex/` are staged (`git add -u -- .hex`),
-/// so the operator's unrelated tracked work (todo.md, me/, projects/, landings/)
-/// is never swept into the upgrade commit. New, untracked files are deliberately
-/// left out — see docs/hex-ops.md on the instance-side gitignore shadowing of
-/// new harness source files.
-fn commit_synced_files(workspace: &Path, version: &str) -> Result<bool, String> {
-    // Lead with `git status` — it yields all three outcomes deterministically and,
-    // unlike `git add -u -- <pathspec>`, does NOT exit-128 when the pathspec matches
-    // no tracked files (which would otherwise spuriously fail a clean upgrade).
-    // `-uno` = tracked changes only (no untracked noise).
-    let status = Command::new("git")
-        .args(["status", "--porcelain", "-uno", "--", ".hex"])
-        .current_dir(workspace)
-        .output()
-        .map_err(|e| format!("could not run git status in {}: {e}", workspace.display()))?;
-    if !status.status.success() {
-        // Non-zero here means git could not operate here at all (e.g. exit 128:
-        // not a git repository). The caller surfaces this loudly.
-        return Err(format!(
-            "git status failed in {}: {}",
-            workspace.display(),
-            String::from_utf8_lossy(&status.stderr).trim()
-        ));
-    }
-    if status.stdout.is_empty() {
-        // Clean synced tree — nothing to commit. No-op success.
+fn commit_synced_files_since(
+    workspace: &Path,
+    version: &str,
+    snapshot: &UpgradeGitSnapshot,
+    owned_paths: Option<&HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> Result<bool, String> {
+    let after = upgrade_dirty_paths(workspace)?;
+    let candidates: Vec<PathBuf> = after
+        .difference(&snapshot.preexisting_paths)
+        .cloned()
+        .collect();
+    let owned: Vec<PathBuf> = match owned_paths {
+        Some(paths) => {
+            for relative in &candidates {
+                if let Some(expected) = paths.get(&workspace.join(relative)) {
+                    let index = Command::new("git")
+                        .args([
+                            "diff",
+                            "--cached",
+                            "--quiet",
+                            "--",
+                            relative.to_string_lossy().as_ref(),
+                        ])
+                        .current_dir(workspace)
+                        .status()
+                        .map_err(|e| {
+                            format!(
+                                "could not inspect git index for {}: {e}",
+                                relative.display()
+                            )
+                        })?;
+                    if !index.success() {
+                        return Err(format!(
+                            "operator staged edit changed upgrade-owned path before commit: {}",
+                            workspace.join(relative).display()
+                        ));
+                    }
+                    let current = read_file_state(&workspace.join(relative))
+                        .map_err(|e| format!("could not inspect {}: {e}", relative.display()))?;
+                    if &current != expected {
+                        return Err(format!(
+                            "operator edit changed upgrade-owned path before commit: {}",
+                            workspace.join(relative).display()
+                        ));
+                    }
+                }
+            }
+            candidates
+                .into_iter()
+                .filter(|relative| paths.contains_key(&workspace.join(relative)))
+                .collect()
+        }
+        None => candidates,
+    };
+    if owned.is_empty() {
         return Ok(false);
     }
 
-    // There ARE tracked changes under .hex/: stage exactly those.
-    let add = Command::new("git")
-        .args(["add", "-u", "--", ".hex"])
+    let mut add = Command::new("git");
+    add.args(["add", "-A", "--"]);
+    for path in &owned {
+        add.arg(path);
+    }
+    let add = add
         .current_dir(workspace)
         .output()
         .map_err(|e| format!("could not run git add in {}: {e}", workspace.display()))?;
     if !add.status.success() {
         return Err(format!(
-            "git add -u -- .hex failed in {}: {}",
+            "git add upgrade-owned .hex paths failed in {}: {}",
             workspace.display(),
             String::from_utf8_lossy(&add.stderr).trim()
         ));
     }
 
-    // Commit with a message naming the version. gpgsign is disabled and hooks are
-    // skipped for this bookkeeping commit so it can never hang on a passphrase or
-    // pre-commit prompt inside an unattended `hex upgrade`. The commit is given the
-    // SAME `.hex` pathspec as the `add` above (`--only -- .hex`): without a pathspec,
-    // `git commit` records the WHOLE index, so any work the operator had pre-staged
-    // (`git add todo.md`) before running `hex upgrade` would be swept into this
-    // bookkeeping commit. `--only -- .hex` records only the working-tree content of
-    // `.hex`, leaving every other staged path untouched — matching the scope
-    // guarantee documented in docs/hex-ops.md.
     let msg = format!("chore(hex): sync harness files to v{version}");
-    let commit = Command::new("git")
-        .args([
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--no-verify",
-            "--only",
-            "-q",
-            "-m",
-            &msg,
-            "--",
-            ".hex",
-        ])
+    let mut commit = Command::new("git");
+    commit.args([
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--no-verify",
+        "--only",
+        "-q",
+        "-m",
+        &msg,
+        "--",
+    ]);
+    for path in &owned {
+        commit.arg(path);
+    }
+    let commit = commit
         .current_dir(workspace)
         .output()
         .map_err(|e| format!("could not run git commit in {}: {e}", workspace.display()))?;
     if !commit.status.success() {
         return Err(format!(
-            "git commit failed in {}: {}",
+            "git commit upgrade-owned .hex paths failed in {}: {}",
             workspace.display(),
             String::from_utf8_lossy(&commit.stderr).trim()
         ));
     }
     Ok(true)
+}
+
+/// Compatibility wrapper for callers that do not have a pre-sync snapshot.
+/// The full upgrade flow always uses `commit_synced_files_since`.
+#[cfg(test)]
+fn commit_synced_files(workspace: &Path, version: &str) -> Result<bool, String> {
+    // Test-only compatibility seam. The production flow always supplies the
+    // pre-sync snapshot; an empty snapshot preserves the historical helper's
+    // direct-call behavior for older unit tests.
+    let snapshot = UpgradeGitSnapshot::default();
+    commit_synced_files_since(workspace, version, &snapshot, None)
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -1370,27 +2026,73 @@ pub fn run(args: &[String]) -> i32 {
 
     // Step 3: Detect changes
     println!("\n3. Detect Changes");
-    let (c1, n1, u1, log1) =
-        detect_changes(&src_dirs.scripts, &hex_dot_dir.join("scripts"), "scripts");
-    let (c2, n2, u2, log2) =
-        detect_changes(&src_dirs.skills, &hex_dot_dir.join("skills"), "skills");
-    let (c3, n3, u3, log3) = detect_changes(
+    macro_rules! detect {
+        ($src:expr, $dst:expr, $label:expr, $prune:expr) => {
+            match detect_managed_changes($src, $dst, $label, $prune) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!(
+                        "  [FAIL] Could not inspect {} during preflight: {e}",
+                        $label
+                    );
+                    return 1;
+                }
+            }
+        };
+    }
+    let (c1, n1, u1, log1) = detect!(
+        &src_dirs.scripts,
+        &hex_dot_dir.join("scripts"),
+        "scripts",
+        true
+    );
+    let (c2, n2, u2, log2) = detect!(
+        &src_dirs.skills,
+        &hex_dot_dir.join("skills"),
+        "skills",
+        true
+    );
+    let (c3, n3, u3, log3) = detect!(
         &src_dirs.commands,
         &hex_dot_dir.join("commands"),
         "commands",
+        true
     );
-    let (c4, n4, u4, log4) = detect_changes(&src_dirs.hooks, &hex_dot_dir.join("hooks"), "hooks");
+    let (c4, n4, u4, log4) = detect!(&src_dirs.hooks, &hex_dot_dir.join("hooks"), "hooks", true);
     // Additive dirs (iii engine config/workers, launchd + other templates)
-    let (c5, n5, u5, log5) = detect_changes(&src_dirs.iii, &hex_dot_dir.join("iii"), "iii");
-    let (c6, n6, u6, log6) = detect_changes(
+    let (c5, n5, u5, log5) = detect!(&src_dirs.iii, &hex_dot_dir.join("iii"), "iii", false);
+    let (c6, n6, u6, log6) = detect!(
         &src_dirs.templates,
         &hex_dot_dir.join("templates"),
         "templates",
+        false
     );
+    let (c7, n7, u7, log7) = detect!(
+        &src_dirs.commands,
+        &hex_dir.join(".claude/commands"),
+        "command mirror",
+        true
+    );
+    let bridge_files = managed_files(&src_dirs, &hex_dir);
+    let (c8, n8, u8, log8) = match bridge_files.iter().map(detect_managed_file).try_fold(
+        (0, 0, 0, Vec::new()),
+        |(c, n, u, mut log), result| {
+            result.map(|(next_c, next_n, next_u, next_log)| {
+                log.extend(next_log);
+                (c + next_c, n + next_n, u + next_u, log)
+            })
+        },
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("  [FAIL] Could not inspect managed cargo bridge during preflight: {e}");
+            return 1;
+        }
+    };
 
-    let total_changed = c1 + c2 + c3 + c4 + c5 + c6;
-    let total_new = n1 + n2 + n3 + n4 + n5 + n6;
-    let total_unchanged = u1 + u2 + u3 + u4 + u5 + u6;
+    let total_changed = c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8;
+    let total_new = n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8;
+    let total_unchanged = u1 + u2 + u3 + u4 + u5 + u6 + u7 + u8;
 
     println!("  → {total_changed} changed, {total_new} new, {total_unchanged} unchanged");
     for line in log1
@@ -1400,6 +2102,8 @@ pub fn run(args: &[String]) -> i32 {
         .chain(&log4)
         .chain(&log5)
         .chain(&log6)
+        .chain(&log7)
+        .chain(&log8)
     {
         println!("{line}");
     }
@@ -1408,11 +2112,32 @@ pub fn run(args: &[String]) -> i32 {
     let mut version_changed = false;
     if let Some(src_ver_file) = &src_dirs.version_txt {
         if src_ver_file.exists() {
-            let src_ver = fs::read_to_string(src_ver_file).unwrap_or_default();
-            let dst_ver = fs::read_to_string(hex_dot_dir.join("version.txt")).unwrap_or_default();
+            let src_ver = match read_file_state(src_ver_file) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    eprintln!(
+                        "  [FAIL] Could not read source version metadata {}: {e}",
+                        src_ver_file.display()
+                    );
+                    return 1;
+                }
+            };
+            let dst_ver = match read_file_state(&hex_dot_dir.join("version.txt")) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    eprintln!("  [FAIL] Could not read installed version metadata: {e}");
+                    return 1;
+                }
+            };
             if src_ver != dst_ver {
                 version_changed = true;
-                println!("  ~ version.txt ({} → {})", dst_ver.trim(), src_ver.trim());
+                println!(
+                    "  ~ version.txt ({} → {})",
+                    String::from_utf8_lossy(&dst_ver).trim(),
+                    String::from_utf8_lossy(&src_ver).trim()
+                );
             }
         }
     }
@@ -1421,9 +2146,42 @@ pub fn run(args: &[String]) -> i32 {
     // synced files changed) must still trigger a rebuild. Without this the gate
     // below early-returns "Nothing to do" before Step 5 ever runs, and the
     // upgrade silently ships nothing while reporting success.
-    let binary_stale = binary_is_stale(&hex_dir, &source_dir);
+    let binary_stale = match binary_is_stale(&hex_dir, &source_dir) {
+        Ok(stale) => stale,
+        Err(e) => {
+            eprintln!("  [FAIL] Could not inspect binary metadata during preflight: {e}");
+            return 1;
+        }
+    };
+    let versions_pin_stale = match versions_pin_is_stale(&hex_dir, &source_dir) {
+        Ok(stale) => stale,
+        Err(e) => {
+            eprintln!("  [FAIL] Could not inspect foundation version pin during preflight: {e}");
+            return 1;
+        }
+    };
+    if versions_pin_stale {
+        println!("  → VERSIONS foundation pin needs reconciliation.");
+    }
 
-    if total_changed == 0 && total_new == 0 && !version_changed && !binary_stale {
+    let companion_plan = match crate::codeintel_upgrade::inspect(&hex_dir, &source_dir) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("  [FAIL] Code-intel preflight failed: {e}");
+            return 1;
+        }
+    };
+    if companion_plan.needs_work() {
+        println!("  → Code-intel needs a separate app, command path or service update.");
+    }
+
+    if total_changed == 0
+        && total_new == 0
+        && !version_changed
+        && !binary_stale
+        && !versions_pin_stale
+        && !companion_plan.needs_work()
+    {
         println!("  [OK] Everything is up to date. Nothing to do.");
         return 0;
     }
@@ -1438,11 +2196,57 @@ pub fn run(args: &[String]) -> i32 {
         return 0;
     }
 
+    let git_snapshot = if is_own_git_toplevel(&hex_dir) {
+        let planned = match planned_upgrade_paths(&hex_dir, &source_dir, &src_dirs) {
+            Ok(paths) => paths,
+            Err(e) => {
+                eprintln!("  [FAIL] Could not inventory required upgrade paths: {e}");
+                return 1;
+            }
+        };
+        match upgrade_git_snapshot_for(&hex_dir, &planned) {
+            Ok(snapshot) => Some(snapshot),
+            Err(e) => {
+                eprintln!("  [FAIL] Could not snapshot operator edits before upgrade: {e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     // Step 4: Apply changes
     println!("\n4. Apply Changes");
     let backup_dir = hex_dot_dir.join(format!(".upgrade-backup-{}", now.format("%Y%m%d-%H%M%S")));
-    fs::create_dir_all(&backup_dir).ok();
+    if let Err(e) = fs::create_dir_all(&backup_dir) {
+        eprintln!("  [FAIL] Could not create upgrade backup directory: {e}");
+        return 1;
+    }
+    let mut failures = Vec::new();
+    let protection = git_snapshot
+        .as_ref()
+        .map(|snapshot| (hex_dir.as_path(), snapshot));
+    let mut owned_paths = HashMap::new();
 
+    // Build the candidate from the selected source before mutating any live
+    // managed file. This includes the path-imported bridge module. A failed
+    // build exits here with the instance source tree still untouched.
+    println!("\n4. Build Candidate");
+    let binary_result = sync_versions_file_protected(
+        &hex_dir,
+        &source_dir,
+        &backup_dir,
+        protection,
+        Some(&mut owned_paths),
+    );
+    if let Err(failure) = &binary_result {
+        eprintln!("  {}", binary_step_failure_message(failure));
+        println!();
+        return 1;
+    }
+
+    // Step 5: Apply changes
+    println!("\n5. Apply Changes");
     let sync_pairs: &[(&PathBuf, PathBuf)] = &[
         (&src_dirs.scripts, hex_dot_dir.join("scripts")),
         (&src_dirs.skills, hex_dot_dir.join("skills")),
@@ -1453,9 +2257,19 @@ pub fn run(args: &[String]) -> i32 {
     let mut applied = 0;
     for (src, dst) in sync_pairs {
         if src.exists() {
-            match apply_sync(src, dst, Some(&backup_dir)) {
+            match apply_sync_protected(
+                src,
+                dst,
+                Some(&backup_dir),
+                protection,
+                Some(&mut owned_paths),
+            ) {
                 Ok(n) => applied += n,
-                Err(e) => eprintln!("  [WARN] Sync failed for {}: {e}", src.display()),
+                Err(e) => {
+                    let message = format!("sync failed for {}: {e}", src.display());
+                    eprintln!("  [FAIL] {message}");
+                    failures.push(message);
+                }
             }
         }
     }
@@ -1468,9 +2282,19 @@ pub fn run(args: &[String]) -> i32 {
     ];
     for (src, dst) in additive_pairs {
         if src.exists() {
-            match apply_sync(src, dst, Some(&backup_dir)) {
+            match apply_sync_protected(
+                src,
+                dst,
+                Some(&backup_dir),
+                protection,
+                Some(&mut owned_paths),
+            ) {
                 Ok(n) => applied += n,
-                Err(e) => eprintln!("  [WARN] Sync failed for {}: {e}", src.display()),
+                Err(e) => {
+                    let message = format!("sync failed for {}: {e}", src.display());
+                    eprintln!("  [FAIL] {message}");
+                    failures.push(message);
+                }
             }
         }
     }
@@ -1478,8 +2302,21 @@ pub fn run(args: &[String]) -> i32 {
     // Mirror commands to runtime slash-command dir
     let runtime_cmd_dir = hex_dir.join(".claude/commands");
     if src_dirs.commands.exists() {
-        fs::create_dir_all(&runtime_cmd_dir).ok();
-        apply_sync(&src_dirs.commands, &runtime_cmd_dir, None).ok();
+        if let Err(e) = fs::create_dir_all(&runtime_cmd_dir) {
+            let message = format!("could not create runtime command directory: {e}");
+            eprintln!("  [FAIL] {message}");
+            failures.push(message);
+        } else if let Err(e) = apply_sync_protected(
+            &src_dirs.commands,
+            &runtime_cmd_dir,
+            Some(&backup_dir),
+            protection,
+            Some(&mut owned_paths),
+        ) {
+            let message = format!("command mirror failed: {e}");
+            eprintln!("  [FAIL] {message}");
+            failures.push(message);
+        }
     }
 
     // Deletion pass
@@ -1487,11 +2324,32 @@ pub fn run(args: &[String]) -> i32 {
     let mut deleted = 0;
     for (src, dst) in sync_pairs {
         if src.exists() {
-            deleted += deletion_pass(dst, src, &backup_dir).unwrap_or(0);
+            match deletion_pass_protected(dst, src, &backup_dir, protection, Some(&mut owned_paths))
+            {
+                Ok(n) => deleted += n,
+                Err(e) => {
+                    let message = format!("deletion pass failed for {}: {e}", dst.display());
+                    eprintln!("  [FAIL] {message}");
+                    failures.push(message);
+                }
+            }
         }
     }
     if src_dirs.commands.exists() {
-        deleted += deletion_pass(&runtime_cmd_dir, &src_dirs.commands, &backup_dir).unwrap_or(0);
+        match deletion_pass_protected(
+            &runtime_cmd_dir,
+            &src_dirs.commands,
+            &backup_dir,
+            protection,
+            Some(&mut owned_paths),
+        ) {
+            Ok(n) => deleted += n,
+            Err(e) => {
+                let message = format!("command deletion pass failed: {e}");
+                eprintln!("  [FAIL] {message}");
+                failures.push(message);
+            }
+        }
     }
 
     if deleted > 0 {
@@ -1500,23 +2358,78 @@ pub fn run(args: &[String]) -> i32 {
         println!("  → Deletion pass: nothing to prune");
     }
 
-    make_scripts_executable(&hex_dot_dir);
+    if let Err(e) = make_scripts_executable(&owned_paths) {
+        let message = format!("could not set script permissions: {e}");
+        eprintln!("  [FAIL] {message}");
+        failures.push(message);
+    }
+
+    for file in managed_files(&src_dirs, &hex_dir) {
+        match apply_managed_file_protected(
+            &file,
+            Some(&backup_dir),
+            protection,
+            Some(&mut owned_paths),
+        ) {
+            Ok(n) => applied += n,
+            Err(e) => {
+                let message = format!("sync failed for {}: {e}", file.label);
+                eprintln!("  [FAIL] {message}");
+                failures.push(message);
+            }
+        }
+    }
 
     // Update version.txt for v2 layout
     if let Some(src_ver_file) = &src_dirs.version_txt {
         if src_ver_file.exists() {
-            fs::copy(src_ver_file, hex_dot_dir.join("version.txt")).ok();
+            let allowed = protection.map_or(Ok(()), |(workspace, snapshot)| {
+                protect_sync_path(
+                    workspace,
+                    &hex_dot_dir.join("version.txt"),
+                    Some(src_ver_file),
+                    snapshot,
+                    Some(&owned_paths),
+                )
+            });
+            match allowed {
+                Err(e) => {
+                    let message = format!("version.txt operator edit conflict: {e}");
+                    eprintln!("  [FAIL] {message}");
+                    failures.push(message);
+                }
+                Ok(()) => {
+                    match fs::read(src_ver_file).and_then(|bytes| {
+                        fs::write(hex_dot_dir.join("version.txt"), &bytes)?;
+                        Ok(bytes)
+                    }) {
+                        Ok(bytes) => {
+                            owned_paths.insert(hex_dot_dir.join("version.txt"), Some(bytes));
+                        }
+                        Err(e) => {
+                            let message = format!("version.txt read/write failed: {e}");
+                            eprintln!("  [FAIL] {message}");
+                            failures.push(message);
+                        }
+                    }
+                }
+            }
         }
     }
 
     println!("  [OK] Applied {applied} file(s)");
 
-    record_upgrade_sha(&config_file, &source_dir, &repo_url);
+    if !failures.is_empty() {
+        eprintln!(
+            "  Upgrade INCOMPLETE: {} required step(s) failed; successful files and backups remain on disk.",
+            failures.len()
+        );
+        return 1;
+    }
+
     let _ = fs::remove_file(hex_dot_dir.join(".update-available"));
 
-    // Step 5: Sync VERSIONS + rebuild binary if needed
-    println!("\n5. Sync VERSIONS");
-    let binary_result = sync_versions_file(&hex_dir, &source_dir, &backup_dir);
+    let companion_result = crate::codeintel_upgrade::apply(&hex_dir, &source_dir, &companion_plan);
 
     // Step 6: Shell setup
     println!("\n6. Shell Setup");
@@ -1537,6 +2450,25 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("  The workspace files may have synced, but the running code is stale.");
         }
         println!();
+        return 1;
+    }
+
+    if let Err(error) = companion_result {
+        eprintln!("  Upgrade INCOMPLETE: code-intel update failed: {error}");
+        eprintln!("  Completed Hex and companion updates remain installed. Retry resumes required companion work.");
+        return 1;
+    }
+
+    // Record provenance only after every required file operation and the
+    // binary deployment have been classified as successful.
+    if let Err(e) = record_upgrade_sha(
+        &config_file,
+        &source_dir,
+        &repo_url,
+        protection,
+        Some(&mut owned_paths),
+    ) {
+        eprintln!("  [FAIL] Upgrade source SHA could not be recorded: {e}");
         return 1;
     }
 
@@ -1574,7 +2506,10 @@ pub fn run(args: &[String]) -> i32 {
                 "unknown".to_string()
             }
         };
-        match commit_synced_files(&hex_dir, &synced_version) {
+        let snapshot = git_snapshot
+            .as_ref()
+            .expect("own git repo must have a pre-upgrade snapshot");
+        match commit_synced_files_since(&hex_dir, &synced_version, snapshot, Some(&owned_paths)) {
             Ok(true) => {
                 println!("  [OK] Committed synced files (v{synced_version}) in instance repo.");
             }
@@ -1589,8 +2524,7 @@ pub fn run(args: &[String]) -> i32 {
                     "  The deployed version is live but not reflected in git (deployed-but-orphaned)."
                 );
                 eprintln!(
-                    "  Fix: git -C {ws} add -u -- .hex && git -C {ws} commit -m \"chore(hex): sync harness files to v{synced_version}\"",
-                    ws = hex_dir.display()
+                    "  Fix: inspect the scoped changed paths, then stage only those paths and commit them; do not use `git add -u -- .hex` while operator edits are present."
                 );
                 println!();
                 return 1;
@@ -1609,13 +2543,558 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_child::{self, Fault as PrivateChildFault};
     use std::fs;
-    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(target_os = "macos")]
     use std::os::unix::fs::MetadataExt;
+    use std::thread;
+    use std::time::Duration;
 
     fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    fn private_upgrade_child(
+        test_name: &str,
+        home: &Path,
+    ) -> std::result::Result<test_child::ChildOutput, String> {
+        private_upgrade_child_with_fault(test_name, home, PrivateChildFault::None)
+    }
+
+    fn private_upgrade_child_with_fault(
+        test_name: &str,
+        home: &Path,
+        fault: PrivateChildFault,
+    ) -> std::result::Result<test_child::ChildOutput, String> {
+        test_child::run_exact(test_name, home, home, fault)
+    }
+
+    fn private_upgrade_test_success(
+        test_name: &str,
+        output: test_child::ChildOutput,
+    ) -> std::result::Result<(), String> {
+        test_child::require_one_pass(test_name, output)
+    }
+
+    /// Legacy upgrade fixtures run only in an exact child with a disposable
+    /// HOME and HEX_DIR. The parent never inherits fixture environment state.
+    fn in_private_upgrade_test(test_name: &str) -> bool {
+        if test_child::in_child(test_name) {
+            test_child::stage("upgrade:child-entry").expect("test-child stage must flush");
+            return false;
+        }
+        let home = tempfile::tempdir().expect("private test HOME");
+        let output = private_upgrade_child(test_name, home.path())
+            .unwrap_or_else(|error| panic!("private upgrade test {test_name} failed: {error}"));
+        private_upgrade_test_success(test_name, output).unwrap_or_else(|error| panic!("{error}"));
+        true
+    }
+
+    #[test]
+    fn private_upgrade_runner_rejects_missing_selector() {
+        let home = tempfile::tempdir().unwrap();
+        let output =
+            private_upgrade_child("upgrade::tests::missing_private_fixture", home.path()).unwrap();
+        assert!(output.status.success());
+        let error = private_upgrade_test_success("upgrade::tests::missing_private_fixture", output)
+            .expect_err("a zero-test selector must be rejected");
+        assert!(error.contains("did not prove one exact passing test"));
+        assert!(error.contains("running 0 tests"));
+    }
+
+    #[test]
+    fn private_upgrade_runner_retains_over_cap_output_tails() {
+        const NAME: &str = "upgrade::tests::private_upgrade_runner_retains_over_cap_output_tails";
+        const STDOUT_HEAD: &str = "OVERCAP_STDOUT_HEAD_ONLY";
+        const STDOUT_TAIL: &str = "OVERCAP_STDOUT_TAIL_SENTINEL";
+        const STDERR_HEAD: &str = "OVERCAP_STDERR_HEAD_ONLY";
+        const STDERR_TAIL: &str = "OVERCAP_STDERR_TAIL_SENTINEL";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:over-cap-control-entered")
+                .expect("over-cap control stage must flush");
+            print!(
+                "{STDOUT_HEAD}{}{}",
+                "x".repeat(test_child::OUTPUT_TAIL_BYTES + 128),
+                STDOUT_TAIL
+            );
+            eprint!(
+                "{STDERR_HEAD}{}{}",
+                "y".repeat(test_child::OUTPUT_TAIL_BYTES + 128),
+                STDERR_TAIL
+            );
+            std::io::stdout()
+                .flush()
+                .expect("over-cap stdout must flush");
+            std::io::stderr()
+                .flush()
+                .expect("over-cap stderr must flush");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let output =
+            private_upgrade_child(NAME, home.path()).expect("over-cap owned child must complete");
+        assert!(
+            output.stdout.total_bytes > test_child::OUTPUT_TAIL_BYTES && output.stdout.truncated,
+            "stdout must retain total bytes and truncation after its cap"
+        );
+        assert!(
+            output.stderr.total_bytes > test_child::OUTPUT_TAIL_BYTES && output.stderr.truncated,
+            "stderr must retain total bytes and truncation after its cap"
+        );
+        let stdout_tail = String::from_utf8_lossy(&output.stdout.tail);
+        let stderr_tail = String::from_utf8_lossy(&output.stderr.tail);
+        assert!(stdout_tail.contains(STDOUT_TAIL) && !stdout_tail.contains(STDOUT_HEAD));
+        assert!(stderr_tail.contains(STDERR_TAIL) && !stderr_tail.contains(STDERR_HEAD));
+        assert!(
+            output.status.success(),
+            "over-cap child must exit successfully"
+        );
+        assert!(
+            stdout_tail.contains(&format!("test {NAME} ... ok"))
+                && stdout_tail.contains("test result: ok. 1 passed"),
+            "the retained stdout tail must prove the exact child passed even though its leading count was trimmed"
+        );
+    }
+
+    #[test]
+    fn private_upgrade_runner_reaps_timed_out_owned_group() {
+        const NAME: &str = "upgrade::tests::private_upgrade_runner_reaps_timed_out_owned_group";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:timeout-control-entered")
+                .expect("timeout control stage must flush");
+            let previous = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+            assert_ne!(
+                previous,
+                libc::SIG_ERR,
+                "timeout control must install its child-only SIGTERM disposition"
+            );
+            println!("TIMEOUT_SIGTERM_IGNORED");
+            println!("TIMEOUT_STDOUT_SENTINEL");
+            eprintln!("TIMEOUT_STDERR_SENTINEL");
+            std::io::stdout()
+                .flush()
+                .expect("timeout stdout must flush");
+            std::io::stderr()
+                .flush()
+                .expect("timeout stderr must flush");
+            thread::sleep(Duration::from_secs(60));
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let error = private_upgrade_child(NAME, home.path())
+            .expect_err("the private child must hit its absolute deadline");
+        println!("TIMEOUT_CONTROL_EXPECTED_ERROR:{error}");
+        assert!(error.contains("exceeded 15 seconds"));
+        assert!(error.contains("HEX_TEST_CHILD_STAGE:upgrade:timeout-control-entered"));
+        assert!(error.contains("TIMEOUT_SIGTERM_IGNORED"));
+        assert!(error.contains("TIMEOUT_STDOUT_SENTINEL"));
+        assert!(error.contains("TIMEOUT_STDERR_SENTINEL"));
+        assert!(error.contains("direct child wait: success"));
+        assert!(error.contains("cleanup elapsed_ms="));
+        assert!(error.contains("grace wait: expired/still-running before group KILL"));
+        assert!(error.contains("root child exit does not prove descendant"));
+    }
+
+    #[test]
+    fn private_upgrade_runner_cleans_owned_child_on_pipe_setup_failure() {
+        const NAME: &str =
+            "upgrade::tests::private_upgrade_runner_cleans_owned_child_on_pipe_setup_failure";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:pipe-setup-control-entered")
+                .expect("pipe setup control stage must flush");
+            println!("PIPE_SETUP_STDOUT_SENTINEL");
+            eprintln!("PIPE_SETUP_STDERR_SENTINEL");
+            std::io::stdout()
+                .flush()
+                .expect("pipe setup stdout must flush");
+            std::io::stderr()
+                .flush()
+                .expect("pipe setup stderr must flush");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let stdout_error = private_upgrade_child_with_fault(
+            NAME,
+            home.path(),
+            PrivateChildFault::BeforeStdoutReader,
+        )
+        .expect_err("the controlled stdout setup failure must clean the child");
+        assert!(stdout_error.contains("controlled stdout pipe setup failure"));
+        assert!(stdout_error.contains("owned root child reaped"));
+        assert!(stdout_error.contains("direct child wait: success"));
+        assert!(stdout_error.contains("cleanup elapsed_ms="));
+
+        let error = private_upgrade_child_with_fault(
+            NAME,
+            home.path(),
+            PrivateChildFault::BeforeStderrReader,
+        )
+        .expect_err("the controlled pipe setup failure must fail after spawning the child");
+        assert!(error.contains("controlled stderr pipe setup failure"));
+        assert!(error.contains("owned root child reaped"));
+        assert!(error.contains("stdout reader: bytes="));
+        assert!(!error.contains("stdout reader was not started"));
+        assert!(error.contains("stderr reader was not started"));
+        assert!(error.contains("cleanup elapsed_ms="));
+    }
+
+    #[test]
+    fn private_upgrade_runner_joins_both_readers_before_reader_failure() {
+        const NAME: &str =
+            "upgrade::tests::private_upgrade_runner_joins_both_readers_before_reader_failure";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:reader-join-control-entered")
+                .expect("reader join control stage must flush");
+            println!("READER_STDOUT_SENTINEL");
+            eprintln!("READER_STDERR_SENTINEL");
+            std::io::stdout().flush().expect("reader stdout must flush");
+            std::io::stderr().flush().expect("reader stderr must flush");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let error = private_upgrade_child_with_fault(
+            NAME,
+            home.path(),
+            PrivateChildFault::BothReadersFailAfterRead,
+        )
+        .expect_err("the controlled reader failures must be reported");
+        assert!(error.contains("stdout reader failed: controlled stdout reader failure"));
+        assert!(error.contains("stderr reader failed: controlled stderr reader failure"));
+        assert!(error.contains("HEX_TEST_CHILD_STAGE:upgrade:reader-join-control-entered"));
+        assert!(error.contains("READER_STDOUT_SENTINEL"));
+        assert!(error.contains("READER_STDERR_SENTINEL"));
+        assert!(error.contains("stdout reader: bytes="));
+        assert!(error.contains("stderr reader: bytes="));
+    }
+
+    #[test]
+    fn private_upgrade_runner_admission_is_bounded_and_releases_after_failure() {
+        const NAME: &str =
+            "upgrade::tests::private_upgrade_runner_admission_is_bounded_and_releases_after_failure";
+        if test_child::in_child(NAME) {
+            test_child::stage("upgrade:admission-control-entered")
+                .expect("admission control stage must flush");
+            println!("ADMISSION_STDOUT_SENTINEL");
+            return;
+        }
+
+        let held = test_child::acquire_default_admission()
+            .expect("the initial test-only admission acquisition must succeed");
+        let admission_error = test_child::acquire_admission(Duration::from_secs(1))
+            .expect_err("a held test-only admission guard must fail within its own deadline");
+        assert!(admission_error.contains("admission exceeded 1 seconds before child spawn"));
+        drop(held);
+
+        let home = tempfile::tempdir().unwrap();
+        let cleanup_error = private_upgrade_child_with_fault(
+            NAME,
+            home.path(),
+            PrivateChildFault::BeforeStderrReader,
+        )
+        .expect_err("the real setup failure must release admission after cleanup");
+        assert!(cleanup_error.contains("owned root child reaped"));
+        assert!(cleanup_error.contains("cleanup elapsed_ms="));
+
+        let output = private_upgrade_child(NAME, home.path())
+            .expect("admission must release after the cleanup error");
+        private_upgrade_test_success(NAME, output)
+            .expect("released admission must run the real child");
+    }
+
+    #[test]
+    fn preflight_counts_deletion_only_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source/scripts");
+        let destination = tmp.path().join("instance/.hex/scripts");
+        fs::create_dir_all(&source).unwrap();
+        write_file(&destination.join("stale.sh"), "stale");
+
+        let (changed, new_count, unchanged, log) =
+            detect_managed_changes(&source, &destination, "scripts", true).unwrap();
+        assert_eq!((changed, new_count, unchanged), (1, 0, 0));
+        assert!(log.iter().any(|line| line.contains("- scripts/stale.sh")));
+    }
+
+    #[test]
+    fn preflight_counts_command_mirror_only_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source/system/commands");
+        let mirror = tmp.path().join("instance/.claude/commands");
+        write_file(&source.join("hex.md"), "current");
+        write_file(&mirror.join("obsolete.md"), "obsolete");
+
+        let (changed, new_count, unchanged, log) =
+            detect_managed_changes(&source, &mirror, "command mirror", true).unwrap();
+        assert_eq!((changed, new_count, unchanged), (1, 1, 0));
+        assert!(log
+            .iter()
+            .any(|line| line.contains("- command mirror/obsolete.md")));
+        assert!(log
+            .iter()
+            .any(|line| line.contains("+ command mirror/hex.md")));
+    }
+
+    #[test]
+    fn preflight_ignores_unmanaged_build_and_dependency_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source/scripts");
+        let destination = tmp.path().join("instance/.hex/scripts");
+        write_file(&source.join("target/generated.sh"), "build output");
+        write_file(
+            &source.join("node_modules/pkg/generated.sh"),
+            "dependency output",
+        );
+        write_file(&destination.join("target/old.sh"), "build output");
+        write_file(
+            &destination.join("node_modules/pkg/old.sh"),
+            "dependency output",
+        );
+
+        let (changed, new_count, unchanged, log) =
+            detect_managed_changes(&source, &destination, "scripts", true).unwrap();
+        assert_eq!((changed, new_count, unchanged), (0, 0, 0));
+        assert!(log.is_empty());
+    }
+
+    fn binary_preflight_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let instance = tmp.path().join("instance");
+        write_file(
+            &source.join("system/harness/Cargo.toml"),
+            "[package]\nversion = \"1.0.0\"\n",
+        );
+        write_file(
+            &instance.join("VERSIONS"),
+            "HEX_FOUNDATION_VERSION=v1.0.0\n",
+        );
+        write_file(
+            &instance.join(".hex/bin/hex"),
+            "#!/bin/sh\nprintf 'hex 1.0.0\\n'\n",
+        );
+        fs::set_permissions(
+            instance.join(".hex/bin/hex"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        init_test_repo(&source);
+        seed_commit(&source, "preflight fixture");
+        let sha = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&source)
+            .output()
+            .unwrap();
+        assert!(sha.status.success());
+        fs::write(instance.join(".hex/bin/hex.sha"), sha.stdout).unwrap();
+        (tmp, source, instance)
+    }
+
+    #[test]
+    fn preflight_binary_metadata_preserves_true_noop() {
+        if in_private_upgrade_test("upgrade::tests::preflight_binary_metadata_preserves_true_noop")
+        {
+            return;
+        }
+        let _env = crate::test_env::isolate_hex_dir();
+        test_child::stage("upgrade:preflight-noop-body").expect("test-child stage must flush");
+        let (_tmp, source, instance) = binary_preflight_fixture();
+        assert!(!binary_is_stale(&instance, &source).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synthetic_managed_policy_evidence_fails_loudly_in_private_home() {
+        if in_private_upgrade_test(
+            "upgrade::tests::synthetic_managed_policy_evidence_fails_loudly_in_private_home",
+        ) {
+            return;
+        }
+        let (_tmp, source, instance) = binary_preflight_fixture();
+        let home = PathBuf::from(std::env::var_os("HOME").expect("private HOME"));
+        write_file(
+            &home.join("Library/Application Support/Hex/build-signing/policy.json"),
+            "{}",
+        );
+        let error = binary_is_stale(&instance, &source)
+            .expect_err("synthetic managed evidence must preflight");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "synthetic evidence must fail loudly through source preflight: {error}"
+        );
+    }
+
+    #[test]
+    fn preflight_binary_metadata_rejects_failed_version_command() {
+        let (_tmp, source, instance) = binary_preflight_fixture();
+        write_file(
+            &instance.join(".hex/bin/hex"),
+            "#!/bin/sh\nprintf 'hex 1.0.0\\n'\nexit 9\n",
+        );
+        assert!(
+            binary_is_stale(&instance, &source).is_err(),
+            "failed executable must not prove current version"
+        );
+    }
+
+    #[test]
+    fn preflight_binary_metadata_rejects_unreadable_versions() {
+        let (_tmp, source, instance) = binary_preflight_fixture();
+        fs::remove_file(instance.join("VERSIONS")).unwrap();
+        fs::create_dir(instance.join("VERSIONS")).unwrap();
+        assert!(
+            binary_is_stale(&instance, &source).is_err(),
+            "required unreadable metadata must not pass no-op"
+        );
+    }
+
+    #[test]
+    fn preflight_binary_metadata_rejects_malformed_manifest_with_version_line() {
+        let (_tmp, source, instance) = binary_preflight_fixture();
+        write_file(
+            &source.join("system/harness/Cargo.toml"),
+            "[package]\nversion = \"1.0.0\"\nthis is not toml\n",
+        );
+        assert!(
+            binary_is_stale(&instance, &source).is_err(),
+            "finding a version line is not parsing a manifest"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_reconciles_stale_versions_pin_when_other_inputs_match() {
+        if in_private_upgrade_test(
+            "upgrade::tests::preflight_reconciles_stale_versions_pin_when_other_inputs_match",
+        ) {
+            return;
+        }
+        test_child::stage("upgrade:stale-pin-body").expect("test-child stage must flush");
+        let _env = crate::test_env::isolate_hex_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let instance = tmp.path().join("instance");
+        let source_files = [
+            "system/scripts/a.sh",
+            "system/skills/s/SKILL.md",
+            "system/commands/c.md",
+            "system/hooks/h.sh",
+            "system/iii/i.yml",
+            "system/templates/t.txt",
+            "system/version.txt",
+            "templates/AGENTS.md",
+        ];
+        for relative in source_files {
+            write_file(&source.join(relative), relative);
+            let destination = match relative {
+                "system/scripts/a.sh" => instance.join(".hex/scripts/a.sh"),
+                "system/skills/s/SKILL.md" => instance.join(".hex/skills/s/SKILL.md"),
+                "system/commands/c.md" => instance.join(".hex/commands/c.md"),
+                "system/hooks/h.sh" => instance.join(".hex/hooks/h.sh"),
+                "system/iii/i.yml" => instance.join(".hex/iii/i.yml"),
+                "system/templates/t.txt" => instance.join(".hex/templates/t.txt"),
+                "system/version.txt" => instance.join(".hex/version.txt"),
+                "templates/AGENTS.md" => continue,
+                _ => unreachable!(),
+            };
+            write_file(&destination, relative);
+        }
+        write_file(
+            &instance.join(".claude/commands/c.md"),
+            "system/commands/c.md",
+        );
+        write_file(
+            &source.join("system/harness/Cargo.toml"),
+            "[package]\nname = \"hex-harness\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+        test_child::stage("upgrade:stale-pin-fixture-ready")
+            .expect("stale-pin fixture-ready stage must flush");
+        init_test_repo(&source);
+        seed_commit(&source, "stale versions preflight fixture");
+        test_child::stage("upgrade:stale-pin-git-ready")
+            .expect("stale-pin git-ready stage must flush");
+
+        write_file(&instance.join("AGENTS.md"), "# test instance\n");
+        write_file(
+            &instance.join("VERSIONS"),
+            "# keep this comment\nHEX_FOUNDATION_VERSION=v0.0.0\nOTHER_PIN=v9\nHEX_FOUNDATION_VERSION=v0.0.0\n",
+        );
+        let bin = instance.join(".hex/bin/hex");
+        write_file(&bin, "#!/bin/sh\nprintf 'hex 1.0.0\\n'\n");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let sha = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&source)
+            .output()
+            .unwrap();
+        assert!(sha.status.success());
+        fs::write(instance.join(".hex/bin/hex.sha"), sha.stdout).unwrap();
+
+        std::env::set_var("HEX_DIR", &instance);
+        let args = vec!["--local".to_string(), source.to_string_lossy().into_owned()];
+        test_child::stage("upgrade:stale-pin-before-run")
+            .expect("stale-pin before-run stage must flush");
+        let exit = run(&args);
+        test_child::stage("upgrade:stale-pin-after-run")
+            .expect("stale-pin after-run stage must flush");
+        assert_eq!(exit, 0);
+        let versions = fs::read_to_string(instance.join("VERSIONS")).unwrap();
+        assert_eq!(versions.matches("HEX_FOUNDATION_VERSION=").count(), 1);
+        assert!(versions.contains("HEX_FOUNDATION_VERSION=v1.0.0"));
+        assert!(versions.contains("# keep this comment"));
+        assert!(versions.contains("OTHER_PIN=v9"));
+        test_child::stage("upgrade:stale-pin-assertions-complete")
+            .expect("stale-pin assertions-complete stage must flush");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_build_failure_leaves_live_managed_files_unchanged() {
+        let _env = crate::test_env::isolate_hex_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let instance = tmp.path().join("instance");
+        write_file(&source.join("templates/AGENTS.md"), "# source\n");
+        write_file(&source.join("system/scripts/managed.sh"), "new script\n");
+        write_file(
+            &source.join("system/managed_cargo_bridge.rs"),
+            "new bridge\n",
+        );
+        write_file(&source.join("system/version.txt"), "2.0.0\n");
+        write_file(
+            &source.join("system/harness/Cargo.toml"),
+            "[package]\nname = \"hex-harness\"\nversion = \"2.0.0\"\nedition = \"2021\"\n",
+        );
+        init_test_repo(&source);
+        seed_commit(&source, "failed candidate fixture");
+
+        write_file(&instance.join("AGENTS.md"), "# instance\n");
+        write_file(
+            &instance.join("VERSIONS"),
+            "HEX_FOUNDATION_VERSION=v1.0.0\n",
+        );
+        let bin = instance.join(".hex/bin/hex");
+        write_file(&bin, "#!/bin/sh\nprintf 'hex 1.0.0\\n'");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        write_file(&instance.join(".hex/scripts/managed.sh"), "old script\n");
+        write_file(
+            &instance.join(".hex/managed_cargo_bridge.rs"),
+            "old bridge\n",
+        );
+
+        std::env::set_var("HEX_DIR", &instance);
+        let exit = run(&["--local".to_string(), source.to_string_lossy().into_owned()]);
+        assert_eq!(exit, 1);
+        assert_eq!(
+            fs::read(instance.join(".hex/scripts/managed.sh")).unwrap(),
+            b"old script\n"
+        );
+        assert_eq!(
+            fs::read(instance.join(".hex/managed_cargo_bridge.rs")).unwrap(),
+            b"old bridge\n"
+        );
     }
 
     // The wrapper block's guard is the function signature "claude() {".
@@ -1873,7 +3352,7 @@ mod tests {
         assert_eq!(result, "#!/bin/bash\nnew content");
         // Old file backed up
         assert!(
-            backup_dir.join("scripts/hook.sh").exists(),
+            backup_dir.join(".hex/hooks/scripts/hook.sh").exists(),
             "old hook must be backed up"
         );
     }
@@ -1893,7 +3372,7 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(!dst.join("stale.sh").exists(), "stale file must be removed");
         assert!(
-            bak.join("stale.sh").exists(),
+            bak.join("dst/stale.sh").exists(),
             "stale file must be backed up"
         );
         assert!(dst.join("current.sh").exists(), "current file must remain");
@@ -2171,6 +3650,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sync_versions_file_returns_binary_step_health() {
+        if in_private_upgrade_test("upgrade::tests::sync_versions_file_returns_binary_step_health")
+        {
+            return;
+        }
+        let _env = crate::test_env::isolate_hex_dir();
+        test_child::stage("upgrade:sync-health-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hex_dir = tmp.path().join("hex");
@@ -2182,6 +3667,8 @@ mod tests {
             &source_dir.join("system/harness/Cargo.toml"),
             "[package]\nname = \"hex-harness\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
         );
+        init_test_repo(&source_dir);
+        seed_commit(&source_dir, "metadata health fixture");
         let bin_dir = hex_dir.join(".hex/bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let mock_bin = bin_dir.join("hex");
@@ -2209,13 +3696,58 @@ mod tests {
         assert!(sync_versions_file(&hex_dir, &source_dir, &backup_dir).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sync_versions_file_rejects_unreadable_installed_sha() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let hex_dir = tmp.path().join("hex");
+        let source_dir = tmp.path().join("source");
+        let backup_dir = tmp.path().join("backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        write_file(&hex_dir.join("VERSIONS"), "HEX_FOUNDATION_VERSION=v0.1.0\n");
+        write_file(
+            &source_dir.join("system/harness/Cargo.toml"),
+            "[package]\nname = \"hex-harness\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+        init_test_repo(&source_dir);
+        seed_commit(&source_dir, "unreadable SHA fixture");
+        let bin_dir = hex_dir.join(".hex/bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let mock_bin = bin_dir.join("hex");
+        fs::write(&mock_bin, "#!/bin/sh\necho hex 1.0.0\n").unwrap();
+        fs::set_permissions(&mock_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(hex_dir.join(".hex/bin/hex.sha")).unwrap();
+
+        assert!(
+            sync_versions_file(&hex_dir, &source_dir, &backup_dir).is_err(),
+            "an unreadable present SHA must fail, not become an unverifiable skip"
+        );
+    }
+
+    #[test]
+    fn sync_versions_file_rejects_source_without_git_head() {
+        let (tmp, source, instance) = binary_preflight_fixture();
+        fs::write(source.join(".git/HEAD"), "ref: refs/heads/missing\n").unwrap();
+        assert!(
+            sync_versions_file(&instance, &source, &tmp.path().join("backup")).is_err(),
+            "matching installed version cannot mask a broken source repository"
+        );
+    }
+
+    #[test]
+    fn sync_versions_file_rejects_invalid_utf8_installed_sha() {
+        let (tmp, source, instance) = binary_preflight_fixture();
+        fs::write(instance.join(".hex/bin/hex.sha"), [0xff]).unwrap();
+        assert!(
+            sync_versions_file(&instance, &source, &tmp.path().join("backup")).is_err(),
+            "invalid installed SHA must not be treated as an absent optional file"
+        );
+    }
+
     /// The deploy-black-hole path itself (OBS-017): a rebuild is NEEDED
-    /// (version mismatch) but the rebuild machinery fails — here the harness
-    /// source sync fails deterministically because `.hex/harness` exists as a
-    /// FILE. sync_versions_file must return false so run() fails the upgrade
-    /// instead of printing "Upgrade complete." over a stale binary. This
-    /// enters the `binary_needs_rebuild == true` block without invoking
-    /// cargo.
+    /// (version mismatch) but the staged source build fails. The instance
+    /// must remain untouched until that candidate build succeeds.
     #[cfg(unix)]
     #[test]
     fn sync_versions_file_fails_when_rebuild_path_breaks() {
@@ -2230,18 +3762,36 @@ mod tests {
             &source_dir.join("system/harness/Cargo.toml"),
             "[package]\nname = \"hex-harness\"\nversion = \"2.0.0\"\nedition = \"2021\"\n",
         );
+        init_test_repo(&source_dir);
+        seed_commit(&source_dir, "rebuild failure fixture");
         // Installed binary reports an OLDER version → rebuild required.
         let bin_dir = hex_dir.join(".hex/bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let mock_bin = bin_dir.join("hex");
         fs::write(&mock_bin, "#!/bin/sh\necho hex 1.0.0\n").unwrap();
         fs::set_permissions(&mock_bin, fs::Permissions::from_mode(0o755)).unwrap();
-        // Sabotage: .hex/harness is a FILE, so the harness source sync fails.
-        fs::write(hex_dir.join(".hex/harness"), "not a directory").unwrap();
+        write_file(
+            &source_dir.join("system/managed_cargo_bridge.rs"),
+            "new bridge source",
+        );
+        write_file(
+            &hex_dir.join(".hex/managed_cargo_bridge.rs"),
+            "installed bridge remains unchanged",
+        );
 
         assert!(
             sync_versions_file(&hex_dir, &source_dir, &backup_dir).is_err(),
             "a broken rebuild path must fail the binary step (deploy black hole)"
+        );
+        assert_eq!(
+            fs::read(hex_dir.join("VERSIONS")).unwrap(),
+            b"HEX_FOUNDATION_VERSION=v0.1.0\n",
+            "a failed staged build must not update managed metadata"
+        );
+        assert_eq!(
+            fs::read(hex_dir.join(".hex/managed_cargo_bridge.rs")).unwrap(),
+            b"installed bridge remains unchanged",
+            "a failed staged build must not update managed bridge source"
         );
     }
 
@@ -2277,6 +3827,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sync_versions_file_preserves_boi_version_and_comments() {
+        if in_private_upgrade_test(
+            "upgrade::tests::sync_versions_file_preserves_boi_version_and_comments",
+        ) {
+            return;
+        }
+        let _env = crate::test_env::isolate_hex_dir();
+        test_child::stage("upgrade:sync-preserve-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2292,6 +3849,8 @@ mod tests {
             &source_dir.join("system/harness/Cargo.toml"),
             "[package]\nname = \"hex-harness\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
         );
+        init_test_repo(&source_dir);
+        seed_commit(&source_dir, "versions preservation fixture");
 
         // Mock installed hex binary reporting the same version so
         // binary_needs_rebuild returns false (no cargo build triggered by
@@ -2432,7 +3991,8 @@ CUSTOM_INSTANCE_PIN=abc123
         let build_failure_msg = "Upgrade FAILED — the hex binary was NOT updated (see Step 5).";
 
         let restart_err = "launchctl bootstrap failed: EIO".to_string();
-        let msg = binary_step_failure_message(&BinaryStepFailure::RestartFailed(restart_err.clone()));
+        let msg =
+            binary_step_failure_message(&BinaryStepFailure::RestartFailed(restart_err.clone()));
 
         assert_ne!(
             msg, build_failure_msg,
@@ -2487,6 +4047,13 @@ CUSTOM_INSTANCE_PIN=abc123
     #[cfg(unix)]
     #[test]
     fn sync_versions_file_return_type_carries_the_failure_kind() {
+        if in_private_upgrade_test(
+            "upgrade::tests::sync_versions_file_return_type_carries_the_failure_kind",
+        ) {
+            return;
+        }
+        let _env = crate::test_env::isolate_hex_dir();
+        test_child::stage("upgrade:sync-kind-body").expect("test-child stage must flush");
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hex_dir = tmp.path().join("hex");
@@ -2498,6 +4065,8 @@ CUSTOM_INSTANCE_PIN=abc123
             &source_dir.join("system/harness/Cargo.toml"),
             "[package]\nname = \"hex-harness\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
         );
+        init_test_repo(&source_dir);
+        seed_commit(&source_dir, "binary health fixture");
         let bin_dir = hex_dir.join(".hex/bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let mock_bin = bin_dir.join("hex");
@@ -2717,5 +4286,424 @@ CUSTOM_INSTANCE_PIN=abc123
             "pre-staged operator work (todo.md) must NOT be swept into the \
              upgrade commit"
         );
+    }
+
+    #[test]
+    fn commit_synced_files_preserves_preexisting_dirty_hex_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/operator-staged.txt"), "base staged\n");
+        write_file(&ws.join(".hex/operator-unstaged.txt"), "base unstaged\n");
+        write_file(&ws.join(".hex/upgrade-owned.txt"), "base upgrade\n");
+        seed_commit(ws, "seed");
+
+        write_file(&ws.join(".hex/operator-staged.txt"), "operator staged\n");
+        Command::new("git")
+            .args(["add", ".hex/operator-staged.txt"])
+            .current_dir(ws)
+            .status()
+            .unwrap();
+        write_file(
+            &ws.join(".hex/operator-unstaged.txt"),
+            "operator unstaged\n",
+        );
+        let snapshot = upgrade_git_snapshot(ws).unwrap();
+
+        write_file(&ws.join(".hex/upgrade-owned.txt"), "upgrade result\n");
+        let made = commit_synced_files_since(ws, "9.9.9-test", &snapshot, None).unwrap();
+        assert!(made);
+        assert!(!path_is_dirty(ws, ".hex/upgrade-owned.txt"));
+        assert!(path_is_dirty(ws, ".hex/operator-staged.txt"));
+        assert!(path_is_dirty(ws, ".hex/operator-unstaged.txt"));
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(ws)
+            .output()
+            .unwrap();
+        let staged_files = String::from_utf8_lossy(&staged.stdout);
+        assert!(staged_files.contains(".hex/operator-staged.txt"));
+
+        let committed = Command::new("git")
+            .args(["show", "--format=", "--name-only", "HEAD"])
+            .current_dir(ws)
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&committed.stdout);
+        assert!(files.contains(".hex/upgrade-owned.txt"));
+        assert!(!files.contains("operator-staged.txt"));
+        assert!(!files.contains("operator-unstaged.txt"));
+    }
+
+    #[test]
+    fn protected_sync_does_not_overwrite_preexisting_dirty_hex_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/scripts/foo.sh"), "base\n");
+        seed_commit(ws, "seed");
+        write_file(&ws.join(".hex/scripts/foo.sh"), "operator\n");
+        let snapshot = upgrade_git_snapshot(ws).unwrap();
+        let source = ws.join("source");
+        write_file(&source.join("foo.sh"), "foundation\n");
+        let result = apply_sync_protected(
+            &source,
+            &ws.join(".hex/scripts"),
+            None,
+            Some((ws, &snapshot)),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(ws.join(".hex/scripts/foo.sh")).unwrap(),
+            "operator\n"
+        );
+    }
+
+    #[test]
+    fn protected_sync_rejects_clean_file_edited_before_first_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/scripts/foo.sh"), "base\n");
+        seed_commit(ws, "seed");
+        let snapshot = upgrade_git_snapshot(ws).unwrap();
+        write_file(&ws.join(".hex/scripts/foo.sh"), "operator-before-write\n");
+        let source = ws.join("source");
+        write_file(&source.join("foo.sh"), "foundation\n");
+        let result = apply_sync_protected(
+            &source,
+            &ws.join(".hex/scripts"),
+            None,
+            Some((ws, &snapshot)),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(ws.join(".hex/scripts/foo.sh")).unwrap(),
+            "operator-before-write\n"
+        );
+    }
+
+    #[test]
+    fn planned_snapshot_records_absence_and_rejects_unplanned_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join("seed"), "seed");
+        seed_commit(ws, "seed");
+        let planned = ws.join(".hex/scripts/new.sh");
+        let snapshot = upgrade_git_snapshot_for(ws, std::slice::from_ref(&planned)).unwrap();
+        assert_eq!(
+            snapshot
+                .baseline_content
+                .get(Path::new(".hex/scripts/new.sh")),
+            Some(&None)
+        );
+        assert!(protect_generated_path(ws, &planned, b"new", &snapshot, None).is_ok());
+        assert!(
+            protect_generated_path(ws, &ws.join(".hex/unplanned"), b"new", &snapshot, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn repeated_owned_sync_accepts_own_write_but_rejects_intervening_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        let dst = ws.join(".hex/scripts/repeat.sh");
+        write_file(&dst, "base");
+        seed_commit(ws, "seed");
+        let snapshot = upgrade_git_snapshot_for(ws, std::slice::from_ref(&dst)).unwrap();
+        let src = ws.join("source");
+        write_file(&src.join("repeat.sh"), "first");
+        let mut owned = HashMap::new();
+        apply_sync_protected(
+            &src,
+            &ws.join(".hex/scripts"),
+            None,
+            Some((ws, &snapshot)),
+            Some(&mut owned),
+        )
+        .unwrap();
+        write_file(&src.join("repeat.sh"), "second");
+        apply_sync_protected(
+            &src,
+            &ws.join(".hex/scripts"),
+            None,
+            Some((ws, &snapshot)),
+            Some(&mut owned),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"second");
+        write_file(&dst, "operator");
+        write_file(&src.join("repeat.sh"), "third");
+        assert!(apply_sync_protected(
+            &src,
+            &ws.join(".hex/scripts"),
+            None,
+            Some((ws, &snapshot)),
+            Some(&mut owned)
+        )
+        .is_err());
+        assert_eq!(fs::read(&dst).unwrap(), b"operator");
+    }
+
+    #[test]
+    fn exact_inventory_includes_crate_roots_and_excludes_runtime_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("instance");
+        let source = tmp.path().join("source");
+        for file in [
+            "harness/Cargo.toml",
+            "harness/build.rs",
+            "harness/src/lib.rs",
+            "code-intel/Cargo.toml",
+            "code-intel/src/lib.rs",
+            "scripts/run.sh",
+            "iii/config.toml",
+            "templates/example",
+            "commands/do.md",
+            "managed_cargo_bridge.rs",
+        ] {
+            write_file(&source.join("system").join(file), "source");
+        }
+        for file in ["harness/target/debug/secret", "harness/node_modules/secret"] {
+            write_file(&source.join("system").join(file), "ignored source output");
+        }
+        for file in [
+            "harness/Cargo.toml",
+            "harness/build.rs",
+            "harness/src/old.rs",
+            "harness/target/debug/cache",
+            "code-intel/Cargo.toml",
+            "iii/data/state.db",
+            "iii/workers/node_modules/cache",
+            "templates/operator-only",
+            "memory.db",
+            "credentials.env",
+            "commands/old.md",
+            "managed_cargo_bridge.rs",
+        ] {
+            write_file(&ws.join(".hex").join(file), "existing");
+        }
+        let sources = source_dirs_for_layout("v2", &source).unwrap();
+        let plan = planned_upgrade_paths(&ws, &source, &sources).unwrap();
+        for file in [
+            "harness/Cargo.toml",
+            "harness/build.rs",
+            "harness/src/lib.rs",
+            "harness/src/old.rs",
+            "code-intel/Cargo.toml",
+            "scripts/run.sh",
+            "commands/old.md",
+            "managed_cargo_bridge.rs",
+        ] {
+            assert!(plan.contains(&ws.join(".hex").join(file)), "missing {file}");
+        }
+        for file in [
+            "harness/target/debug/cache",
+            "harness/target/debug/secret",
+            "harness/node_modules/secret",
+            "iii/data/state.db",
+            "iii/workers/node_modules/cache",
+            "templates/operator-only",
+            "memory.db",
+            "credentials.env",
+        ] {
+            assert!(
+                !plan.contains(&ws.join(".hex").join(file)),
+                "unplanned runtime read: {file}"
+            );
+        }
+        assert!(plan.contains(&ws.join(".claude/commands/do.md")));
+        init_test_repo(&ws);
+        seed_commit(&ws, "seed");
+        let snapshot = upgrade_git_snapshot_for(&ws, &plan).unwrap();
+        assert_eq!(snapshot.baseline_content.len(), plan.len());
+        assert!(snapshot
+            .baseline_content
+            .contains_key(Path::new(".hex/harness/Cargo.toml")));
+        assert!(snapshot
+            .baseline_content
+            .contains_key(Path::new(".hex/managed_cargo_bridge.rs")));
+        // The real writer accepts both root files and new files from this exact inventory.
+        let mut owned = HashMap::new();
+        apply_sync_protected(
+            &source.join("system/harness"),
+            &ws.join(".hex/harness"),
+            None,
+            Some((&ws, &snapshot)),
+            Some(&mut owned),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(ws.join(".hex/harness/Cargo.toml")).unwrap(),
+            b"source"
+        );
+        assert!(!ws.join(".hex/harness/target/debug/secret").exists());
+    }
+
+    #[test]
+    fn commit_and_inventory_do_not_read_ignored_runtime_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".gitignore"), ".hex/memory.db\n.hex/iii/data/\n");
+        let managed = ws.join(".hex/scripts/run.sh");
+        write_file(&managed, "base");
+        seed_commit(ws, "seed");
+        let ignored = ws.join(".hex/memory.db");
+        write_file(&ignored, "private runtime bytes");
+        fs::set_permissions(&ignored, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = (|| -> Result<bool, String> {
+            let snapshot = upgrade_git_snapshot_for(ws, std::slice::from_ref(&managed))?;
+            assert_eq!(snapshot.baseline_content.len(), 1);
+            write_file(&managed, "new");
+            let owned = HashMap::from([(managed, Some(b"new".to_vec()))]);
+            commit_synced_files_since(ws, "test", &snapshot, Some(&owned))
+        })();
+        fs::set_permissions(&ignored, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.unwrap());
+        assert_eq!(fs::read(&ignored).unwrap(), b"private runtime bytes");
+    }
+
+    #[test]
+    fn protected_backups_keep_same_relative_names_in_distinct_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/scripts/foo.sh"), "script-old\n");
+        write_file(&ws.join(".hex/hooks/foo.sh"), "hook-old\n");
+        write_file(&ws.join(".hex/commands/foo.sh"), "command-old\n");
+        write_file(&ws.join(".claude/commands/foo.sh"), "mirror-old\n");
+        seed_commit(ws, "seed");
+        let snapshot = upgrade_git_snapshot(ws).unwrap();
+        let script_src = ws.join("script-source");
+        let hook_src = ws.join("hook-source");
+        write_file(&script_src.join("foo.sh"), "script-new\n");
+        write_file(&hook_src.join("foo.sh"), "hook-new\n");
+        let backup = ws.join(".hex/.upgrade-backup-test");
+        apply_sync_protected(
+            &script_src,
+            &ws.join(".hex/scripts"),
+            Some(&backup),
+            Some((ws, &snapshot)),
+            None,
+        )
+        .unwrap();
+        apply_sync_protected(
+            &hook_src,
+            &ws.join(".hex/hooks"),
+            Some(&backup),
+            Some((ws, &snapshot)),
+            None,
+        )
+        .unwrap();
+        for destination in [".hex/commands", ".claude/commands"] {
+            apply_sync_protected(
+                &script_src,
+                &ws.join(destination),
+                Some(&backup),
+                Some((ws, &snapshot)),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            fs::read_to_string(backup.join(".hex/commands/foo.sh")).unwrap(),
+            "command-old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(backup.join(".claude/commands/foo.sh")).unwrap(),
+            "mirror-old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(backup.join(".hex/scripts/foo.sh")).unwrap(),
+            "script-old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(backup.join(".hex/hooks/foo.sh")).unwrap(),
+            "hook-old\n"
+        );
+    }
+
+    #[test]
+    fn commit_owned_paths_ignores_unrelated_new_dirty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/owned.txt"), "base\n");
+        seed_commit(ws, "seed");
+        let snapshot = upgrade_git_snapshot(ws).unwrap();
+        write_file(&ws.join(".hex/owned.txt"), "upgrade\n");
+        write_file(&ws.join(".hex/operator-new.txt"), "operator\n");
+        let mut owned = HashMap::new();
+        owned.insert(
+            ws.join(".hex/owned.txt"),
+            Some(fs::read(ws.join(".hex/owned.txt")).unwrap()),
+        );
+        assert!(commit_synced_files_since(ws, "9.9.9-test", &snapshot, Some(&owned)).unwrap());
+        assert!(path_is_dirty(ws, ".hex/operator-new.txt"));
+        assert!(!path_is_dirty(ws, ".hex/owned.txt"));
+    }
+
+    #[test]
+    fn commit_owned_path_rejects_edit_after_upgrade_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/owned.txt"), "base\n");
+        seed_commit(ws, "seed");
+        let snapshot = upgrade_git_snapshot(ws).unwrap();
+        write_file(&ws.join(".hex/owned.txt"), "upgrade\n");
+        let mut owned = HashMap::new();
+        owned.insert(
+            ws.join(".hex/owned.txt"),
+            Some(fs::read(ws.join(".hex/owned.txt")).unwrap()),
+        );
+        write_file(&ws.join(".hex/owned.txt"), "operator-after\n");
+        let result = commit_synced_files_since(ws, "9.9.9-test", &snapshot, Some(&owned));
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(ws.join(".hex/owned.txt")).unwrap(),
+            "operator-after\n"
+        );
+    }
+
+    #[test]
+    fn commit_owned_path_rejects_operator_index_change_even_if_worktree_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        init_test_repo(ws);
+        write_file(&ws.join(".hex/owned.txt"), "base\n");
+        seed_commit(ws, "seed");
+        let snapshot = upgrade_git_snapshot(ws).unwrap();
+        write_file(&ws.join(".hex/owned.txt"), "upgrade\n");
+        let mut owned = HashMap::new();
+        owned.insert(
+            ws.join(".hex/owned.txt"),
+            Some(fs::read(ws.join(".hex/owned.txt")).unwrap()),
+        );
+        write_file(&ws.join(".hex/owned.txt"), "operator-staged\n");
+        Command::new("git")
+            .args(["add", ".hex/owned.txt"])
+            .current_dir(ws)
+            .status()
+            .unwrap();
+        write_file(&ws.join(".hex/owned.txt"), "upgrade\n");
+        let result = commit_synced_files_since(ws, "9.9.9-test", &snapshot, Some(&owned));
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(ws.join(".hex/owned.txt")).unwrap(),
+            "upgrade\n"
+        );
+        let staged = Command::new("git")
+            .args(["show", ":.hex/owned.txt"])
+            .current_dir(ws)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout), "operator-staged\n");
     }
 }

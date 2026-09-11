@@ -243,13 +243,25 @@ fn registry() -> Vec<LineCheck> {
         verbose_suffix: "",
     });
 
-    // macOS LaunchAgent plists tied to the owner's namespace.
+    // macOS LaunchAgent plists tied to the owner's namespace. The four
+    // canonical signing product identifiers are app bundle identities, not
+    // LaunchAgent labels, and are intentionally retained in signing code and
+    // its tests. Other labels in the personal namespace still fail closed.
     checks.push(LineCheck {
         label: "com.mrap. LaunchAgent",
         pattern: re(r"com\.mrap\."), // personalization-audit: pattern registry
         include_ext: Some(&["py", "sh", "plist"]),
         exclude_dirs: COMMON_EXCLUDE_DIRS,
-        filters: compile(COMMON_FILTERS),
+        filters: {
+            let mut f = compile(COMMON_FILTERS);
+            f.push(re(
+                r"com\.mrap\.(?:hex(?:\.(?:scipd|cq))?|boi)(?:$|[^A-Za-z0-9_.])",
+            )); // personalization-audit: canonical signing identities
+            f.push(re(
+                r#"com\.mrap\.(?:" \+ (?:product|identity)(?:$|[^A-Za-z0-9_])|\{self\.product\}(?:$|[^A-Za-z0-9_]))"#,
+            )); // personalization-audit: canonical signing identity construction
+            f
+        },
         plain_suffix: "",
         verbose_suffix: "",
     });
@@ -756,6 +768,58 @@ mod tests {
         let fixture = "workspace = mrap-hex"; // personalization-audit: test fixture
         let v = check_content(&check("mrap-specific identifier"), "docs/setup.md", fixture);
         assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn canonical_signing_ids_pass_but_personal_launchagent_labels_flag() {
+        let c = check("com.mrap. LaunchAgent");
+        for canonical_id in [
+            "com.mrap.hex",
+            "com.mrap.boi",
+            "com.mrap.hex.scipd",
+            "com.mrap.hex.cq",
+        ] {
+            assert!(
+                check_content(&c, "system/scripts/macos-signing.py", canonical_id).is_empty(),
+                "canonical signing identity must pass: {canonical_id}"
+            );
+        }
+        for canonical_construction in [
+            r#"self.identifier = "com.mrap." + product"#,
+            r#"identifier "com.mrap.{self.product}""#,
+            r#"result["identifier"] = "com.mrap." + identity"#,
+        ] {
+            assert!(
+                check_content(&c, "tests/test_macos_signing.py", canonical_construction).is_empty(),
+                "canonical signing identity construction must pass: {canonical_construction}"
+            );
+        }
+        let personal_label = "<key>Label</key><string>com.mrap.private-agent</string>";
+        assert_eq!(
+            check_content(
+                &c,
+                "system/templates/launchd/private-agent.plist",
+                personal_label
+            )
+            .len(),
+            1
+        );
+        for near_match in [
+            "com.mrap.hex.private",
+            "com.mrap.hex.scipd.evil",
+            r#"self.identifier = "com.mrap." + product_evil"#,
+        ] {
+            assert_eq!(
+                check_content(
+                    &c,
+                    "system/templates/launchd/private-agent.plist",
+                    near_match
+                )
+                .len(),
+                1,
+                "near-match must remain a LaunchAgent violation: {near_match}"
+            );
+        }
     }
 
     #[test]

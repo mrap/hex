@@ -19,6 +19,75 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  macos-signing-change-filter:
+    name: detect macOS signing changes
+    runs-on: ubuntu-latest
+    outputs:
+      macos_signing: ${{ steps.filter.outputs.macos_signing }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        name: identify affected paths
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+          elif [[ "$EVENT_BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            printf 'macos_signing=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            base="$EVENT_BEFORE"
+          fi
+
+          macos_signing=false
+          changed="$(git diff --name-only "$base" "$HEAD_SHA")"
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/ci.yml|Cargo.toml|Cargo.lock|install.sh|system/harness/Cargo.toml|system/harness/src/lib.rs|system/harness/src/upgrade.rs|system/harness/src/codeintel_upgrade.rs|system/harness/src/harness/supervise.rs|system/harness/src/main.rs|system/harness/src/*identity*|system/harness/tests/macos_app_admission.rs|system/harness/tests/macos_codeintel_upgrade.rs|system/scripts/macos-signing.py|system/scripts/macos-app-install.py|tests/test_macos_signing.py|tests/test_macos_app_install.py|tests/test_macos_install_caller.py|tests/test_macos_codeintel_products.py|tests/test_macos_app_alias.py|tests/test_macos_app_service.py|system/code-intel/Cargo.toml|docs/macos-signing.md|docs/macos-app-install.md|docs/macos-install-callers.md|docs/macos-build-standard.md|docs/macos-code-intel-alias.md)
+                macos_signing=true
+                ;;
+            esac
+          done <<< "$changed"
+
+          printf 'macos_signing=%s\n' "$macos_signing" >> "$GITHUB_OUTPUT"
+
+  style-hook-contract:
+    name: advisory hook contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -I -B tests/test_gdd_style_gate.py
+
+  managed-target-contract:
+    name: managed target contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -I -B -m unittest discover -s tests -p test_managed_target_check.py
+
+  cleanup-verify-contract:
+    name: cleanup verify contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: python3 -I -B tests/test_cleanup_verify.py
+
   fmt:
     name: cargo fmt --check
     runs-on: ubuntu-latest
@@ -49,5 +118,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  macos-signing-install:
+    name: macOS signing and install policy tests
+    needs: macos-signing-change-filter
+    if: needs.macos-signing-change-filter.outputs.macos_signing == 'true'
+    # Explicit current standard GitHub-hosted macOS label. Keep this stable
+    # instead of following macos-latest as Apple runner images change.
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify credential-free test inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f tests/test_macos_signing.py
+          test -f tests/test_macos_app_install.py
+          test -f tests/test_macos_install_caller.py
+          test -f tests/test_macos_codeintel_products.py
+          test -f tests/test_macos_app_alias.py
+          test -f tests/test_macos_app_service.py
+          bash -n install.sh
+      - name: Run signing and install policy tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(python3 -I -c 'import sys; print(sys.platform)')" = darwin
+          python3 -W error -I -B tests/test_macos_signing.py
+          python3 -W error -I -B tests/test_macos_app_install.py
+          python3 -W error -I -B tests/test_macos_install_caller.py
+          python3 -W error -I -B tests/test_macos_codeintel_products.py
+          python3 -W error -I -B tests/test_macos_app_alias.py
+          python3 -W error -I -B tests/test_macos_app_service.py
+
+  macos-app-callers:
+    name: macOS app build and service callers
+    needs: macos-signing-change-filter
+    if: needs.macos-signing-change-filter.outputs.macos_signing == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test callers without credentials or service changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HEX_DIR="$RUNNER_TEMP/hex-app-caller-tests"
+          cargo test --locked -p hex-harness --lib app_identity::tests
+          cargo test --locked -p hex-harness --lib harness::supervise::tests
+          cargo test --locked -p hex-harness --bin hex upgrade::tests
+          cargo test --locked -p hex-harness --test macos_app_admission
+          cargo test --locked -p hex-harness --test macos_codeintel_upgrade

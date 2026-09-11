@@ -152,7 +152,7 @@ pub fn scan_diff(diff: &str) -> Vec<Finding> {
                         findings.push(Finding {
                             file: file.clone(),
                             line: new_line,
-                            pattern: *name,
+                            pattern: name,
                             matched_len: m.as_str().chars().count(),
                         });
                     }
@@ -256,10 +256,7 @@ pub fn install_hook(hooks_dir: &Path) -> std::io::Result<InstallOutcome> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &pre_commit,
-                    std::fs::Permissions::from_mode(0o755),
-                )?;
+                std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o755))?;
             }
             return Ok(InstallOutcome::AlreadyInstalled);
         }
@@ -359,7 +356,9 @@ fn run_install() {
             let joined = if p.is_absolute() { p } else { cwd.join(p) };
             joined.canonicalize().unwrap_or(joined)
         };
-        let hooks_canon = hooks_dir.canonicalize().unwrap_or_else(|_| hooks_dir.clone());
+        let hooks_canon = hooks_dir
+            .canonicalize()
+            .unwrap_or_else(|_| hooks_dir.clone());
         if hp_abs != hooks_canon {
             eprintln!(
                 "secret-scan --install: WARNING — core.hooksPath is set to '{}', so git will \
@@ -547,7 +546,10 @@ mod tests {
 
     #[test]
     fn detects_legacy_openai_key() {
-        let secret = format!("{}{}", "sk-", "Ab0Cd1Ef2Gh3Ij4Kl5Mn6Op7Qr8St9Uv0Wx1Yz2Ab3Cd4Ef5");
+        let secret = format!(
+            "{}{}",
+            "sk-", "Ab0Cd1Ef2Gh3Ij4Kl5Mn6Op7Qr8St9Uv0Wx1Yz2Ab3Cd4Ef5"
+        );
         let d = diff_with(&format!("key: {secret}"));
         let f = scan_diff(&d);
         assert_eq!(f.len(), 1, "{f:?}");
@@ -558,7 +560,10 @@ mod tests {
     fn legacy_openai_pattern_does_not_double_match_vendored_sk_keys() {
         // sk-ant/sk-or/sk-proj all break the unbroken-alnum run with a hyphen,
         // so each must match ONLY its own vendor pattern.
-        let secret = format!("{}{}", "sk-ant-", "api03-Ab0Cd1Ef2Gh3Ij4Kl5Mn6Op7Qr8St9Uv0Wx1Yz2Ab3Cd4");
+        let secret = format!(
+            "{}{}",
+            "sk-ant-", "api03-Ab0Cd1Ef2Gh3Ij4Kl5Mn6Op7Qr8St9Uv0Wx1Yz2Ab3Cd4"
+        );
         let d = diff_with(&format!("key: {secret}"));
         let f = scan_diff(&d);
         assert_eq!(f.len(), 1, "{f:?}");
@@ -613,7 +618,10 @@ mod tests {
               ctx = \"{secret}\"\n\
              +new = 1\n"
         );
-        assert!(scan_diff(&d).is_empty(), "only added lines should be scanned");
+        assert!(
+            scan_diff(&d).is_empty(),
+            "only added lines should be scanned"
+        );
     }
 
     #[test]
@@ -654,7 +662,10 @@ mod tests {
         assert_eq!(f[0].file, "a.rs");
         assert_eq!(f[0].line, 2, "the ++-content line is added line 2");
         assert_eq!(f[1].file, "a.rs", "attribution must not be corrupted");
-        assert_eq!(f[1].line, 3, "counter must advance past the ++-content line");
+        assert_eq!(
+            f[1].line, 3,
+            "counter must advance past the ++-content line"
+        );
     }
 
     #[test]
@@ -789,7 +800,10 @@ mod tests {
         // Loud: names the refusal in caps.
         assert!(msg.contains("REFUSING"), "not loud: {msg}");
         // Actionable: points at the offending hook and how to proceed.
-        assert!(msg.contains("/repo/.git/hooks/pre-commit"), "no path: {msg}");
+        assert!(
+            msg.contains("/repo/.git/hooks/pre-commit"),
+            "no path: {msg}"
+        );
         assert!(
             msg.contains("hex hook secret-scan --install"),
             "no remediation: {msg}"

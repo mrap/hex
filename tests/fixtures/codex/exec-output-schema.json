@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "title": { "type": "string" },
+    "count": { "type": "integer" },
+    "done":  { "type": "boolean" }
+  },
+  "required": ["title", "count", "done"]
+}

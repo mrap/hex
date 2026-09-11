@@ -1,0 +1,10 @@
+{
+  "session_id": "<SESSION_ID>",
+  "turn_id": "<TURN_ID>",
+  "transcript_path": "<TMP>/home/sessions/2026/09/07/rollout-2026-09-07T15-05-18-<SESSION_ID>.jsonl",
+  "cwd": "<TMP>/proj",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-5.4-mini",
+  "permission_mode": "bypassPermissions",
+  "prompt": "Run the shell command: echo hello-from-probe-A . After it runs, reply with the single word DONE and stop."
+}

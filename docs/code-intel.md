@@ -37,8 +37,18 @@ the how-to.
 
 ## Walkthrough
 
+For development, `cargo build --release -p scipd` produces compiler outputs
+under Cargo's selected target directory. This command does not install or
+qualify a macOS app. Do not point a LaunchAgent at those outputs.
+
+For managed macOS installation, use a qualified Foundation `install.sh` or
+`hex upgrade` release containing the code-intel caller integration. Those
+callers publish the separate CQ and SCIPD apps through the shared transaction
+and repair the Hex command aliases. See the
+[macOS build standard](macos-build-standard.md) for the source and qualification
+boundary. After installation, use the installed `cq` command:
+
 ```bash
-cargo build --release -p scipd        # binary at target/release/cq
 cq register ~/github.com/mrap/hex-foundation
 # {"registered":"ab12cd34ef56","root":"/path/to/hex-foundation"}
 
@@ -105,15 +115,20 @@ edited or not, committed or not.
 
 ### The daemon
 
+Managed install and upgrade reconcile an **existing** `com.hex.scipd` service
+through the common helper after verifying its installed app. They preserve
+unrelated plist settings and do not start a deliberately stopped service.
+An interrupted reload has a separate recovery path.
+
+First-time creation of an absent SCIPD service has no qualified automatic setup
+path yet. The shared installer preserves an absent service; installing the app
+does not imply that its daemon starts. Do not substitute a raw Cargo path or a
+manual `launchctl bootstrap` command for the missing managed setup path.
+
+For an existing service, check its response after the qualified update:
+
 ```bash
-cargo build --release -p scipd        # binaries at target/release/{cq,scipd}
-mkdir -p ~/.codeintel/logs
-sed -e "s|__SCIPD_BIN__|$HOME/github.com/mrap/hex-foundation/target/release/scipd|" \
-    -e "s|__HOME__|$HOME|" \
-    system/templates/launchd/com.hex.scipd.plist \
-    > ~/Library/LaunchAgents/com.hex.scipd.plist
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.hex.scipd.plist
-cq doctor                             # scipd section goes "ok" once the socket answers
+cq doctor                             # scipd section reports whether it answers
 ```
 
 One daemon per user, serving every registered workspace. KeepAlive restarts

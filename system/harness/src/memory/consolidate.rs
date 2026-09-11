@@ -163,7 +163,8 @@ fn object_token_set(object: &str) -> std::collections::BTreeSet<String> {
 fn is_polarity_token(t: &str) -> bool {
     matches!(
         t,
-        "not" | "no"
+        "not"
+            | "no"
             | "never"
             | "none"
             | "cannot"
@@ -285,7 +286,10 @@ fn op_fact_canonicalize(conn: &mut Connection) -> anyhow::Result<()> {
     let mut groups: std::collections::BTreeMap<(String, String), Vec<usize>> =
         std::collections::BTreeMap::new();
     for (i, f) in facts.iter().enumerate() {
-        let key = (canonical_subject_key(&f.subject), f.predicate.to_lowercase());
+        let key = (
+            canonical_subject_key(&f.subject),
+            f.predicate.to_lowercase(),
+        );
         groups.entry(key).or_default().push(i);
     }
 
@@ -674,7 +678,10 @@ mod tests {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM facts", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 3, "canonicalization must tombstone, never DELETE rows");
+        assert_eq!(
+            total, 3,
+            "canonicalization must tombstone, never DELETE rows"
+        );
 
         // The two case+separator variants must fold to ONE live row. Because the
         // collapse rule keys on canonical-subject + predicate + object
@@ -697,11 +704,9 @@ mod tests {
 
         // The extra-token spelling's row survives regardless of the merge call.
         let fc3_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM facts WHERE id = 'fc-3'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM facts WHERE id = 'fc-3'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(
             fc3_rows, 1,
@@ -723,9 +728,30 @@ mod tests {
         let db = tmp.path().join("memory.db");
         let mut conn = memory::open_db(&db).unwrap();
 
-        insert_canon_fact(&conn, "dec-1", "Mike", "decided", "reply in GDD style", "2026-08-28");
-        insert_canon_fact(&conn, "dec-2", "Mike", "decided", "reply in GDD style", "2026-08-29");
-        insert_canon_fact(&conn, "dec-3", "Mike", "decided", "reply in GDD style", "2026-08-30");
+        insert_canon_fact(
+            &conn,
+            "dec-1",
+            "Mike",
+            "decided",
+            "reply in GDD style",
+            "2026-08-28",
+        );
+        insert_canon_fact(
+            &conn,
+            "dec-2",
+            "Mike",
+            "decided",
+            "reply in GDD style",
+            "2026-08-29",
+        );
+        insert_canon_fact(
+            &conn,
+            "dec-3",
+            "Mike",
+            "decided",
+            "reply in GDD style",
+            "2026-08-30",
+        );
         insert_canon_fact(
             &conn,
             "dec-best",
@@ -837,7 +863,14 @@ mod tests {
         let db = tmp.path().join("memory.db");
         let mut conn = memory::open_db(&db).unwrap();
 
-        insert_canon_fact(&conn, "pol-1", "Mike", "decided", "use Postgres", "2026-08-20");
+        insert_canon_fact(
+            &conn,
+            "pol-1",
+            "Mike",
+            "decided",
+            "use Postgres",
+            "2026-08-20",
+        );
         insert_canon_fact(
             &conn,
             "pol-2",

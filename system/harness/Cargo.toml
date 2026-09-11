@@ -7,7 +7,7 @@
 name = "hex-harness"
 # Source of truth for hex version. Bumped by `hex release cut`; build.rs
 # injects this via env!("CARGO_PKG_VERSION") at compile time.
-version = "0.52.2"
+version = "0.52.3"
 edition = "2021"
 
 # Keep the lib + bin named `hex` even though the package is `hex-harness`.
@@ -53,7 +53,6 @@ axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 tower = "0.4"
@@ -77,12 +76,10 @@ libc = "0.2"
 # rendered plist (verified 2026-06-05: with SessionCreate keychain reads fail
 # rc=36; without it rc=0).
 #
-# The spec contract asks for rev `df4ab27` (its stated "current main"), but the
-# upstream repo's actual current main rev as of this landing is
-# `5171fbb206e93b56523275f72bd1b97c776de90a` — so we pin to the real-existing
-# rev to keep `cargo build` green. The `df4ab27` string is preserved here so
-# any historical pin-audit grep still resolves to this file.
-daemon-green = { git = "https://github.com/mrap/daemon-green", rev = "5171fbb206e93b56523275f72bd1b97c776de90a" }
+# Pin the reviewed, published app-association support used by signed services.
+# Historical note: the original spec named nonexistent `df4ab27`; its corrected
+# baseline was `5171fbb206e93b56523275f72bd1b97c776de90a`.
+daemon-green = { git = "https://github.com/mrap/daemon-green", rev = "0ea88bc24b62a1070e4f7a31a59420124366b3c2" }
 # Moved from dev-dependencies (2026-06-10, spec Sbe8m4886 / task T0mnyfwa7):
 # the claude-cli transport needs a tempdir at runtime for `claude -p`'s cwd
 # (CLAUDE.md auto-discovery is cwd-based — spawning from a workspace cwd will

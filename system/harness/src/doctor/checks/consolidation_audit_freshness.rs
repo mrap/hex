@@ -9,6 +9,7 @@
 //!     disabled via `hex module disable` — the operator turned the feed off; or
 //!   - `evolution/` does not exist; or
 //!   - `evolution/` exists but holds no `consolidation-audit-*.md` yet.
+//!
 //! The last two are one family: "no audits to measure." An instance can have an
 //! `evolution/` dir from the Improvement Engine (observations.md / suggestions.md)
 //! without ever having run a full consolidation, so an empty result must NOT
@@ -68,9 +69,7 @@ impl DoctorCheck for ConsolidationAuditFreshness {
                         "newest consolidation audit is {age}d old ({date}) — full consolidation Layer 3 stopped producing audits (>{STALE_DAYS}d stale); run `hex memory consolidate full`"
                     ))
                 } else {
-                    CheckResult::pass(format!(
-                        "newest consolidation audit {age}d old ({date})"
-                    ))
+                    CheckResult::pass(format!("newest consolidation audit {age}d old ({date})"))
                 }
             }
         }
@@ -123,7 +122,11 @@ mod tests {
         let today = chrono::Local::now().date_naive();
         write_audit(&evo, &today.format("%Y-%m-%d").to_string());
         let res = ConsolidationAuditFreshness.run(&ctx_for(tmp.path()));
-        assert_eq!(res.status, Status::Pass, "fresh audit must PASS, got {res:?}");
+        assert_eq!(
+            res.status,
+            Status::Pass,
+            "fresh audit must PASS, got {res:?}"
+        );
     }
 
     #[test]
@@ -134,7 +137,11 @@ mod tests {
         let old = chrono::Local::now().date_naive() - chrono::Duration::days(10);
         write_audit(&evo, &old.format("%Y-%m-%d").to_string());
         let res = ConsolidationAuditFreshness.run(&ctx_for(tmp.path()));
-        assert_eq!(res.status, Status::Fail, "stale audit must FAIL, got {res:?}");
+        assert_eq!(
+            res.status,
+            Status::Fail,
+            "stale audit must FAIL, got {res:?}"
+        );
     }
 
     #[test]
@@ -142,7 +149,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // No evolution/ created at all.
         let res = ConsolidationAuditFreshness.run(&ctx_for(tmp.path()));
-        assert_eq!(res.status, Status::Skip, "absent dir must SKIP, got {res:?}");
+        assert_eq!(
+            res.status,
+            Status::Skip,
+            "absent dir must SKIP, got {res:?}"
+        );
     }
 
     #[test]

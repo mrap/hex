@@ -2,8 +2,10 @@ use chrono::{Local, NaiveDate};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use walkdir::{DirEntry, WalkDir};
 
 // ── Constants (mirror Python) ─────────────────────────────────────────────────
 
@@ -716,74 +718,191 @@ where
 
 // ── File discovery ────────────────────────────────────────────────────────────
 
-/// Collect all indexable files with their indexing strategy.
-pub fn get_indexable_files(hex_root: &Path) -> Vec<(PathBuf, String)> {
-    let mut files: Vec<(PathBuf, String)> = Vec::new();
+fn checked_source_root(hex_root: &Path, relative: &str) -> io::Result<Option<PathBuf>> {
+    let root_metadata = std::fs::metadata(hex_root)?;
+    if !root_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "memory source root is not a directory: {}",
+                hex_root.display()
+            ),
+        ));
+    }
+    if relative == "." {
+        return Ok(Some(hex_root.to_path_buf()));
+    }
 
-    // Standard directories — full index
-    for dir in INDEX_DIRS {
-        let dir_path = hex_root.join(dir);
-        if !dir_path.exists() {
-            continue;
+    let mut current = hex_root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid configured memory source root: {relative}"),
+            ));
+        };
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(None);
         }
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "configured memory source component is not a directory: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(Some(current))
+}
 
-        let exts = ["md", "txt"];
-        for ext in &exts {
-            let pattern = if *dir == "." {
-                format!("{}/*.{}", dir_path.display(), ext)
-            } else {
-                format!("{}/**/*.{}", dir_path.display(), ext)
+fn keep_discovery_entry<F>(
+    entry: &DirEntry,
+    hex_root: &Path,
+    observer: &mut F,
+    path_error: &mut Option<io::Error>,
+) -> bool
+where
+    F: FnMut(&Path),
+{
+    if path_error.is_some() {
+        return false;
+    }
+    observer(entry.path());
+    if entry.depth() == 0 {
+        return true;
+    }
+    if entry.file_type().is_symlink() {
+        return false;
+    }
+    match entry.path().strip_prefix(hex_root) {
+        Ok(relative) => !should_skip(&relative.to_string_lossy()),
+        Err(error) => {
+            *path_error = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "memory discovery escaped root at {}: {error}",
+                    entry.path().display()
+                ),
+            ));
+            false
+        }
+    }
+}
+
+fn collect_source_root<F>(
+    hex_root: &Path,
+    relative: &str,
+    recursive: bool,
+    strategy: &str,
+    observer: &mut F,
+    files: &mut Vec<(PathBuf, String)>,
+) -> io::Result<()>
+where
+    F: FnMut(&Path),
+{
+    let Some(source_root) = checked_source_root(hex_root, relative)? else {
+        return Ok(());
+    };
+    let max_depth = if recursive { usize::MAX } else { 1 };
+    let mut path_error = None;
+    let mut source_files = Vec::new();
+    {
+        let walker = WalkDir::new(&source_root)
+            .follow_links(false)
+            .follow_root_links(relative == ".")
+            .max_depth(max_depth)
+            .into_iter()
+            .filter_entry(|entry| keep_discovery_entry(entry, hex_root, observer, &mut path_error));
+        for entry in walker {
+            let entry = entry.map_err(|error| {
+                let kind = error
+                    .io_error()
+                    .map(io::Error::kind)
+                    .unwrap_or(io::ErrorKind::Other);
+                io::Error::new(kind, error.to_string())
+            })?;
+            if entry.depth() == 0 || !entry.file_type().is_file() {
+                continue;
+            }
+            let Some(file_name) = entry.path().file_name().and_then(|name| name.to_str()) else {
+                continue;
             };
-            if let Ok(paths) = glob::glob(&pattern) {
-                for path in paths.flatten() {
-                    let rel = match path.strip_prefix(hex_root) {
-                        Ok(r) => r.to_string_lossy().to_string(),
-                        Err(_) => continue,
-                    };
-                    if !should_skip(&rel) {
-                        files.push((path, "full".to_string()));
-                    }
-                }
+            if !file_name.ends_with(".md") && !file_name.ends_with(".txt") {
+                continue;
             }
+            source_files.push(entry.into_path());
         }
     }
+    if let Some(error) = path_error {
+        return Err(error);
+    }
+    source_files.sort_by(|left, right| {
+        let extension_order = |path: &Path| match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) if name.ends_with(".md") => 0,
+            Some(name) if name.ends_with(".txt") => 1,
+            _ => unreachable!("source files were filtered by extension"),
+        };
+        extension_order(left)
+            .cmp(&extension_order(right))
+            .then_with(|| left.cmp(right))
+    });
+    for path in source_files {
+        let file_strategy = if strategy == "tiered" && is_old_transcript(&path) {
+            "summary"
+        } else if strategy == "tiered" {
+            "full"
+        } else {
+            strategy
+        };
+        files.push((path, file_strategy.to_string()));
+    }
+    Ok(())
+}
 
-    // Tiered raw directories
-    for (subdir, strategy) in TIERED_RAW_DIRS {
-        if *strategy == "exclude" {
-            continue;
-        }
-        let dir_path = hex_root.join(subdir);
-        if !dir_path.exists() {
-            continue;
-        }
-        for ext in &["md", "txt"] {
-            let pattern = format!("{}/**/*.{}", dir_path.display(), ext);
-            if let Ok(paths) = glob::glob(&pattern) {
-                for path in paths.flatten() {
-                    let rel = match path.strip_prefix(hex_root) {
-                        Ok(r) => r.to_string_lossy().to_string(),
-                        Err(_) => continue,
-                    };
-                    if should_skip(&rel) {
-                        continue;
-                    }
-                    let file_strategy = if *strategy == "tiered" {
-                        if is_old_transcript(&path) {
-                            "summary".to_string()
-                        } else {
-                            "full".to_string()
-                        }
-                    } else {
-                        strategy.to_string()
-                    };
-                    files.push((path, file_strategy));
-                }
-            }
+fn get_indexable_files_with_observer<F>(
+    hex_root: &Path,
+    mut observer: F,
+) -> io::Result<Vec<(PathBuf, String)>>
+where
+    F: FnMut(&Path),
+{
+    let mut files = Vec::new();
+    for relative in INDEX_DIRS {
+        collect_source_root(
+            hex_root,
+            relative,
+            *relative != ".",
+            "full",
+            &mut observer,
+            &mut files,
+        )?;
+    }
+    for (relative, strategy) in TIERED_RAW_DIRS {
+        if *strategy != "exclude" {
+            collect_source_root(
+                hex_root,
+                relative,
+                true,
+                strategy,
+                &mut observer,
+                &mut files,
+            )?;
         }
     }
+    Ok(files)
+}
 
-    files
+/// Collect all indexable regular files without following filesystem links.
+pub fn get_indexable_files(hex_root: &Path) -> io::Result<Vec<(PathBuf, String)>> {
+    get_indexable_files_with_observer(hex_root, |_| {})
 }
 
 // ── Main indexer ──────────────────────────────────────────────────────────────
@@ -862,6 +981,16 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
     }
     let _index_lock = lock_file; // released when run_index returns
 
+    // Discovery must complete before DB setup, model construction, indexing, or
+    // stale-record cleanup. An incomplete source list cannot authorize deletion.
+    let file_tuples = match get_indexable_files(hex_root) {
+        Ok(files) => files,
+        Err(error) => {
+            eprintln!("hex memory index: source discovery failed: {error}");
+            return 1;
+        }
+    };
+
     let conn = match super::open_db(&db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -901,7 +1030,6 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
         .collect()
     };
 
-    let file_tuples = get_indexable_files(hex_root);
     println!("Found {} files to check", file_tuples.len());
 
     let mut indexed = 0usize;
@@ -1351,6 +1479,386 @@ mod tests {
             0.5
         );
         assert_eq!(get_source_weight("misc/unknown.md", false), 1.0);
+    }
+
+    #[test]
+    fn memory_source_eligibility_characterizes_ordinary_selection() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("workspace");
+        let expected = [
+            (".md", "full"),
+            (".root-hidden.md", "full"),
+            ("CLAUDE.md", "full"),
+            (".txt", "full"),
+            ("notes.txt", "full"),
+            ("me/.profile.md", "full"),
+            ("me/me.md", "full"),
+            ("me/.notes/nested.txt", "full"),
+            ("projects/example/.evidence.md", "full"),
+            ("projects/example/context.md", "full"),
+            ("people/alice/profile.txt", "full"),
+            ("evolution/observations.md", "full"),
+            ("landings/2099-01-01.md", "full"),
+            ("raw/research/paper.md", "full"),
+            ("raw/captures/clip.txt", "full"),
+            ("raw/transcripts/2000-01-01.md", "summary"),
+            ("raw/transcripts/2999-01-01.md", "full"),
+            ("raw/docs/reference.md", "full"),
+            ("raw/messages/message.txt", "full"),
+            ("raw/calendar/event.md", "full"),
+        ];
+        for (relative, _) in expected {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("fixture: {relative}\n")).unwrap();
+        }
+
+        let excluded = [
+            "misc/deep.md",
+            "me/UPPER.MD",
+            "me/image.png",
+            "projects/example/.claude/ignored.md",
+            "projects/example/.git/ignored.md",
+            "projects/example/.hex/ignored.md",
+            "projects/example/.sessions/ignored.md",
+            "projects/example/_archive/ignored.md",
+            "projects/example/hex-archive/ignored.md",
+            "projects/example/node_modules/ignored.md",
+            "raw/handoffs/ignored.md",
+            "raw/reflect-runs/ignored.md",
+            "raw/reflections/ignored.md",
+            "raw/root.md",
+        ];
+        for relative in excluded {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("excluded fixture: {relative}\n")).unwrap();
+        }
+
+        let selected = get_indexable_files(&root).expect("complete ordinary fixture discovery");
+        assert_eq!(
+            selected.len(),
+            expected.len(),
+            "ordinary discovery returned duplicate or unexpected paths"
+        );
+        let selected: Vec<_> = selected
+            .into_iter()
+            .map(|(path, strategy)| (path.strip_prefix(&root).unwrap().to_path_buf(), strategy))
+            .collect();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(path, strategy)| (PathBuf::from(path), strategy.to_string()))
+            .collect();
+
+        assert_eq!(
+            selected, expected,
+            "ordinary source roots, ordering, strategies, hidden paths, extensions, or skip rules changed"
+        );
+    }
+
+    // This regression intentionally fails against glob-based discovery. It uses
+    // only owned temporary fixtures and calls discovery without indexing.
+    #[cfg(unix)]
+    #[test]
+    fn memory_source_eligibility_rejects_external_registry_without_mutation() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::symlink;
+
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("workspace");
+        let external = fixture.path().join("external-registry");
+        std::fs::create_dir_all(root.join("projects/example/evidence/cargo")).unwrap();
+        std::fs::create_dir_all(external.join("package")).unwrap();
+        let canonical = root.join("projects/example/context.md");
+        std::fs::write(&canonical, "# Current project\nRetain this document.\n").unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "# Workspace\n").unwrap();
+        std::fs::create_dir_all(root.join("projects/example/.git")).unwrap();
+        std::fs::write(
+            root.join("projects/example/.git/ignored.md"),
+            "ignored subtree\n",
+        )
+        .unwrap();
+        let vendor = external.join("package/README.md");
+        std::fs::write(&vendor, "# Synthetic vendor\nNot workspace memory.\n").unwrap();
+        let vendor_text = external.join("package/NOTICE.txt");
+        std::fs::write(&vendor_text, "Synthetic external notice.\n").unwrap();
+        let alias = root.join("projects/example/evidence/cargo/registry");
+        symlink(&external, &alias).unwrap();
+        let before_link = std::fs::read_link(&alias).unwrap();
+        let before_vendor = std::fs::read(&vendor).unwrap();
+        let before_text = std::fs::read(&vendor_text).unwrap();
+        let before_canonical = std::fs::read(&canonical).unwrap();
+
+        let mut visited = Vec::new();
+        let selected = get_indexable_files_with_observer(&root, |path| {
+            visited.push(path.strip_prefix(&root).unwrap().to_path_buf());
+        })
+        .expect("complete no-follow discovery");
+
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(&alias).unwrap(), before_link);
+        assert_eq!(std::fs::read(&vendor).unwrap(), before_vendor);
+        assert_eq!(std::fs::read(&vendor_text).unwrap(), before_text);
+        assert_eq!(std::fs::read(&canonical).unwrap(), before_canonical);
+        assert!(
+            !root.join(".hex").exists(),
+            "discovery creates no runtime state"
+        );
+        let selected: BTreeMap<_, _> = selected
+            .into_iter()
+            .map(|(path, strategy)| (path.strip_prefix(&root).unwrap().to_path_buf(), strategy))
+            .collect();
+        assert_eq!(
+            selected.get(Path::new("CLAUDE.md")),
+            Some(&"full".to_string())
+        );
+        assert_eq!(
+            selected.get(Path::new("projects/example/context.md")),
+            Some(&"full".to_string())
+        );
+        assert!(
+            !selected
+                .keys()
+                .any(|path| path.starts_with("projects/example/evidence/cargo/registry")),
+            "dependency symlink pulled external registry into discovery: {:?}",
+            selected.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            selected.len(),
+            2,
+            "ordinary sources preserved; external aliases rejected"
+        );
+        let relative_alias = Path::new("projects/example/evidence/cargo/registry");
+        assert!(visited.iter().any(|path| path == relative_alias));
+        assert!(
+            !visited
+                .iter()
+                .any(|path| path.starts_with(relative_alias.join("package"))),
+            "discovery observed a descendant after rejecting the directory link"
+        );
+        let skipped = Path::new("projects/example/.git");
+        assert!(visited.iter().any(|path| path == skipped));
+        assert!(
+            !visited
+                .iter()
+                .any(|path| path != skipped && path.starts_with(skipped)),
+            "discovery observed a descendant after rejecting a skipped directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_source_eligibility_preserves_caller_root_alias_authority() {
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::symlink;
+
+        let fixture = TempDir::new().unwrap();
+        let physical_parent = fixture.path().join("physical-parent");
+        let physical_root = physical_parent.join("workspace");
+        std::fs::create_dir_all(physical_root.join("me")).unwrap();
+        std::fs::write(physical_root.join("CLAUDE.md"), "root\n").unwrap();
+        std::fs::write(physical_root.join("me/me.md"), "nested\n").unwrap();
+
+        let direct_alias = fixture.path().join("direct-workspace-alias");
+        symlink(&physical_root, &direct_alias).unwrap();
+        let ancestor_alias = fixture.path().join("ancestor-alias");
+        symlink(&physical_parent, &ancestor_alias).unwrap();
+        let rooted_below_alias = ancestor_alias.join("workspace");
+
+        for root in [&direct_alias, &rooted_below_alias] {
+            let selected = get_indexable_files(root).expect("caller root alias is authoritative");
+            let relative: BTreeSet<_> = selected
+                .into_iter()
+                .map(|(path, _)| {
+                    assert!(
+                        path.starts_with(root),
+                        "discovery changed caller path spelling"
+                    );
+                    path.strip_prefix(root).unwrap().to_path_buf()
+                })
+                .collect();
+            assert_eq!(
+                relative,
+                [PathBuf::from("CLAUDE.md"), PathBuf::from("me/me.md")]
+                    .into_iter()
+                    .collect()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_source_eligibility_rejects_directory_file_and_root_aliases() {
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::symlink;
+
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("workspace");
+        let external = fixture.path().join("external");
+        std::fs::create_dir_all(root.join("projects/example/canonical-dir")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "canonical root\n").unwrap();
+        std::fs::write(
+            root.join("projects/example/context.md"),
+            "canonical project\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("projects/example/canonical-dir/inside.md"),
+            "canonical directory\n",
+        )
+        .unwrap();
+        std::fs::write(external.join("outside.md"), "external file\n").unwrap();
+
+        let links = [
+            (external.clone(), root.join("projects/example/external-dir")),
+            (
+                root.join("projects/example/canonical-dir"),
+                root.join("projects/example/in-root-dir"),
+            ),
+            (
+                external.join("outside.md"),
+                root.join("projects/example/external-file.md"),
+            ),
+            (
+                root.join("projects/example/context.md"),
+                root.join("projects/example/in-root-file.md"),
+            ),
+            (root.join("CLAUDE.md"), root.join("AGENTS.md")),
+        ];
+        for (target, link) in &links {
+            symlink(target, link).unwrap();
+        }
+        let before: Vec<_> = links
+            .iter()
+            .map(|(_, link)| (link.clone(), std::fs::read_link(link).unwrap()))
+            .collect();
+
+        let selected = get_indexable_files(&root).expect("complete alias matrix discovery");
+        let selected: BTreeSet<_> = selected
+            .into_iter()
+            .map(|(path, _)| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+
+        assert_eq!(
+            selected,
+            [
+                PathBuf::from("CLAUDE.md"),
+                PathBuf::from("projects/example/canonical-dir/inside.md"),
+                PathBuf::from("projects/example/context.md"),
+            ]
+            .into_iter()
+            .collect()
+        );
+        for (link, target) in before {
+            assert_eq!(std::fs::read_link(link).unwrap(), target);
+        }
+        assert_eq!(
+            std::fs::read(external.join("outside.md")).unwrap(),
+            b"external file\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_source_eligibility_rejects_configured_and_intermediate_root_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("workspace");
+        let external_me = fixture.path().join("external-me");
+        let external_raw = fixture.path().join("external-raw");
+        std::fs::create_dir_all(root.join("projects/example")).unwrap();
+        std::fs::create_dir_all(&external_me).unwrap();
+        std::fs::create_dir_all(external_raw.join("research")).unwrap();
+        std::fs::write(root.join("projects/example/context.md"), "canonical\n").unwrap();
+        std::fs::write(external_me.join("me.md"), "external me\n").unwrap();
+        std::fs::write(external_raw.join("research/paper.md"), "external raw\n").unwrap();
+        symlink(&external_me, root.join("me")).unwrap();
+        symlink(&external_raw, root.join("raw")).unwrap();
+
+        let selected = get_indexable_files(&root).expect("reject aliased configured roots");
+        let relative: Vec<_> = selected
+            .into_iter()
+            .map(|(path, _)| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+
+        assert_eq!(relative, [PathBuf::from("projects/example/context.md")]);
+        assert_eq!(std::fs::read_link(root.join("me")).unwrap(), external_me);
+        assert_eq!(std::fs::read_link(root.join("raw")).unwrap(), external_raw);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_source_eligibility_rejects_broken_and_cycle_links_without_descent() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("workspace");
+        let project = root.join("projects/example");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("context.md"), "canonical\n").unwrap();
+        let broken = project.join("broken.md");
+        let cycle = project.join("cycle");
+        symlink(project.join("missing.md"), &broken).unwrap();
+        symlink(&project, &cycle).unwrap();
+
+        let mut visited = Vec::new();
+        let selected = get_indexable_files_with_observer(&root, |path| {
+            visited.push(path.strip_prefix(&root).unwrap().to_path_buf());
+        })
+        .expect("broken and cycle links are entries, not discovery roots");
+        let relative: Vec<_> = selected
+            .into_iter()
+            .map(|(path, _)| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+
+        assert_eq!(relative, [PathBuf::from("projects/example/context.md")]);
+        assert!(visited.contains(&PathBuf::from("projects/example/broken.md")));
+        assert!(visited.contains(&PathBuf::from("projects/example/cycle")));
+        let relative_cycle = Path::new("projects/example/cycle");
+        assert!(
+            !visited
+                .iter()
+                .any(|path| path != relative_cycle && path.starts_with(relative_cycle)),
+            "cycle link was traversed"
+        );
+    }
+
+    #[test]
+    fn memory_source_eligibility_allows_missing_optional_roots() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+
+        assert!(get_indexable_files(&root)
+            .expect("missing configured roots are optional")
+            .is_empty());
+    }
+
+    #[test]
+    fn memory_source_eligibility_propagates_metadata_errors() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "ordinary root file\n").unwrap();
+        std::fs::write(root.join("me"), "not a directory\n").unwrap();
+
+        let mut visited = Vec::new();
+        let error = get_indexable_files_with_observer(&root, |path| {
+            visited.push(path.strip_prefix(&root).unwrap().to_path_buf());
+        })
+        .expect_err("configured source metadata error must fail discovery");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("configured memory source component"));
+        assert!(visited.contains(&PathBuf::from("CLAUDE.md")));
+        assert!(!root.join(".hex").exists());
     }
 
     #[test]

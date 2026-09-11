@@ -14,6 +14,7 @@
 //! tick's persisted snapshot, and alerts on exactly two transition classes:
 //!   1. a spec newly reaching a terminal status (completed / failed / canceled)
 //!   2. a task newly entering `state='blocked'` (any reason)
+//!
 //! Detection only, never remediates (same doctrine as `hex failures`).
 //!
 //! Failure stance (S6): boi.db absent → quiet no-op (this worker ships in
@@ -191,7 +192,7 @@ fn diff(prev: Option<&PersistedState>, cur: &Snapshot) -> Vec<Transition> {
     for t in &cur.tasks {
         match task_watch_state(t).as_str() {
             "blocked" => {
-                let newly = prev.tasks.get(&t.task_id).map_or(true, |w| w != "blocked");
+                let newly = prev.tasks.get(&t.task_id).is_none_or(|w| w != "blocked");
                 if newly {
                     out.push(Transition::TaskBlocked {
                         task_id: t.task_id.clone(),
@@ -202,7 +203,7 @@ fn diff(prev: Option<&PersistedState>, cur: &Snapshot) -> Vec<Transition> {
                 }
             }
             "starved" => {
-                let newly = prev.tasks.get(&t.task_id).map_or(true, |w| w != "starved");
+                let newly = prev.tasks.get(&t.task_id).is_none_or(|w| w != "starved");
                 if newly {
                     out.push(Transition::TaskStarved {
                         task_id: t.task_id.clone(),
@@ -677,8 +678,219 @@ fn flap_suffix(flap: i64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Human-readable phone push rendering (spec S1vwthf8e / task T6k580e5a)
+// ---------------------------------------------------------------------------
+//
+// The third-party phone push must read as `NAME — OUTCOME` — a bounded,
+// single-line job name plus a plain, truthful outcome word — never the machine
+// dedupe key, a raw spec/task id, a path, a credential, or the diagnostic
+// reason (all of those stay in stderr/telemetry and the first-party email via
+// the unchanged `msg`). The rendered string is threaded to the push rail ONLY,
+// through `alert::notify_with_class_push`; the alert key, email subject/body,
+// dedupe, priority/email class, and rate cap are all unchanged.
+
+/// Bounded plain fallback for a missing/blank/malformed/unsafe display name.
+const UNNAMED_JOB: &str = "Unnamed job";
+
+/// Max bytes of the sanitized name in a push body (the outcome word is appended
+/// after, so it is never eaten by truncation). Keeps the whole body well under a
+/// phone-notification length and any sane push-service limit.
+const MAX_NAME_BYTES: usize = 120;
+
+/// A path-shaped string or embedded private/system path. Ordinary slash-bearing
+/// prose such as `docs/testing.md refresh` remains valid display text.
+fn looks_like_path(s: &str) -> bool {
+    s.split_whitespace().any(|token| {
+        let token = token.trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '(' | '[' | ')' | ']' | '{' | '}' | ':' | ';' | ',')
+        });
+        token.starts_with('/')
+            || token.starts_with("~/")
+            || token.contains("=/")
+            || token.contains("=~/")
+            || token.contains("/Users/")
+            || token.contains("/private/")
+            || token.contains("/var/")
+            || token.contains("/home/")
+            || token.contains("/etc/")
+    })
+}
+
+/// A credential-shaped token by well-known secret prefix. Rejected rather than
+/// partially redacted, wherever the token appears in the display text.
+fn looks_like_credential(s: &str) -> bool {
+    const PREFIXES: [&str; 9] = [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "AKIA",
+    ];
+    PREFIXES.iter().any(|p| s.contains(p))
+}
+
+fn looks_like_email(s: &str) -> bool {
+    s.split_whitespace().any(|token| {
+        token
+            .split_once('@')
+            .is_some_and(|(_, domain)| domain.contains('.') && !domain.starts_with('.'))
+    })
+}
+
+fn looks_like_machine_id(s: &str) -> bool {
+    s.split_whitespace().any(|token| {
+        let token = token.trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '(' | '[' | ')' | ']' | '{' | '}' | ':' | ';' | ',')
+        });
+        let bytes = token.as_bytes();
+        bytes.len() >= 9
+            && matches!(bytes.first(), Some(b'S' | b'T'))
+            && bytes[1..].iter().all(u8::is_ascii_alphanumeric)
+    })
+}
+
+/// Truncate to at most `MAX_NAME_BYTES`, never splitting a UTF-8 char. Builds
+/// the result char-by-char (no string slicing — inherently codepoint-safe, and
+/// avoids the panic a naive byte slice risks). Appends `…` when it actually cut.
+fn truncate_name(s: &str) -> String {
+    if s.len() <= MAX_NAME_BYTES {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(MAX_NAME_BYTES + '…'.len_utf8());
+    for ch in s.chars() {
+        if out.len() + ch.len_utf8() > MAX_NAME_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// Fold a raw name candidate into a bounded, single-line, phone-safe display
+/// name. Missing/blank/multiline-blank/path-shaped/credential-shaped → the
+/// bounded plain fallback `Unnamed job` (reject rather than partially redact).
+/// Otherwise: first line only, trimmed, char-boundary-safe length bound.
+fn display_name(raw: Option<&str>) -> String {
+    if raw.is_some_and(|s| s.chars().any(|c| c.is_control() && c != '\n')) {
+        return UNNAMED_JOB.to_string();
+    }
+    let first = match raw {
+        Some(s) => s.lines().next().unwrap_or("").trim(),
+        None => "",
+    };
+    if first.is_empty()
+        || looks_like_path(first)
+        || looks_like_credential(first)
+        || looks_like_email(first)
+        || looks_like_machine_id(first)
+    {
+        return UNNAMED_JOB.to_string();
+    }
+    truncate_name(first)
+}
+
+/// Compose the phone push body: `NAME — OUTCOME`. The name is sanitized/bounded;
+/// the outcome is a short, controlled, truthful word supplied by the caller.
+fn render_push_body(name: Option<&str>, outcome: &str) -> String {
+    format!("{} — {}", display_name(name), outcome)
+}
+
+/// Resolve the current spec version's human `title` for `spec_id`, or `None`.
+///
+/// Production opens `~/.boi/v2/boi.db` READ-ONLY and joins
+/// `spec_runtime.current_version = spec_versions.version` (verified against the
+/// live schema: `spec_runtime(spec_id, current_version) REFERENCES
+/// spec_versions(spec_id, version)`). Absent db → quiet `None` (same doctrine as
+/// [`read_snapshot`]); an open/query error is LOUD on stderr (S6) then `None`.
+/// Either way the alert still fires with the `Unnamed job` fallback — a missing
+/// title never blocks a transition alert.
+///
+/// Tests pass an explicit temporary fixture path through `emit_spec_alert_from_db`.
+/// Production uses the read-only BOI path. No test path falls back to the live
+/// database.
+fn resolve_spec_title(spec_id: &str) -> Option<String> {
+    resolve_spec_title_at(None, spec_id)
+}
+
+fn resolve_spec_title_at(db_path: Option<&Path>, spec_id: &str) -> Option<String> {
+    let path = match db_path {
+        Some(path) => path.to_path_buf(),
+        None => boi_db_path().ok()?,
+    };
+    if !path.exists() {
+        return None; // absent → quiet no-op (most instances never run BOI)
+    }
+    let conn = match rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "boi-spec-watch: spec-title lookup open {} failed: {e} \
+                 (S6; falling back to {UNNAMED_JOB})",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    spec_title_from_conn(&conn, spec_id)
+}
+
+/// The version-correct title lookup, split out so it is unit-testable against a
+/// temp SQLite fixture. Joins the spec's CURRENT version's snapshot and extracts
+/// its top-level `title`. A query error is LOUD (S6) then `None`; no row / no
+/// title → `None`.
+fn spec_title_from_conn(conn: &rusqlite::Connection, spec_id: &str) -> Option<String> {
+    let snapshot: Option<String> = match conn
+        .query_row(
+            "SELECT sv.snapshot FROM spec_versions sv \
+             JOIN spec_runtime sr \
+               ON sr.spec_id = sv.spec_id AND sr.current_version = sv.version \
+             WHERE sv.spec_id = ?1",
+            rusqlite::params![spec_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "boi-spec-watch: spec-title query for {spec_id} failed: {e} \
+                 (S6; falling back to {UNNAMED_JOB})"
+            );
+            return None;
+        }
+    };
+    snapshot.and_then(|s| parse_spec_title(&s))
+}
+
+/// Extract the top-level `title` string from a spec-version `snapshot` JSON blob.
+/// Malformed JSON, a missing `title`, or a non-string `title` → `None` (the
+/// alert degrades to the `Unnamed job` fallback; the transition still alerts).
+fn parse_spec_title(snapshot_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(snapshot_json)
+        .ok()
+        .and_then(|v| {
+            v.get("title")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
 /// Surface a spec-terminal transition via the shared alert path.
 fn emit_spec_alert(spec_id: &str, status: &str) {
+    emit_spec_alert_from_db(None, spec_id, status);
+}
+
+fn emit_spec_alert_from_db(db_path: Option<&Path>, spec_id: &str, status: &str) {
     // All three terminal statuses alert (trigger unchanged). A terminally
     // FAILED spec IS a work-order-terminal-failure → the WorkOrderFailed
     // rail (push urgent + email); completed/canceled stay Default (push
@@ -688,11 +900,20 @@ fn emit_spec_alert(spec_id: &str, status: &str) {
     } else {
         hex::alert::AlertClass::Default
     };
-    hex::alert::notify_with_class(
+    // Phone push: prefer the current spec version's human title, else the
+    // bounded `Unnamed job` fallback; outcome is the literal terminal status
+    // word (never an invented success word for failed/canceled).
+    let title = match db_path {
+        Some(path) => resolve_spec_title_at(Some(path), spec_id),
+        None => resolve_spec_title(spec_id),
+    };
+    let push = render_push_body(title.as_deref(), &status.to_lowercase());
+    hex::alert::notify_with_class_push(
         &format!("boi-spec-watch:spec-terminal:{spec_id}"),
         "BOI spec terminal",
         &format!("spec {spec_id} → {}", status.to_uppercase()),
         class,
+        Some(&push),
     );
 }
 
@@ -707,7 +928,10 @@ fn emit_task_alert(t: &Transition, flap: i64) {
             reason,
         } => {
             let label = ref_.clone().unwrap_or_else(|| task_id.clone());
-            hex::alert::notify(
+            // Phone push: the recognizable job label + a plain outcome. The raw
+            // reason/id/flap detail stays in `msg` (stderr/telemetry/email only).
+            let push = render_push_body(ref_.as_deref(), "needs attention");
+            hex::alert::notify_with_class_push(
                 &format!("boi-spec-watch:task-blocked:{task_id}"),
                 "BOI task blocked",
                 &format!(
@@ -715,6 +939,8 @@ fn emit_task_alert(t: &Transition, flap: i64) {
                     reason.clone().unwrap_or_else(|| "unknown".to_string()),
                     flap_suffix(flap),
                 ),
+                hex::alert::AlertClass::Default,
+                Some(&push),
             );
         }
         Transition::TaskStarved {
@@ -723,13 +949,18 @@ fn emit_task_alert(t: &Transition, flap: i64) {
             spec_id,
         } => {
             let label = ref_.clone().unwrap_or_else(|| task_id.clone());
-            hex::alert::notify(
+            // Starved gets its OWN plain word ("stalled") so it stays distinct
+            // from blocked ("needs attention") on the phone.
+            let push = render_push_body(ref_.as_deref(), "stalled");
+            hex::alert::notify_with_class_push(
                 &format!("boi-spec-watch:task-starved:{task_id}"),
                 "BOI task starved",
                 &format!(
                     "task {label} ({spec_id}) ACTIVE with no live phase_run for 30m{}",
                     flap_suffix(flap),
                 ),
+                hex::alert::AlertClass::Default,
+                Some(&push),
             );
         }
         Transition::SpecTerminal { .. } => {}
@@ -951,7 +1182,8 @@ mod tests {
         {
             let tmp = tempfile::TempDir::new().unwrap();
             rig(&tmp);
-            emit_spec_alert("Sredfail1", "failed");
+            let db_path = missing_boi_db(&tmp);
+            emit_spec_alert_from_db(Some(&db_path), "Sredfail1", "failed");
             let emails = crate::alert::test_sink::emails();
             let pushes = crate::alert::test_sink::pushes();
             assert_eq!(
@@ -971,7 +1203,8 @@ mod tests {
         {
             let tmp = tempfile::TempDir::new().unwrap();
             rig(&tmp);
-            emit_spec_alert("Sredok1", "completed");
+            let db_path = missing_boi_db(&tmp);
+            emit_spec_alert_from_db(Some(&db_path), "Sredok1", "completed");
             let pushes = crate::alert::test_sink::pushes();
             assert_eq!(
                 pushes.len(),
@@ -1523,6 +1756,592 @@ mod tests {
 
         // No prior baseline → nothing to clear.
         assert!(cleared_tasks(None, &cur).is_empty());
+    }
+
+    // ---- GROUP 2 (RED, task T6k580e5a): human-readable phone bodies -------
+    //
+    // Reproduces the unreadable-phone-body bug described in spec S1vwthf8e:
+    // the phone push for a BOI alert is `[key] title` (see `push_body` in
+    // `alert.rs`) — `title` is a STATIC string ("BOI spec terminal" / "BOI
+    // task blocked" / "BOI task starved") and `key` is the internal machine
+    // dedupe key. The actual outcome and any job-recognizable label live only
+    // in `msg`, which never reaches push (by design — push is third-party).
+    // Net effect: every phone notification for every job looks identical and
+    // never says what finished, what failed, or which job it was.
+    //
+    // Target contract (recorded here and in docs/boi-notifications.md so
+    // execute implements exactly this, not a guess):
+    //   * push body carries a bounded, single-line NAME + a plain, truthful
+    //     OUTCOME word — never the raw machine key or entity id.
+    //   * spec outcomes: "completed" | "failed" | "canceled" (the literal
+    //     terminal status word — never invent a success word for a
+    //     non-completed status).
+    //   * task outcomes are two DISTINCT words so blocked and starved remain
+    //     distinguishable on the phone: blocked → "needs attention",
+    //     starved → "stalled" — NOT the vocabulary list's "waiting to run",
+    //     which reads as benign (scheduler will get to it eventually) for a
+    //     task that is actually active-but-stuck-for-30m. That under-alarms
+    //     exactly the class of bug this task fixes, so it is a deliberate,
+    //     documented deviation from the spec's "suggested" outcome words
+    //     (docs/boi-notifications.md records the same reasoning).
+    //   * name resolution: task alerts use the existing `ref` label (already
+    //     computed today, just never routed to push). Missing/blank/
+    //     malformed/unavailable metadata (None, "", whitespace-only, or a
+    //     path/credential-shaped value) falls back to the bounded plain
+    //     token "Unnamed job" — reject rather than partially redact, so nothing
+    //     ambiguous about "is this raw?" ever ships.
+    //   * names are folded to a single line and length-bounded without
+    //     splitting a UTF-8 char (no panics, no mojibake).
+    //   * diagnostic detail remains outside the phone body. Title lookup and
+    //     sanitization are covered by focused tests below. These worker tests
+    //     use an explicit missing fixture database, never the live BOI DB.
+
+    /// Shared rig: fresh HEX_DIR, ntfy configured (push only; no email needed
+    /// — task alerts and non-failed spec alerts use `AlertClass::Default`),
+    /// sink reset. Every case below gets its OWN `TempDir` and a unique
+    /// spec/task id, so the 6h per-key dedupe stamp and the 6/hour push cap
+    /// never suppress or collapse a case into the next one.
+    fn red_rig() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HEX_DIR", tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".hex/config")).unwrap();
+        std::fs::write(
+            tmp.path().join(".hex/config/alerts.toml"),
+            "ntfy_topic_url = \"https://ntfy.example.invalid/t\"\n",
+        )
+        .unwrap();
+        crate::alert::test_sink::reset();
+        tmp
+    }
+
+    fn missing_boi_db(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join("missing-boi.db")
+    }
+
+    fn only_push_body() -> String {
+        let pushes = crate::alert::test_sink::pushes();
+        assert_eq!(pushes.len(), 1, "expected exactly one push: {pushes:?}");
+        pushes[0].body.clone()
+    }
+
+    #[test]
+    fn red_spec_terminal_push_shows_truthful_plain_outcome_not_generic_body() {
+        let _g = crate::telemetry::test_support::lock_env();
+        for (spec_id, status) in [
+            ("Sredgrp2a", "completed"),
+            ("Sredgrp2b", "failed"),
+            ("Sredgrp2c", "canceled"),
+        ] {
+            let tmp = red_rig();
+            let db_path = missing_boi_db(&tmp);
+            emit_spec_alert_from_db(Some(&db_path), spec_id, status);
+            let body = only_push_body();
+
+            assert!(
+                body.to_lowercase().contains(status),
+                "push body for a {status} spec must say so in plain terms: {body:?}"
+            );
+            // Never invent a successful result for failed/canceled work.
+            if status != "completed" {
+                assert!(
+                    !body.to_lowercase().contains("completed"),
+                    "a {status} spec must never read as completed: {body:?}"
+                );
+            }
+            // The internal machine key/id are for dedupe and local logs only
+            // — never the primary phone body.
+            assert!(
+                !body.contains("boi-spec-watch:"),
+                "phone body leaked the internal alert key: {body:?}"
+            );
+            assert!(
+                !body.contains(spec_id),
+                "phone body leaked the raw spec id: {body:?}"
+            );
+            // A spec push needs a NAME SLOT, not just an outcome word — the
+            // headline complaint in the spec is "cannot identify the work".
+            // This synthetic spec_id has no resolvable current-version title
+            // in any real boi.db (there is none here at all), so the body
+            // must carry the documented bounded fallback. This assertion is
+            // about body CONTENT, not call shape: it still holds once
+            // execute adds a title-resolution parameter/lookup to whatever
+            // emits this alert, for ids where no title resolves.
+            assert!(
+                body.contains("Unnamed job"),
+                "spec push must carry a name slot, filled with the documented \
+                 fallback when no title resolves: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn red_task_blocked_and_starved_push_distinct_truthful_outcomes_with_label() {
+        let _g = crate::telemetry::test_support::lock_env();
+
+        // Blocked.
+        {
+            let _tmp = red_rig();
+            let t = Transition::TaskBlocked {
+                task_id: "T1redgrp2a".to_string(),
+                ref_: Some("nightly-ingest".to_string()),
+                spec_id: "Sredgrp2d".to_string(),
+                reason: Some("merge_conflict".to_string()),
+            };
+            emit_task_alert(&t, 1);
+            let body = only_push_body();
+            assert!(
+                body.contains("nightly-ingest"),
+                "blocked-task push must name the recognizable job label: {body:?}"
+            );
+            assert!(
+                body.contains("needs attention"),
+                "a blocked task must read as needing attention: {body:?}"
+            );
+            assert!(
+                !body.contains("stalled"),
+                "blocked must not be confusable with the starved wording: {body:?}"
+            );
+            assert!(
+                !body.contains("T1redgrp2a") && !body.contains("Sredgrp2d"),
+                "phone body leaked a raw machine id: {body:?}"
+            );
+            assert!(
+                !body.contains("merge_conflict"),
+                "the primary phone body must stay compact (name+outcome only), \
+                 not carry the raw diagnostic reason: {body:?}"
+            );
+        }
+
+        // Starved — same shape, but a DIFFERENT outcome word than blocked.
+        {
+            let _tmp = red_rig();
+            let t = Transition::TaskStarved {
+                task_id: "T1redgrp2b".to_string(),
+                ref_: Some("weekly-report".to_string()),
+                spec_id: "Sredgrp2e".to_string(),
+            };
+            emit_task_alert(&t, 1);
+            let body = only_push_body();
+            assert!(
+                body.contains("weekly-report"),
+                "starved-task push must name the recognizable job label: {body:?}"
+            );
+            assert!(
+                body.contains("stalled"),
+                "a starved task must read with its own plain outcome word: {body:?}"
+            );
+            assert!(
+                !body.contains("needs attention"),
+                "starved must not be confusable with the blocked wording: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn red_task_alert_missing_or_blank_label_falls_back_to_bounded_plain_name() {
+        let _g = crate::telemetry::test_support::lock_env();
+
+        // No ref at all.
+        {
+            let _tmp = red_rig();
+            let t = Transition::TaskBlocked {
+                task_id: "T1redgrp2c".to_string(),
+                ref_: None,
+                spec_id: "Sredgrp2f".to_string(),
+                reason: None,
+            };
+            emit_task_alert(&t, 1);
+            let body = only_push_body();
+            assert!(
+                body.contains("Unnamed job"),
+                "a task with no label must fall back to the bounded plain name: {body:?}"
+            );
+            assert!(
+                !body.contains("T1redgrp2c"),
+                "the fallback must not be the raw machine task id: {body:?}"
+            );
+        }
+
+        // Blank (whitespace-only) ref.
+        {
+            let _tmp = red_rig();
+            let t = Transition::TaskBlocked {
+                task_id: "T1redgrp2d".to_string(),
+                ref_: Some("   ".to_string()),
+                spec_id: "Sredgrp2g".to_string(),
+                reason: None,
+            };
+            emit_task_alert(&t, 1);
+            let body = only_push_body();
+            assert!(
+                body.contains("Unnamed job"),
+                "a blank label must fall back to the bounded plain name, not ship blank: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn red_task_alert_multiline_label_collapses_to_one_line() {
+        let _g = crate::telemetry::test_support::lock_env();
+        let _tmp = red_rig();
+        let t = Transition::TaskBlocked {
+            task_id: "T1redgrp2e".to_string(),
+            ref_: Some("Nightly ingest\nsecond line should not surface".to_string()),
+            spec_id: "Sredgrp2h".to_string(),
+            reason: None,
+        };
+        emit_task_alert(&t, 1);
+        let body = only_push_body();
+        assert!(
+            body.contains("Nightly ingest"),
+            "the first line of a multiline label must still surface: {body:?}"
+        );
+        assert!(
+            !body.contains('\n'),
+            "phone bodies must be single-line: {body:?}"
+        );
+        assert!(
+            !body.contains("second line should not surface"),
+            "a folded multiline label must not leak its later lines: {body:?}"
+        );
+    }
+
+    #[test]
+    fn red_task_alert_overlong_label_is_length_bounded() {
+        let _g = crate::telemetry::test_support::lock_env();
+        let _tmp = red_rig();
+        let long_name = "job-".to_string() + &"x".repeat(500);
+        let t = Transition::TaskBlocked {
+            task_id: "T1redgrp2f".to_string(),
+            ref_: Some(long_name.clone()),
+            spec_id: "Sredgrp2i".to_string(),
+            reason: None,
+        };
+        emit_task_alert(&t, 1);
+        let body = only_push_body();
+        assert!(
+            body.len() < long_name.len(),
+            "an overlong label must be truncated, not shipped whole ({} bytes): {body:?}",
+            body.len()
+        );
+        assert!(
+            body.len() <= 200,
+            "the phone body must stay length-bounded: {} bytes: {body:?}",
+            body.len()
+        );
+        assert!(
+            body.contains("needs attention"),
+            "truncation must not eat the outcome word: {body:?}"
+        );
+    }
+
+    #[test]
+    fn red_task_alert_unicode_label_truncates_without_panicking_or_corrupting() {
+        let _g = crate::telemetry::test_support::lock_env();
+        let _tmp = red_rig();
+        // Multi-byte-only characters the whole way through: a naive byte-index
+        // slice (as opposed to a char-boundary-safe one) landing mid-codepoint
+        // panics in Rust. 300 repeats of a 3-byte CJK character is comfortably
+        // past any sane bound.
+        let unicode_name: String = "咖".repeat(300);
+        let t = Transition::TaskBlocked {
+            task_id: "T1redgrp2g".to_string(),
+            ref_: Some(unicode_name.clone()),
+            spec_id: "Sredgrp2j".to_string(),
+            reason: None,
+        };
+        // Part of this test IS "must not panic": today nothing attempts to
+        // slice this string at all (no label reaches the body), so there is
+        // no panic to observe yet — but the moment execute adds byte-index
+        // truncation without a char-boundary check, this exact input starts
+        // panicking mid-codepoint. The `body.contains('咖')` assertion below
+        // is the behavioral regression this test pins.
+        emit_task_alert(&t, 1);
+        let body = only_push_body();
+        assert!(
+            body.contains('咖'),
+            "a bounded unicode label must still surface a recognizable, \
+             non-corrupted fragment: {body:?}"
+        );
+        assert!(
+            body.len() <= 200,
+            "the phone body must stay length-bounded even for wide chars: {} bytes: {body:?}",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn red_task_alert_path_shaped_label_is_rejected_not_leaked() {
+        let _g = crate::telemetry::test_support::lock_env();
+        let _tmp = red_rig();
+        let path_name = "/Users/test/fixtures/id_rsa".to_string();
+        let t = Transition::TaskBlocked {
+            task_id: "T1redgrp2h".to_string(),
+            ref_: Some(path_name.clone()),
+            spec_id: "Sredgrp2k".to_string(),
+            reason: None,
+        };
+        emit_task_alert(&t, 1);
+        let body = only_push_body();
+        assert!(
+            !body.contains(&path_name),
+            "a path-shaped label must never ship raw to the phone: {body:?}"
+        );
+        assert!(
+            body.contains("Unnamed job"),
+            "a rejected path-shaped label must fall back to the bounded plain name: {body:?}"
+        );
+    }
+
+    #[test]
+    fn red_task_alert_credential_shaped_label_is_rejected_not_leaked() {
+        let _g = crate::telemetry::test_support::lock_env();
+        let _tmp = red_rig();
+        let cred_name = "ghp_1234567890abcdef1234567890abcdef1234".to_string();
+        let t = Transition::TaskBlocked {
+            task_id: "T1redgrp2i".to_string(),
+            ref_: Some(cred_name.clone()),
+            spec_id: "Sredgrp2l".to_string(),
+            reason: None,
+        };
+        emit_task_alert(&t, 1);
+        let body = only_push_body();
+        assert!(
+            !body.contains(&cred_name),
+            "a credential-shaped label must never ship raw to the phone: {body:?}"
+        );
+        assert!(
+            body.contains("Unnamed job"),
+            "a rejected credential-shaped label must fall back to the bounded plain name: {body:?}"
+        );
+    }
+
+    /// Coverage, not a reproduced bug (already true today): a privacy canary
+    /// stuffed into the diagnostic `reason` must never reach the phone push,
+    /// through the REAL `emit_task_alert` call path (the existing
+    /// `push_body_contains_no_path_email_or_personal_tokens` in `alert.rs`
+    /// only proves this against a hardcoded title — it can't catch a future
+    /// regression where boi-spec-watch starts passing a hostile string
+    /// through as the push title/body). This guards that the compact
+    /// name+outcome design keeps the reason out of the push after execute
+    /// lands, not just before.
+    #[test]
+    fn task_alert_diagnostic_reason_canary_never_reaches_push() {
+        let _g = crate::telemetry::test_support::lock_env();
+        let _tmp = red_rig();
+        let canary = "SECRET-CANARY-TOKEN-99";
+        let t = Transition::TaskBlocked {
+            task_id: "T1redgrp2j".to_string(),
+            ref_: Some("canary-job".to_string()),
+            spec_id: "Sredgrp2m".to_string(),
+            reason: Some(format!(
+                "/Users/test/{canary}/report.pdf contact person@example.invalid"
+            )),
+        };
+        emit_task_alert(&t, 1);
+        let body = only_push_body();
+        assert!(
+            !body.contains(canary),
+            "diagnostic reason content must never reach the phone push: {body:?}"
+        );
+        assert!(!body.contains('@'), "phone push must not leak an email: {body:?}");
+        assert!(!body.contains('/'), "phone push must not leak a path: {body:?}");
+    }
+
+    // ---- GROUP 3 (execute, task T6k580e5a): name-resolution + render units ---
+    //
+    // Direct unit coverage for the concrete functions the execute phase added,
+    // per the write_red_tests hand-off: the version-correct spec-title lookup
+    // and JSON extraction (against a temp SQLite fixture — never the live db),
+    // and the display-name sanitizer's edge cases in isolation.
+
+    /// Build a temp boi.db with the spec-title lookup's real schema subset:
+    /// `spec_runtime(spec_id, current_version, status)` FK-joined to
+    /// `spec_versions(spec_id, version, snapshot)`.
+    fn title_fixture_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE spec_runtime (
+                spec_id         TEXT PRIMARY KEY,
+                current_version INTEGER NOT NULL,
+                status          TEXT NOT NULL
+             );
+             CREATE TABLE spec_versions (
+                spec_id  TEXT NOT NULL,
+                version  INTEGER NOT NULL,
+                snapshot JSON NOT NULL,
+                PRIMARY KEY (spec_id, version)
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn spec_title_lookup_prefers_current_version_snapshot() {
+        let conn = title_fixture_db();
+        // Two versions with DIFFERENT titles; current_version pins v2.
+        conn.execute(
+            "INSERT INTO spec_versions (spec_id, version, snapshot) \
+             VALUES ('S1', 1, '{\"title\":\"old plan title\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spec_versions (spec_id, version, snapshot) \
+             VALUES ('S1', 2, '{\"title\":\"revised plan title\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spec_runtime (spec_id, current_version, status) \
+             VALUES ('S1', 2, 'completed')",
+            [],
+        )
+        .unwrap();
+
+        // Must return the CURRENT version's title, not just any/most-recent.
+        assert_eq!(
+            spec_title_from_conn(&conn, "S1"),
+            Some("revised plan title".to_string()),
+            "lookup must be version-correct (current_version = 2)"
+        );
+
+        // Flip current_version back to v1 → the older title.
+        conn.execute("UPDATE spec_runtime SET current_version = 1 WHERE spec_id = 'S1'", [])
+            .unwrap();
+        assert_eq!(
+            spec_title_from_conn(&conn, "S1"),
+            Some("old plan title".to_string()),
+        );
+    }
+
+    #[test]
+    fn spec_title_lookup_missing_or_untitled_is_none() {
+        let conn = title_fixture_db();
+        // Unknown spec id → None (no row).
+        assert_eq!(spec_title_from_conn(&conn, "Sabsent"), None);
+
+        // Present, but the current-version snapshot has no `title` key → None.
+        conn.execute(
+            "INSERT INTO spec_versions (spec_id, version, snapshot) \
+             VALUES ('S2', 1, '{\"scope\":\"no title here\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spec_runtime (spec_id, current_version, status) \
+             VALUES ('S2', 1, 'failed')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(spec_title_from_conn(&conn, "S2"), None);
+
+        // current_version points at a version with NO row in spec_versions → None
+        // (the join finds nothing; alert still fires with the fallback).
+        conn.execute(
+            "INSERT INTO spec_versions (spec_id, version, snapshot) \
+             VALUES ('S3', 1, '{\"title\":\"v1 only\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spec_runtime (spec_id, current_version, status) \
+             VALUES ('S3', 2, 'completed')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(spec_title_from_conn(&conn, "S3"), None);
+    }
+
+    #[test]
+    fn parse_spec_title_handles_malformed_and_typed_edges() {
+        assert_eq!(
+            parse_spec_title(r#"{"title":"a plain title","scope":"x"}"#),
+            Some("a plain title".to_string())
+        );
+        assert_eq!(parse_spec_title("not valid json"), None);
+        assert_eq!(parse_spec_title(r#"{"scope":"no title key"}"#), None);
+        // Non-string title → None (never renders a JSON fragment as a name).
+        assert_eq!(parse_spec_title(r#"{"title":42}"#), None);
+        assert_eq!(parse_spec_title(r#"{"title":null}"#), None);
+        assert_eq!(parse_spec_title(""), None);
+    }
+
+    #[test]
+    fn display_name_sanitizes_all_edges() {
+        // Trustworthy name passes through.
+        assert_eq!(display_name(Some("nightly-ingest")), "nightly-ingest");
+        // A slash that is NOT a leading path anchor is fine (not a path leak).
+        assert_eq!(display_name(Some("docs/testing.md refresh")), "docs/testing.md refresh");
+        // Missing / blank / whitespace-only → fallback.
+        assert_eq!(display_name(None), UNNAMED_JOB);
+        assert_eq!(display_name(Some("")), UNNAMED_JOB);
+        assert_eq!(display_name(Some("   ")), UNNAMED_JOB);
+        // Path-shaped and credential-shaped → fallback (rejected, not redacted).
+        assert_eq!(
+            display_name(Some("/Users/test/fixtures/id_rsa")),
+            UNNAMED_JOB
+        );
+        assert_eq!(display_name(Some("~/private/key")), UNNAMED_JOB);
+        assert_eq!(
+            display_name(Some("ghp_1234567890abcdef1234567890abcdef1234")),
+            UNNAMED_JOB
+        );
+        // Multiline → first line only.
+        assert_eq!(display_name(Some("first line\nsecond line")), "first line");
+        // Overlong ASCII → truncated, ellipsized, bounded.
+        let long = "x".repeat(500);
+        let out = display_name(Some(&long));
+        assert!(out.len() <= MAX_NAME_BYTES + "…".len());
+        assert!(out.ends_with('…'));
+        // Overlong multibyte → char-boundary-safe (no panic), still bounded and
+        // recognizable.
+        let cjk = "咖".repeat(300);
+        let out = display_name(Some(&cjk));
+        assert!(out.len() <= MAX_NAME_BYTES + "…".len());
+        assert!(out.contains('咖'));
+    }
+
+    #[test]
+    fn display_name_rejects_embedded_sensitive_content() {
+        assert_eq!(display_name(Some("nightly /Users/test/private/key")), UNNAMED_JOB);
+        assert_eq!(
+            display_name(Some("release ghp_1234567890abcdef1234567890abcdef1234")),
+            UNNAMED_JOB
+        );
+        assert_eq!(display_name(Some("contact person@example.invalid")), UNNAMED_JOB);
+        assert_eq!(display_name(Some("job S1vwthf8e")), UNNAMED_JOB);
+        assert_eq!(display_name(Some("(S12345678)")), UNNAMED_JOB);
+        assert_eq!(display_name(Some("path=/tmp/fixture/report.txt")), UNNAMED_JOB);
+        assert_eq!(display_name(Some("job\rname")), UNNAMED_JOB);
+    }
+
+    #[test]
+    fn spec_terminal_push_uses_fixture_title_through_emission() {
+        let _g = crate::telemetry::test_support::lock_env();
+        let tmp = red_rig();
+        let db_path = tmp.path().join("boi.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE spec_runtime (
+                spec_id TEXT PRIMARY KEY, current_version INTEGER NOT NULL, status TEXT NOT NULL
+             );
+             CREATE TABLE spec_versions (
+                spec_id TEXT NOT NULL, version INTEGER NOT NULL, snapshot JSON NOT NULL,
+                PRIMARY KEY (spec_id, version)
+             );
+             INSERT INTO spec_versions VALUES
+                ('Sfixture', 1, '{\"title\":\"old title\"}'),
+                ('Sfixture', 2, '{\"title\":\"Current fixture job\"}');
+             INSERT INTO spec_runtime VALUES ('Sfixture', 2, 'completed');",
+        )
+        .unwrap();
+
+        emit_spec_alert_from_db(Some(&db_path), "Sfixture", "completed");
+        let body = only_push_body();
+        assert!(body.contains("Current fixture job"), "fixture title missing: {body:?}");
+        assert!(body.contains("completed"), "truthful outcome missing: {body:?}");
     }
 
     // ---- worker wiring ----

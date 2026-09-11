@@ -221,7 +221,16 @@ mod tests {
         assert!(
             p.trim_end().ends_with("No prose, no commentary."),
             "prompt must END with the re-anchor instruction, got tail: {:?}",
-            &p[p.len().saturating_sub(80)..]
+            // Char-boundary-safe tail (crate policy: no raw string indexing —
+            // `vocab_for_prompt()` injection means the offset is not ASCII by
+            // construction). Last 80 chars, in order.
+            p.chars()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>()
         );
     }
 

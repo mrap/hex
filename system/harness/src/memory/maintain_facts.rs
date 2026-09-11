@@ -13,6 +13,27 @@ use std::path::Path;
 /// sweep + no-op path never pays the model cold-load. `hex_dir` resolves
 /// the fastembed cache (`hex_dir/.fastembed_cache`).
 pub fn backfill(conn: &Connection, hex_dir: &Path) -> anyhow::Result<usize> {
+    let mut embedder = None;
+    backfill_with(conn, |texts| {
+        if embedder.is_none() {
+            embedder = Some(super::embed::Embedder::new(hex_dir)?);
+        }
+        embedder
+            .as_ref()
+            .expect("embedder initialized above")
+            .embed_documents(texts)
+    })
+}
+
+/// Run the idempotent fact sweep with an injected document embedder.
+///
+/// The production wrapper above constructs the real ONNX embedder only when
+/// the sweep has pending work. Tests inject a deterministic backend so the
+/// database and idempotence contract does not depend on downloading a model.
+fn backfill_with<F>(conn: &Connection, mut embed_documents: F) -> anyhow::Result<usize>
+where
+    F: FnMut(&[String]) -> anyhow::Result<Vec<Vec<f32>>>,
+{
     // tombstoned (or deleted) facts must leave the index first
     conn.execute(
         "DELETE FROM facts_vec WHERE fact_id NOT IN
@@ -34,7 +55,6 @@ pub fn backfill(conn: &Connection, hex_dir: &Path) -> anyhow::Result<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
-    let embedder = super::embed::Embedder::new(hex_dir)?;
     let mut done = 0;
     // Batch of 8 mirrors index.rs EMBED_BATCH (OBS-019: bounds the per-call
     // ONNX working set).
@@ -42,7 +62,7 @@ pub fn backfill(conn: &Connection, hex_dir: &Path) -> anyhow::Result<usize> {
         let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
         // Facts are corpus entries — document side of the asymmetric model,
         // matching the chunk pipeline (index.rs). Maintenance ctx: fail loud.
-        let vecs = embedder.embed_documents(&texts)?;
+        let vecs = embed_documents(&texts)?;
         for ((id, _), vec) in batch.iter().zip(vecs) {
             // serialize the embedding EXACTLY as vector::insert_vec does for
             // vec_chunks — shared helper, no second serializer.
@@ -76,9 +96,8 @@ mod tests {
 
     /// Plan Task 11 Step 1: tempdir-style DB with 2 live facts + 1 tombstoned
     /// → backfill embeds exactly the 2 live ones; a re-run backfills 0
-    /// (idempotent). Uses the real embedder — the model cache lives at
-    /// `./.fastembed_cache` (cargo test cwd = system/harness, where the
-    /// nomic ONNX snapshot is already cached).
+    /// (idempotent). The fake backend keeps this database contract test
+    /// deterministic and leaves real-model coverage in `embed.rs`.
     #[test]
     fn backfill_embeds_live_facts_only_and_is_idempotent() {
         let c = fixture();
@@ -86,7 +105,13 @@ mod tests {
         insert_fact(&c, "f-live-2", "fastembed for embeddings", 0);
         insert_fact(&c, "f-dead-1", "an abandoned approach", 1);
 
-        let n = backfill(&c, Path::new(".")).unwrap();
+        let n = backfill_with(&c, |texts| {
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.25f32; crate::memory::vector::EMBED_DIM])
+                .collect())
+        })
+        .unwrap();
         assert_eq!(n, 2, "both live facts must be embedded");
         let count: i64 = c
             .query_row("SELECT COUNT(*) FROM facts_vec", [], |r| r.get(0))
@@ -101,7 +126,10 @@ mod tests {
             .unwrap();
         assert_eq!(dead, 0, "tombstoned fact must not be embedded");
 
-        let n2 = backfill(&c, Path::new(".")).unwrap();
+        let n2 = backfill_with(&c, |_| {
+            panic!("the deterministic backend must not run on an idempotent re-run")
+        })
+        .unwrap();
         assert_eq!(n2, 0, "re-run must backfill nothing (idempotent)");
         let count2: i64 = c
             .query_row("SELECT COUNT(*) FROM facts_vec", [], |r| r.get(0))
@@ -118,7 +146,16 @@ mod tests {
         let v = vec![0.5f32; crate::memory::vector::EMBED_DIM];
         crate::memory::vector::insert_fact_vec(&c, "f-dead-1", &v).unwrap();
 
-        let n = backfill(&c, Path::new("/nonexistent-hex-dir")).unwrap();
+        let n_real = backfill(&c, Path::new("/nonexistent-hex-dir")).unwrap();
+        assert_eq!(
+            n_real, 0,
+            "the production wrapper must not load a model when idle"
+        );
+
+        let n = backfill_with(&c, |_| {
+            panic!("the deterministic backend must not run with no pending facts")
+        })
+        .unwrap();
         assert_eq!(n, 0, "nothing live to embed");
         let count: i64 = c
             .query_row("SELECT COUNT(*) FROM facts_vec", [], |r| r.get(0))

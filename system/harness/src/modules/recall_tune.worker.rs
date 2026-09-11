@@ -706,8 +706,10 @@ mod tests {
     }
 
     fn nondefault_config() -> RecallConfig {
-        let mut c = RecallConfig::default();
-        c.rrf_k = 42.0;
+        let mut c = RecallConfig {
+            rrf_k: 42.0,
+            ..Default::default()
+        };
         c.arm_weights.content = [3.0, 0.5, 4.0];
         c.arm_weights.entity = [5.0, 2.0, 0.5];
         c.move_relevance.fired = 0.8;
@@ -856,8 +858,10 @@ mod tests {
         assert_eq!(loaded.move_relevance.unfired, cfg.move_relevance.unfired);
 
         // Second land: the previous config is archived to a timestamped .prev.
-        let mut cfg2 = RecallConfig::default();
-        cfg2.rrf_k = 12.0;
+        let cfg2 = RecallConfig {
+            rrf_k: 12.0,
+            ..Default::default()
+        };
         let archive2 = land_config(root, &cfg2, "20260826T050000Z").unwrap();
         let arch = archive2.expect("second land must archive the predecessor");
         assert!(arch.exists(), "archived .prev must exist on disk");
@@ -894,8 +898,10 @@ mod tests {
         std::fs::write(&prev_archive, toml::to_string(&RecallConfig::default()).unwrap()).unwrap();
 
         // The LIVE (landed) config: a distinct rrf_k so a restore is observable.
-        let mut landed = RecallConfig::default();
-        landed.rrf_k = 12.0;
+        let landed = RecallConfig {
+            rrf_k: 12.0,
+            ..Default::default()
+        };
         std::fs::write(config_path(root), toml::to_string(&landed).unwrap()).unwrap();
 
         // A win_log row recording the land: candidate held-out 8, pre-change 7.

@@ -36,7 +36,9 @@ Verify: hex info repo-mission
 - C2 agents-md-decomposition: pending (depends on C1)
 - C4 trail-audit-implementation: pending (depends on C1)
 
-**Build status:** Run `cargo build` in `system/harness/` to verify binary compiles.
+**Build status:** Use the supported local Cargo gate in
+`docs/managed-build-targets.md` for local build verification. Hosted CI remains
+the separate full build authority.
 
 [PROGRESS.md](PROGRESS.md) is a **historical snapshot** (frozen 2026-05-16) from the C1/C3 session — not live session state. When the static answer above looks stale, consult `CHANGELOG.md` and `git log` for what has actually shipped, and `todo.md` for the current priority list.
 
@@ -77,7 +79,9 @@ Verify: hex doctor
 
 **Harness binary (build + unit tests):**
 
-Verify: cargo test --manifest-path system/harness/Cargo.toml
+Use the supported local Cargo gate documented in
+`docs/managed-build-targets.md`. Do not bypass managed output selection with a
+bare local Cargo command.
 
 **BOI queue integrity (worker state + spec status):**
 
@@ -88,8 +92,8 @@ Verify: ~/.boi/bin/boi dashboard
 There is no dedicated `hex verify-claims` subcommand yet — see the Open Verify
 Stubs table below. Until it lands, verify claims by running the checks the
 spec's own `verifications` block declares (each task carries them), plus
-`hex doctor` for system-level health and `cargo test --manifest-path
-system/harness/Cargo.toml` for harness behavior.
+`hex doctor` for system-level health and the supported local Cargo gate for
+harness behavior.
 
 Full test matrix — unit, core-e2e, codex-parity, containerized — in [docs/testing.md](docs/testing.md); read it before running or adding tests.
 
@@ -173,7 +177,7 @@ If your runtime exposes structured file/search tools, use them. If it only gives
 
 ## Code intelligence (cq)
 
-**Prefer `cq` over grep for def/refs/callers questions in Rust repos** — it answers from a semantic SCIP index, not text matching. Binary: `cargo build --release -p scipd` → `target/release/cq`. Full guide: [docs/code-intel.md](docs/code-intel.md).
+**Prefer `cq` over grep for def/refs/callers questions in Rust repos** — it answers from a semantic SCIP index, not text matching. Use the installed `cq` command. For supported local Rust work, use `system/scripts/managed-cargo-gate.py` and inspect its receipt; this guide does not designate a bare-Cargo build or artifact path. Full guide: [docs/code-intel.md](docs/code-intel.md).
 
 ```bash
 cq def <name | FILE:LINE:COL>      # definition site(s)        (positions are 1-based)
@@ -366,7 +370,7 @@ Consolidated 2026-04-29 (39 → 18 rules). Lineage tags trace to pre-consolidati
 
 | # | Rule |
 |---|------|
-| S1 | **Sync fixes to hex base.** Every fix to hex scripts/skills/config syncs back to the hex-foundation repo. Commit locally; never push without approval. (replaces S10) |
+| S1 | **Sync fixes to hex base.** Every fix to hex scripts/skills/config syncs back to the hex-foundation repo. For the GitFlow hex-foundation repository, reviewed routine changes may merge and push to `develop` after the required gates pass. Force-pushes, history rewrites, changes to other protected branches, and production mutations still require explicit approval. (replaces S10) |
 | S2 | **Monitor, audit, and automate BOI operations.** Ensure BOI workers are running or set up failure detection for overnight runs. One restart attempt, then notify. After dispatch failures, audit all config locations. Workers can mutate phase files. Never ad-hoc polling loops. (consolidates S3, S4, S6) |
 | S3 | **Lock before writing shared files.** Check coordination lock on learnings.md, todo.md, evolution/, landings/. Locks auto-expire after 5 min. (replaces S5) |
 | S4 | **Hex voice and formatting.** Concise, direct, no fluff, no hedging. Lead with the ask. Produce artifacts, not advice. No markdown tables in Slack — bullet lists with bold labels only; never pipe-delimited tables. (consolidates S7, S8) |

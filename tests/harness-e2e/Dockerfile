@@ -49,6 +49,9 @@ RUN cargo chef cook --recipe-path recipe.json
 # Real harness source over the warmed dep cache: only our crates recompile. The
 # binary is copied OUT to /hex-bin (a real layer) for the runtime stage to grab.
 COPY system/harness/ ./
+# Shared Rust module and its compile-time embedded scripts.
+COPY system/managed_cargo_bridge.rs /managed_cargo_bridge.rs
+COPY system/scripts/managed-cargo-gate.py system/scripts/managed-target-check.py /scripts/
 RUN cargo build 2>&1 && cp /build/target/debug/hex /hex-bin
 
 # ── Stage 2: Runtime — ONLY the hex binary, nothing vendored ─────────────────

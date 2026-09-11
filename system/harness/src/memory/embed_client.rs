@@ -125,8 +125,7 @@ pub(crate) fn try_roundtrip(
     query: &str,
     timeout: Duration,
 ) -> Result<Vec<f32>, String> {
-    let mut stream =
-        UnixStream::connect(sock).map_err(|e| format!("connect failed: {e}"))?;
+    let mut stream = UnixStream::connect(sock).map_err(|e| format!("connect failed: {e}"))?;
     // Per-syscall timeouts so the worker thread itself cannot block forever
     // (belt-and-suspenders with the caller-side `recv_timeout` ceiling).
     stream
@@ -149,8 +148,10 @@ pub(crate) fn try_roundtrip(
         .map_err(|e| format!("read failed (want {RESPONSE_BYTES} bytes): {e}"))?;
 
     let vec: Vec<f32> = buf
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     if vec.len() != EMBED_DIM {
         return Err(format!(
@@ -185,10 +186,7 @@ where
             Ok(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "embed-serve already listening on {}",
-                        socket_path.display()
-                    ),
+                    format!("embed-serve already listening on {}", socket_path.display()),
                 ));
             }
             Err(_) => {
@@ -241,9 +239,7 @@ where
     if !line.ends_with('\n') {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "request not newline-terminated within {MAX_QUERY_BYTES} bytes"
-            ),
+            format!("request not newline-terminated within {MAX_QUERY_BYTES} bytes"),
         ));
     }
     let query = line.trim_end_matches(['\r', '\n']);
@@ -340,7 +336,10 @@ mod tests {
             Path::new("/tmp/embed.sock"),
             "connect failed: No such file or directory (os error 2)",
         );
-        assert!(reason_line.contains("WARN"), "fallback must be loud: {reason_line}");
+        assert!(
+            reason_line.contains("WARN"),
+            "fallback must be loud: {reason_line}"
+        );
         assert!(
             reason_line.contains("BM25-only"),
             "fallback must name the degraded mode: {reason_line}"
@@ -357,7 +356,10 @@ mod tests {
         let timeout_line =
             fallback_warn_line(Path::new("/tmp/embed.sock"), "timed out after 150ms");
         assert!(timeout_line.contains("WARN") && timeout_line.contains("BM25-only"));
-        assert!(timeout_line.contains("timed out"), "timeout cause must survive");
+        assert!(
+            timeout_line.contains("timed out"),
+            "timeout cause must survive"
+        );
     }
 
     #[test]

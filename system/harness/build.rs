@@ -105,7 +105,7 @@ fn main() {
         personal_mods.push_str(&format!("#[path = {path:?}] mod {ident};\n"));
     }
     personal_mods
-        .push_str("pub fn probe_registry() -> Vec<(&'static str, fn() -> i32)> {\n    vec![");
+        .push_str("type ProbeFn = fn() -> i32;\n\npub fn probe_registry() -> Vec<(&'static str, ProbeFn)> {\n    vec![");
     for (ident, name, _path) in &probe_entries {
         personal_mods.push_str(&format!("({name:?}, {ident}::run_probe as fn() -> i32), "));
     }

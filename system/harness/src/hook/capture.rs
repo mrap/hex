@@ -225,18 +225,6 @@ mod tests {
         assert_eq!(source_from_stdin(&raw), Some(t));
     }
 
-    /// Point the process-global $HEX_DIR at a fresh tempdir so telemetry
-    /// writes land there. This module compiles into the BIN target, where the
-    /// lib's `telemetry::test_support` (`#[cfg(test)]`) is not available —
-    /// hence the local helper. The TempDir is leaked so the path stays valid
-    /// for any later telemetry write in this test process. This is the only
-    /// bin-target test that mutates HEX_DIR, so no env lock is needed.
-    fn isolate_hex_dir() -> &'static std::path::Path {
-        let tmp = Box::leak(Box::new(TempDir::new().unwrap()));
-        std::env::set_var("HEX_DIR", tmp.path());
-        tmp.path()
-    }
-
     #[test]
     fn run_inner_copies_stdin_transcript() {
         // run_inner's success path records telemetry, which resolves
@@ -244,7 +232,7 @@ mod tests {
         // dir (review-fix 2026-06-11: without this, the test wrote fake
         // `hook::capture ok` rows into the PRODUCTION events.db, fabricating
         // the exact signal the post-deploy smoke test queries).
-        let _hex_dir = isolate_hex_dir();
+        let _environment = crate::test_env::isolate_hex_dir();
         let tmp = TempDir::new().unwrap();
         let hex = tmp.path().join("hex");
         std::fs::create_dir_all(&hex).unwrap();
@@ -255,10 +243,18 @@ mod tests {
         assert!(hex.join("raw/transcripts/sess.jsonl").is_file());
 
         // The capture telemetry row must land in the ISOLATED store.
-        let rows = crate::telemetry::recent(10).unwrap();
-        assert!(
-            rows.iter()
-                .any(|r| r.source == "hook::capture" && r.status == "ok"),
+        let conn = crate::telemetry::open_ro().unwrap();
+        let expected_detail = format!(
+            "{} (5 bytes)",
+            hex.join("raw/transcripts/sess.jsonl").display()
+        );
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE source = 'hook::capture' AND status = 'ok' AND detail = ?1",
+            [expected_detail],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            count, 1,
             "capture success row must be recorded in the isolated HEX_DIR \
              telemetry store"
         );

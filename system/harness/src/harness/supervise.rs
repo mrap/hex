@@ -160,6 +160,8 @@ pub enum EnsureAction {
     Install,
     /// Operator deliberately stopped it (sentinel present) → do nothing.
     SkipIntentionalDown,
+    /// Identity or transaction checks prevent a service-changing recovery.
+    Blocked,
 }
 
 /// Pure: decide what `ensure` should do. No I/O so it is exhaustively table-tested.
@@ -277,6 +279,51 @@ pub fn build_watchdog_spec(hex_dir: &Path) -> daemon_green::ServiceSpec {
         .log_path(log_path)
 }
 
+fn apply_verified_owner(
+    mut spec: daemon_green::ServiceSpec,
+    owner: &crate::app_identity::VerifiedOwner,
+) -> daemon_green::ServiceSpec {
+    if owner.is_signed() {
+        spec.program = owner.executable().to_owned();
+        spec = spec.associated_bundle_identifiers([crate::app_identity::HEX_APP_ID]);
+    }
+    spec
+}
+
+fn start_services_with(
+    hex_dir: &Path,
+    manager: &dyn daemon_green::ServiceManager,
+    preflight: impl FnOnce() -> std::io::Result<crate::app_identity::VerifiedOwner>,
+) -> Result<(), String> {
+    let owner = preflight().map_err(|e| format!("app identity preflight: {e}"))?;
+    let _guard = acquire_bootstrap_lock(hex_dir).map_err(|e| format!("bootstrap lock: {e}"))?;
+    std::fs::create_dir_all(hex_dir.join(".hex/logs"))
+        .map_err(|e| format!("create service logs: {e}"))?;
+    manager
+        .install(&apply_verified_owner(build_harness_spec(hex_dir), &owner))
+        .map_err(|e| format!("harness install: {e}"))?;
+    clear_intentionally_down(hex_dir);
+    manager
+        .start(HARNESS_LABEL)
+        .map_err(|e| format!("harness start: {e}"))?;
+    if let Err(error) = manager
+        .install(&apply_verified_owner(build_watchdog_spec(hex_dir), &owner))
+        .and_then(|_| manager.start(WATCHDOG_LABEL))
+    {
+        if owner.is_signed() {
+            return Err(format!("signed watchdog registration: {error}"));
+        }
+        eprintln!("hex harness start: watchdog failed (non-fatal): {error}");
+    }
+    Ok(())
+}
+
+pub fn start_services(hex_dir: &Path) -> Result<(), String> {
+    start_services_with(hex_dir, daemon_green::native().as_ref(), || {
+        crate::app_identity::verified_owner(hex_dir)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Drivers (I/O — thin shells over daemon-green + the pure logic above)
 // ---------------------------------------------------------------------------
@@ -309,10 +356,36 @@ fn emit_harness_down_alert(hex_dir: &Path, msg: &str) {
 /// This replaces every bare `daemon_green::native().restart(label)` that previously swallowed
 /// failure as a `[WARN]` and returned success.
 pub fn restart_and_verify(hex_dir: &Path, label: &str) -> Result<RestartVerdict, String> {
+    restart_verified(hex_dir, label, false)
+}
+
+pub fn restart_explicit(hex_dir: &Path, label: &str) -> Result<RestartVerdict, String> {
+    restart_verified(hex_dir, label, true)
+}
+
+fn restart_verified(
+    hex_dir: &Path,
+    label: &str,
+    clear_stop: bool,
+) -> Result<RestartVerdict, String> {
+    let owner = crate::app_identity::verified_owner(hex_dir)
+        .map_err(|e| format!("app identity preflight: {e}"))?;
     let _guard = acquire_bootstrap_lock(hex_dir).map_err(|e| format!("bootstrap lock: {e}"))?;
     let mgr = daemon_green::native();
-
-    if let Err(e) = mgr.restart(label) {
+    if owner.is_signed() && label != HARNESS_LABEL {
+        return Err("unexpected signed service label".into());
+    }
+    if clear_stop {
+        clear_intentionally_down(hex_dir);
+    }
+    let restart = if owner.is_signed() {
+        mgr.install(&apply_verified_owner(build_harness_spec(hex_dir), &owner))
+            .map_err(|e| format!("signed harness registration failed: {e}"))?;
+        mgr.start(label)
+    } else {
+        mgr.restart(label)
+    };
+    if let Err(e) = restart {
         eprintln!("  [WARN] {label}: restart call failed: {e} — verifying / retrying anyway");
     }
     let serving_first = wait_for_engine(ENGINE_ADDR, VERIFY_TIMEOUT);
@@ -362,8 +435,15 @@ pub fn ensure_once(hex_dir: &Path) -> EnsureAction {
     let action = decide_ensure(health, serving, is_intentionally_down(hex_dir));
 
     match action {
-        EnsureAction::NoOp | EnsureAction::SkipIntentionalDown => action,
+        EnsureAction::NoOp | EnsureAction::SkipIntentionalDown | EnsureAction::Blocked => action,
         EnsureAction::Install | EnsureAction::Reboot => {
+            let owner = match crate::app_identity::verified_owner(hex_dir) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    eprintln!("[hex harness watchdog] app identity blocks recovery: {error}");
+                    return EnsureAction::Blocked;
+                }
+            };
             // Serialize with any in-flight restart/upgrade (R1).
             let _guard = match acquire_bootstrap_lock(hex_dir) {
                 Ok(g) => g,
@@ -376,9 +456,14 @@ pub fn ensure_once(hex_dir: &Path) -> EnsureAction {
             if engine_listening(ENGINE_ADDR) {
                 return EnsureAction::NoOp;
             }
-            if action == EnsureAction::Install {
-                if let Err(e) = mgr.install(&build_harness_spec(hex_dir)) {
+            if action == EnsureAction::Install || owner.is_signed() {
+                if let Err(e) =
+                    mgr.install(&apply_verified_owner(build_harness_spec(hex_dir), &owner))
+                {
                     eprintln!("[hex harness watchdog] WARN install failed: {e}");
+                    if owner.is_signed() {
+                        return EnsureAction::Blocked;
+                    }
                 }
             }
             if let Err(e) = mgr.start(HARNESS_LABEL) {
@@ -417,6 +502,109 @@ pub fn watchdog_loop(hex_dir: &Path) -> ! {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[derive(Default)]
+    struct ManagerSpy {
+        specs: std::cell::RefCell<Vec<daemon_green::ServiceSpec>>,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl daemon_green::ServiceManager for ManagerSpy {
+        fn install(&self, spec: &daemon_green::ServiceSpec) -> daemon_green::Result<()> {
+            self.specs.borrow_mut().push(spec.clone());
+            self.calls
+                .borrow_mut()
+                .push(format!("install:{}", spec.label));
+            Ok(())
+        }
+        fn start(&self, label: &str) -> daemon_green::Result<()> {
+            self.calls.borrow_mut().push(format!("start:{label}"));
+            Ok(())
+        }
+        fn stop(&self, _: &str) -> daemon_green::Result<()> {
+            panic!("unexpected stop")
+        }
+        fn restart(&self, _: &str) -> daemon_green::Result<()> {
+            panic!("unexpected restart")
+        }
+        fn status(&self, _: &str) -> daemon_green::Result<daemon_green::ServiceStatus> {
+            panic!("unexpected status")
+        }
+        fn logs(&self, _: &str, _: usize) -> daemon_green::Result<String> {
+            panic!("unexpected logs")
+        }
+    }
+
+    #[test]
+    fn failed_identity_preflight_leaves_services_logs_and_stop_marker_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        mark_intentionally_down(temp.path());
+        let before = std::fs::read(stopped_sentinel(temp.path())).unwrap();
+        let manager = ManagerSpy::default();
+        let result = start_services_with(temp.path(), &manager, || {
+            Err(std::io::Error::other("invalid identity"))
+        });
+        assert!(result.is_err());
+        assert!(manager.calls.borrow().is_empty());
+        assert!(!temp.path().join(".hex/logs").exists());
+        assert!(!lock_path(temp.path()).exists());
+        assert_eq!(
+            std::fs::read(stopped_sentinel(temp.path())).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn signed_service_specs_only_change_owner_and_association() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ManagerSpy::default();
+        let exe = temp.path().join(".hex/Hex.app/Contents/MacOS/hex");
+        start_services_with(temp.path(), &manager, || {
+            Ok(crate::app_identity::VerifiedOwner::fixture(
+                exe.clone(),
+                true,
+            ))
+        })
+        .unwrap();
+        assert_eq!(
+            *manager.calls.borrow(),
+            [
+                "install:com.hex.harness",
+                "start:com.hex.harness",
+                "install:com.hex.harness-watchdog",
+                "start:com.hex.harness-watchdog"
+            ]
+        );
+        for (mut actual, legacy) in manager.specs.borrow().clone().into_iter().zip([
+            build_harness_spec(temp.path()),
+            build_watchdog_spec(temp.path()),
+        ]) {
+            assert_eq!(actual.program, exe);
+            assert_eq!(actual.associated_bundle_identifiers, ["com.mrap.hex"]);
+            actual.program = legacy.program.clone();
+            actual.associated_bundle_identifiers.clear();
+            assert_eq!(format!("{actual:?}"), format!("{legacy:?}"));
+        }
+    }
+
+    #[test]
+    fn unconfigured_service_specs_preserve_raw_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ManagerSpy::default();
+        start_services_with(temp.path(), &manager, || {
+            Ok(crate::app_identity::VerifiedOwner::fixture(
+                temp.path().join(".hex/bin/hex"),
+                false,
+            ))
+        })
+        .unwrap();
+        for (actual, expected) in manager.specs.borrow().iter().zip([
+            build_harness_spec(temp.path()),
+            build_watchdog_spec(temp.path()),
+        ]) {
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
+    }
 
     #[test]
     fn engine_listening_true_when_bound_false_when_not() {

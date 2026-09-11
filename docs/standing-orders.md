@@ -66,7 +66,7 @@ If your response contains any of these, run the 5-point checklist before sending
 3. **For each option — criticism:** What breaks? What's the failure mode? What happens out of order? What happens when a dependency is down? What's the maintenance cost?
 4. **Verdict per option:** Survives criticism or doesn't. One sentence.
 5. **Recommendation:** Pick one. Justify with evidence from the criticism. Name the first 3 files to create/modify.
-6. **Dispatch as `mode: challenge`** so the BOI worker questions its own assumptions during implementation.
+6. **Use the standard TOML pipeline.** Put adversarial criticism in the spec scope and review gates; BOI v2 removed the `mode` field.
 
 **When the design succeeds:** Extract the winning pattern into a reusable template (standing order, spec template, or script) so future design decisions in that domain get the same rigor automatically. This is how the system compounds — good patterns become infrastructure.
 

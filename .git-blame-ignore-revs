@@ -4,3 +4,5 @@
 899999f5cdee19a39b6f439ee7233cde3750a935
 # cargo fmt reformat — hex quality campaign 2026-07-28.
 923b28ae205a20d6d838231060f4abb646499631
+# cargo fmt --all — next-generation-2026-09-08 audit-repair slice (task T84q902a9).
+f3c1247518707f3f5ef10c6de47227e66aaaefe6

@@ -70,8 +70,8 @@ pub fn add_function(
     // Step 3: write JSON definition last (tmp + rename = atomic commit barrier)
     let fn_dir = registry_dir.join("functions");
     fs::create_dir_all(&fn_dir).map_err(|e| format!("create functions dir: {e}"))?;
-    let fn_path = fn_dir.join(format!("{}.json", &cap.id));
-    let tmp_path = fn_dir.join(format!(".{}.json.tmp", &cap.id));
+    let fn_path = fn_dir.join(format!("{}.json", cap.id));
+    let tmp_path = fn_dir.join(format!(".{}.json.tmp", cap.id));
     let json = serde_json::to_vec_pretty(cap).map_err(|e| format!("serialize capability: {e}"))?;
     fs::write(&tmp_path, &json).map_err(|e| format!("write tmp json: {e}"))?;
     fs::rename(&tmp_path, &fn_path)
@@ -84,8 +84,8 @@ pub fn add_function(
 pub fn add_trigger(registry_dir: &Path, cap: &TriggerCapability) -> Result<(), String> {
     let tr_dir = registry_dir.join("triggers");
     fs::create_dir_all(&tr_dir).map_err(|e| format!("create triggers dir: {e}"))?;
-    let tr_path = tr_dir.join(format!("{}.json", &cap.id));
-    let tmp_path = tr_dir.join(format!(".{}.json.tmp", &cap.id));
+    let tr_path = tr_dir.join(format!("{}.json", cap.id));
+    let tmp_path = tr_dir.join(format!(".{}.json.tmp", cap.id));
     let json = serde_json::to_vec_pretty(cap).map_err(|e| format!("serialize trigger: {e}"))?;
     fs::write(&tmp_path, &json).map_err(|e| format!("write tmp trigger json: {e}"))?;
     fs::rename(&tmp_path, &tr_path)

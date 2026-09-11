@@ -707,6 +707,7 @@ workers:
     /// Malformed YAML must not crash the harness — loud skip, empty result.
     #[test]
     fn instance_engine_workers_malformed_is_loud_skip() {
+        let _g = crate::telemetry::test_support::lock_env();
         let tmp = tempdir().unwrap();
         std::env::set_var("HEX_DIR", tmp.path()); // hermetic alert/telemetry writes
         let path = tmp.path().join("engine-workers.yaml");
@@ -718,6 +719,7 @@ workers:
     /// silently-ignored keys.
     #[test]
     fn instance_engine_workers_rejects_unknown_top_level_keys() {
+        let _g = crate::telemetry::test_support::lock_env();
         let tmp = tempdir().unwrap();
         std::env::set_var("HEX_DIR", tmp.path());
         let path = tmp.path().join("engine-workers.yaml");

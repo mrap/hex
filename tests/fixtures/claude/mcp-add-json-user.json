@@ -1,0 +1,31 @@
+{
+  "firstStartTime": "<REDACTED>",
+  "firstStartVersion": "2.1.263",
+  "machineID": "<REDACTED>",
+  "opusProMigrationComplete": true,
+  "sonnet1m45MigrationComplete": true,
+  "seenNotifications": {},
+  "hasResetAutoModeOptInForDefaultOffer": true,
+  "migrationVersion": 14,
+  "userID": "<REDACTED>",
+  "mcpServers": {
+    "probe-http": {
+      "type": "http",
+      "url": "https://example.invalid/mcp",
+      "headers": {
+        "X-Test": "1"
+      }
+    },
+    "probe-stdio": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "some-mcp-server"
+      ],
+      "env": {
+        "API_KEY": "xxx"
+      }
+    }
+  }
+}

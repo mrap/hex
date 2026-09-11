@@ -29,6 +29,15 @@
 
 set -uo pipefail
 
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+case "$SCRIPT_SOURCE" in
+  */*) SCRIPT_DIR="${SCRIPT_SOURCE%/*}" ;;
+  *) SCRIPT_DIR="." ;;
+esac
+SCRIPT_DIR="$(cd "$SCRIPT_DIR" && pwd -P)"
+SYSTEM_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd -P)"
+MANAGED_CARGO_GATE="$SYSTEM_DIR/scripts/managed-cargo-gate.py"
+
 REPO="."
 CHECK_BATCH=0
 for arg in "$@"; do
@@ -38,6 +47,7 @@ for arg in "$@"; do
   esac
 done
 cd "$REPO" || { echo "ERROR: cannot cd into $REPO" >&2; exit 1; }
+REPO="$(pwd -P)"
 
 overall_status=0
 LOG="$(mktemp)"
@@ -63,6 +73,65 @@ run_step() {
   return 0  # keep going; overall_status is the real signal
 }
 
+source_revision_context() {
+  SOURCE_REVISION="unavailable"
+  SOURCE_STATE="unavailable"
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if SOURCE_REVISION=$(git rev-parse HEAD 2>/dev/null); then
+      if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+        SOURCE_STATE="clean"
+      else
+        SOURCE_STATE="dirty"
+      fi
+    fi
+  fi
+}
+
+private_receipt_dir() {
+  local base="$REPO/.cleanup" directory="$REPO/.cleanup/managed-cargo-receipts"
+  local current mode owner previous_umask failed=0
+  previous_umask=$(umask)
+  umask 077
+  for current in "$base" "$directory"; do
+    if [ -L "$current" ]; then
+      echo "ERROR: managed Cargo receipt directory must not be a symlink: $current" >&2
+      failed=1
+      break
+    fi
+    if [ ! -e "$current" ]; then
+      if ! mkdir "$current"; then
+        failed=1
+        break
+      fi
+    fi
+    if [ ! -d "$current" ]; then
+      echo "ERROR: managed Cargo receipt path is not a directory: $current" >&2
+      failed=1
+      break
+    fi
+    if ! mode=$(stat -f '%Lp' "$current" 2>/dev/null || stat -c '%a' "$current" 2>/dev/null) || \
+       ! owner=$(stat -f '%u' "$current" 2>/dev/null || stat -c '%u' "$current" 2>/dev/null); then
+      failed=1
+      break
+    fi
+    [ "$owner" = "$(id -u)" ] && (( (8#$mode & 0022) == 0 )) || {
+      echo "ERROR: managed Cargo receipt directory is not private and owned by this user: $current" >&2
+      failed=1
+      break
+    }
+  done
+  umask "$previous_umask"
+  [ "$failed" -eq 0 ] || return 1
+  MANAGED_CARGO_RECEIPTS="$directory"
+}
+
+run_managed_cargo() {
+  local label="$1" mode="$2" operation="$3"; shift 3
+  run_step "$label" "$mode" python3 "$MANAGED_CARGO_GATE" \
+    --caller repo-cleanup --source-revision "$SOURCE_REVISION" --source-state "$SOURCE_STATE" \
+    --receipt-dir "$MANAGED_CARGO_RECEIPTS" "$operation" "$@"
+}
+
 # --- HARD RULE 6 mechanical check (only with --check-batch) ---
 if [ "$CHECK_BATCH" -eq 1 ]; then
   echo "--- batch-size check (HARD RULE 6) ---"
@@ -84,24 +153,42 @@ ran_anything=0
 
 if [ -f Cargo.toml ]; then
   ran_anything=1
-  run_step "cargo build" gate cargo build --all-targets
-  run_step "cargo test" gate cargo test
-  run_step "cargo clippy (report-only)" report cargo clippy --all-targets
+  if [ ! -f "$MANAGED_CARGO_GATE" ] || [ -L "$MANAGED_CARGO_GATE" ]; then
+    echo "ERROR: managed Cargo gate is unavailable beside this installed skill." >&2
+    overall_status=1
+  else
+    source_revision_context
+    if private_receipt_dir; then
+      run_managed_cargo "cargo build" gate build --all-targets
+      run_managed_cargo "cargo test" gate test
+      run_managed_cargo "cargo clippy (report-only)" report clippy --all-targets
+    else
+      overall_status=1
+    fi
+  fi
 fi
 
 if [ -f package.json ]; then
   ran_anything=1
   if command -v npm >/dev/null 2>&1; then
     run_step "npm run build (if defined)" gate npm run --if-present build
-    run_step "npm test" gate npm test --if-present
+    run_step "npm test" gate npm test
     run_step "npm run lint (report-only)" report npm run --if-present lint
+  else
+    echo "ERROR: package.json found but npm is unavailable; tests did not run." >&2
+    overall_status=1
   fi
 fi
 
 if [ -f pyproject.toml ] || [ -f setup.py ]; then
   ran_anything=1
   command -v ruff >/dev/null 2>&1 && run_step "ruff check (report-only)" report ruff check .
-  command -v pytest >/dev/null 2>&1 && run_step "pytest" gate pytest -q
+  if command -v pytest >/dev/null 2>&1; then
+    run_step "pytest" gate pytest -q
+  else
+    echo "ERROR: Python project found but pytest is unavailable; tests did not run." >&2
+    overall_status=1
+  fi
 fi
 
 if [ -f go.mod ]; then

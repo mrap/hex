@@ -1,0 +1,76 @@
+{
+  "_provenance": "Scrubbed from a codex 0.153.4 `codex exec --json` run (model gpt-5.4-mini, ChatGPT auth, plan_type pro) that made 3 shell tool calls in one turn. Extracted from the session rollout token_count event_msg records under a temp CODEX_HOME. Temp paths and account identifiers removed.",
+  "_finding_token_count_records": 4,
+  "_finding_note": "One token_count record is emitted per model step (1 initial + 1 after each of the 3 tool-call results = 4). Each carries its own rate_limits snapshot. total_token_usage.total_tokens accumulates across the whole exec invocation; last_token_usage is the per-step usage. primary.used_percent stayed 0.0 for every step, so whether a multi-tool-call turn counts as one server-side message is NOT resolvable from used_percent deltas at this utilization.",
+  "accumulation_across_turn": [
+    {
+      "model_step": 1,
+      "rollout_ordinal": 16,
+      "total_tokens_cumulative": 11876,
+      "last_step_total_tokens": 11876,
+      "rate_limits_primary_used_percent": 0.0
+    },
+    {
+      "model_step": 2,
+      "rollout_ordinal": 21,
+      "total_tokens_cumulative": 23868,
+      "last_step_total_tokens": 11992,
+      "rate_limits_primary_used_percent": 0.0
+    },
+    {
+      "model_step": 3,
+      "rollout_ordinal": 26,
+      "total_tokens_cumulative": 35965,
+      "last_step_total_tokens": 12097,
+      "rate_limits_primary_used_percent": 0.0
+    },
+    {
+      "model_step": 4,
+      "rollout_ordinal": 30,
+      "total_tokens_cumulative": 48119,
+      "last_step_total_tokens": 12154,
+      "rate_limits_primary_used_percent": 0.0
+    }
+  ],
+  "final_token_count_payload": {
+    "type": "token_count",
+    "info": {
+      "total_token_usage": {
+        "input_tokens": 47795,
+        "cached_input_tokens": 39424,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 324,
+        "reasoning_output_tokens": 132,
+        "total_tokens": 48119
+      },
+      "last_token_usage": {
+        "input_tokens": 12148,
+        "cached_input_tokens": 11520,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 6,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 12154
+      },
+      "model_context_window": 258400
+    },
+    "rate_limits": {
+      "limit_id": "codex",
+      "limit_name": null,
+      "primary": {
+        "used_percent": 0.0,
+        "window_minutes": 10080,
+        "resets_at": 1789412443
+      },
+      "secondary": null,
+      "credits": {
+        "has_credits": false,
+        "unlimited": false,
+        "balance": "0"
+      },
+      "individual_limit": null,
+      "spend_control_reached": null,
+      "plan_type": "pro",
+      "rate_limit_reached_type": null
+    }
+  }
+}

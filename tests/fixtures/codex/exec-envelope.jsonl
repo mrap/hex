@@ -1,0 +1,4 @@
+{"type": "thread.started", "thread_id": "<THREAD_ID>"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "hello"}}
+{"type": "turn.completed", "usage": {"input_tokens": 11635, "cached_input_tokens": 8448, "cache_write_input_tokens": 0, "output_tokens": 18, "reasoning_output_tokens": 11}}

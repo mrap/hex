@@ -133,15 +133,16 @@ max_pings_per_day = 3
 
 ## Scheduling (launchd)
 
-`hex hitl nudge` is the hourly driver — idempotent and safe to re-run. Install the
-template `system/templates/launchd/com.hex.hitl-nudge.plist` (substitute the
-`*_PLACEHOLDER` values first, as the repo sanitize gate forbids hardcoded paths):
+`hex hitl nudge` is the hourly driver. The template at
+`system/templates/launchd/com.hex.hitl-nudge.plist` describes the historical
+legacy-only registration, with substituted `HEXBIN`, `HEXDIR` and log paths.
+It is not a qualified managed macOS service installer.
 
-```bash
-# after rendering HEXBIN/HEXDIR/LOG placeholders into the plist:
-cp <rendered>.plist ~/Library/LaunchAgents/com.hex.hitl-nudge.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hex.hitl-nudge.plist
-```
+There is no qualified automatic managed HITL-nudge installation path yet. Do
+not render an arbitrary executable into that template and bootstrap it on a
+managed installation. The common signer does not itself qualify every service
+that invokes Hex. See the [macOS build standard](macos-build-standard.md) for
+covered callers and remaining service limits.
 
 The job runs `hex hitl nudge` every hour (`StartInterval` 3600): it sends the
 pings due now and, when the current hour equals `digest_hour` and the digest has

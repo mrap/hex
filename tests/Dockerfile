@@ -11,14 +11,18 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY system/harness/ system/harness/
 COPY system/code-intel/ system/code-intel/
+# Shared Rust module and its compile-time embedded scripts.
+COPY system/managed_cargo_bridge.rs system/managed_cargo_bridge.rs
+COPY system/scripts/managed-cargo-gate.py system/scripts/managed-target-check.py system/scripts/
 RUN cargo build -p hex-harness 2>&1
 
 # Stage 2: Test runner
-FROM python:3.10-slim
+FROM rust:1-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends git && \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git python3 python3-pip pkg-config libssl-dev g++ && \
     rm -rf /var/lib/apt/lists/* && \
-    pip install --no-cache-dir pytest
+    pip install --no-cache-dir --break-system-packages pytest
 
 # Git needs a user for commits (not used, but prevents warnings)
 RUN git config --global user.email "test@test.com" && \

@@ -1,0 +1,67 @@
+# goose 1.46.0 codex provider - captured codex CLI argv
+# Source: CODEX_COMMAND pointed at a wrapper that logged argv + a whitelist of
+# env vars, then exec'd the real codex 0.153.4 binary. Temp paths redacted to <TMP>.
+# Command that produced each block:
+#   env HOME=<TMP>/home[N] CODEX_HOME=<TMP>/codexhome CODEX_COMMAND=<TMP>/bin/codex-wrap.sh \
+#       [CODEX_REASONING_EFFORT=<val>] CODEX_SKIP_GIT_CHECK=true GOOSE_MODE=<mode> \
+#       GOOSE_DISABLE_KEYRING=true GOOSE_DISABLE_SESSION_NAMING=true \
+#       goose run --no-session -q --recipe <TMP>/recipe.yaml < /dev/null
+# The recipe sets settings.goose_provider=codex, settings.goose_model=gpt-5.4-mini.
+# goose invokes:  <CODEX_COMMAND> exec -c model_reasoning_effort="<effort>" --json [--yolo] -
+# The prompt is piped to codex on stdin (positional "-"). goose does NOT forward -m/--model;
+# codex uses its own config/default model (this probe pinned model="gpt-5.4-mini" in
+# <TMP>/codexhome/config.toml so the live call used gpt-5.4-mini).
+
+
+===== RUN A: GOOSE_MODE=auto, CODEX_REASONING_EFFORT=high (recipe-driven) =====
+=== INVOCATION 1788809108 ===
+arg0=<TMP>/bin/codex-wrap.sh
+arg[0]=exec
+arg[1]=-c
+arg[2]=model_reasoning_effort="high"
+arg[3]=--json
+arg[4]=--yolo
+arg[5]=-
+env CODEX_HOME=<TMP>/codexhome
+env CODEX_COMMAND=<TMP>/bin/codex-wrap.sh
+env CODEX_REASONING_EFFORT=high
+env CODEX_SKIP_GIT_CHECK=true
+env GOOSE_MODE=auto
+env GOOSE_PROVIDER=<unset>
+env GOOSE_MODEL=<unset>
+--- end invocation ---
+
+===== RUN B: GOOSE_MODE=approve, CODEX_REASONING_EFFORT unset  (note: --yolo absent; effort defaults to high) =====
+=== INVOCATION 1788809172 ===
+arg0=<TMP>/bin/codex-wrap.sh
+arg[0]=exec
+arg[1]=-c
+arg[2]=model_reasoning_effort="high"
+arg[3]=--json
+arg[4]=-
+env CODEX_HOME=<TMP>/codexhome
+env CODEX_COMMAND=<TMP>/bin/codex-wrap.sh
+env CODEX_REASONING_EFFORT=<unset>
+env CODEX_SKIP_GIT_CHECK=true
+env GOOSE_MODE=approve
+env GOOSE_PROVIDER=<unset>
+env GOOSE_MODEL=<unset>
+--- end invocation ---
+
+===== RUN C: GOOSE_MODE=auto, CODEX_REASONING_EFFORT=low, fresh HOME (proves the effort env is honored: low passes through) =====
+=== INVOCATION 1788809238 ===
+arg0=<TMP>/bin/codex-wrap.sh
+arg[0]=exec
+arg[1]=-c
+arg[2]=model_reasoning_effort="low"
+arg[3]=--json
+arg[4]=--yolo
+arg[5]=-
+env CODEX_HOME=<TMP>/codexhome
+env CODEX_COMMAND=<TMP>/bin/codex-wrap.sh
+env CODEX_REASONING_EFFORT=low
+env CODEX_SKIP_GIT_CHECK=true
+env GOOSE_MODE=auto
+env GOOSE_PROVIDER=<unset>
+env GOOSE_MODEL=<unset>
+--- end invocation ---

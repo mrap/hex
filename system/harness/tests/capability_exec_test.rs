@@ -4,6 +4,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+// Keep fixture writes and process creation in one case at a time. On Linux,
+// another case can fork while a script is writable and retain that descriptor
+// until exec, making an otherwise closed script fail to execute with ETXTBSY.
+static CASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Create a mock sandbox dir with a run-test.sh that exec's the given binary.
@@ -45,6 +50,7 @@ fn base_ctx() -> ExecContext {
 
 #[test]
 fn test_sandbox_not_bare_host_no_sandbox_dir() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     fs::create_dir_all(&registry_dir).unwrap();
@@ -75,6 +81,7 @@ fn test_sandbox_not_bare_host_no_sandbox_dir() {
 
 #[test]
 fn test_sandbox_not_bare_host_empty_sandbox_dir() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     fs::create_dir_all(&registry_dir).unwrap();
@@ -103,6 +110,7 @@ fn test_sandbox_not_bare_host_empty_sandbox_dir() {
 
 #[test]
 fn test_timeout_kill_reports_timed_out() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     let sandbox = make_sandbox(&dir);
@@ -139,6 +147,7 @@ fn test_timeout_kill_reports_timed_out() {
 
 #[test]
 fn test_timeout_kill_records_minus_one_exit_code() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     let sandbox = make_sandbox(&dir);
@@ -164,6 +173,7 @@ fn test_timeout_kill_records_minus_one_exit_code() {
 
 #[test]
 fn test_output_truncation_stdout() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     let sandbox = make_sandbox(&dir);
@@ -197,6 +207,7 @@ fn test_output_truncation_stdout() {
 
 #[test]
 fn test_output_not_truncated_under_cap() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     let sandbox = make_sandbox(&dir);
@@ -233,6 +244,7 @@ fn test_output_not_truncated_under_cap() {
 
 #[test]
 fn test_per_wake_cap_enforced() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     let sandbox = make_sandbox(&dir);
@@ -263,6 +275,7 @@ fn test_per_wake_cap_enforced() {
 
 #[test]
 fn test_per_wake_cap_allows_up_to_cap() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     let sandbox = make_sandbox(&dir);
@@ -288,6 +301,7 @@ fn test_per_wake_cap_allows_up_to_cap() {
 
 #[test]
 fn test_calls_jsonl_row_shape() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     let sandbox = make_sandbox(&dir);
@@ -350,6 +364,7 @@ fn test_calls_jsonl_row_shape() {
 
 #[test]
 fn test_calls_jsonl_exit_code_zero_on_success() {
+    let _case = CASE_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let registry_dir = dir.path().join("registry");
     let sandbox = make_sandbox(&dir);
