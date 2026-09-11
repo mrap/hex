@@ -66,27 +66,69 @@ pub fn sample_df() -> Option<DfSample> {
     parse_df(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// `du -sk` per watched dir (expanded), GB truncating. Missing/unreadable
-/// dirs are skipped silently — a watched dir that was cleaned up is normal.
-pub fn du_sizes(dirs: &[String]) -> BTreeMap<String, i64> {
+/// Exclusion masks applied to `du` during the on-pressure discovery pass only
+/// (KTD6/R7). Discovery walks `$HOME`'s direct children (see `sample_tick`),
+/// which puts `~/Library` in scope; without an exclusion, `du` recurses into
+/// `~/Library/CloudStorage` (the iCloud virtual mount) and reports
+/// phantom/inflated sizes that don't reflect real local disk use. `WATCH_LIST`
+/// never needs this (none of its entries sit under `~/Library`), so the
+/// watch-list `du_sizes` path below passes no masks and its command/output
+/// stay byte-for-byte identical to before this constant existed.
+pub const DU_EXCLUDE_MASKS: &[&str] = &["CloudStorage"];
+
+/// Build the `du` argv for one dir: `-sk`, then BSD `du -I <mask>` once per
+/// mask (a mask match is ignored anywhere in the recursive walk), then the
+/// dir itself.
+fn du_args<'a>(dir: &'a str, masks: &[&'a str]) -> Vec<&'a str> {
+    let mut args: Vec<&str> = vec!["-sk"];
+    for m in masks {
+        args.push("-I");
+        args.push(m);
+    }
+    args.push(dir);
+    args
+}
+
+/// Raw `du -sk` KiB result for one dir (before GB truncation), honoring
+/// `masks`. `None` for a missing dir or a `du` invocation that fails or
+/// doesn't parse.
+fn du_kb(dir: &str, masks: &[&str]) -> Option<i64> {
+    if !std::path::Path::new(dir).exists() {
+        return None;
+    }
+    let o = std::process::Command::new("du")
+        .args(du_args(dir, masks))
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&o.stdout)
+        .split_whitespace()
+        .next()?
+        .parse::<i64>()
+        .ok()
+}
+
+fn du_sizes_with_masks(dirs: &[String], masks: &[&str]) -> BTreeMap<String, i64> {
     let mut out = BTreeMap::new();
     for d in dirs {
-        if !std::path::Path::new(d).exists() {
-            continue;
-        }
-        let Ok(o) = std::process::Command::new("du").args(["-sk", d]).output() else {
-            continue;
-        };
-        let s = String::from_utf8_lossy(&o.stdout);
-        if let Some(kb) = s
-            .split_whitespace()
-            .next()
-            .and_then(|v| v.parse::<i64>().ok())
-        {
+        if let Some(kb) = du_kb(d, masks) {
             out.insert(d.clone(), kb / 1_048_576);
         }
     }
     out
+}
+
+/// `du -sk` per watched dir (expanded), GB truncating. Missing/unreadable
+/// dirs are skipped silently — a watched dir that was cleaned up is normal.
+/// No exclusion masks — command/behavior are unchanged from before KTD6.
+pub fn du_sizes(dirs: &[String]) -> BTreeMap<String, i64> {
+    du_sizes_with_masks(dirs, &[])
+}
+
+/// Discovery-only `du`: same as [`du_sizes`] but honors `DU_EXCLUDE_MASKS`
+/// (KTD6/R7) so a virtual mount like iCloud's CloudStorage never inflates a
+/// discovery-pass size.
+pub fn du_sizes_discovery(dirs: &[String]) -> BTreeMap<String, i64> {
+    du_sizes_with_masks(dirs, DU_EXCLUDE_MASKS)
 }
 
 /// Persist samples as telemetry rows (durable trend history).
@@ -114,6 +156,21 @@ pub fn record_du(sizes: &BTreeMap<String, i64>) {
     });
 }
 
+/// Persist an on-pressure discovery pass under a DISTINCT event name
+/// (KTD5/R6) so `evaluate_rules`'s trend loop — which filters on
+/// `event='sample::du'` — never compares discovery-sourced sizes across
+/// ticks. Same detail shape as [`record_du`].
+pub fn record_du_discovery(sizes: &BTreeMap<String, i64>) {
+    crate::telemetry::record_loud(&crate::telemetry::TelemetryEvent {
+        source: "hex-resources".into(),
+        event: "sample::du-discovery".into(),
+        status: "ok".into(),
+        duration_ms: None,
+        exit_code: None,
+        detail: serde_json::to_string(sizes).ok(),
+    });
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Breach {
     Floor {
@@ -124,6 +181,27 @@ pub enum Breach {
         growth_gb: i64,
         window_hours: i64,
     },
+}
+
+/// Compose the `Breach::Floor` alert message: the base floor line, plus (R5)
+/// the three largest entries of the already-loaded `last_du` map, sorted
+/// descending by size, using whatever path form the map already holds
+/// (watch-list entries are `expand_home`-expanded by the time they're
+/// recorded). An empty map (no du sample yet) yields the base line only.
+fn floor_message(free_gb: i64, last_du: &BTreeMap<String, i64>) -> String {
+    let base = format!("root free space {free_gb}G < {FLOOR_FREE_GB}G floor");
+    let mut entries: Vec<(&String, &i64)> = last_du.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1));
+    let top: Vec<String> = entries
+        .into_iter()
+        .take(3)
+        .map(|(d, g)| format!("{d} {g}G"))
+        .collect();
+    if top.is_empty() {
+        base
+    } else {
+        format!("{base}; top: {}", top.join(", "))
+    }
 }
 
 /// Deterministic tier-1 rules over the current df sample + du history rows.
@@ -201,6 +279,12 @@ pub fn sample_tick(now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Breach>, St
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok();
+    // Parse the already-loaded last_du row's detail for the floor message
+    // (R5) — no extra query, just the JSON already sitting in `last_du`.
+    let last_du_sizes: BTreeMap<String, i64> = last_du
+        .as_ref()
+        .and_then(|(_, detail)| serde_json::from_str(detail).ok())
+        .unwrap_or_default();
     let last_df_free: Option<i64> = last_du.as_ref().and_then(|(ts, _)| {
         conn.query_row(
             "SELECT detail FROM events
@@ -232,7 +316,7 @@ pub fn sample_tick(now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Breach>, St
         let (key_ident, msg, data) = match b {
             Breach::Floor { free_gb } => (
                 "floor".to_string(),
-                format!("root free space {free_gb}G < {FLOOR_FREE_GB}G floor"),
+                floor_message(*free_gb, &last_du_sizes),
                 serde_json::json!({ "category": "floor", "free_gb": free_gb }),
             ),
             Breach::Trend {
@@ -271,7 +355,11 @@ pub fn sample_tick(now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Breach>, St
                         .collect()
                 })
                 .unwrap_or_default();
-            record_du(&du_sizes(&tops));
+            // Distinct event name (KTD5/R6) so evaluate_rules's watch-list
+            // trend loop never sees discovery rows, and CloudStorage-excluded
+            // du (KTD6/R7) so ~/Library's discovery size isn't inflated by
+            // the iCloud virtual mount.
+            record_du_discovery(&du_sizes_discovery(&tops));
         }
         let orb_running = std::process::Command::new("pgrep")
             .args(["-x", "OrbStack"])
@@ -396,6 +484,57 @@ mod rule_tests {
         .unwrap();
         assert!(breaches.is_empty(), "{breaches:?}");
     }
+
+    /// R6/KTD5: discovery samples land under a distinct event name, so a huge
+    /// growth between two `sample::du-discovery` rows never registers as a
+    /// trend breach — evaluate_rules's trend loop only ever reads
+    /// `event='sample::du'`.
+    #[test]
+    fn discovery_samples_excluded_from_trend() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        seed_row(
+            "sample::du-discovery",
+            now - Duration::hours(70),
+            r#"{"/x/Library":5}"#,
+        );
+        seed_row(
+            "sample::du-discovery",
+            now - Duration::hours(1),
+            r#"{"/x/Library":500}"#,
+        );
+        let breaches = evaluate_rules(
+            &DfSample {
+                free_gb: 999,
+                used_gb: 1,
+            },
+            now,
+        )
+        .unwrap();
+        assert!(breaches.is_empty(), "{breaches:?}");
+    }
+
+    /// R6/KTD5: the production discovery-recording function itself writes
+    /// under `sample::du-discovery`, not `sample::du` — proves the wiring in
+    /// `sample_tick`'s on-pressure block, not just the query filter.
+    #[test]
+    fn record_du_discovery_uses_distinct_event_name() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        let mut sizes = BTreeMap::new();
+        sizes.insert("/x/Library".to_string(), 42);
+        record_du_discovery(&sizes);
+        let conn = crate::telemetry::open_ro().unwrap();
+        let (event, detail): (String, String) = conn
+            .query_row(
+                "SELECT event, COALESCE(detail,'') FROM events
+                 WHERE source='hex-resources' ORDER BY ts DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event, "sample::du-discovery");
+        assert!(detail.contains("/x/Library"));
+    }
 }
 
 #[cfg(test)]
@@ -422,5 +561,70 @@ mod tests {
         ]);
         assert!(sizes.contains_key(tmp.path().to_string_lossy().as_ref()));
         assert!(!sizes.contains_key("/nonexistent/definitely/missing"));
+    }
+
+    /// R5: three-or-more `last_du` entries → message ends with the three
+    /// largest, descending by size.
+    #[test]
+    fn floor_message_lists_three_largest_descending() {
+        let mut m = BTreeMap::new();
+        m.insert("~/.boi".to_string(), 151);
+        m.insert("~/worktrees".to_string(), 154);
+        m.insert("~/hex/target".to_string(), 12);
+        m.insert("~/.npm".to_string(), 3);
+        let msg = floor_message(100, &m);
+        assert!(
+            msg.ends_with("top: ~/worktrees 154G, ~/.boi 151G, ~/hex/target 12G"),
+            "{msg}"
+        );
+    }
+
+    /// R5: a single `last_du` entry → message lists exactly one.
+    #[test]
+    fn floor_message_single_entry() {
+        let mut m = BTreeMap::new();
+        m.insert("~/only".to_string(), 42);
+        let msg = floor_message(10, &m);
+        assert_eq!(msg, "root free space 10G < 150G floor; top: ~/only 42G");
+    }
+
+    /// R5: no `last_du` entries yet → base line only, no dangling "top:".
+    #[test]
+    fn floor_message_empty_map() {
+        let m = BTreeMap::new();
+        let msg = floor_message(5, &m);
+        assert_eq!(msg, "root free space 5G < 150G floor");
+    }
+
+    /// R7/KTD6: discovery `du` over a fixture home whose `Library` contains
+    /// both a CloudStorage subtree and an ordinary one — the built command
+    /// includes `-I CloudStorage`, and running the real `du` on the fixture
+    /// with that mask reports a smaller `Library` size than without it.
+    #[test]
+    fn discovery_du_excludes_cloudstorage_mask() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("Library");
+        std::fs::create_dir_all(lib.join("CloudStorage")).unwrap();
+        std::fs::create_dir_all(lib.join("other")).unwrap();
+        std::fs::write(lib.join("CloudStorage").join("big"), vec![0u8; 400 * 1024]).unwrap();
+        std::fs::write(lib.join("other").join("small"), vec![0u8; 10 * 1024]).unwrap();
+        let lib_str = lib.to_string_lossy().into_owned();
+
+        let args = du_args(&lib_str, DU_EXCLUDE_MASKS);
+        assert!(
+            args.windows(2).any(|w| w == ["-I", "CloudStorage"]),
+            "{args:?}"
+        );
+
+        let with_excl = du_kb(&lib_str, DU_EXCLUDE_MASKS).expect("du with mask");
+        let without_excl = du_kb(&lib_str, &[]).expect("du without mask");
+        assert!(
+            with_excl < without_excl,
+            "expected CloudStorage-excluded size to be smaller: {with_excl} >= {without_excl}"
+        );
+
+        // du_sizes_discovery wires the mask through end-to-end.
+        let sizes = du_sizes_discovery(&[lib_str.clone()]);
+        assert!(sizes.contains_key(&lib_str));
     }
 }
