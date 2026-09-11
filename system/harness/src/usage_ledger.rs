@@ -127,6 +127,35 @@ impl UsageLedger {
         path: impl AsRef<Path>,
         options: ImportOptions,
     ) -> Result<ImportResult> {
+        const PRETRANSACTION_CHUNK: usize = 1_024;
+        if options.max_records > PRETRANSACTION_CHUNK {
+            let mut remaining = options.max_records;
+            let mut total = ImportResult::default();
+            loop {
+                let part = self.import_jsonl(
+                    path.as_ref(),
+                    ImportOptions {
+                        max_records: remaining.min(PRETRANSACTION_CHUNK),
+                        abort_before_commit: options.abort_before_commit,
+                    },
+                )?;
+                total.accepted += part.accepted;
+                total.duplicates += part.duplicates;
+                total.conflicts += part.conflicts;
+                total.quarantined += part.quarantined;
+                total.bytes_read += part.bytes_read;
+                total.pending_partial |= part.pending_partial;
+                if !part.backlog {
+                    break;
+                }
+                remaining -= remaining.min(PRETRANSACTION_CHUNK);
+                if remaining == 0 {
+                    total.backlog = true;
+                    break;
+                }
+            }
+            return Ok(total);
+        }
         let path = path.as_ref();
         let meta = fs::metadata(path)?;
         let identity = file_identity(&meta);
@@ -158,6 +187,8 @@ impl UsageLedger {
         // Decode complete lines before opening the transaction, but retain only
         // typed accounting fields and a fingerprint. Raw JSON never reaches the
         // ledger or the transaction state machine.
+        // A collection may request a very large limit, but raw source events
+        // are deliberately held in a small, fixed pre-transaction chunk.
         let mut pending: Vec<(i64, std::result::Result<Event, String>, String)> = Vec::new();
         let mut offset = cursor as u64;
         let mut last_complete = offset;
