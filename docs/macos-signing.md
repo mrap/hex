@@ -16,7 +16,7 @@ Use a local JSON policy containing only public identity configuration:
   "schema_version": 1,
   "certificate_sha1": "0123456789ABCDEF0123456789ABCDEF01234567",
   "team_id": "TEAM123456",
-  "keychain": "/Users/me/Library/Keychains/signing.keychain-db"
+  "keychain": "/Users/test/Library/Keychains/signing.keychain-db"
 }
 ```
 

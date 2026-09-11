@@ -2074,7 +2074,7 @@ mod tests {
     fn red_task_alert_path_shaped_label_is_rejected_not_leaked() {
         let _g = crate::telemetry::test_support::lock_env();
         let _tmp = red_rig();
-        let path_name = "/Users/example/fixtures/id_rsa".to_string();
+        let path_name = "/Users/test/fixtures/id_rsa".to_string();
         let t = Transition::TaskBlocked {
             task_id: "T1redgrp2h".to_string(),
             ref_: Some(path_name.clone()),
@@ -2135,7 +2135,7 @@ mod tests {
             ref_: Some("canary-job".to_string()),
             spec_id: "Sredgrp2m".to_string(),
             reason: Some(format!(
-                "/Users/example/{canary}/report.pdf contact person@example.invalid"
+                "/Users/test/{canary}/report.pdf contact person@example.invalid"
             )),
         };
         emit_task_alert(&t, 1);
@@ -2280,7 +2280,7 @@ mod tests {
         assert_eq!(display_name(Some("   ")), UNNAMED_JOB);
         // Path-shaped and credential-shaped → fallback (rejected, not redacted).
         assert_eq!(
-            display_name(Some("/Users/example/fixtures/id_rsa")),
+            display_name(Some("/Users/test/fixtures/id_rsa")),
             UNNAMED_JOB
         );
         assert_eq!(display_name(Some("~/private/key")), UNNAMED_JOB);
@@ -2305,7 +2305,7 @@ mod tests {
 
     #[test]
     fn display_name_rejects_embedded_sensitive_content() {
-        assert_eq!(display_name(Some("nightly /Users/example/private/key")), UNNAMED_JOB);
+        assert_eq!(display_name(Some("nightly /Users/test/private/key")), UNNAMED_JOB);
         assert_eq!(
             display_name(Some("release ghp_1234567890abcdef1234567890abcdef1234")),
             UNNAMED_JOB
