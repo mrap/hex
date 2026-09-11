@@ -248,6 +248,24 @@ fn one_large_invocation_drains_multiple_pretransaction_chunks() {
 }
 
 #[test]
+fn small_append_probes_only_bounded_source_fingerprints() {
+    let (_dir, mut ledger, path) = setup();
+    let mut fixture = String::new();
+    for index in 0..2_000 {
+        fixture.push_str(&line(&format!("history-{index:04}"), None, 1));
+        fixture.push('\n');
+    }
+    fs::write(&path, fixture).unwrap();
+    ledger.import_jsonl(&path, ImportOptions { max_records: 3_000, ..Default::default() }).unwrap();
+    let metadata = fs::metadata(&path).unwrap().len();
+    assert!(metadata > 100_000);
+    fs::write(&path, format!("{}\n", line("appended", None, 1))).unwrap();
+    let result = ledger.import_jsonl(&path, ImportOptions { max_records: 1_024, ..Default::default() }).unwrap();
+    assert_eq!(result.accepted, 1);
+    assert!(result.bytes_read < 16 * 1024, "{}", result.bytes_read);
+}
+
+#[test]
 fn ordered_window_read_has_composite_event_index() {
     let (dir, _ledger, _path) = setup();
     let db = rusqlite::Connection::open(dir.path().join("usage.db")).unwrap();
