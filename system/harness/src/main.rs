@@ -2357,7 +2357,7 @@ fn run_failures(window: i64, alert: bool) -> i32 {
             if alert {
                 hex::alert::notify_with_class(
                     &hex::failures::alert_key("storm", &s.head),
-                    "hex failure storm — same error across multiple workers",
+                    "hex failure storm: same error across multiple workers",
                     &format!(
                         "{} across {} workers: {}",
                         s.head,
