@@ -2481,13 +2481,57 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::fs;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     #[cfg(target_os = "macos")]
     use std::os::unix::fs::MetadataExt;
 
     fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    static UPGRADE_FIXTURE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// Serializes and restores every process-global input used by upgrade
+    /// identity preflight. Synthetic legacy fixtures must not inherit a real
+    /// managed app policy from the developer's home directory.
+    struct UpgradeFixtureEnv {
+        previous_home: Option<OsString>,
+        previous_hex_dir: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl UpgradeFixtureEnv {
+        fn for_instance(home: &Path, hex_dir: &Path) -> Self {
+            let lock = UPGRADE_FIXTURE_ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous_home = std::env::var_os("HOME");
+            let previous_hex_dir = std::env::var_os("HEX_DIR");
+            std::env::set_var("HOME", home);
+            std::env::set_var("HEX_DIR", hex_dir);
+            Self {
+                previous_home,
+                previous_hex_dir,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for UpgradeFixtureEnv {
+        fn drop(&mut self) {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_hex_dir {
+                Some(value) => std::env::set_var("HEX_DIR", value),
+                None => std::env::remove_var("HEX_DIR"),
+            }
+        }
     }
 
     #[test]
@@ -2580,7 +2624,8 @@ mod tests {
 
     #[test]
     fn preflight_binary_metadata_preserves_true_noop() {
-        let (_tmp, source, instance) = binary_preflight_fixture();
+        let (tmp, source, instance) = binary_preflight_fixture();
+        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &instance);
         assert!(!binary_is_stale(&instance, &source).unwrap());
     }
 
@@ -2624,10 +2669,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn preflight_reconciles_stale_versions_pin_when_other_inputs_match() {
-        let _env = crate::test_env::isolate_hex_dir();
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
         let instance = tmp.path().join("instance");
+        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &instance);
         let source_files = [
             "system/scripts/a.sh",
             "system/skills/s/SKILL.md",
@@ -3249,6 +3294,7 @@ mod tests {
         let hex_dir = tmp.path().join("hex");
         let source_dir = tmp.path().join("source");
         let backup_dir = tmp.path().join("backup");
+        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &hex_dir);
         fs::create_dir_all(&backup_dir).unwrap();
         write_file(&hex_dir.join("VERSIONS"), "HEX_FOUNDATION_VERSION=v0.1.0\n");
         write_file(
@@ -3409,6 +3455,7 @@ mod tests {
         let hex_dir = tmp.path().join("hex");
         let source_dir = tmp.path().join("source");
         let backup_dir = tmp.path().join("backup");
+        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &hex_dir);
         fs::create_dir_all(&hex_dir).unwrap();
         fs::create_dir_all(&source_dir).unwrap();
         fs::create_dir_all(&backup_dir).unwrap();
@@ -3621,6 +3668,7 @@ CUSTOM_INSTANCE_PIN=abc123
         let hex_dir = tmp.path().join("hex");
         let source_dir = tmp.path().join("source");
         let backup_dir = tmp.path().join("backup");
+        let _environment = UpgradeFixtureEnv::for_instance(tmp.path(), &hex_dir);
         fs::create_dir_all(&backup_dir).unwrap();
         write_file(&hex_dir.join("VERSIONS"), "HEX_FOUNDATION_VERSION=v0.1.0\n");
         write_file(

@@ -10,13 +10,55 @@
 //! Recurring cadence: the `hex-burn-guard` worker runs `hex usage burn` every 10m.
 //! Future metrics (daily totals, by-model, by-session) belong in this namespace.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use clap::Subcommand;
+use hex::usage_ledger::{ImportOptions, UsageLedger};
+use hex::usage_reporting;
+use serde_json::json;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum UsageCommands {
+    /// Import one local Codex JSONL source into the durable usage ledger
+    Collect {
+        /// Explicit local JSONL source. Defaults to $HEX_DIR/.hex/usage/codex.jsonl.
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Codex home for discovery. Defaults to $HOME/.codex.
+        #[arg(long)]
+        codex_root: Option<PathBuf>,
+        /// Ledger path. Defaults to $HEX_DIR/.hex/usage/usage.db.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+        /// Maximum complete records committed in this run.
+        #[arg(long, default_value_t = 1_000)]
+        max_records: usize,
+    },
+    /// Write a deterministic local JSON usage summary
+    Report {
+        /// Ledger path. Defaults to $HEX_DIR/.hex/usage/usage.db.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+        /// Report path. Defaults to $HEX_DIR/.hex/usage/report.json.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// RFC3339 UTC cutoff. Omit to use the current time.
+        #[arg(long)]
+        cutoff: Option<String>,
+        /// Locally query contributor IDs by `model`, `family`, or `child`.
+        #[arg(long)]
+        detail_dimension: Option<String>,
+        /// Model or family key for a contributor detail query.
+        #[arg(long)]
+        detail_key: Option<String>,
+        /// Number of matching response IDs to skip in a detail query.
+        #[arg(long, default_value_t = 0)]
+        detail_offset: usize,
+        /// Maximum response IDs returned by a detail query.
+        #[arg(long, default_value_t = 100)]
+        detail_limit: usize,
+    },
     /// Trailing-window burn rate; alert if above threshold
     Burn {
         /// Alert threshold in USD per hour
@@ -153,6 +195,29 @@ fn burn_alert_class(key: &str) -> crate::alert::AlertClass {
 
 pub fn run(cmd: UsageCommands) -> i32 {
     match cmd {
+        UsageCommands::Collect {
+            source,
+            codex_root,
+            ledger,
+            max_records,
+        } => collect(source, codex_root, ledger, max_records),
+        UsageCommands::Report {
+            ledger,
+            output,
+            cutoff,
+            detail_dimension,
+            detail_key,
+            detail_offset,
+            detail_limit,
+        } => report(
+            ledger,
+            output,
+            cutoff,
+            detail_dimension,
+            detail_key,
+            detail_offset,
+            detail_limit,
+        ),
         UsageCommands::Burn {
             threshold,
             window_mins,
@@ -195,6 +260,290 @@ pub fn run(cmd: UsageCommands) -> i32 {
                 );
             }
             0
+        }
+    }
+}
+
+fn usage_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HEX_DIR").unwrap_or_else(|_| ".".into()))
+        .join(".hex")
+        .join("usage")
+}
+fn default_ledger() -> PathBuf {
+    usage_dir().join("usage.db")
+}
+fn default_report() -> PathBuf {
+    usage_dir().join("report.json")
+}
+
+fn health(status: &str, detail: String) {
+    // Failures are coalesced locally: repeat the same last collector failure
+    // does not fill telemetry. No alert or outbound transport is invoked.
+    let repeated = status == "error"
+        && hex::telemetry::recent(50)
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|r| r.source == "usage-tracking" && r.event == "collect")
+            })
+            .map(|r| r.status == status)
+            .unwrap_or(false);
+    if !repeated {
+        let _ = hex::telemetry::record(&hex::telemetry::TelemetryEvent {
+            source: "usage-tracking".into(),
+            event: "collect".into(),
+            status: status.into(),
+            duration_ms: None,
+            exit_code: Some(if status == "ok" { 0 } else { 1 }),
+            detail: Some(detail),
+        });
+    }
+}
+
+fn discover(codex_root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut issues = Vec::new();
+    for dir in [
+        codex_root.join("sessions"),
+        codex_root.join("archived_sessions"),
+    ] {
+        if dir.exists() {
+            paths.extend(
+                walkdir::WalkDir::new(&dir)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension().is_some_and(|x| x == "jsonl")
+                    })
+                    .map(|e| e.into_path()),
+            );
+        }
+    }
+    let state = codex_root.join("state_5.sqlite");
+    if state.exists() {
+        match rusqlite::Connection::open_with_flags(
+            &state,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(db) => match db
+                .prepare("SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL")
+            {
+                Ok(mut s) => {
+                    if let Ok(rows) = s.query_map([], |r| r.get::<_, String>(0)) {
+                        for row in rows.flatten() {
+                            let p = PathBuf::from(row);
+                            if p.is_file() {
+                                paths.push(p)
+                            } else {
+                                issues.push(format!("missing_rollout={}", p.display()))
+                            }
+                        }
+                    }
+                }
+                Err(e) => issues.push(format!("state_schema={e}")),
+            },
+            Err(e) => issues.push(format!("state_unreadable={e}")),
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    (paths, issues)
+}
+fn collect(
+    source: Option<PathBuf>,
+    codex_root: Option<PathBuf>,
+    ledger: Option<PathBuf>,
+    max_records: usize,
+) -> i32 {
+    let (sources, mut issues) = match source {
+        Some(path) => (vec![path], Vec::new()),
+        None => {
+            let root = codex_root.unwrap_or_else(|| {
+                PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
+            });
+            discover(&root)
+        }
+    };
+    let ledger = ledger.unwrap_or_else(default_ledger);
+    if max_records == 0 || sources.is_empty() {
+        eprintln!("usage collect: no local sources discovered");
+        health("error", "no_sources".into());
+        return 1;
+    }
+    if let Some(parent) = ledger.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("usage collect: cannot create ledger directory: {e}");
+            return 1;
+        }
+    }
+    match UsageLedger::open(&ledger) {
+        Ok(mut l) => {
+            let mut remaining = max_records;
+            let mut accepted = 0;
+            let mut backlog = false;
+            for path in sources {
+                if remaining == 0 {
+                    backlog = true;
+                    break;
+                }
+                if !path.is_file() {
+                    issues.push(format!("unreadable={}", path.display()));
+                    continue;
+                }
+                match l.import_jsonl(
+                    &path,
+                    ImportOptions {
+                        max_records: remaining,
+                        abort_before_commit: false,
+                    },
+                ) {
+                    Ok(r) => {
+                        accepted += r.accepted;
+                        backlog |= r.backlog;
+                        remaining = remaining.saturating_sub(
+                            (r.accepted + r.duplicates + r.conflicts + r.quarantined) as usize,
+                        )
+                    }
+                    Err(e) => issues.push(format!("import_failed={}: {e:?}", path.display())),
+                }
+            }
+            println!(
+                "usage collect: accepted={accepted} backlog={backlog} issues={}",
+                issues.len()
+            );
+            health(
+                if issues.is_empty() { "ok" } else { "error" },
+                format!(
+                    "backlog={} accepted={} issues={}",
+                    backlog,
+                    accepted,
+                    issues.join(";")
+                ),
+            );
+            if issues.is_empty() {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("usage collect: failed: {e:?}");
+            health("error", "ledger_open_failed".into());
+            1
+        }
+    }
+}
+
+fn report(
+    ledger: Option<PathBuf>,
+    output: Option<PathBuf>,
+    cutoff: Option<String>,
+    detail_dimension: Option<String>,
+    detail_key: Option<String>,
+    detail_offset: usize,
+    detail_limit: usize,
+) -> i32 {
+    let ledger = ledger.unwrap_or_else(default_ledger);
+    let output = output.unwrap_or_else(default_report);
+    let cutoff = match cutoff {
+        Some(value) => match value.parse::<DateTime<Utc>>() {
+            Ok(time) => time,
+            Err(_) => {
+                eprintln!("usage report: cutoff must be RFC3339 UTC");
+                return 1;
+            }
+        },
+        None => Utc::now(),
+    };
+    let end = Utc.from_utc_datetime(
+        &cutoff.date_naive().and_hms_opt(0, 0, 0).expect("midnight is valid"),
+    );
+    let start = end - Duration::days(1);
+    let preceding_start = start - Duration::days(1);
+    if detail_limit > 1_000 {
+        eprintln!("usage report: detail limit must not exceed 1000");
+        return 1;
+    }
+    let detail_dimension = match detail_dimension.as_deref() {
+        None => None,
+        Some("model") => Some(hex::usage_ledger::ContributorDimension::Model),
+        Some("family") => Some(hex::usage_ledger::ContributorDimension::Family),
+        Some("child") => Some(hex::usage_ledger::ContributorDimension::Child),
+        Some(_) => {
+            eprintln!("usage report: detail dimension must be model, family, or child");
+            return 1;
+        }
+    };
+    let result = UsageLedger::open(&ledger).and_then(|mut ledger| {
+        let coverage = ledger.coverage()?;
+        let read = ledger.frozen_read([
+            hex::usage_ledger::HalfOpenUtcWindow { start, end },
+            hex::usage_ledger::HalfOpenUtcWindow { start: preceding_start, end: start },
+        ])?;
+        let mut accumulator = usage_reporting::ReportAccumulator::new(coverage, start, end, false);
+        accumulator.extend_summary_groups(&read.summary_groups(hex::usage_ledger::FrozenWindow::First)?, false);
+        accumulator.extend_summary_groups(&read.summary_groups(hex::usage_ledger::FrozenWindow::Second)?, true);
+        let detail = match detail_dimension {
+            None => None,
+            Some(dimension) => {
+                let key = match (dimension, detail_key.as_deref()) {
+                    (hex::usage_ledger::ContributorDimension::Child, None) => None,
+                    (_, Some(key)) => Some(key),
+                    _ => return Err(hex::usage_ledger::LedgerError::InvalidWindow),
+                };
+                let mut after = None;
+                let mut skipped = 0usize;
+                let mut response_ids = Vec::new();
+                let (total_matches, has_more) = loop {
+                    let page = read.contributor_detail_page(hex::usage_ledger::FrozenWindow::First, dimension, key, after.as_ref(), 1_000)?;
+                    let mut page_has_unreturned_rows = false;
+                    for row in &page.rows {
+                        if skipped < detail_offset {
+                            skipped += 1;
+                        } else if response_ids.len() < detail_limit {
+                            response_ids.push(row.response_id.clone());
+                        } else {
+                            page_has_unreturned_rows = true;
+                            break;
+                        }
+                    }
+                    if response_ids.len() == detail_limit {
+                        break (page.total_matches, page_has_unreturned_rows || page.next_cursor().is_some());
+                    }
+                    let Some(next) = page.next_cursor() else { break (page.total_matches, false) };
+                    after = Some(next);
+                };
+                Some(json!({"dimension": match dimension { hex::usage_ledger::ContributorDimension::Model => "model", hex::usage_ledger::ContributorDimension::Family => "family", hex::usage_ledger::ContributorDimension::Child => "child" }, "key": key.unwrap_or("child_responses"), "total_matches": total_matches, "offset": detail_offset, "response_ids": response_ids, "has_more": has_more}))
+            }
+        };
+        Ok((accumulator.finish(), detail))
+    });
+    let Ok((report, detail)) = result else {
+        eprintln!("usage report: ledger unavailable: {}", ledger.display());
+        return 1;
+    };
+    let contributor = |item: &hex::usage_reporting::Contributor| json!({"key":item.key,"tokens":item.measured.total().to_string(),"credits_micro":item.credits.value.0.to_string()});
+    let optional_total = |value: i128, missing: &str| (!report.incomplete_labels.contains(missing)).then(|| value.to_string());
+    let measured = |measured: &hex::usage_reporting::MeasuredTokens| json!({"responses":measured.responses,"input_tokens":measured.input.to_string(),"cached_input_tokens":measured.cached_input.to_string(),"output_tokens":measured.output.to_string(),"cache_write_input_tokens":optional_total(measured.cache_write_input,"missing_cache_write_input_tokens"),"reasoning_output_tokens":optional_total(measured.reasoning_output,"missing_reasoning_output_tokens"),"provider_total_tokens":measured.provider_total.map(|value|value.to_string())});
+    let unknown_fields = report.incomplete_labels.iter().filter(|label| label.starts_with("unknown_")).cloned().collect::<Vec<_>>();
+    let body=json!({"schema":"hex.usage-report.v2","cutoff":cutoff.to_rfc3339(),"windows":{"current":{"start":report.start.to_rfc3339(),"end":report.end.to_rfc3339(),"measured":measured(&report.measured)},"preceding":{"start":preceding_start.to_rfc3339(),"end":start.to_rfc3339(),"measured":measured(&report.preceding_measured)},"change_tokens":report.preceding_change_tokens.map(|value|value.to_string())},"modeled_credits":{"unit":"credit_equivalent","rate_version":report.modeled_credits.rate_version,"rate_source":report.modeled_credits.rate_source,"total_micro":report.modeled_credits.value.0.to_string(),"fresh_micro":report.modeled_credit_components.fresh.0.to_string(),"cached_micro":report.modeled_credit_components.cached.0.to_string(),"output_micro":report.modeled_credit_components.output.0.to_string(),"incomplete":report.modeled_credits.incomplete,"labels":report.modeled_credits.labels},"actual_billed_debited":{"value":serde_json::Value::Null,"unit":"api_usd","labels":report.actual_billed_debited.labels},"coverage":{"accepted":report.coverage.accepted,"noncanonical":report.coverage.noncanonical,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"source_backlog":report.coverage.pending_sources,"stale_sources":report.coverage.stale_sources,"unknown_fields":unknown_fields},"completeness":if report.incomplete_labels.is_empty(){"complete"}else{"incomplete"},"incomplete":report.incomplete_labels,"by_model":report.by_model.iter().map(contributor).collect::<Vec<_>>(),"by_family":report.by_family.iter().map(contributor).collect::<Vec<_>>(),"child_coordination":{"share_millionths":report.child_coordination_share_millionths},"contributor_detail":detail}).to_string()+"\n";
+    if let Some(parent) = output.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("usage report: cannot create output directory: {e}");
+            return 1;
+        }
+    }
+    let temp = output.with_extension("tmp");
+    match std::fs::write(&temp, body).and_then(|_| std::fs::rename(&temp, &output)) {
+        Ok(()) => {
+            println!("usage report: {}", output.display());
+            0
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            eprintln!("usage report: write failed: {e}");
+            1
         }
     }
 }
