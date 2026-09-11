@@ -221,7 +221,15 @@ if [ -n "$HEX_BIN" ]; then
     '  printf "partial-mode"' \
     '  exit 1' \
     'fi' \
-    'exec /usr/bin/stat "$@"' > "$STAT_DIR/stat"
+    'if [ "$1" = "-c" ] && [ "$2" = "%a" ]; then' \
+    '  case "$3" in' \
+    '    */allowed.env) printf "%s\\n" 600 ;;' \
+    '    */shared.env) printf "%s\\n" 640 ;;' \
+    '    *) exit 1 ;;' \
+    '  esac' \
+    '  exit 0' \
+    'fi' \
+    'exit 1' > "$STAT_DIR/stat"
   chmod 700 "$STAT_DIR/stat"
   FALLBACK_OUT=$(env -u GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND \
     HEX_DIR="$INSTALL_DIR" PATH="$STAT_DIR:$(dirname "$HEX_BIN"):$PATH" \

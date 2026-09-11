@@ -254,9 +254,11 @@ fn registry() -> Vec<LineCheck> {
         exclude_dirs: COMMON_EXCLUDE_DIRS,
         filters: {
             let mut f = compile(COMMON_FILTERS);
-            f.push(re(r"com\.mrap\.(?:hex(?:\.(?:scipd|cq))?|boi)\b")); // personalization-audit: canonical signing identities
             f.push(re(
-                r#"com\.mrap\.(?:" \+ (?:product|identity)|\{self\.product\})"#,
+                r"com\.mrap\.(?:hex(?:\.(?:scipd|cq))?|boi)(?:$|[^A-Za-z0-9_.])",
+            )); // personalization-audit: canonical signing identities
+            f.push(re(
+                r#"com\.mrap\.(?:" \+ (?:product|identity)(?:$|[^A-Za-z0-9_])|\{self\.product\}(?:$|[^A-Za-z0-9_]))"#,
             )); // personalization-audit: canonical signing identity construction
             f
         },
@@ -802,6 +804,22 @@ mod tests {
             .len(),
             1
         );
+        for near_match in [
+            "com.mrap.hex.private",
+            "com.mrap.hex.scipd.evil",
+            r#"self.identifier = "com.mrap." + product_evil"#,
+        ] {
+            assert_eq!(
+                check_content(
+                    &c,
+                    "system/templates/launchd/private-agent.plist",
+                    near_match
+                )
+                .len(),
+                1,
+                "near-match must remain a LaunchAgent violation: {near_match}"
+            );
+        }
     }
 
     #[test]
