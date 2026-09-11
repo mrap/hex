@@ -4,6 +4,7 @@ use hex::usage_ledger::{
     UsageLedger,
 };
 use std::fs;
+use std::io::Write;
 use tempfile::TempDir;
 fn line(id: &str, parent: Option<&str>, output: i64) -> String {
     format!(
@@ -248,7 +249,7 @@ fn one_large_invocation_drains_multiple_pretransaction_chunks() {
 }
 
 #[test]
-fn small_append_probes_only_bounded_source_fingerprints() {
+fn append_revalidates_historical_source_before_cursor_reuse() {
     let (_dir, mut ledger, path) = setup();
     let mut fixture = String::new();
     for index in 0..2_000 {
@@ -259,21 +260,23 @@ fn small_append_probes_only_bounded_source_fingerprints() {
     ledger.import_jsonl(&path, ImportOptions { max_records: 3_000, ..Default::default() }).unwrap();
     let metadata = fs::metadata(&path).unwrap().len();
     assert!(metadata > 100_000);
-    fs::write(&path, format!("{}\n", line("appended", None, 1))).unwrap();
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", line("appended", None, 1)).unwrap();
     let result = ledger.import_jsonl(&path, ImportOptions { max_records: 1_024, ..Default::default() }).unwrap();
     assert_eq!(result.accepted, 1);
-    assert!(result.bytes_read < 16 * 1024, "{}", result.bytes_read);
+    assert!(result.bytes_read >= metadata, "{}", result.bytes_read);
 }
 
 #[test]
-fn longer_rewrite_with_same_prefix_starts_new_generation() {
+fn longer_rewrite_preserving_head_and_old_end_starts_new_generation() {
     let (_dir, mut ledger, path) = setup();
     let mut lines = (0..100)
         .map(|index| line(&format!("history-{index:04}"), None, 1))
         .collect::<Vec<_>>();
     fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
     ledger.import_jsonl(&path, Default::default()).unwrap();
-    lines[95] = line("rewrite-0095", None, 1);
+    // This middle replacement preserves both the initial and old-end 4 KiB
+    // checkpoints. Full historical revalidation must still restart the cursor.
+    lines[50] = line("rewrite-0050", None, 1);
     fs::write(&path, format!("{}\n{}\n", lines.join("\n"), line("appended", None, 1))).unwrap();
     let result = ledger.import_jsonl(&path, Default::default()).unwrap();
     assert_eq!(result.accepted, 2);

@@ -296,6 +296,10 @@ impl UsageLedger {
             "ALTER TABLE source_files ADD COLUMN source_content_hash TEXT NOT NULL DEFAULT ''",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE source_files ADD COLUMN source_full_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         for column in [
             "cache_write_input_tokens INTEGER",
             "reasoning_output_tokens INTEGER",
@@ -400,36 +404,32 @@ impl UsageLedger {
             .unwrap_or(0);
         let ctime_ns = source_change_ns(&meta);
         let path_text = path.to_string_lossy().to_string();
-        let prior:Option<(i64,i64,String,i64,i64,i64,String)>=self.conn.query_row("SELECT generation,cursor,prefix_hash,source_len,source_mtime_ns,source_ctime_ns,source_content_hash FROM source_files WHERE identity=?1 ORDER BY generation DESC LIMIT 1",params![identity],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
-        // No-change reads rely on metadata only. A changed ctime detects a
-        // same-size, preserved-mtime replacement. Changed files retain bounded
-        // head/tail provenance, so an ordinary append never scans old history.
-        let unchanged = matches!(&prior, Some((_, _, _, old_len, old_mtime, old_ctime, _)) if *old_len == meta.len() as i64 && *old_mtime == mtime_ns && *old_ctime == ctime_ns);
-        let (prefix, generation_fingerprint, probe_bytes) = if unchanged {
+        let prior:Option<(i64,i64,String,i64,i64,i64,String,String)>=self.conn.query_row("SELECT generation,cursor,prefix_hash,source_len,source_mtime_ns,source_ctime_ns,source_content_hash,source_full_hash FROM source_files WHERE identity=?1 ORDER BY generation DESC LIMIT 1",params![identity],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
+        // Only an identical metadata tuple skips source-body reads. Any change
+        // revalidates the complete historical source before cursor reuse.
+        let unchanged = matches!(&prior, Some((_, _, _, old_len, old_mtime, old_ctime, _, _)) if *old_len == meta.len() as i64 && *old_mtime == mtime_ns && *old_ctime == ctime_ns);
+        let (prefix, generation_fingerprint, full_hash, probe_bytes) = if unchanged {
             let prior = prior.as_ref().unwrap();
-            (prior.2.clone(), prior.6.clone(), 0)
+            (prior.2.clone(), prior.6.clone(), prior.7.clone(), 0)
         } else {
             let (prefix, prefix_bytes) = prefix_hash(path)?;
-            let (tail, tail_bytes) = tail_hash(path, meta.len())?;
-            (prefix, tail, prefix_bytes + tail_bytes)
+            let (full_hash, full_bytes) = file_hash(path, meta.len())?;
+            (prefix.clone(), prefix, full_hash, prefix_bytes + full_bytes)
         };
-        // For a longer source, compare the previously stored old-end checkpoint
-        // at its original offset. This distinguishes an append from a rewrite
-        // that preserves the opening fingerprint without reading old history.
-        let (append_checkpoint_matches, append_checkpoint_bytes) = match &prior {
-            Some((_, _, _, old_len, _, _, old_checkpoint)) if meta.len() as i64 > *old_len => {
-                let (checkpoint, bytes) = tail_hash_at(path, *old_len as u64)?;
-                (checkpoint == *old_checkpoint, bytes)
+        let (historical_hash_matches, historical_bytes) = match &prior {
+            Some((_, _, _, old_len, _, _, _, old_full)) if !old_full.is_empty() && meta.len() as i64 == *old_len => (full_hash == *old_full, 0),
+            Some((_, _, _, old_len, _, _, _, old_full)) if !old_full.is_empty() && meta.len() as i64 > *old_len => {
+                let (historical_hash, bytes) = file_hash(path, *old_len as u64)?;
+                (historical_hash == *old_full, bytes)
             }
-            _ => (true, 0),
+            _ => (false, 0),
         };
-        let probe_bytes = probe_bytes + append_checkpoint_bytes;
+        let probe_bytes = probe_bytes + historical_bytes;
         let (generation, cursor) = match prior {
-            Some((g, c, old_prefix, old_len, _, _, _))
+            Some((g, c, _, _, _, _, _, _))
                 if meta.len() as i64 >= c
-                    && old_prefix == prefix
-                    && ((meta.len() as i64 > old_len && append_checkpoint_matches) || unchanged) => (g, c),
-            Some((g, _, _, _, _, _, _)) => (g + 1, 0),
+                    && (unchanged || historical_hash_matches) => (g, c),
+            Some((g, _, _, _, _, _, _, _)) => (g + 1, 0),
             None => (0, 0),
         };
         let source_key = format!("{identity}:{generation}");
@@ -471,7 +471,7 @@ impl UsageLedger {
         }
         let backlog = pending.len() >= options.max_records || (!partial && offset < meta.len());
         let tx = self.conn.transaction()?;
-        tx.execute("INSERT INTO source_files(source_key,identity,generation,path,prefix_hash,cursor,source_len,updated_at,source_mtime_ns,source_ctime_ns,source_content_hash) VALUES(?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10) ON CONFLICT(source_key) DO UPDATE SET path=excluded.path,source_len=excluded.source_len,updated_at=excluded.updated_at,source_mtime_ns=excluded.source_mtime_ns,source_ctime_ns=excluded.source_ctime_ns,source_content_hash=excluded.source_content_hash",params![source_key,identity,generation,path_text,prefix,meta.len() as i64,Utc::now().to_rfc3339(),mtime_ns,ctime_ns,generation_fingerprint])?;
+        tx.execute("INSERT INTO source_files(source_key,identity,generation,path,prefix_hash,cursor,source_len,updated_at,source_mtime_ns,source_ctime_ns,source_content_hash,source_full_hash) VALUES(?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10,?11) ON CONFLICT(source_key) DO UPDATE SET path=excluded.path,source_len=excluded.source_len,updated_at=excluded.updated_at,source_mtime_ns=excluded.source_mtime_ns,source_ctime_ns=excluded.source_ctime_ns,source_content_hash=excluded.source_content_hash,source_full_hash=excluded.source_full_hash",params![source_key,identity,generation,path_text,prefix,meta.len() as i64,Utc::now().to_rfc3339(),mtime_ns,ctime_ns,generation_fingerprint,full_hash])?;
         let mut out = ImportResult {
             pending_partial: partial,
             backlog,
@@ -1087,16 +1087,21 @@ fn prefix_hash(path: &Path) -> Result<(String, u64)> {
     let n = f.read(&mut b)?;
     Ok((hash(&b[..n]), n as u64))
 }
-fn tail_hash(path: &Path, length: u64) -> Result<(String, u64)> {
-    tail_hash_at(path, length)
-}
-fn tail_hash_at(path: &Path, end: u64) -> Result<(String, u64)> {
+fn file_hash(path: &Path, length: u64) -> Result<(String, u64)> {
     let mut file = File::open(path)?;
-    let count = end.min(4096);
-    file.seek(SeekFrom::Start(end - count))?;
-    let mut buffer = vec![0; count as usize];
-    file.read_exact(&mut buffer)?;
-    Ok((hash(&buffer), count))
+    let mut digest = Sha256::new();
+    let mut remaining = length;
+    let mut buffer = [0_u8; 8192];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let count = file.read(&mut buffer[..want])?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    Ok((format!("{:x}", digest.finalize()), length - remaining))
 }
 #[cfg(unix)]
 fn source_change_ns(meta: &fs::Metadata) -> i64 {
@@ -1118,7 +1123,7 @@ fn file_identity(meta: &fs::Metadata) -> String {
 }
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ledger_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TEXT NOT NULL,generation INTEGER NOT NULL,path TEXT NOT NULL,prefix_hash TEXT NOT NULL,cursor INTEGER NOT NULL,source_len INTEGER NOT NULL,updated_at TEXT,source_mtime_ns INTEGER NOT NULL DEFAULT 0,source_ctime_ns INTEGER NOT NULL DEFAULT 0,source_content_hash TEXT NOT NULL DEFAULT '',UNIQUE(identity,generation));
+CREATE TABLE IF NOT EXISTS source_files (source_key TEXT PRIMARY KEY,identity TEXT NOT NULL,generation INTEGER NOT NULL,path TEXT NOT NULL,prefix_hash TEXT NOT NULL,cursor INTEGER NOT NULL,source_len INTEGER NOT NULL,updated_at TEXT,source_mtime_ns INTEGER NOT NULL DEFAULT 0,source_ctime_ns INTEGER NOT NULL DEFAULT 0,source_content_hash TEXT NOT NULL DEFAULT '',source_full_hash TEXT NOT NULL DEFAULT '',UNIQUE(identity,generation));
 CREATE TABLE IF NOT EXISTS observations (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,record_hash TEXT NOT NULL,verdict TEXT NOT NULL CHECK(verdict IN ('accepted','duplicate','conflict','quarantine')),reason TEXT,provider TEXT,account_scope TEXT,response_id TEXT,PRIMARY KEY(source_key,byte_offset));
 CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_scope TEXT NOT NULL,response_id TEXT NOT NULL,record_hash TEXT NOT NULL,parent_response_id TEXT,root_task_family TEXT,event_at TEXT,model TEXT,effort TEXT,input_tokens INTEGER,cached_input_tokens INTEGER,cache_write_input_tokens INTEGER,output_tokens INTEGER,reasoning_output_tokens INTEGER,total_tokens INTEGER,session_id TEXT,PRIMARY KEY(provider,account_scope,response_id));
 CREATE TABLE IF NOT EXISTS codex_session_state (source_key TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT,effort TEXT,root_task_family TEXT,parent_thread_id TEXT,cumulative_input INTEGER NOT NULL DEFAULT 0,cumulative_cached INTEGER NOT NULL DEFAULT 0,cumulative_cache_write INTEGER,cumulative_output INTEGER NOT NULL DEFAULT 0,cumulative_reasoning INTEGER,cumulative_total INTEGER,PRIMARY KEY(source_key,session_id));
