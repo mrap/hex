@@ -371,7 +371,20 @@ fn collect(
         }
     };
     let ledger = ledger.unwrap_or_else(default_ledger);
-    if max_records == 0 || sources.is_empty() {
+    if max_records == 0 {
+        eprintln!("usage collect: no local sources discovered");
+        health("error", "no_sources".into());
+        return 1;
+    }
+    // A configured local Codex root can legitimately have no live sessions,
+    // including when every state-db rollout pointer has gone stale. A periodic
+    // collection then completes as a visible no-op, not an unhealthy worker.
+    if discovered_sources && sources.is_empty() {
+        println!("usage collect: accepted=0 backlog=false issues=0");
+        health("ok", "backlog=false accepted=0 issues=".into());
+        return 0;
+    }
+    if sources.is_empty() {
         eprintln!("usage collect: no local sources discovered");
         health("error", "no_sources".into());
         return 1;

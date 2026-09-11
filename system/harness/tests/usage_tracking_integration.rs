@@ -66,6 +66,43 @@ fn discovery_imports_active_archive_and_rollout_while_skipping_missing_rollout()
     assert!(rows.iter().any(|r| r.response_id == "archive"));
     assert!(rows.iter().any(|r| r.response_id == "rollout"));
 }
+
+#[test]
+fn discovery_with_only_stale_rollouts_is_a_successful_noop() {
+    let root = TempDir::new().unwrap();
+    let codex = root.path().join("codex");
+    let ledger = root.path().join("ledger.db");
+    fs::create_dir_all(&codex).unwrap();
+    let db = rusqlite::Connection::open(codex.join("state_5.sqlite")).unwrap();
+    db.execute("CREATE TABLE threads(rollout_path TEXT)", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1)",
+        [root
+            .path()
+            .join("vanished.jsonl")
+            .to_string_lossy()
+            .to_string()],
+    )
+    .unwrap();
+    drop(db);
+    let status = Command::new(bin())
+        .env("HEX_DIR", root.path())
+        .args([
+            "usage",
+            "collect",
+            "--codex-root",
+            codex.to_str().unwrap(),
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--max-records",
+            "100",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!ledger.exists());
+}
 #[test]
 fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
     let root = TempDir::new().unwrap();
