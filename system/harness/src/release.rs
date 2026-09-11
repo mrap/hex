@@ -953,14 +953,15 @@ fn gate_tests_result(result: managed_cargo_bridge::Result) -> GateResult {
 fn docker_suite(
     repo_root: &Path,
     dockerfile: &str,
-    tag: &str,
+    image_name: &str,
     label: &str,
     carveout: bool,
 ) -> GateResult {
     println!("  Running {label}...");
+    let tag = docker_image_tag(repo_root, image_name);
     let mut build = Command::new("docker");
     build
-        .args(["build", "-f", dockerfile, "-t", tag, "."])
+        .args(["build", "-f", dockerfile, "-t", &tag, "."])
         .current_dir(repo_root);
     let b = match run_checked("docker", &mut build) {
         Ok(r) => r,
@@ -973,7 +974,7 @@ fn docker_suite(
         ));
     }
     let mut run = Command::new("docker");
-    run.args(["run", "--rm", tag]).current_dir(repo_root);
+    run.args(["run", "--rm", &tag]).current_dir(repo_root);
     let r = match run_checked("docker", &mut run) {
         Ok(r) => r,
         Err(msg) => return GateResult::Fail(msg),
@@ -990,6 +991,26 @@ fn docker_suite(
             output_tail(&r.combined(), 400)
         ))
     }
+}
+
+/// Return a deterministic Docker image tag scoped to one repository root and
+/// one gate. Docker image tags are global to the daemon, so a fixed tag lets
+/// concurrent worktrees replace an image between this gate's build and run.
+fn docker_image_tag(repo_root: &Path, image_name: &str) -> String {
+    let root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in root
+        .to_string_lossy()
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(image_name.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{image_name}-{:016x}", hash)
 }
 
 /// The pinned doctor carve-out: a Doctor failure inside Docker is expected
@@ -3352,6 +3373,21 @@ mod tests {
         // opts in via a `[[profiles]] name = "hex-foundation"` entry.
         assert!(p.repo_dir.is_none());
         assert!(!p.watch);
+    }
+
+    #[test]
+    fn docker_image_tags_are_distinct_for_concurrent_worktrees() {
+        let td = tempfile::tempdir().unwrap();
+        let first = td.path().join("worktree-one");
+        let second = td.path().join("worktree-two");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let first_env = docker_image_tag(&first, "hex-env-test");
+        assert_eq!(first_env, docker_image_tag(&first, "hex-env-test"));
+        assert_ne!(first_env, docker_image_tag(&second, "hex-env-test"));
+        assert_ne!(first_env, docker_image_tag(&first, "hex-e2e-test"));
+        assert!(first_env.starts_with("hex-env-test-"));
     }
 
     #[test]
