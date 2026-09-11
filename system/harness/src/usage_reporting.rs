@@ -251,6 +251,18 @@ impl ReportAccumulator {
         }
     }
 
+    /// Summary callers pass `include_ids = false`, so page rows do not remain
+    /// owned after aggregation. This exposes the retained optional detail IDs
+    /// for a deterministic bounded-memory regression test.
+    pub fn retained_response_ids(&self) -> usize {
+        let ids = |accumulator: &Accumulator| {
+            accumulator.models.values().map(|bucket| bucket.response_ids.len()).sum::<usize>()
+                + accumulator.families.values().map(|bucket| bucket.response_ids.len()).sum::<usize>()
+                + accumulator.children.response_ids.len()
+        };
+        ids(&self.current) + ids(&self.previous)
+    }
+
     pub fn finish(self) -> UsageReport {
         report_from_accumulators(
             self.coverage,
@@ -306,7 +318,7 @@ fn report_from_accumulators(
         end,
         measured: current.measured.clone(),
         modeled_credits: current.estimate(EstimateUnit::CreditEquivalent),
-        modeled_credit_components: credit_components(&current.rows),
+        modeled_credit_components: current.credits.components.clone(),
         modeled_api_usd: unavailable(
             EstimateUnit::ApiUsd,
             "api_usd_rate_not_defined_by_audited_facts",
@@ -333,7 +345,7 @@ fn report_from_accumulators(
 #[derive(Default)]
 struct Bucket {
     measured: MeasuredTokens,
-    rows: Vec<UsageRow>,
+    credits: CreditAccumulator,
     response_ids: Vec<String>,
     labels: BTreeSet<String>,
 }
@@ -341,7 +353,7 @@ struct Bucket {
 #[derive(Default)]
 struct Accumulator {
     measured: MeasuredTokens,
-    rows: Vec<UsageRow>,
+    credits: CreditAccumulator,
     labels: BTreeSet<String>,
     invalid_usage: bool,
     models: BTreeMap<String, Bucket>,
@@ -357,7 +369,7 @@ impl Accumulator {
             return;
         }
         self.measured.add(row);
-        self.rows.push(row.clone());
+        self.credits.add(row);
         let model = row.model.clone().unwrap_or_else(|| "unknown".into());
         let family = row
             .root_task_family
@@ -387,7 +399,7 @@ impl Accumulator {
             .insert("speed_unavailable_standard_rate_only".into());
     }
     fn estimate(&self, unit: EstimateUnit) -> Estimate {
-        estimate_rows(&self.rows, unit)
+        self.credits.estimate(unit)
     }
     fn contributors(&self, buckets: &BTreeMap<String, Bucket>) -> Vec<Contributor> {
         let mut out: Vec<_> = buckets
@@ -409,9 +421,7 @@ impl Accumulator {
 
 fn add_bucket(bucket: &mut Bucket, row: &UsageRow, include_ids: bool) {
     bucket.measured.add(row);
-    // Credit estimates require the complete row regardless of whether the
-    // summary exposes IDs. ID retention is the bounded-summary concern.
-    bucket.rows.push(row.clone());
+    bucket.credits.add(row);
     if include_ids {
         bucket.response_ids.push(row.response_id.clone());
     }
@@ -470,7 +480,7 @@ fn contributor(key: &str, bucket: &Bucket) -> Contributor {
         key: key.into(),
         measured: bucket.measured.clone(),
         response_ids: ids,
-        credits: estimate_rows(&bucket.rows, EstimateUnit::CreditEquivalent),
+        credits: bucket.credits.estimate(EstimateUnit::CreditEquivalent),
     }
 }
 fn complete(row: &UsageRow) -> bool {
@@ -485,59 +495,53 @@ fn rate(model: &str) -> Option<TokenRates> {
         .find(|r| r.model == model)
         .map(|r| r.rates)
 }
-fn estimate_rows(rows: &[UsageRow], unit: EstimateUnit) -> Estimate {
-    if unit == EstimateUnit::ApiUsd {
-        return unavailable(unit, "api_usd_rate_not_defined_by_audited_facts");
-    }
-    let mut value = MicroUnits(0);
-    let mut labels = BTreeSet::new();
-    for row in rows {
+#[derive(Default)]
+struct CreditAccumulator {
+    components: CreditComponents,
+    labels: BTreeSet<String>,
+}
+
+impl CreditAccumulator {
+    fn add(&mut self, row: &UsageRow) {
         let Some(model) = row.model.as_deref() else {
-            labels.insert("unknown_model_rate".into());
-            continue;
+            self.labels.insert("unknown_model_rate".into());
+            return;
         };
         let Some(rates) = rate(model) else {
-            labels.insert(format!("unknown_model_rate:{model}"));
-            continue;
+            self.labels.insert(format!("unknown_model_rate:{model}"));
+            return;
         };
         if !complete(row) {
-            labels.insert("missing_or_invalid_usage".into());
-            continue;
+            self.labels.insert("missing_or_invalid_usage".into());
+            return;
         }
         let input = row.input_tokens.unwrap() as i128;
         let cached = row.cached_input_tokens.unwrap() as i128;
-        value.0 += (input - cached) * rates.fresh as i128
-            + cached * rates.cached as i128
-            + row.output_tokens.unwrap() as i128 * rates.output as i128;
+        let output = row.output_tokens.unwrap() as i128;
+        self.components.fresh.0 += (input - cached) * rates.fresh as i128;
+        self.components.cached.0 += cached * rates.cached as i128;
+        self.components.output.0 += output * rates.output as i128;
     }
-    // No speed appears in UsageRow. The audited facts support a standard-rate
-    // comparison but not a speed-adjusted provider/account amount.
-    labels.insert("speed_unavailable_standard_rate_only".into());
-    Estimate {
-        unit,
-        rate_version: AUDITED_RATE_VERSION,
-        rate_source: AUDITED_RATE_SOURCE,
-        value,
-        incomplete: !labels.is_empty(),
-        labels,
+
+    fn estimate(&self, unit: EstimateUnit) -> Estimate {
+        if unit == EstimateUnit::ApiUsd {
+            return unavailable(unit, "api_usd_rate_not_defined_by_audited_facts");
+        }
+        let mut labels = self.labels.clone();
+        // No speed appears in UsageRow. The audited facts support a standard-rate
+        // comparison but not a speed-adjusted provider/account amount.
+        labels.insert("speed_unavailable_standard_rate_only".into());
+        Estimate {
+            unit,
+            rate_version: AUDITED_RATE_VERSION,
+            rate_source: AUDITED_RATE_SOURCE,
+            value: MicroUnits(
+                self.components.fresh.0 + self.components.cached.0 + self.components.output.0,
+            ),
+            incomplete: !labels.is_empty(),
+            labels,
+        }
     }
-}
-fn credit_components(rows: &[UsageRow]) -> CreditComponents {
-    let mut out = CreditComponents::default();
-    for row in rows {
-        let (Some(model), true) = (row.model.as_deref(), complete(row)) else {
-            continue;
-        };
-        let Some(r) = rate(model) else {
-            continue;
-        };
-        let input = row.input_tokens.unwrap() as i128;
-        let cached = row.cached_input_tokens.unwrap() as i128;
-        out.fresh.0 += (input - cached) * r.fresh as i128;
-        out.cached.0 += cached * r.cached as i128;
-        out.output.0 += row.output_tokens.unwrap() as i128 * r.output as i128;
-    }
-    out
 }
 fn unavailable(unit: EstimateUnit, label: &str) -> Estimate {
     let mut labels = BTreeSet::new();

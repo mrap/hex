@@ -390,3 +390,27 @@ fn incremental_pages_keep_half_open_window_boundaries_and_preceding_change() {
     assert_eq!(report.start, start);
     assert_eq!(report.end, end);
 }
+
+#[test]
+fn summary_accumulator_does_not_retain_page_rows() {
+    let start = t("2026-09-10T00:00:00Z");
+    let end = t("2026-09-11T00:00:00Z");
+    let mut accumulator = ReportAccumulator::new(Coverage::default(), start, end, false);
+    for index in 0..100_001 {
+        let row = row(
+            &format!("response-{index}"),
+            "2026-09-10T12:00:00Z",
+            Some("gpt-5.6-luna"),
+            Some("load"),
+            None,
+            Some(1),
+            Some(0),
+            Some(1),
+        );
+        accumulator.extend(std::slice::from_ref(&row));
+    }
+    assert_eq!(accumulator.retained_response_ids(), 0);
+    let report = accumulator.finish();
+    assert_eq!(report.measured.responses, 100_001);
+    assert_eq!(report.modeled_credits.value, MicroUnits(3_500_035));
+}
