@@ -1024,11 +1024,12 @@ fn count_pending_files(
         .count()
 }
 
-/// Compute `(rel_path, mtime)` once per discovered file. Shared by the CLI
-/// pending pre-pass (which needs the list) and, via [`IndexRunSetup::mtimes`],
-/// the indexing loop in [`run_index_body`] (which needs a lookup by
-/// `rel_path`) — both previously called [`file_mtime`] on every file
-/// themselves, doubling the stat() calls for a CLI run.
+/// Compute `(rel_path, mtime)` once per discovered file, for the CLI pending
+/// pre-pass ([`count_pending_files`]) only. The indexing loop in
+/// [`run_index_body`] always calls [`file_mtime`] fresh at the point it
+/// processes each file rather than reusing this snapshot — reusing it used to
+/// let a file edited between this pre-pass and the loop reaching it be judged
+/// against a stale mtime and silently deferred a tick (fixed 2026-09-11).
 fn rel_path_mtimes(file_tuples: &[(PathBuf, String)], hex_root: &Path) -> Vec<(String, f64)> {
     file_tuples
         .iter()
@@ -1049,12 +1050,6 @@ struct IndexRunSetup {
     conn: Connection,
     file_tuples: Vec<(PathBuf, String)>,
     existing: HashMap<String, (f64, String)>,
-    /// Precomputed `rel_path -> mtime` from [`rel_path_mtimes`], set only by
-    /// [`run_index_cli`] (which already computes this list for the pending
-    /// pre-pass). [`run_index_body`] uses it when present and falls back to
-    /// [`file_mtime`] when absent, so the non-CLI [`run_index`] path (where
-    /// this stays `None`) is byte-identical to before.
-    mtimes: Option<HashMap<String, f64>>,
 }
 
 /// `Err(code)` means the caller should return `code` immediately without
@@ -1141,7 +1136,6 @@ fn setup_index_run(hex_root: &Path) -> Result<IndexRunSetup, i32> {
         conn,
         file_tuples,
         existing,
-        mtimes: None,
     })
 }
 
@@ -1178,7 +1172,7 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
 /// (unchanged, per KTD7).
 pub fn run_index_cli(hex_root: &Path, full: bool, max: bool, throttle: fn(&str, bool)) -> i32 {
     let t0 = std::time::Instant::now();
-    let mut setup = match setup_index_run(hex_root) {
+    let setup = match setup_index_run(hex_root) {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -1186,7 +1180,6 @@ pub fn run_index_cli(hex_root: &Path, full: bool, max: bool, throttle: fn(&str, 
     let file_mtimes = rel_path_mtimes(&setup.file_tuples, hex_root);
     let pending = count_pending_files(&file_mtimes, &setup.existing);
     let env_value = std::env::var("HEX_INDEX_BACKLOG_ESCALATE").ok();
-    setup.mtimes = Some(file_mtimes.into_iter().collect());
 
     match escalation_decision(pending, max, env_value.as_deref()) {
         Escalation::Normal {
@@ -1226,7 +1219,6 @@ fn run_index_body(
         conn,
         file_tuples,
         existing,
-        mtimes,
     } = setup;
 
     let embedder = match super::embed::Embedder::new(hex_root) {
@@ -1270,13 +1262,12 @@ fn run_index_body(
             Ok(r) => r.to_string_lossy().to_string(),
             Err(_) => continue,
         };
-        // Reuse the pre-pass's mtime when the CLI path already computed it
-        // (rel_path_mtimes); run_index's non-CLI path has no precomputed map
-        // and falls back to a fresh file_mtime() call, unchanged from before.
-        let mtime = mtimes
-            .as_ref()
-            .and_then(|m| m.get(&rel_path).copied())
-            .unwrap_or_else(|| file_mtime(filepath));
+        // Always read a fresh mtime here rather than reusing any pre-pass
+        // snapshot: a file edited between the CLI pending pre-pass
+        // (rel_path_mtimes) and the loop reaching it here must be judged
+        // against its current mtime, not a stale one, or the edit silently
+        // waits for the next tick (fixed 2026-09-11).
+        let mtime = file_mtime(filepath);
 
         if !full {
             let prev = existing.get(&rel_path);

@@ -364,8 +364,10 @@ pub struct StormSignature {
 /// root cause hitting `storm_min_workers()`-or-more DISTINCT workers inside
 /// `window_hours` is one storm, so the caller can fire one alert naming the
 /// error and the worker count instead of one alert per worker (KTD3/KTD4;
-/// R3/R4). Only signatures whose most recent row falls inside the window are
-/// considered, mirroring `failure_signatures`'s "active in window" filter.
+/// R3/R4). Only rows whose own `ts` falls inside the window are grouped at
+/// all (filtered before grouping, not after) — a group must not accrue
+/// distinct fids from outside the window just because some other row in the
+/// same head landed inside it.
 pub fn storm_signatures(
     now: DateTime<Utc>,
     window_hours: i64,
@@ -390,8 +392,22 @@ fn build_storm_signatures(
     now: DateTime<Utc>,
     window_hours: i64,
 ) -> Vec<StormSignature> {
+    // Compute the cutoff BEFORE grouping and skip out-of-window rows up
+    // front: `rows` is every failing row ever fetched (fetch_failure_rows has
+    // no time bound), and grouping by head alone (unlike
+    // build_failure_signatures's (fid, head) grouping) previously let a
+    // distinct fid from a stale row count toward the storm threshold as long
+    // as SOME row in that head's group was recent — a group's `last_ts` could
+    // be inside the window while its `fids` set included workers whose only
+    // rows were hours or days old. Filtering here means every row folded into
+    // a group is already known to be in-window, so the group's fid count is
+    // genuinely an in-window count and no post-hoc filter is needed.
+    let window_start = window_start(now, window_hours);
     let mut map: std::collections::BTreeMap<String, StormGroup> = Default::default();
     for r in rows {
+        if r.ts.as_str() < window_start.as_str() {
+            continue;
+        }
         let g = map.entry(r.head.clone()).or_insert_with(|| StormGroup {
             fids: BTreeSet::new(),
             total_rows: 0,
@@ -405,7 +421,6 @@ fn build_storm_signatures(
         // mirrors build_failure_signatures (no min/max comparison needed).
         g.last_ts = r.ts.clone();
     }
-    let window_start = window_start(now, window_hours);
     // Read the threshold here, at the point of use — not hoisted into
     // fetch_failure_rows or cached — so an env override still applies
     // per-call (storm_min_workers_env_override_and_garbage_fallback flips the
@@ -413,7 +428,6 @@ fn build_storm_signatures(
     let threshold = storm_min_workers();
     let mut out: Vec<StormSignature> = map
         .into_iter()
-        .filter(|(_, g)| g.last_ts >= window_start)
         .filter(|(_, g)| g.fids.len() >= threshold)
         .map(|(head, g)| {
             let sample_fids: Vec<String> = g.fids.iter().take(5).cloned().collect();
@@ -520,6 +534,29 @@ pub fn alert_key(kind: &str, ident: &str) -> String {
         .collect::<Vec<_>>()
         .join("-");
     format!("failures-{kind}-{safe}")
+}
+
+/// Tiny dependency-free FNV-1a (32-bit) hash, used only to disambiguate
+/// [`storm_alert_key`]'s dedupe key — not for anything security-sensitive.
+fn fnv1a32(s: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in s.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Storm-specific alert key. [`alert_key`]'s sanitization is lossy — all
+/// punctuation and whitespace collapse to `-` and runs of `-` collapse
+/// further — so two distinct signature heads that differ only in
+/// punctuation/spacing (e.g. "foo: bar" vs "foo bar") can sanitize to the
+/// same key. That collapses two distinct storms into one dedupe key, so the
+/// second storm never alerts within `alert::notify`'s dedupe window. Appending
+/// a short stable hash of the RAW (pre-sanitize) head keeps distinct heads
+/// distinct while staying stable for the same head across calls.
+pub fn storm_alert_key(head: &str) -> String {
+    alert_key("storm", &format!("{head}-{:08x}", fnv1a32(head)))
 }
 
 #[cfg(test)]
@@ -859,6 +896,65 @@ mod storm_tests {
             storms
         );
         assert_eq!(storms[0].distinct_fids, 3);
+    }
+
+    #[test]
+    fn stale_fids_outside_window_do_not_count_toward_storm_threshold() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        seed_schema();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        let head = "spawn failed for `hex`: No such file or directory (os error 2)";
+        // Two distinct fids, both 100h old — well outside a 24h window.
+        for fid in ["old::a", "old::b"] {
+            row_d(fid, now - Duration::hours(100), "error", head);
+        }
+        // One fid inside the window — same head.
+        row_d("new::c", now - Duration::hours(1), "error", head);
+        let storms = storm_signatures(now, 24).unwrap();
+        assert!(
+            storms.is_empty(),
+            "2 stale fids + 1 in-window fid must NOT count as a 3-worker storm: {:?}",
+            storms
+        );
+
+        // Three distinct fids all inside the window IS a storm.
+        for fid in ["new::d", "new::e"] {
+            row_d(fid, now - Duration::hours(1), "error", head);
+        }
+        let storms = storm_signatures(now, 24).unwrap();
+        assert_eq!(
+            storms.len(),
+            1,
+            "3 distinct fids inside the window must be a storm: {:?}",
+            storms
+        );
+        assert_eq!(storms[0].distinct_fids, 3);
+    }
+
+    #[test]
+    fn storm_alert_key_disambiguates_heads_that_alert_key_collapses() {
+        // Punctuation/whitespace differ only in a way alert_key's sanitizer
+        // collapses both to: verify that collision actually happens first,
+        // so this test documents the exact failure storm_alert_key defends
+        // against, then verify storm_alert_key tells them apart.
+        let head1 = "foo: bar";
+        let head2 = "foo bar";
+        assert_eq!(
+            alert_key("storm", head1),
+            alert_key("storm", head2),
+            "precondition: alert_key must collapse these two distinct heads to the same key"
+        );
+        let key1 = storm_alert_key(head1);
+        let key2 = storm_alert_key(head2);
+        assert_ne!(
+            key1, key2,
+            "storm_alert_key must keep distinct heads apart even when alert_key would collapse them"
+        );
+        assert_eq!(
+            storm_alert_key(head1),
+            storm_alert_key(head1),
+            "storm_alert_key must be deterministic for the same head"
+        );
     }
 
     #[test]

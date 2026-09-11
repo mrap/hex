@@ -182,6 +182,24 @@ class MacAppInstallTests(unittest.TestCase):
         self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
         self.assertEqual(os.readlink(paths.cli), old_cli_target)
 
+    def test_self_check_failure_clears_journal_so_next_install_succeeds(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        failing = subprocess.CompletedProcess(args=["cli", "--version"], returncode=1, stdout="", stderr="boom")
+        with patch.object(INSTALL, "_run_self_check", return_value=failing):
+            with self.assertRaisesRegex(INSTALL.InstallError, "self-check failed"):
+                self.install()
+        # The rollback above restored public state cleanly (no rollback
+        # errors), so the journal must not be left behind blocking the next
+        # install -- previously it was, and a later install() refused with
+        # "open install journal requires recovery" until an operator ran
+        # abandon-staging by hand.
+        self.assertFalse(paths.journal.exists())
+        # A second, good install succeeds with no manual recovery step.
+        result = self.install()
+        self.assertEqual(result["bundle_identifier"], "com.mrap.boi")
+
     def test_self_check_times_out_twice_restores_previous_app(self):
         from unittest.mock import patch
         self.install()
@@ -215,6 +233,47 @@ class MacAppInstallTests(unittest.TestCase):
         with patch.object(INSTALL, "_run_self_check") as run_mock:
             INSTALL._self_check_published_cli(None)
         run_mock.assert_not_called()
+
+    def test_self_check_oserror_on_first_attempt_restores_previous_app_and_cli(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        old_app_hash = INSTALL._tree_sha256(paths.app)
+        old_cli_target = os.readlink(paths.cli)
+        with patch.object(INSTALL, "_run_self_check", side_effect=OSError("no such file")):
+            with self.assertRaisesRegex(INSTALL.InstallError, "could not execute") as caught:
+                self.install()
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
+        self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_oserror_after_retry_restores_previous_app_and_cli(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        old_app_hash = INSTALL._tree_sha256(paths.app)
+        old_cli_target = os.readlink(paths.cli)
+        timeout_exc = subprocess.TimeoutExpired(cmd=["cli", "--version"], timeout=10)
+        with patch.object(INSTALL, "_run_self_check", side_effect=[timeout_exc, OSError("no such file")]), \
+                patch.object(INSTALL, "_self_check_sleep") as sleep_mock:
+            with self.assertRaisesRegex(INSTALL.InstallError, "could not execute") as caught:
+                self.install()
+        sleep_mock.assert_called_once()
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
+        self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_timeout_secs_env_parsing(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(INSTALL.SELF_CHECK_TIMEOUT_ENV, None)
+            self.assertEqual(
+                INSTALL._self_check_timeout_secs(), INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS)
+        with patch.dict(os.environ, {INSTALL.SELF_CHECK_TIMEOUT_ENV: "garbage"}):
+            self.assertEqual(
+                INSTALL._self_check_timeout_secs(), INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS)
+        with patch.dict(os.environ, {INSTALL.SELF_CHECK_TIMEOUT_ENV: "3.5"}):
+            self.assertEqual(INSTALL._self_check_timeout_secs(), 3.5)
 
     def test_install_error_payload_reports_self_check_failed(self):
         from unittest.mock import patch
@@ -605,7 +664,11 @@ class MacAppInstallTests(unittest.TestCase):
                 self.install()
         finally:
             INSTALL._fsync_dir = original
-        self.assertNotEqual(json.loads(paths.journal.read_text())["phase"], "committed")
+        # Rollback restores public state cleanly here, so the journal is
+        # cleared (2026-09-11 fix) instead of being left behind at whatever
+        # pre-committed phase it last reached -- either way, "committed" is
+        # never written to disk.
+        self.assertFalse(paths.journal.exists())
         self.assertEqual(paths.executable.read_bytes(), old_bytes)
 
     def test_inherited_lock_requires_held_lock_and_expected_inode(self):

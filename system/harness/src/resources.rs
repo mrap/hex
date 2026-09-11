@@ -281,7 +281,10 @@ pub fn sample_tick(now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Breach>, St
         .ok();
     // Parse the already-loaded last_du row's detail for the floor message
     // (R5) — no extra query, just the JSON already sitting in `last_du`.
-    let last_du_sizes: BTreeMap<String, i64> = last_du
+    // Mutable: when this tick itself refreshes du (below, `du_due`), the
+    // freshly computed sizes are merged in so the floor message reflects
+    // this tick's own du pass rather than the stale pre-tick DB row.
+    let mut last_du_sizes: BTreeMap<String, i64> = last_du
         .as_ref()
         .and_then(|(_, detail)| serde_json::from_str(detail).ok())
         .unwrap_or_default();
@@ -308,7 +311,13 @@ pub fn sample_tick(now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Breach>, St
     };
     if du_due {
         let dirs: Vec<String> = WATCH_LIST.iter().map(|d| expand_home(d)).collect();
-        record_du(&du_sizes(&dirs));
+        let fresh_du_sizes = du_sizes(&dirs);
+        record_du(&fresh_du_sizes);
+        // Union fresh over stale: this tick's own du pass wins per-dir, but a
+        // dir that this pass skipped (missing/unreadable — du_sizes drops it
+        // silently) still falls back to whatever the last successful sample
+        // saw, instead of vanishing from the floor message entirely.
+        last_du_sizes.extend(fresh_du_sizes);
     }
 
     let breaches = evaluate_rules(&df, now).map_err(|e| e.to_string())?;

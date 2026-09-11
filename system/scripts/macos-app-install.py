@@ -1319,11 +1319,23 @@ def install(product: str, root: Path, source: Path, signer: Signer, *, policy_pa
                         _restore_public(parent_fd, target, rollback, old_name, had_old, transaction_id, expected_current, fallback)
                     except Exception as rollback_exc:
                         rollback_errors.append(str(rollback_exc))
+                if not rollback_errors:
+                    # Public state is fully restored to its pre-transaction
+                    # identity, so the journal is no longer needed to block a
+                    # later install() -- clear it the same way the success
+                    # path does (same ownership/transaction guard), or a
+                    # post-publish failure (e.g. a failed self-check) leaves a
+                    # clean rollback behind an "open install journal requires
+                    # recovery" error that only abandon-staging can clear.
+                    try:
+                        _clear_journal(paths, transaction_id)
+                    except Exception as clear_exc:
+                        rollback_errors.append(f"journal cleanup failed: {clear_exc}")
             detail = str(exc)
             if staging_evidence_error:
                 detail += "; " + staging_evidence_error
             if rollback_errors:
-                detail += "; rollback failed: " + "; ".join(rollback_errors)
+                detail += "; rollback failed: " + "; ".join(rollback_errors) + "; journal left in place, recovery required"
             raise InstallError(detail, published=bool(published) or bool(rollback_errors),
                                 self_check_failed=bool(getattr(exc, "self_check_failed", False))) from exc
 
