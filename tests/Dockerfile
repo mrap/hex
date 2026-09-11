@@ -20,7 +20,7 @@ RUN cargo build -p hex-harness 2>&1
 FROM rust:1-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git python3 python3-pip pkg-config libssl-dev && \
+    git python3 python3-pip pkg-config libssl-dev g++ && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir --break-system-packages pytest
 
