@@ -2228,6 +2228,25 @@ pub fn run(args: &[String]) -> i32 {
         .map(|snapshot| (hex_dir.as_path(), snapshot));
     let mut owned_paths = HashMap::new();
 
+    // Build the candidate from the selected source before mutating any live
+    // managed file. This includes the path-imported bridge module. A failed
+    // build exits here with the instance source tree still untouched.
+    println!("\n4. Build Candidate");
+    let binary_result = sync_versions_file_protected(
+        &hex_dir,
+        &source_dir,
+        &backup_dir,
+        protection,
+        Some(&mut owned_paths),
+    );
+    if let Err(failure) = &binary_result {
+        eprintln!("  {}", binary_step_failure_message(failure));
+        println!();
+        return 1;
+    }
+
+    // Step 5: Apply changes
+    println!("\n5. Apply Changes");
     let sync_pairs: &[(&PathBuf, PathBuf)] = &[
         (&src_dirs.scripts, hex_dot_dir.join("scripts")),
         (&src_dirs.skills, hex_dot_dir.join("skills")),
@@ -2410,22 +2429,7 @@ pub fn run(args: &[String]) -> i32 {
 
     let _ = fs::remove_file(hex_dot_dir.join(".update-available"));
 
-    // Step 5: Sync VERSIONS + rebuild binary if needed
-    println!("\n5. Sync VERSIONS");
-    let binary_result = sync_versions_file_protected(
-        &hex_dir,
-        &source_dir,
-        &backup_dir,
-        protection,
-        Some(&mut owned_paths),
-    );
-
-    let companion_result = if binary_result.is_ok() {
-        crate::codeintel_upgrade::apply(&hex_dir, &source_dir, &companion_plan)
-    } else {
-        eprintln!("  Code-intel updates were not attempted because the Hex step failed.");
-        Ok(())
-    };
+    let companion_result = crate::codeintel_upgrade::apply(&hex_dir, &source_dir, &companion_plan);
 
     // Step 6: Shell setup
     println!("\n6. Shell Setup");
@@ -3042,6 +3046,54 @@ mod tests {
         assert!(versions.contains("OTHER_PIN=v9"));
         test_child::stage("upgrade:stale-pin-assertions-complete")
             .expect("stale-pin assertions-complete stage must flush");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_build_failure_leaves_live_managed_files_unchanged() {
+        let _env = crate::test_env::isolate_hex_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let instance = tmp.path().join("instance");
+        write_file(&source.join("templates/AGENTS.md"), "# source\n");
+        write_file(&source.join("system/scripts/managed.sh"), "new script\n");
+        write_file(
+            &source.join("system/managed_cargo_bridge.rs"),
+            "new bridge\n",
+        );
+        write_file(&source.join("system/version.txt"), "2.0.0\n");
+        write_file(
+            &source.join("system/harness/Cargo.toml"),
+            "[package]\nname = \"hex-harness\"\nversion = \"2.0.0\"\nedition = \"2021\"\n",
+        );
+        init_test_repo(&source);
+        seed_commit(&source, "failed candidate fixture");
+
+        write_file(&instance.join("AGENTS.md"), "# instance\n");
+        write_file(
+            &instance.join("VERSIONS"),
+            "HEX_FOUNDATION_VERSION=v1.0.0\n",
+        );
+        let bin = instance.join(".hex/bin/hex");
+        write_file(&bin, "#!/bin/sh\nprintf 'hex 1.0.0\\n'");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        write_file(&instance.join(".hex/scripts/managed.sh"), "old script\n");
+        write_file(
+            &instance.join(".hex/managed_cargo_bridge.rs"),
+            "old bridge\n",
+        );
+
+        std::env::set_var("HEX_DIR", &instance);
+        let exit = run(&["--local".to_string(), source.to_string_lossy().into_owned()]);
+        assert_eq!(exit, 1);
+        assert_eq!(
+            fs::read(instance.join(".hex/scripts/managed.sh")).unwrap(),
+            b"old script\n"
+        );
+        assert_eq!(
+            fs::read(instance.join(".hex/managed_cargo_bridge.rs")).unwrap(),
+            b"old bridge\n"
+        );
     }
 
     // The wrapper block's guard is the function signature "claude() {".
