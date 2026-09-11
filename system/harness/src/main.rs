@@ -2240,8 +2240,8 @@ fn run_failures(window: i64, alert: bool) -> i32 {
             return 2;
         }
     };
-    let sigs = hex::failures::failure_signatures(now, window).unwrap_or_default();
-    let storms = hex::failures::storm_signatures(now, window).unwrap_or_default();
+    let (sigs, storms) =
+        hex::failures::failure_and_storm_signatures(now, window).unwrap_or_default();
     let dups = hex::failures::duplicate_fires(&exp, now).unwrap_or_default();
     let compiled = hex::failures::compiled_module_basenames();
     let not_landed = hex::failures::modules_not_landed(&hex_dir, &compiled);
@@ -2342,7 +2342,7 @@ fn run_failures(window: i64, alert: bool) -> i32 {
         bad = true;
         println!(
             "\nFAILURE STORMS (same error across {}+ distinct workers):",
-            hex::failures::STORM_MIN_WORKERS
+            hex::failures::storm_min_workers()
         );
         for s in &storms {
             println!(

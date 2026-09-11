@@ -951,8 +951,14 @@ enum Escalation {
     Throttle,
     /// Skip the throttle and run at normal priority. `pending`/`threshold` are
     /// carried through for the log line even when the decision was forced by
-    /// `--max` rather than an actual backlog.
-    Normal { pending: usize, threshold: usize },
+    /// `--max` rather than an actual backlog — `forced_by_max` tells the log
+    /// line which case it is, so it never claims a backlog crossed the
+    /// threshold when `--max` is what actually forced normal priority.
+    Normal {
+        pending: usize,
+        threshold: usize,
+        forced_by_max: bool,
+    },
 }
 
 /// Default for `HEX_INDEX_BACKLOG_ESCALATE` (KTD7).
@@ -975,20 +981,27 @@ fn backlog_escalate_threshold(env_value: Option<&str>) -> Option<usize> {
 
 /// Pure R8/R9 priority decision (KTD7). `max` always forces
 /// [`Escalation::Normal`] (still carrying `pending`/`threshold` for the log
-/// line). Otherwise the run escalates only when `pending` exceeds the parsed
-/// threshold; an env value of exactly "0" disables escalation entirely
-/// (always [`Escalation::Throttle`] unless `--max`).
+/// line, with `forced_by_max: true` so the log line doesn't claim a backlog
+/// crossed the threshold when `--max` is what forced it). Otherwise the run
+/// escalates only when `pending` exceeds the parsed threshold
+/// (`forced_by_max: false`); an env value of exactly "0" disables escalation
+/// entirely (always [`Escalation::Throttle`] unless `--max`).
 fn escalation_decision(pending: usize, max: bool, env_value: Option<&str>) -> Escalation {
     let threshold = backlog_escalate_threshold(env_value);
     if max {
         return Escalation::Normal {
             pending,
             threshold: threshold.unwrap_or(DEFAULT_BACKLOG_ESCALATE),
+            forced_by_max: true,
         };
     }
     match threshold {
         None => Escalation::Throttle,
-        Some(threshold) if pending > threshold => Escalation::Normal { pending, threshold },
+        Some(threshold) if pending > threshold => Escalation::Normal {
+            pending,
+            threshold,
+            forced_by_max: false,
+        },
         Some(_) => Escalation::Throttle,
     }
 }
@@ -1011,6 +1024,23 @@ fn count_pending_files(
         .count()
 }
 
+/// Compute `(rel_path, mtime)` once per discovered file. Shared by the CLI
+/// pending pre-pass (which needs the list) and, via [`IndexRunSetup::mtimes`],
+/// the indexing loop in [`run_index_body`] (which needs a lookup by
+/// `rel_path`) — both previously called [`file_mtime`] on every file
+/// themselves, doubling the stat() calls for a CLI run.
+fn rel_path_mtimes(file_tuples: &[(PathBuf, String)], hex_root: &Path) -> Vec<(String, f64)> {
+    file_tuples
+        .iter()
+        .filter_map(|(filepath, _)| {
+            filepath
+                .strip_prefix(hex_root)
+                .ok()
+                .map(|r| (r.to_string_lossy().to_string(), file_mtime(filepath)))
+        })
+        .collect()
+}
+
 /// Discovery + DB-open + existing-record lookup shared by [`run_index`] and
 /// [`run_index_cli`] (KTD7), so the pending pre-pass and the indexing loop see
 /// the same `file_tuples`/`existing` without a second full DB read.
@@ -1019,6 +1049,12 @@ struct IndexRunSetup {
     conn: Connection,
     file_tuples: Vec<(PathBuf, String)>,
     existing: HashMap<String, (f64, String)>,
+    /// Precomputed `rel_path -> mtime` from [`rel_path_mtimes`], set only by
+    /// [`run_index_cli`] (which already computes this list for the pending
+    /// pre-pass). [`run_index_body`] uses it when present and falls back to
+    /// [`file_mtime`] when absent, so the non-CLI [`run_index`] path (where
+    /// this stays `None`) is byte-identical to before.
+    mtimes: Option<HashMap<String, f64>>,
 }
 
 /// `Err(code)` means the caller should return `code` immediately without
@@ -1105,6 +1141,7 @@ fn setup_index_run(hex_root: &Path) -> Result<IndexRunSetup, i32> {
         conn,
         file_tuples,
         existing,
+        mtimes: None,
     })
 }
 
@@ -1141,26 +1178,31 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
 /// (unchanged, per KTD7).
 pub fn run_index_cli(hex_root: &Path, full: bool, max: bool, throttle: fn(&str, bool)) -> i32 {
     let t0 = std::time::Instant::now();
-    let setup = match setup_index_run(hex_root) {
+    let mut setup = match setup_index_run(hex_root) {
         Ok(s) => s,
         Err(code) => return code,
     };
 
-    let file_mtimes: Vec<(String, f64)> = setup
-        .file_tuples
-        .iter()
-        .filter_map(|(filepath, _)| {
-            filepath
-                .strip_prefix(hex_root)
-                .ok()
-                .map(|r| (r.to_string_lossy().to_string(), file_mtime(filepath)))
-        })
-        .collect();
+    let file_mtimes = rel_path_mtimes(&setup.file_tuples, hex_root);
     let pending = count_pending_files(&file_mtimes, &setup.existing);
     let env_value = std::env::var("HEX_INDEX_BACKLOG_ESCALATE").ok();
+    setup.mtimes = Some(file_mtimes.into_iter().collect());
 
     match escalation_decision(pending, max, env_value.as_deref()) {
-        Escalation::Normal { pending, threshold } => {
+        Escalation::Normal {
+            pending,
+            threshold,
+            forced_by_max: true,
+        } => {
+            println!(
+                "hex memory index: --max set, running at normal priority ({pending} pending, threshold {threshold})"
+            );
+        }
+        Escalation::Normal {
+            pending,
+            threshold,
+            forced_by_max: false,
+        } => {
             println!(
                 "hex memory index: {pending} pending > {threshold}, running at normal priority"
             );
@@ -1184,6 +1226,7 @@ fn run_index_body(
         conn,
         file_tuples,
         existing,
+        mtimes,
     } = setup;
 
     let embedder = match super::embed::Embedder::new(hex_root) {
@@ -1227,7 +1270,13 @@ fn run_index_body(
             Ok(r) => r.to_string_lossy().to_string(),
             Err(_) => continue,
         };
-        let mtime = file_mtime(filepath);
+        // Reuse the pre-pass's mtime when the CLI path already computed it
+        // (rel_path_mtimes); run_index's non-CLI path has no precomputed map
+        // and falls back to a fresh file_mtime() call, unchanged from before.
+        let mtime = mtimes
+            .as_ref()
+            .and_then(|m| m.get(&rel_path).copied())
+            .unwrap_or_else(|| file_mtime(filepath));
 
         if !full {
             let prev = existing.get(&rel_path);
@@ -2405,7 +2454,8 @@ mod tests {
             escalation_decision(500, false, None),
             Escalation::Normal {
                 pending: 500,
-                threshold: 200
+                threshold: 200,
+                forced_by_max: false
             }
         );
     }
@@ -2426,7 +2476,8 @@ mod tests {
             escalation_decision(500, false, Some("abc")),
             Escalation::Normal {
                 pending: 500,
-                threshold: 200
+                threshold: 200,
+                forced_by_max: false
             },
             "garbage env value falls back to the default threshold (200), never panics"
         );
@@ -2443,7 +2494,8 @@ mod tests {
             escalation_decision(1, true, None),
             Escalation::Normal {
                 pending: 1,
-                threshold: 200
+                threshold: 200,
+                forced_by_max: true
             },
             "--max always escalates, regardless of pending count"
         );
@@ -2535,14 +2587,7 @@ mod tests {
             .collect()
         };
 
-        let file_mtimes: Vec<(String, f64)> = file_tuples
-            .iter()
-            .filter_map(|(p, _)| {
-                p.strip_prefix(hex_root)
-                    .ok()
-                    .map(|r| (r.to_string_lossy().to_string(), file_mtime(p)))
-            })
-            .collect();
+        let file_mtimes = rel_path_mtimes(&file_tuples, hex_root);
 
         assert_eq!(
             count_pending_files(&file_mtimes, &existing),
