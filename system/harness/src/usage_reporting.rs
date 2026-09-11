@@ -145,6 +145,22 @@ pub struct Contributor {
     pub credits: Estimate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContributorDimension {
+    Model,
+    Family,
+    Child,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContributorDetail {
+    pub dimension: ContributorDimension,
+    pub key: String,
+    pub total_matches: usize,
+    pub offset: usize,
+    pub response_ids: Vec<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct UsageReport {
     pub start: DateTime<Utc>,
@@ -174,13 +190,34 @@ pub fn report(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> UsageReport {
+    report_inner(rows, coverage, start, end, true)
+}
+
+/// Produces the default bounded summary. Contributor IDs remain available via
+/// [`contributor_detail`], so the summary never serializes an unbounded ID list.
+pub fn report_summary(
+    rows: &[UsageRow],
+    coverage: Coverage,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> UsageReport {
+    report_inner(rows, coverage, start, end, false)
+}
+
+fn report_inner(
+    rows: &[UsageRow],
+    coverage: Coverage,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    include_ids: bool,
+) -> UsageReport {
     let previous_start = start - (end - start);
     let mut current = Accumulator::default();
     let mut previous = Accumulator::default();
     for row in rows {
         match parse_time(row) {
-            Some(time) if time >= start && time < end => current.add(row),
-            Some(time) if time >= previous_start && time < start => previous.add(row),
+            Some(time) if time >= start && time < end => current.add(row, include_ids),
+            Some(time) if time >= previous_start && time < start => previous.add(row, false),
             _ => {}
         }
     }
@@ -252,7 +289,7 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    fn add(&mut self, row: &UsageRow) {
+    fn add(&mut self, row: &UsageRow, include_ids: bool) {
         if !complete(row) {
             self.labels.insert("missing_or_invalid_usage".into());
             self.invalid_usage = true;
@@ -265,10 +302,10 @@ impl Accumulator {
             .root_task_family
             .clone()
             .unwrap_or_else(|| "unknown".into());
-        add_bucket(self.models.entry(model).or_default(), row);
-        add_bucket(self.families.entry(family).or_default(), row);
+        add_bucket(self.models.entry(model).or_default(), row, include_ids);
+        add_bucket(self.families.entry(family).or_default(), row, include_ids);
         if row.parent_response_id.is_some() {
-            add_bucket(&mut self.children, row);
+            add_bucket(&mut self.children, row, include_ids);
         }
         if row.model.is_none() {
             self.labels.insert("unknown_model".into());
@@ -309,12 +346,58 @@ impl Accumulator {
     }
 }
 
-fn add_bucket(bucket: &mut Bucket, row: &UsageRow) {
+fn add_bucket(bucket: &mut Bucket, row: &UsageRow, include_ids: bool) {
     bucket.measured.add(row);
-    bucket.rows.push(row.clone());
+    if include_ids {
+        bucket.rows.push(row.clone());
+    }
     if row.model.is_none() {
         bucket.labels.insert("unknown_model".into());
     }
+}
+
+/// Returns one stable, bounded page of IDs for a current-window contributor.
+/// The caller supplies an explicit dimension and key, so model and family names
+/// cannot be confused. Child detail uses the fixed `child_responses` key.
+pub fn contributor_detail(
+    rows: &[UsageRow],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    dimension: ContributorDimension,
+    key: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<ContributorDetail, &'static str> {
+    let key = match dimension {
+        ContributorDimension::Child => "child_responses",
+        ContributorDimension::Model | ContributorDimension::Family => {
+            key.ok_or("detail key is required")?
+        }
+    };
+    let mut ids = rows
+        .iter()
+        .filter(|row| {
+            matches!(parse_time(row), Some(time) if time >= start && time < end)
+                && complete(row)
+                && match dimension {
+                    ContributorDimension::Model => row.model.as_deref().unwrap_or("unknown") == key,
+                    ContributorDimension::Family => {
+                        row.root_task_family.as_deref().unwrap_or("unknown") == key
+                    }
+                    ContributorDimension::Child => row.parent_response_id.is_some(),
+                }
+        })
+        .map(|row| row.response_id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    let total_matches = ids.len();
+    Ok(ContributorDetail {
+        dimension,
+        key: key.into(),
+        total_matches,
+        offset,
+        response_ids: ids.into_iter().skip(offset).take(limit).collect(),
+    })
 }
 fn contributor(key: &str, bucket: &Bucket) -> Contributor {
     let mut ids: Vec<_> = bucket

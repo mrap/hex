@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use hex::usage_ledger::{Coverage, UsageRow};
-use hex::usage_reporting::{report, EstimateUnit, MicroUnits, AUDITED_RATE_VERSION};
+use hex::usage_reporting::{
+    contributor_detail, report, report_summary, ContributorDimension, EstimateUnit, MicroUnits,
+    AUDITED_RATE_VERSION,
+};
 
 fn t(s: &str) -> DateTime<Utc> {
     s.parse().unwrap()
@@ -136,6 +139,76 @@ fn report_answer_key_is_stable_and_does_not_double_count_children() {
     );
     assert_eq!(r.preceding_measured.total(), 11);
     assert_eq!(r.preceding_change_tokens, Some(219));
+}
+
+#[test]
+fn bounded_summary_keeps_stable_paged_contributor_detail() {
+    let rows = vec![
+        row(
+            "z",
+            "2026-09-10T01:00:00Z",
+            Some("gpt-5.6-terra"),
+            Some("alpha"),
+            None,
+            Some(10),
+            Some(0),
+            Some(1),
+        ),
+        row(
+            "a",
+            "2026-09-10T02:00:00Z",
+            Some("gpt-5.6-terra"),
+            Some("alpha"),
+            Some("z"),
+            Some(10),
+            Some(0),
+            Some(1),
+        ),
+        row(
+            "b",
+            "2026-09-10T03:00:00Z",
+            Some("gpt-5.6-terra"),
+            Some("beta"),
+            Some("z"),
+            Some(10),
+            Some(0),
+            Some(1),
+        ),
+    ];
+    let start = t("2026-09-10T00:00:00Z");
+    let end = t("2026-09-11T00:00:00Z");
+    let summary = report_summary(&rows, Coverage::default(), start, end);
+    assert!(summary
+        .by_family
+        .iter()
+        .all(|item| item.response_ids.is_empty()));
+    assert!(summary.child_coordination.response_ids.is_empty());
+    let first = contributor_detail(
+        &rows,
+        start,
+        end,
+        ContributorDimension::Family,
+        Some("alpha"),
+        0,
+        1,
+    )
+    .unwrap();
+    assert_eq!(first.total_matches, 2);
+    assert_eq!(first.response_ids, vec!["a"]);
+    let second = contributor_detail(
+        &rows,
+        start,
+        end,
+        ContributorDimension::Family,
+        Some("alpha"),
+        1,
+        1,
+    )
+    .unwrap();
+    assert_eq!(second.response_ids, vec!["z"]);
+    let children =
+        contributor_detail(&rows, start, end, ContributorDimension::Child, None, 0, 10).unwrap();
+    assert_eq!(children.response_ids, vec!["a", "b"]);
 }
 #[test]
 fn ties_sort_by_key_and_unknowns_are_visible() {

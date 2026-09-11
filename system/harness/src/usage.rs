@@ -46,6 +46,18 @@ pub enum UsageCommands {
         /// RFC3339 UTC cutoff. Omit to use the current time.
         #[arg(long)]
         cutoff: Option<String>,
+        /// Locally query contributor IDs by `model`, `family`, or `child`.
+        #[arg(long)]
+        detail_dimension: Option<String>,
+        /// Model or family key for a contributor detail query.
+        #[arg(long)]
+        detail_key: Option<String>,
+        /// Number of matching response IDs to skip in a detail query.
+        #[arg(long, default_value_t = 0)]
+        detail_offset: usize,
+        /// Maximum response IDs returned by a detail query.
+        #[arg(long, default_value_t = 100)]
+        detail_limit: usize,
     },
     /// Trailing-window burn rate; alert if above threshold
     Burn {
@@ -193,7 +205,19 @@ pub fn run(cmd: UsageCommands) -> i32 {
             ledger,
             output,
             cutoff,
-        } => report(ledger, output, cutoff),
+            detail_dimension,
+            detail_key,
+            detail_offset,
+            detail_limit,
+        } => report(
+            ledger,
+            output,
+            cutoff,
+            detail_dimension,
+            detail_key,
+            detail_offset,
+            detail_limit,
+        ),
         UsageCommands::Burn {
             threshold,
             window_mins,
@@ -411,7 +435,15 @@ fn collect(
     }
 }
 
-fn report(ledger: Option<PathBuf>, output: Option<PathBuf>, cutoff: Option<String>) -> i32 {
+fn report(
+    ledger: Option<PathBuf>,
+    output: Option<PathBuf>,
+    cutoff: Option<String>,
+    detail_dimension: Option<String>,
+    detail_key: Option<String>,
+    detail_offset: usize,
+    detail_limit: usize,
+) -> i32 {
     let ledger = ledger.unwrap_or_else(default_ledger);
     let output = output.unwrap_or_else(default_report);
     const ROW_CAP: usize = 100_000;
@@ -435,10 +467,43 @@ fn report(ledger: Option<PathBuf>, output: Option<PathBuf>, cutoff: Option<Strin
         None => Utc::now(),
     };
     let start = DateTime::from_timestamp(0, 0).expect("unix epoch");
-    let report = usage_reporting::report(&rows, coverage, start, end);
+    if detail_limit > 1_000 {
+        eprintln!("usage report: detail limit must not exceed 1000");
+        return 1;
+    }
+    let detail_dimension = match detail_dimension.as_deref() {
+        None => None,
+        Some("model") => Some(usage_reporting::ContributorDimension::Model),
+        Some("family") => Some(usage_reporting::ContributorDimension::Family),
+        Some("child") => Some(usage_reporting::ContributorDimension::Child),
+        Some(_) => {
+            eprintln!("usage report: detail dimension must be model, family, or child");
+            return 1;
+        }
+    };
+    let detail = match detail_dimension {
+        Some(dimension) => match usage_reporting::contributor_detail(
+            &rows,
+            start,
+            end,
+            dimension,
+            detail_key.as_deref(),
+            detail_offset,
+            detail_limit,
+        ) {
+            Ok(detail) => Some(detail),
+            Err(message) => {
+                eprintln!("usage report: {message}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let report = usage_reporting::report_summary(&rows, coverage, start, end);
     let truncated = rows.len() == ROW_CAP;
-    let contributor = |item: &hex::usage_reporting::Contributor| json!({"key":item.key,"tokens":item.measured.total().to_string(),"credits_micro":item.credits.value.0.to_string(),"response_ids":item.response_ids});
-    let body=json!({"schema":"hex.usage-report.v1","cutoff":end.to_rfc3339(),"measured":{"responses":report.measured.responses,"input_tokens":report.measured.input.to_string(),"cached_input_tokens":report.measured.cached_input.to_string(),"output_tokens":report.measured.output.to_string()},"modeled_credits":{"unit":"credit_equivalent","rate_version":report.modeled_credits.rate_version,"rate_source":report.modeled_credits.rate_source,"total_micro":report.modeled_credits.value.0.to_string(),"fresh_micro":report.modeled_credit_components.fresh.0.to_string(),"cached_micro":report.modeled_credit_components.cached.0.to_string(),"output_micro":report.modeled_credit_components.output.0.to_string(),"incomplete":report.modeled_credits.incomplete,"labels":report.modeled_credits.labels},"actual_billed_debited":"unavailable","preceding_change_tokens":report.preceding_change_tokens.map(|x|x.to_string()),"coverage":{"accepted":report.coverage.accepted,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"pending_sources":report.coverage.pending_sources,"row_cap":ROW_CAP,"rows_truncated":truncated},"incomplete":report.incomplete_labels,"by_model":report.by_model.iter().map(contributor).collect::<Vec<_>>(),"by_family":report.by_family.iter().map(contributor).collect::<Vec<_>>(),"child_coordination":{"share_millionths":report.child_coordination_share_millionths,"response_ids":report.child_coordination.response_ids}}).to_string()+"\n";
+    let contributor = |item: &hex::usage_reporting::Contributor| json!({"key":item.key,"tokens":item.measured.total().to_string(),"credits_micro":item.credits.value.0.to_string()});
+    let detail = detail.map(|item| json!({"dimension":match item.dimension { usage_reporting::ContributorDimension::Model => "model", usage_reporting::ContributorDimension::Family => "family", usage_reporting::ContributorDimension::Child => "child" },"key":item.key,"total_matches":item.total_matches,"offset":item.offset,"response_ids":item.response_ids}));
+    let body=json!({"schema":"hex.usage-report.v1","cutoff":end.to_rfc3339(),"measured":{"responses":report.measured.responses,"input_tokens":report.measured.input.to_string(),"cached_input_tokens":report.measured.cached_input.to_string(),"output_tokens":report.measured.output.to_string()},"modeled_credits":{"unit":"credit_equivalent","rate_version":report.modeled_credits.rate_version,"rate_source":report.modeled_credits.rate_source,"total_micro":report.modeled_credits.value.0.to_string(),"fresh_micro":report.modeled_credit_components.fresh.0.to_string(),"cached_micro":report.modeled_credit_components.cached.0.to_string(),"output_micro":report.modeled_credit_components.output.0.to_string(),"incomplete":report.modeled_credits.incomplete,"labels":report.modeled_credits.labels},"actual_billed_debited":"unavailable","preceding_change_tokens":report.preceding_change_tokens.map(|x|x.to_string()),"coverage":{"accepted":report.coverage.accepted,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"pending_sources":report.coverage.pending_sources,"row_cap":ROW_CAP,"rows_truncated":truncated},"incomplete":report.incomplete_labels,"by_model":report.by_model.iter().map(contributor).collect::<Vec<_>>(),"by_family":report.by_family.iter().map(contributor).collect::<Vec<_>>(),"child_coordination":{"share_millionths":report.child_coordination_share_millionths},"contributor_detail":detail}).to_string()+"\n";
     if let Some(parent) = output.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!("usage report: cannot create output directory: {e}");
