@@ -104,7 +104,8 @@ fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
         .unwrap();
     assert!(status.success());
     let text = fs::read_to_string(&output).unwrap();
-    assert!(text.contains("\"r1\""));
+    assert!(!text.contains("\"r1\""));
+    assert!(text.contains("\"credits_micro\":\"81\""));
     assert!(text.contains("\"accepted\":1"));
     assert!(text.contains("\"by_model\""));
     assert!(text.contains("\"by_family\""));
@@ -126,6 +127,26 @@ fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
         .unwrap();
     assert!(status.success());
     assert_eq!(fs::read_to_string(&output).unwrap(), first);
+    let status = Command::new(bin())
+        .env("HEX_DIR", root.path())
+        .args([
+            "usage",
+            "report",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--cutoff",
+            "2026-09-11T00:00:00Z",
+            "--detail-dimension",
+            "model",
+            "--detail-key",
+            "gpt-5.6-luna",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(fs::read_to_string(&output).unwrap().contains("\"r1\""));
     let paths = hex::workers::hex_modules::module_paths();
     assert!(paths
         .iter()

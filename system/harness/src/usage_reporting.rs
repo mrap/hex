@@ -274,6 +274,7 @@ fn report_inner(
 struct Bucket {
     measured: MeasuredTokens,
     rows: Vec<UsageRow>,
+    response_ids: Vec<String>,
     labels: BTreeSet<String>,
 }
 
@@ -348,8 +349,11 @@ impl Accumulator {
 
 fn add_bucket(bucket: &mut Bucket, row: &UsageRow, include_ids: bool) {
     bucket.measured.add(row);
+    // Credit estimates require the complete row regardless of whether the
+    // summary exposes IDs. ID retention is the bounded-summary concern.
+    bucket.rows.push(row.clone());
     if include_ids {
-        bucket.rows.push(row.clone());
+        bucket.response_ids.push(row.response_id.clone());
     }
     if row.model.is_none() {
         bucket.labels.insert("unknown_model".into());
@@ -400,11 +404,7 @@ pub fn contributor_detail(
     })
 }
 fn contributor(key: &str, bucket: &Bucket) -> Contributor {
-    let mut ids: Vec<_> = bucket
-        .rows
-        .iter()
-        .map(|row| row.response_id.clone())
-        .collect();
+    let mut ids = bucket.response_ids.clone();
     ids.sort();
     Contributor {
         key: key.into(),

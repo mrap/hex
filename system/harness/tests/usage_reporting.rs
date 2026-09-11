@@ -182,7 +182,10 @@ fn bounded_summary_keeps_stable_paged_contributor_detail() {
         .by_family
         .iter()
         .all(|item| item.response_ids.is_empty()));
+    assert_eq!(summary.by_family[0].credits.value, MicroUnits(1_600));
+    assert_eq!(summary.by_family[1].credits.value, MicroUnits(800));
     assert!(summary.child_coordination.response_ids.is_empty());
+    assert_eq!(summary.child_coordination.credits.value, MicroUnits(1_600));
     let first = contributor_detail(
         &rows,
         start,
