@@ -34,8 +34,24 @@ struct SourceDirs {
     /// deployed copies hold runtime state (`.hex/iii/data`, worker `node_modules`).
     iii: PathBuf,
     templates: PathBuf,
+    /// A source file with a fixed managed destination. It participates in the
+    /// same inventory as directory trees; it is not a build-only side copy.
     managed_cargo_bridge: PathBuf,
     version_txt: Option<PathBuf>,
+}
+
+struct ManagedFile<'a> {
+    source: &'a Path,
+    destination: PathBuf,
+    label: &'a str,
+}
+
+fn managed_files<'a>(sources: &'a SourceDirs, hex_dir: &Path) -> Vec<ManagedFile<'a>> {
+    vec![ManagedFile {
+        source: &sources.managed_cargo_bridge,
+        destination: hex_dir.join(".hex/managed_cargo_bridge.rs"),
+        label: "managed_cargo_bridge.rs",
+    }]
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -277,6 +293,73 @@ fn detect_managed_changes(
         log.extend(stale_log);
     }
     Ok((changed, new_count, unchanged, log))
+}
+
+fn detect_managed_file(file: &ManagedFile<'_>) -> io::Result<(usize, usize, usize, Vec<String>)> {
+    if !file.source.exists() {
+        return Ok((0, 0, 0, vec![]));
+    }
+    if !file.destination.exists() {
+        return Ok((0, 1, 0, vec![format!("  + {}", file.label)]));
+    }
+    if files_differ(file.source, &file.destination) {
+        return Ok((1, 0, 0, vec![format!("  ~ {}", file.label)]));
+    }
+    Ok((0, 0, 1, vec![]))
+}
+
+fn apply_managed_file_protected(
+    file: &ManagedFile<'_>,
+    backup_dir: Option<&Path>,
+    protection: Option<(&Path, &UpgradeGitSnapshot)>,
+    mut owned: Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>,
+) -> io::Result<usize> {
+    if !file.source.exists() {
+        return Ok(0);
+    }
+    if let Some((workspace, snapshot)) = protection {
+        protect_sync_path(
+            workspace,
+            &file.destination,
+            Some(file.source),
+            snapshot,
+            owned.as_deref(),
+        )?;
+    }
+    if file.destination.exists() && files_differ(file.source, &file.destination) {
+        if let Some(backup_dir) = backup_dir {
+            let relative = file.destination.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed destination has no filename",
+                )
+            })?;
+            let backup = backup_path(
+                backup_dir,
+                file.destination.parent().unwrap(),
+                Path::new(relative),
+                protection.map(|(root, _)| root),
+            );
+            if let Some(parent) = backup.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if !owned
+                .as_deref()
+                .is_some_and(|paths| paths.contains_key(&file.destination))
+            {
+                fs::copy(&file.destination, backup)?;
+            }
+        }
+    }
+    if !file.destination.exists() || files_differ(file.source, &file.destination) {
+        let bytes = fs::read(file.source)?;
+        copy_file_with_perms(file.source, &file.destination, &bytes)?;
+        if let Some(paths) = owned.as_deref_mut() {
+            paths.insert(file.destination.clone(), Some(bytes));
+        }
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 /// Sync src_dir into dst_dir. Backs up overwritten files into backup_dir if provided.
@@ -951,35 +1034,32 @@ fn sync_versions_file_protected(
     let mut new_content = lines.join("\n");
     new_content.push('\n');
 
-    let tmp = versions_file.with_extension("tmp");
-    if let Some((workspace, snapshot)) = protection {
-        protect_generated_path(
-            workspace,
-            &versions_file,
-            new_content.as_bytes(),
-            snapshot,
-            owned.as_deref(),
-        )
-        .map_err(|e| {
-            eprintln!("  [FAIL] VERSIONS operator edit conflict: {e}");
+    // Do not mutate a managed destination until the candidate binary builds.
+    // The source tree below includes every build input, including the bridge
+    // module, so a failed build leaves the instance source and VERSIONS intact.
+    let install_versions = |owned: &mut Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>| -> Result<(), BinaryStepFailure> {
+        let tmp = versions_file.with_extension("tmp");
+        if let Some((workspace, snapshot)) = protection {
+            protect_generated_path(workspace, &versions_file, new_content.as_bytes(), snapshot, owned.as_deref())
+                .map_err(|e| {
+                    eprintln!("  [FAIL] VERSIONS operator edit conflict: {e}");
+                    BinaryStepFailure::Build
+                })?;
+        }
+        fs::write(&tmp, &new_content).map_err(|e| {
+            eprintln!("  [FAIL] Could not write {}: {e}", tmp.display());
             BinaryStepFailure::Build
         })?;
-    }
-    fs::write(&tmp, &new_content).map_err(|e| {
-        eprintln!("  [FAIL] Could not write {}: {e}", tmp.display());
-        BinaryStepFailure::Build
-    })?;
-    fs::rename(&tmp, &versions_file).map_err(|e| {
-        eprintln!(
-            "  [FAIL] Could not install {}: {e}",
-            versions_file.display()
-        );
-        BinaryStepFailure::Build
-    })?;
-    if let Some(paths) = owned.as_mut() {
-        paths.insert(versions_file.clone(), Some(new_content.into_bytes()));
-    }
-    println!("  [OK] VERSIONS → HEX_FOUNDATION_VERSION=v{cargo_ver}");
+        fs::rename(&tmp, &versions_file).map_err(|e| {
+            eprintln!("  [FAIL] Could not install {}: {e}", versions_file.display());
+            BinaryStepFailure::Build
+        })?;
+        if let Some(paths) = owned.as_deref_mut() {
+            paths.insert(versions_file.clone(), Some(new_content.clone().into_bytes()));
+        }
+        println!("  [OK] VERSIONS → HEX_FOUNDATION_VERSION=v{cargo_ver}");
+        Ok(())
+    };
 
     // Rebuild hex binary if version or commit SHA changed
     let hex_dot_dir = hex_dir.join(".hex");
@@ -1018,7 +1098,7 @@ fn sync_versions_file_protected(
         installed_sha.as_deref(),
         source_sha.as_deref(),
     ) {
-        let harness_dst = hex_dot_dir.join("harness");
+        let harness_dst = source_dir.join("system/harness");
         let reason = if version_mismatch {
             format!(
                 "version mismatch ({} → {cargo_ver})",
@@ -1032,71 +1112,9 @@ fn sync_versions_file_protected(
             )
         };
         println!("  → hex binary {reason} — rebuilding...");
-        let harness_src = source_dir.join("system/harness");
-        if let Err(e) = apply_sync_protected(
-            &harness_src,
-            &harness_dst,
-            Some(backup_dir),
-            protection,
-            owned.as_deref_mut(),
-        ) {
-            eprintln!("  [FAIL] Failed to sync harness source: {e}");
-            return Err(BinaryStepFailure::Build);
-        }
-        // Deletion pass scoped to src/ and tests/ only — never touches target/ or Cargo.lock.
-        for sub in &["src", "tests"] {
-            let dst_sub = harness_dst.join(sub);
-            let src_sub = harness_src.join(sub);
-            if dst_sub.exists() && src_sub.exists() {
-                if let Err(e) = deletion_pass_protected(
-                    &dst_sub,
-                    &src_sub,
-                    backup_dir,
-                    protection,
-                    owned.as_deref_mut(),
-                ) {
-                    eprintln!("  [FAIL] Harness deletion pass on {sub}/ failed: {e}");
-                    return Err(BinaryStepFailure::Build);
-                }
-            }
-        }
-
-        // The harness depends on scipd via `scipd = { path = "../code-intel" }`
-        // (system/code-intel, workspace sibling). Sync it to .hex/code-intel —
-        // sibling of .hex/harness — BEFORE the cargo build, or the path dep
-        // cannot resolve and the rebuild fails. Same mechanism as the harness
-        // sync above: full-dir apply_sync + deletion pass scoped to src/ and
-        // tests/ only (never target/ or generated Cargo.lock).
-        let codeintel_src = source_dir.join("system/code-intel");
-        let codeintel_dst = hex_dot_dir.join("code-intel");
-        if codeintel_src.exists() {
-            if let Err(e) = apply_sync_protected(
-                &codeintel_src,
-                &codeintel_dst,
-                Some(backup_dir),
-                protection,
-                owned.as_deref_mut(),
-            ) {
-                eprintln!("  [FAIL] Failed to sync code-intel source: {e}");
-                return Err(BinaryStepFailure::Build);
-            }
-            for sub in &["src", "tests"] {
-                let dst_sub = codeintel_dst.join(sub);
-                let src_sub = codeintel_src.join(sub);
-                if dst_sub.exists() && src_sub.exists() {
-                    if let Err(e) = deletion_pass_protected(
-                        &dst_sub,
-                        &src_sub,
-                        backup_dir,
-                        protection,
-                        owned.as_deref_mut(),
-                    ) {
-                        eprintln!("  [FAIL] code-intel deletion pass on {sub}/ failed: {e}");
-                        return Err(BinaryStepFailure::Build);
-                    }
-                }
-            }
-        }
+        // Build directly from the selected source checkout. Its sibling
+        // code-intel crate and bridge module are therefore staged together
+        // without writing into the live instance before cargo succeeds.
 
         // Detect a personal overlay and build with --features personal (and set
         // HEX_DIR so build.rs can find it). Keyed on overlay PRESENCE — a
@@ -1105,9 +1123,9 @@ fn sync_versions_file_protected(
         // added/removed/re-homed (e.g. release.rs leaving the binary).
         let use_personal = detect_personal_overlay(&hex_dot_dir);
         let mut build_args = vec!["build", "--release"];
-        // --target-dir is always set to harness_dst/target so the output location is
-        // deterministic regardless of workspace nesting (fixes OBS-017).
-        let target_dir = harness_dst.join("target");
+        // Build output is private staging, so a failed build cannot mutate the
+        // installed harness source tree.
+        let target_dir = backup_dir.join("harness-build-target");
         let target_dir_str = target_dir.to_string_lossy().into_owned();
         build_args.extend_from_slice(&["--target-dir", &target_dir_str]);
         if use_personal {
@@ -1122,7 +1140,7 @@ fn sync_versions_file_protected(
         match build_status {
             Ok(s) if s.success() => {
                 // --target-dir guarantees the binary is always here.
-                let release_bin = harness_dst.join("target/release/hex");
+                let release_bin = target_dir.join("release/hex");
                 // Re-check after compilation. A newly configured or previously
                 // signed app must not fall through to legacy raw installation.
                 let final_mode =
@@ -1174,7 +1192,7 @@ fn sync_versions_file_protected(
                                 eprintln!("  [FAIL] Could not install installed SHA: {e}");
                                 BinaryStepFailure::Build
                             })?;
-                            if let Some(paths) = owned {
+                            if let Some(paths) = owned.as_deref_mut() {
                                 paths.insert(
                                     installed_sha_file.clone(),
                                     Some(sha.as_bytes().to_vec()),
@@ -1213,7 +1231,7 @@ fn sync_versions_file_protected(
                         if let Err(e) = restart_result {
                             return Err(BinaryStepFailure::RestartFailed(e));
                         }
-                        Ok(())
+                        install_versions(&mut owned)
                     }
                     Err(e) => {
                         eprintln!("  [FAIL] atomic binary install failed: {e}");
@@ -1247,7 +1265,7 @@ fn sync_versions_file_protected(
         } else {
             println!("  [OK] hex binary already at v{cargo_ver} (SHA matches) — no rebuild needed");
         }
-        Ok(())
+        install_versions(&mut owned)
     }
 }
 
@@ -1730,6 +1748,11 @@ fn planned_upgrade_paths(
             }
         }
     }
+    for file in managed_files(sources, workspace) {
+        if file.source.exists() {
+            paths.insert(file.destination);
+        }
+    }
     paths.extend([
         hex.join("version.txt"),
         hex.join("bin/hex.sha"),
@@ -2050,10 +2073,26 @@ pub fn run(args: &[String]) -> i32 {
         "command mirror",
         true
     );
+    let bridge_files = managed_files(&src_dirs, &hex_dir);
+    let (c8, n8, u8, log8) = match bridge_files.iter().map(detect_managed_file).try_fold(
+        (0, 0, 0, Vec::new()),
+        |(c, n, u, mut log), result| {
+            result.map(|(next_c, next_n, next_u, next_log)| {
+                log.extend(next_log);
+                (c + next_c, n + next_n, u + next_u, log)
+            })
+        },
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("  [FAIL] Could not inspect managed cargo bridge during preflight: {e}");
+            return 1;
+        }
+    };
 
-    let total_changed = c1 + c2 + c3 + c4 + c5 + c6 + c7;
-    let total_new = n1 + n2 + n3 + n4 + n5 + n6 + n7;
-    let total_unchanged = u1 + u2 + u3 + u4 + u5 + u6 + u7;
+    let total_changed = c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8;
+    let total_new = n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8;
+    let total_unchanged = u1 + u2 + u3 + u4 + u5 + u6 + u7 + u8;
 
     println!("  → {total_changed} changed, {total_new} new, {total_unchanged} unchanged");
     for line in log1
@@ -2064,6 +2103,7 @@ pub fn run(args: &[String]) -> i32 {
         .chain(&log5)
         .chain(&log6)
         .chain(&log7)
+        .chain(&log8)
     {
         println!("{line}");
     }
@@ -2305,16 +2345,19 @@ pub fn run(args: &[String]) -> i32 {
         failures.push(message);
     }
 
-    // The harness imports this sibling module by path. It must be staged before
-    // rebuilding, or a source upgrade can leave managed files updated but the
-    // binary stale.
-    if src_dirs.managed_cargo_bridge.exists() {
-        let dst = hex_dot_dir.join("managed_cargo_bridge.rs");
-        match fs::read(&src_dirs.managed_cargo_bridge)
-            .and_then(|bytes| copy_file_with_perms(&src_dirs.managed_cargo_bridge, &dst, &bytes))
-        {
-            Ok(()) => { owned_paths.entry(dst.clone()).or_insert(None); applied += 1; }
-            Err(e) => { let message = format!("sync failed for managed cargo bridge: {e}"); eprintln!("  [FAIL] {message}"); failures.push(message); }
+    for file in managed_files(&src_dirs, &hex_dir) {
+        match apply_managed_file_protected(
+            &file,
+            Some(&backup_dir),
+            protection,
+            Some(&mut owned_paths),
+        ) {
+            Ok(n) => applied += n,
+            Err(e) => {
+                let message = format!("sync failed for {}: {e}", file.label);
+                eprintln!("  [FAIL] {message}");
+                failures.push(message);
+            }
         }
     }
 
@@ -3649,12 +3692,8 @@ mod tests {
     }
 
     /// The deploy-black-hole path itself (OBS-017): a rebuild is NEEDED
-    /// (version mismatch) but the rebuild machinery fails — here the harness
-    /// source sync fails deterministically because `.hex/harness` exists as a
-    /// FILE. sync_versions_file must return false so run() fails the upgrade
-    /// instead of printing "Upgrade complete." over a stale binary. This
-    /// enters the `binary_needs_rebuild == true` block without invoking
-    /// cargo.
+    /// (version mismatch) but the staged source build fails. The instance
+    /// must remain untouched until that candidate build succeeds.
     #[cfg(unix)]
     #[test]
     fn sync_versions_file_fails_when_rebuild_path_breaks() {
@@ -3677,12 +3716,28 @@ mod tests {
         let mock_bin = bin_dir.join("hex");
         fs::write(&mock_bin, "#!/bin/sh\necho hex 1.0.0\n").unwrap();
         fs::set_permissions(&mock_bin, fs::Permissions::from_mode(0o755)).unwrap();
-        // Sabotage: .hex/harness is a FILE, so the harness source sync fails.
-        fs::write(hex_dir.join(".hex/harness"), "not a directory").unwrap();
+        write_file(
+            &source_dir.join("system/managed_cargo_bridge.rs"),
+            "new bridge source",
+        );
+        write_file(
+            &hex_dir.join(".hex/managed_cargo_bridge.rs"),
+            "installed bridge remains unchanged",
+        );
 
         assert!(
             sync_versions_file(&hex_dir, &source_dir, &backup_dir).is_err(),
             "a broken rebuild path must fail the binary step (deploy black hole)"
+        );
+        assert_eq!(
+            fs::read(hex_dir.join("VERSIONS")).unwrap(),
+            b"HEX_FOUNDATION_VERSION=v0.1.0\n",
+            "a failed staged build must not update managed metadata"
+        );
+        assert_eq!(
+            fs::read(hex_dir.join(".hex/managed_cargo_bridge.rs")).unwrap(),
+            b"installed bridge remains unchanged",
+            "a failed staged build must not update managed bridge source"
         );
     }
 
@@ -4354,6 +4409,7 @@ CUSTOM_INSTANCE_PIN=abc123
             "iii/config.toml",
             "templates/example",
             "commands/do.md",
+            "managed_cargo_bridge.rs",
         ] {
             write_file(&source.join("system").join(file), "source");
         }
@@ -4372,6 +4428,7 @@ CUSTOM_INSTANCE_PIN=abc123
             "memory.db",
             "credentials.env",
             "commands/old.md",
+            "managed_cargo_bridge.rs",
         ] {
             write_file(&ws.join(".hex").join(file), "existing");
         }
@@ -4385,6 +4442,7 @@ CUSTOM_INSTANCE_PIN=abc123
             "code-intel/Cargo.toml",
             "scripts/run.sh",
             "commands/old.md",
+            "managed_cargo_bridge.rs",
         ] {
             assert!(plan.contains(&ws.join(".hex").join(file)), "missing {file}");
         }
@@ -4411,6 +4469,9 @@ CUSTOM_INSTANCE_PIN=abc123
         assert!(snapshot
             .baseline_content
             .contains_key(Path::new(".hex/harness/Cargo.toml")));
+        assert!(snapshot
+            .baseline_content
+            .contains_key(Path::new(".hex/managed_cargo_bridge.rs")));
         // The real writer accepts both root files and new files from this exact inventory.
         let mut owned = HashMap::new();
         apply_sync_protected(
