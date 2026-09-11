@@ -360,6 +360,7 @@ fn collect(
     ledger: Option<PathBuf>,
     max_records: usize,
 ) -> i32 {
+    let discovered_sources = source.is_none();
     let (sources, mut issues) = match source {
         Some(path) => (vec![path], Vec::new()),
         None => {
@@ -392,7 +393,14 @@ fn collect(
                     break;
                 }
                 if !path.is_file() {
-                    issues.push(format!("unreadable={}", path.display()));
+                    if discovered_sources {
+                        // A session can disappear after discovery but before this
+                        // bounded import. Treat that as the same stale-pointer
+                        // warning rather than poisoning the worker health state.
+                        eprintln!("usage collect: skipped vanished source={}", path.display());
+                    } else {
+                        issues.push(format!("unreadable={}", path.display()));
+                    }
                     continue;
                 }
                 match l.import_jsonl(
