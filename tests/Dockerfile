@@ -21,7 +21,7 @@ FROM rust:1-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends git python3 python3-pip && \
     rm -rf /var/lib/apt/lists/* && \
-    pip install --no-cache-dir pytest
+    pip install --no-cache-dir --break-system-packages pytest
 
 # Git needs a user for commits (not used, but prevents warnings)
 RUN git config --global user.email "test@test.com" && \
