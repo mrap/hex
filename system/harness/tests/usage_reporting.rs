@@ -126,6 +126,10 @@ fn report_answer_key_is_stable_and_does_not_double_count_children() {
     assert_eq!(r.by_model[0].key, "gpt-6-astra");
     assert_eq!(r.child_coordination.measured.total(), 120);
     assert_eq!(r.child_coordination_share_millionths, Some(521_739));
+    // One seeded report exposes the answer key without mixing cache-write or
+    // reasoning dimensions into the standard input/output credit estimate.
+    assert_eq!(r.modeled_credit_components.fresh, MicroUnits(29_000));
+    assert_eq!(r.modeled_credit_components.cached, MicroUnits(100));
     assert_eq!(
         r.child_coordination.response_ids,
         vec!["child-a", "child-b"]
