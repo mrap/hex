@@ -10,3 +10,9 @@ Accepted, not applied:
 - #7 P1 `system/scripts/macos-app-install.py:1296`: reviewer proposes running the self-check against the staged candidate before the atomic swap. Pushed back: the 2026-09-10 outage was a broken published symlink, which a pre-swap check cannot see. The post-publish check plus rollback stays (KTD1). A pre-swap smoke test could be added in addition.
 - #8 P2 `system/harness/src/main.rs:3151`: `hex resources status` does not show the new top-3 reclaimable-directory hint that the alert path shows. Follow-up: share `floor_message` with `format_breach`.
 - Advisory: `signature_head` digit collapse can merge unrelated errors into one storm; escalation ignores battery state; `du -I CloudStorage` masks any directory of that name.
+
+## Round 2 (2026-09-12, run `20260912-0950-modules`, correctness + adversarial on Sonnet)
+
+- Pushed back: "WATCH_LIST trend filter does not exclude ~/worktrees." `~/worktrees` is a watch-list entry; its 108 GB growth in 72 h is real (release-campaign worktrees with 4 GB target dirs each), so the alert is a true positive.
+- FYI (anchor 50): run the self-check against the staged candidate before the symlink swap. Declined for the same reason as round 1: the 2026-09-10 failure was the published symlink itself.
+- Residual: `module verify` compares file names, not content; an edited worker with the same name still passes. Follow-up: hash the worker sources into the registry.
