@@ -1,6 +1,6 @@
 # Residual review findings: fix/outage-followups-20260911
 
-Source: ce-code-review run `20260911-175930-e15a1b2f` (5 reviewers: correctness, project-standards, testing, reliability, adversarial; all on Sonnet; no cross-model peer). Plan: `docs/plans/2026-09-11-1612-fix-harness-outage-followups-plan.md` (mrap-hex instance repo).
+Source: ce-code-review run `20260911-175930-e15a1b2f` (5 reviewers: correctness, project-standards, testing, reliability, adversarial; all on Sonnet; no cross-model peer). Plan: `docs/plans/2026-09-11-1612-fix-harness-outage-followups-plan.md` (instance repo).
 
 Applied in commit `fix(review): ...` on this branch: storm window filter (#2), storm alert key hash suffix (#3), installer journal cleared after a clean rollback (#6), self-check exec-failure tests (#5), fresh du sizes in floor alert (#11), fresh mtime in index loop (#10).
 

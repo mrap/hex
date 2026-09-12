@@ -178,7 +178,7 @@ class MacAppInstallTests(unittest.TestCase):
         self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
         self.assertEqual(os.readlink(paths.cli), old_cli_target)
 
-    def test_self_check_happy_path_reports_not_failed(self):
+    def test_self_check_success_reports_not_failed(self):
         result = self.install()
         self.assertFalse(result["self_check_failed"])
         paths = INSTALL.product_paths("boi", self.root)
