@@ -40,6 +40,14 @@ pub fn expand_home(p: &str) -> String {
     }
 }
 
+/// `WATCH_LIST`, expanded to the absolute-path form that both `sample_tick`
+/// (when it builds `dirs` for a du pass) and `evaluate_rules`'s trend loop
+/// (R3/KTD3, to filter out non-watched keys) need to agree on. One helper so
+/// the two sides can never drift apart.
+fn watch_list_expanded() -> Vec<String> {
+    WATCH_LIST.iter().map(|d| expand_home(d)).collect()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DfSample {
     pub free_gb: i64,
@@ -241,7 +249,17 @@ pub fn evaluate_rules(
             |s: &str| -> BTreeMap<String, i64> { serde_json::from_str(s).unwrap_or_default() };
         let oldest = parse(&details[0]);
         let newest = parse(details.last().unwrap());
+        // R3/KTD3: a key not in WATCH_LIST (e.g. a stale on-pressure
+        // discovery sample recorded before the discovery event rename) never
+        // produces a trend breach, however much it grew. Exact-key match
+        // against the same expanded form sample_tick writes — not a prefix
+        // check, so a watched dir's parent (e.g. `~/Library` next to the
+        // watched `~/Library/pnpm`) stays excluded too.
+        let watched = watch_list_expanded();
         for (dir, new_gb) in &newest {
+            if !watched.contains(dir) {
+                continue;
+            }
             if let Some(old_gb) = oldest.get(dir) {
                 let growth = new_gb - old_gb;
                 if growth > TREND_GROWTH_GB {
@@ -310,7 +328,7 @@ pub fn sample_tick(now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Breach>, St
         }
     };
     if du_due {
-        let dirs: Vec<String> = WATCH_LIST.iter().map(|d| expand_home(d)).collect();
+        let dirs: Vec<String> = watch_list_expanded();
         let fresh_du_sizes = du_sizes(&dirs);
         record_du(&fresh_du_sizes);
         // Union fresh over stale: this tick's own du pass wins per-dir, but a
@@ -446,15 +464,19 @@ mod rule_tests {
     fn trend_breach_from_history() {
         let (_t, _g) = crate::telemetry::test_support::isolate();
         let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        // R3/KTD3: the trend loop now only reports breaches for keys in
+        // WATCH_LIST, so the seeded dir must be one — use its expanded form,
+        // the same one sample_tick writes.
+        let watched = expand_home("~/hex/target");
         seed_row(
             "sample::du",
             now - Duration::hours(70),
-            r#"{"/x/target":5}"#,
+            &format!(r#"{{"{watched}":5}}"#),
         );
         seed_row(
             "sample::du",
             now - Duration::hours(1),
-            r#"{"/x/target":40}"#,
+            &format!(r#"{{"{watched}":40}}"#),
         );
         let breaches = evaluate_rules(
             &DfSample {
@@ -466,7 +488,7 @@ mod rule_tests {
         .unwrap();
         match breaches.iter().find(|b| matches!(b, Breach::Trend { .. })) {
             Some(Breach::Trend { dir, growth_gb, .. }) => {
-                assert_eq!(dir, "/x/target");
+                assert_eq!(dir, &watched);
                 assert_eq!(*growth_gb, 35);
             }
             _ => panic!("expected trend breach: {breaches:?}"),
@@ -477,12 +499,51 @@ mod rule_tests {
     fn no_breach_when_healthy() {
         let (_t, _g) = crate::telemetry::test_support::isolate();
         let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        // Watched key, small growth — no breach because growth stays under
+        // TREND_GROWTH_GB (not because the key gets filtered out).
+        let watched = expand_home("~/hex/target");
         seed_row(
             "sample::du",
             now - Duration::hours(70),
-            r#"{"/x/target":5}"#,
+            &format!(r#"{{"{watched}":5}}"#),
         );
-        seed_row("sample::du", now - Duration::hours(1), r#"{"/x/target":6}"#);
+        seed_row(
+            "sample::du",
+            now - Duration::hours(1),
+            &format!(r#"{{"{watched}":6}}"#),
+        );
+        let breaches = evaluate_rules(
+            &DfSample {
+                free_gb: 999,
+                used_gb: 1,
+            },
+            now,
+        )
+        .unwrap();
+        assert!(breaches.is_empty(), "{breaches:?}");
+    }
+
+    /// R3/KTD3: a `sample::du` row for a directory that isn't in `WATCH_LIST`
+    /// (e.g. an old on-pressure discovery sample recorded before the
+    /// discovery event rename) must never produce a trend breach, no matter
+    /// how much it grew. `<home>/Library` is deliberately the *parent* of the
+    /// watched `~/Library/pnpm` entry — proves the check is exact-key
+    /// membership, not a prefix match.
+    #[test]
+    fn trend_ignores_non_watch_list_dir() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        let non_watched = expand_home("~/Library");
+        seed_row(
+            "sample::du",
+            now - Duration::hours(70),
+            &format!(r#"{{"{non_watched}":5}}"#),
+        );
+        seed_row(
+            "sample::du",
+            now - Duration::hours(1),
+            &format!(r#"{{"{non_watched}":505}}"#),
+        );
         let breaches = evaluate_rules(
             &DfSample {
                 free_gb: 999,
