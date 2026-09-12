@@ -103,6 +103,16 @@ class MacAppServiceTests(unittest.TestCase):
         self.paths = INSTALL.product_paths("code-intel-daemon", self.root)
         self.plist = self.base / "Library/LaunchAgents/com.hex.scipd.plist"
         self.plist.parent.mkdir(parents=True)
+        # FakeSigner.stage() copies opaque bytes into the candidate executable, so a
+        # real post-install self-check subprocess would always fail here. Default it
+        # to a clean pass; the self-check itself is covered in test_macos_app_install.py.
+        from unittest.mock import patch
+        import subprocess as _sp
+        self._self_check_patch = patch.object(
+            INSTALL, "_run_self_check",
+            return_value=_sp.CompletedProcess(args=["cli", "--version"], returncode=0, stdout="ok\n", stderr=""))
+        self._self_check_patch.start()
+        self.addCleanup(self._self_check_patch.stop)
         self.addCleanup(self.temp.cleanup)
 
     def seed(self):
@@ -181,9 +191,12 @@ class MacAppServiceTests(unittest.TestCase):
         self.seed()
         self.write_plist([str(self.paths.executable.absolute())], ["wrong.id"])
         launchctl = FakeLaunchctl(self.paths, True, str(self.paths.executable.absolute()), fail_bootstrap=True)
-        with self.assertRaisesRegex(INSTALL.InstallError, "bootstrap failed") as context:
-            INSTALL.service_reconcile("code-intel-daemon", self.root, self.signer, policy_path=self.policy, launchctl=launchctl, plist_path=self.plist)
+        with patch.object(INSTALL, "_service_reload_sleep"):
+            with self.assertRaisesRegex(INSTALL.InstallError, "bootstrap failed") as context:
+                INSTALL.service_reconcile("code-intel-daemon", self.root, self.signer, policy_path=self.policy, launchctl=launchctl, plist_path=self.plist)
         self.assertTrue(context.exception.published)
+        self.assertIn("after 5 attempts", str(context.exception))
+        self.assertEqual([call[0] for call in launchctl.calls].count("bootstrap"), 5)
         marker = json.loads((self.paths.root / "SCIPD.service-reconcile-pending.json").read_text(encoding="utf-8"))
         self.assertEqual(marker["phase"], "reload-pending")
 
@@ -283,7 +296,8 @@ class MacAppServiceTests(unittest.TestCase):
         else:
             self.assertTrue(marker.exists())
             self.assertEqual(json.loads(marker.read_text())["generation"], json.loads(self.paths.state.read_text())["generation"])
-            self.assertEqual([call[0] for call in launchctl.calls], ["print", "bootout", "bootstrap", "print"])
+            # bootout is now followed by a print poll that waits for the old service to be gone.
+            self.assertEqual([call[0] for call in launchctl.calls], ["print", "bootout", "print", "bootstrap", "print"])
             self.assertFalse(INSTALL._service_receipt_path(self.paths).exists())
 
     def test_pending_private_write_oserror_reports_publication(self):
@@ -390,7 +404,11 @@ raise SystemExit(a.main(['service-reconcile','code-intel-daemon','--root',str(ro
             helper_provenance[name] = {"sha256": copied._sha256(path), "source_revision": "f" * 40}
         source = fixture / "scipd"
         source.write_bytes(b"scipd")
-        copied.install("code-intel-daemon", root, source, self.signer, policy_path=policy, helper_provenance=helper_provenance, helper_sources=helper_sources, source_revision="e" * 40, version="0.1.0")
+        # The copied module has its own `_run_self_check`; stub it like setUp does for INSTALL.
+        from unittest.mock import patch as _patch
+        import subprocess as _sp
+        with _patch.object(copied, "_run_self_check", return_value=_sp.CompletedProcess(args=["cli", "--version"], returncode=0, stdout="ok\n", stderr="")):
+            copied.install("code-intel-daemon", root, source, self.signer, policy_path=policy, helper_provenance=helper_provenance, helper_sources=helper_sources, source_revision="e" * 40, version="0.1.0")
         paths = copied.product_paths("code-intel-daemon", root)
         plist = home / "Library/LaunchAgents/com.hex.scipd.plist"
         plist.parent.mkdir(parents=True)
@@ -437,6 +455,79 @@ raise SystemExit(a.main(['service-reconcile','code-intel-daemon','--root',str(ro
     def test_cli_product_is_rejected(self):
         with self.assertRaisesRegex(INSTALL.InstallError, "only code-intel-daemon"):
             INSTALL.service_reconcile("code-intel-cli", self.root, self.signer, policy_path=self.policy, launchctl=FakeLaunchctl(self.paths, False, ""), plist_path=self.plist)
+
+
+class BootstrapRetryTests(unittest.TestCase):
+    """Direct tests of the post-bootout retry helpers, without the full install()/
+    service_reconcile() fixture -- a fake launchctl callable is all this logic needs.
+
+    2026-09-12 outage: `launchctl bootout` returns before the old scipd instance has
+    fully exited, so an immediate `launchctl bootstrap` of the freshly published plist
+    can return "Bootstrap failed: 5: Input/output error" while launchd is still
+    tearing the old instance down. A manual bootstrap of the identical plist 30s
+    later succeeded. `_bootstrap_service_with_retry` retries a bounded number of
+    times, spaced out, before giving up.
+    """
+
+    def setUp(self):
+        self.gui_domain = f"gui/{os.getuid()}"
+        self.plist = Path("/tmp/fake-scipd.plist")
+
+    def test_bootstrap_retry_succeeds_on_third_attempt(self):
+        calls = []
+
+        def launchctl(argv):
+            calls.append(list(argv))
+            if len(calls) < 3:
+                return 1, "", "Bootstrap failed: 5: Input/output error"
+            return 0, "", ""
+
+        with patch.object(INSTALL, "_service_reload_sleep") as sleep_mock:
+            INSTALL._bootstrap_service_with_retry(launchctl, self.gui_domain, self.plist)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_bootstrap_retry_exhausted_reports_attempt_count(self):
+        calls = []
+
+        def launchctl(argv):
+            calls.append(list(argv))
+            return 1, "", "Bootstrap failed: 5: Input/output error"
+
+        with patch.object(INSTALL, "_service_reload_sleep") as sleep_mock:
+            with self.assertRaisesRegex(INSTALL.InstallError, "after 5 attempts") as context:
+                INSTALL._bootstrap_service_with_retry(launchctl, self.gui_domain, self.plist)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(sleep_mock.call_count, 4)
+        self.assertTrue(context.exception.published)
+        self.assertIn("service bootstrap failed after plist publication", str(context.exception))
+
+    def test_bootstrap_retry_succeeds_first_try_makes_one_call(self):
+        calls = []
+
+        def launchctl(argv):
+            calls.append(list(argv))
+            return 0, "", ""
+
+        with patch.object(INSTALL, "_service_reload_sleep") as sleep_mock:
+            INSTALL._bootstrap_service_with_retry(launchctl, self.gui_domain, self.plist)
+        self.assertEqual(len(calls), 1)
+        sleep_mock.assert_not_called()
+
+    def test_wait_for_service_bootout_polls_until_gone(self):
+        calls = []
+
+        def launchctl(argv):
+            calls.append(list(argv))
+            # First two "print" polls still see the old instance; the third sees it gone.
+            if len([c for c in calls if c[0] == "print"]) < 3:
+                return 0, "\tprogram = /old/scipd\n", ""
+            return 1, "", "Could not find service"
+
+        with patch.object(INSTALL, "_service_reload_sleep") as sleep_mock:
+            INSTALL._wait_for_service_bootout(launchctl, f"{self.gui_domain}/{INSTALL.SCIPD_LAUNCHD_LABEL}")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep_mock.call_count, 2)
 
 
 if __name__ == "__main__":

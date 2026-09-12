@@ -16,3 +16,7 @@ Accepted, not applied:
 - Pushed back: "WATCH_LIST trend filter does not exclude ~/worktrees." `~/worktrees` is a watch-list entry; its 108 GB growth in 72 h is real (release-campaign worktrees with 4 GB target dirs each), so the alert is a true positive.
 - FYI (anchor 50): run the self-check against the staged candidate before the symlink swap. Declined for the same reason as round 1: the 2026-09-10 failure was the published symlink itself.
 - Residual: `module verify` compares file names, not content; an edited worker with the same name still passes. Follow-up: hash the worker sources into the registry.
+
+## Round 3 (2026-09-12, operational)
+
+- `hex upgrade --local` on 2026-09-12 10:52: the code-intel signed-app install booted out `com.hex.scipd`, published the new plist, and `launchctl bootstrap` returned `Bootstrap failed: 5: Input/output error` because the old daemon had not finished exiting. A manual bootstrap of the same plist 30 s later succeeded. Follow-up: retry bootstrap with a short backoff when the exit is 5, or wait for the booted-out pid to exit before bootstrapping.

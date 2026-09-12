@@ -88,6 +88,16 @@ class CodeIntelProductTests(unittest.TestCase):
             self.sources[name] = path
             self.helpers[name] = {"sha256": INSTALL._sha256(path), "source_revision": "f" * 40}
         self.signer = FakeSigner(self.codeintel_version)
+        # FakeSigner.stage() copies opaque bytes into the candidate executable, so a
+        # real post-install self-check subprocess would always fail here. Default it
+        # to a clean pass; the self-check itself is covered in test_macos_app_install.py.
+        from unittest.mock import patch
+        import subprocess as _sp
+        self._self_check_patch = patch.object(
+            INSTALL, "_run_self_check",
+            return_value=_sp.CompletedProcess(args=["cli", "--version"], returncode=0, stdout="ok\n", stderr=""))
+        self._self_check_patch.start()
+        self.addCleanup(self._self_check_patch.stop)
         self.addCleanup(self.temp.cleanup)
 
     def install(self, product):

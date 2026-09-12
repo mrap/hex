@@ -46,6 +46,10 @@ MAX_HELPER_BYTES = 1024 * 1024
 MAX_PLIST_BYTES = 64 * 1024
 MAX_LAUNCHCTL_BYTES = 64 * 1024
 SCIPD_LAUNCHD_LABEL = "com.hex.scipd"
+SERVICE_BOOTOUT_WAIT_SECS = 10.0
+SERVICE_BOOTOUT_POLL_INTERVAL_SECS = 0.2
+SERVICE_BOOTSTRAP_MAX_ATTEMPTS = 5
+SERVICE_BOOTSTRAP_RETRY_PAUSE_SECS = 1.0
 
 
 class InstallError(RuntimeError):
@@ -663,6 +667,45 @@ def _launchctl_program(output: str) -> Optional[str]:
     return values[0]
 
 
+def _service_reload_sleep(seconds: float) -> None:
+    """The post-bootout poll / bootstrap-retry pause, isolated so tests can patch it and run fast."""
+    time.sleep(seconds)
+
+
+def _wait_for_service_bootout(launchctl: Callable[[list[str]], tuple[int, str, str]], domain: str) -> None:
+    """`launchctl bootout` returns once launchd accepts the request, not once the old
+    process has actually exited. Bootstrapping the new plist while the old instance is
+    still mid-exit can return "Bootstrap failed: 5: Input/output error" (observed
+    2026-09-12; a manual bootstrap of the identical plist 30s later succeeded). Poll
+    `launchctl print` for the domain until it reports the service gone, bounded to
+    SERVICE_BOOTOUT_WAIT_SECS -- a stuck teardown is surfaced by the bootstrap retry
+    that follows, not swallowed here.
+    """
+    deadline = time.monotonic() + SERVICE_BOOTOUT_WAIT_SECS
+    while True:
+        loaded, _ = _launchctl_loaded(launchctl, domain)
+        if not loaded:
+            return
+        if time.monotonic() >= deadline:
+            return
+        _service_reload_sleep(SERVICE_BOOTOUT_POLL_INTERVAL_SECS)
+
+
+def _bootstrap_service_with_retry(launchctl: Callable[[list[str]], tuple[int, str, str]], gui_domain: str, plist: Path) -> None:
+    """Bootstrap can transiently fail with an I/O error while launchd is still tearing
+    down the just-booted-out service (see `_wait_for_service_bootout`). Retry a bounded
+    number of fresh bootstrap attempts, spaced out, before giving up.
+    """
+    stderr = ""
+    for attempt in range(1, SERVICE_BOOTSTRAP_MAX_ATTEMPTS + 1):
+        returncode, _, stderr = launchctl(["bootstrap", gui_domain, str(plist.absolute())])
+        if not returncode:
+            return
+        if attempt < SERVICE_BOOTSTRAP_MAX_ATTEMPTS:
+            _service_reload_sleep(SERVICE_BOOTSTRAP_RETRY_PAUSE_SECS)
+    raise InstallError(f"service bootstrap failed after plist publication: {stderr.strip()[-500:]} after {SERVICE_BOOTSTRAP_MAX_ATTEMPTS} attempts", published=True)
+
+
 def _replace_bound(parent_fd: int, temporary: Path, destination: Path) -> None:
     os.rename(temporary.name, destination.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
@@ -864,9 +907,8 @@ def service_reconcile(product: str, root: Path, signer: Signer, *, policy_path: 
                 returncode, _, stderr = launchctl(["bootout", domain])
                 if returncode:
                     raise InstallError(f"service bootout failed after plist publication: {stderr.strip()[-500:]}", published=True)
-            returncode, _, stderr = launchctl(["bootstrap", f"gui/{os.getuid()}", str(plist.absolute())])
-            if returncode:
-                raise InstallError(f"service bootstrap failed after plist publication: {stderr.strip()[-500:]}", published=True)
+                _wait_for_service_bootout(launchctl, domain)
+            _bootstrap_service_with_retry(launchctl, f"gui/{os.getuid()}", plist)
             verified_loaded, verified_output = _launchctl_loaded(launchctl, domain)
             if not verified_loaded or _launchctl_program(verified_output) != owner["executable_path"]:
                 raise InstallError("service reload did not load the verified scipd executable", published=True)
