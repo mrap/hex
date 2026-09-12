@@ -20,3 +20,8 @@ Accepted, not applied:
 ## Round 3 (2026-09-12, operational)
 
 - `hex upgrade --local` on 2026-09-12 10:52: the code-intel signed-app install booted out `com.hex.scipd`, published the new plist, and `launchctl bootstrap` returned `Bootstrap failed: 5: Input/output error` because the old daemon had not finished exiting. A manual bootstrap of the same plist 30 s later succeeded. Follow-up: retry bootstrap with a short backoff when the exit is 5, or wait for the booted-out pid to exit before bootstrapping.
+
+## Round 4 (2026-09-12, release ceremony)
+
+- `hex release cut` pins `refs/heads/develop` (the local branch) without fetching or checking it against `origin/develop`. After the first attempt left the checkout detached, later `git pull --ff-only` calls advanced HEAD, not the branch, so three further attempts tested a stale develop and blamed the parity gate. Follow-up: fetch and require local develop == origin/develop before pinning, or pin `origin/develop`.
+- The Claude Code harness kills its own background shells under system memory pressure; the docker-e2e gate plus a full-priority index run reached that threshold twice. The detached `release.requested` path is the right way to run a cut from a session.
