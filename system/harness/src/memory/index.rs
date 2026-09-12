@@ -962,7 +962,7 @@ enum Escalation {
 }
 
 /// Default for `HEX_INDEX_BACKLOG_ESCALATE` (KTD7).
-const DEFAULT_BACKLOG_ESCALATE: usize = 200;
+const DEFAULT_BACKLOG_ESCALATE: usize = 1000;
 
 /// Parse `HEX_INDEX_BACKLOG_ESCALATE`. `None` = escalation disabled (the env
 /// value was exactly "0", so the run always throttles unless `--max`);
@@ -2442,10 +2442,10 @@ mod tests {
     #[test]
     fn escalation_decision_env_unset_high_pending_escalates() {
         assert_eq!(
-            escalation_decision(500, false, None),
+            escalation_decision(5000, false, None),
             Escalation::Normal {
-                pending: 500,
-                threshold: 200,
+                pending: 5000,
+                threshold: 1000,
                 forced_by_max: false
             }
         );
@@ -2464,18 +2464,18 @@ mod tests {
     #[test]
     fn escalation_decision_garbage_env_falls_back_to_default() {
         assert_eq!(
-            escalation_decision(500, false, Some("abc")),
+            escalation_decision(5000, false, Some("abc")),
             Escalation::Normal {
-                pending: 500,
-                threshold: 200,
+                pending: 5000,
+                threshold: 1000,
                 forced_by_max: false
             },
-            "garbage env value falls back to the default threshold (200), never panics"
+            "garbage env value falls back to the default threshold (1000), never panics"
         );
         assert_eq!(
-            escalation_decision(100, false, Some("abc")),
+            escalation_decision(500, false, Some("abc")),
             Escalation::Throttle,
-            "100 pending is under the default-200 fallback threshold"
+            "500 pending is under the default-1000 fallback threshold"
         );
     }
 
@@ -2485,7 +2485,7 @@ mod tests {
             escalation_decision(1, true, None),
             Escalation::Normal {
                 pending: 1,
-                threshold: 200,
+                threshold: 1000,
                 forced_by_max: true
             },
             "--max always escalates, regardless of pending count"
