@@ -588,6 +588,9 @@ enum ModuleCommands {
     /// Disable a module: it stays scheduled, but every fire logs a loud skip
     /// and does nothing (takes effect at its next fire; no restart)
     Disable { name: String },
+    /// Exit 1 if any .hex/modules/*.worker.rs on disk is missing from this
+    /// binary's registry (built without --features personal, most commonly).
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -1493,6 +1496,24 @@ fn main() {
             }
             ModuleCommands::Disable { name } => {
                 std::process::exit(module_set_enabled(&name, false));
+            }
+            ModuleCommands::Verify => {
+                let hex_dir = get_hex_dir();
+                let compiled = hex::failures::compiled_module_basenames();
+                let missing = hex::failures::modules_not_landed(&hex_dir, &compiled);
+                if !missing.is_empty() {
+                    for file in &missing {
+                        eprintln!(
+                            "module verify: MISSING {file} — on disk but not compiled into this binary; build with --features personal"
+                        );
+                    }
+                    std::process::exit(1);
+                }
+                println!(
+                    "module verify: OK — {} compiled module(s), 0 missing",
+                    compiled.len()
+                );
+                std::process::exit(0)
             }
         },
         Commands::Charter { command } => {

@@ -1075,9 +1075,13 @@ def _self_check_timeout_secs() -> float:
     return value if value > 0 else SELF_CHECK_DEFAULT_TIMEOUT_SECS
 
 
-def _run_self_check(cli: Path, timeout: float) -> subprocess.CompletedProcess:
-    """Spawn the just-published CLI's --version. Tests patch this so no real binary runs."""
-    return subprocess.run([str(cli), "--version"], capture_output=True, text=True, timeout=timeout)
+def _run_self_check(cli: Path, args: list[str], timeout: float, env: Optional[Mapping[str, str]] = None) -> subprocess.CompletedProcess:
+    """Spawn the just-published CLI with `args`. Tests patch this so no real binary runs."""
+    run_env = None
+    if env is not None:
+        run_env = dict(os.environ)
+        run_env.update(env)
+    return subprocess.run([str(cli), *args], capture_output=True, text=True, timeout=timeout, env=run_env)
 
 
 def _self_check_sleep(seconds: float) -> None:
@@ -1085,7 +1089,34 @@ def _self_check_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _self_check_published_cli(cli: Optional[Path]) -> None:
+def _module_verify_workspace(product: Product, root: Path) -> Optional[Path]:
+    """R2: the hex workspace to gate `module verify` on, or None to skip it.
+
+    `root` here is the product's fixed install root (Paths.root) -- for the hex
+    product that is, by install.sh convention, `<workspace>/.hex` (it invokes
+    `_macos_app_install hex "$TARGET_DIR/.hex" ...`, and TARGET_DIR is the hex
+    workspace containing CLAUDE.md; confirmed against this instance, where
+    `.hex/bin/hex` is the published symlink and CLAUDE.md sits one level up).
+    Personal worker files live at `<workspace>/.hex/modules/*.worker.rs`, and
+    `hex module verify`'s HEX_DIR must be the workspace itself --
+    get_hex_dir() requires CLAUDE.md directly under it, so HEX_DIR=root (the
+    plan's literal notation) would always fail; HEX_DIR=root/modules would
+    always be empty. Only the hex product carries this convention, and only
+    when root's name is literally ".hex" -- skip defensively otherwise rather
+    than gate on a guessed path.
+    """
+    if product.name != "hex" or root.name != ".hex":
+        return None
+    workspace = root.parent
+    modules_dir = workspace / ".hex" / "modules"
+    if not modules_dir.is_dir():
+        return None
+    if not any(modules_dir.rglob("*.worker.rs")):
+        return None
+    return workspace
+
+
+def _self_check_published_cli(cli: Optional[Path], product: Product, root: Path) -> None:
     """R1/R2: confirm the just-published CLI can execute before the journal commits.
 
     One retry after a pause, on timeout only (KTD2) -- a freshly signed app's first
@@ -1093,16 +1124,21 @@ def _self_check_published_cli(cli: Optional[Path]) -> None:
     raises InstallError(self_check_failed=True); the caller's existing
     `except Exception` handler turns that into a full rollback. A product with no
     CLI path is skipped.
+
+    R2/KTD2: after --version succeeds, when `_module_verify_workspace` finds an
+    on-disk personal worker file for the hex product, also runs
+    `<cli> module verify` with HEX_DIR set to that workspace -- catches a binary
+    published without the personal modules those files belong to.
     """
     if cli is None:
         return
     timeout = _self_check_timeout_secs()
     try:
-        result = _run_self_check(cli, timeout)
+        result = _run_self_check(cli, ["--version"], timeout)
     except subprocess.TimeoutExpired:
         _self_check_sleep(SELF_CHECK_RETRY_PAUSE_SECS)
         try:
-            result = _run_self_check(cli, timeout)
+            result = _run_self_check(cli, ["--version"], timeout)
         except subprocess.TimeoutExpired as exc:
             raise InstallError(f"self-check timed out twice after {timeout}s: {cli} --version", self_check_failed=True) from exc
         except OSError as exc:
@@ -1112,6 +1148,26 @@ def _self_check_published_cli(cli: Optional[Path]) -> None:
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         raise InstallError(f"self-check failed: {cli} --version exited {result.returncode}: {stderr}", self_check_failed=True)
+
+    workspace = _module_verify_workspace(product, root)
+    if workspace is None:
+        return
+    verify_env = {"HEX_DIR": str(workspace)}
+    try:
+        verify_result = _run_self_check(cli, ["module", "verify"], timeout, env=verify_env)
+    except subprocess.TimeoutExpired:
+        _self_check_sleep(SELF_CHECK_RETRY_PAUSE_SECS)
+        try:
+            verify_result = _run_self_check(cli, ["module", "verify"], timeout, env=verify_env)
+        except subprocess.TimeoutExpired as exc:
+            raise InstallError(f"self-check timed out twice after {timeout}s: {cli} module verify", self_check_failed=True) from exc
+        except OSError as exc:
+            raise InstallError(f"self-check could not execute {cli}: {exc}", self_check_failed=True) from exc
+    except OSError as exc:
+        raise InstallError(f"self-check could not execute {cli}: {exc}", self_check_failed=True) from exc
+    if verify_result.returncode != 0:
+        stderr = (verify_result.stderr or "").strip()
+        raise InstallError(f"self-check: {cli} module verify failed: {stderr[-500:]}", self_check_failed=True)
 
 
 def install(product: str, root: Path, source: Path, signer: Signer, *, policy_path: Optional[Path] = None, helper_provenance: Optional[Mapping[str, Any]] = None, helper_sources: Optional[Mapping[str, Path]] = None, source_revision: Optional[str] = None, version: str = "1.0.0") -> dict[str, Any]:
@@ -1293,7 +1349,7 @@ def install(product: str, root: Path, source: Path, signer: Signer, *, policy_pa
             with _open_dir(rollback) as rollback_fd:
                 for directory_fd in (helper_fd, cli_fd, rollback_fd, app_fd):
                     _fsync_dir(directory_fd)
-            _self_check_published_cli(paths.cli)
+            _self_check_published_cli(paths.cli, item, paths.root)
             journal["phase"] = "committed"
             _write_journal(paths, journal)
             _clear_journal(paths, transaction_id)

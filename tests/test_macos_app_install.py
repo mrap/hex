@@ -103,6 +103,26 @@ class MacAppInstallTests(unittest.TestCase):
         sources = {name: self.root / "libexec" / name for name in self.helpers}
         return INSTALL.install("boi", self.root, self.source, self.signer, policy_path=self.policy, helper_provenance=self.helpers, helper_sources=sources, source_revision="e" * 40)
 
+    def _hex_fixture(self, workspace_name, *, with_module=False):
+        # install.sh convention: root = <workspace>/.hex, workspace holds CLAUDE.md
+        # and .hex/modules -- see _module_verify_workspace's docstring.
+        workspace = Path(self.temp.name) / workspace_name
+        root = workspace / ".hex"
+        root.mkdir(parents=True)
+        (root / "libexec").mkdir()
+        helpers = {}
+        sources = {}
+        for name in ("macos-signing.py", "macos-app-install.py"):
+            path = root / "libexec" / name
+            path.write_text(name, encoding="utf-8")
+            helpers[name] = {"sha256": INSTALL._sha256(path), "source_revision": "f" * 40}
+            sources[name] = path
+        if with_module:
+            (root / "modules").mkdir()
+            (root / "modules" / "orbstack_prune.worker.rs").write_text("// w", encoding="utf-8")
+        install_kwargs = dict(policy_path=self.policy, helper_provenance=helpers, helper_sources=sources, source_revision="e" * 40)
+        return workspace, root, install_kwargs
+
     def test_empty_publication_uses_fixed_paths_and_state(self):
         result = self.install()
         paths = INSTALL.product_paths("boi", self.root)
@@ -231,8 +251,80 @@ class MacAppInstallTests(unittest.TestCase):
         # Optional), so this exercises the guard directly rather than through install().
         from unittest.mock import patch
         with patch.object(INSTALL, "_run_self_check") as run_mock:
-            INSTALL._self_check_published_cli(None)
+            INSTALL._self_check_published_cli(None, INSTALL.PRODUCTS["boi"], self.root)
         run_mock.assert_not_called()
+
+    def test_module_verify_skipped_without_modules_dir(self):
+        # (a) No .hex/modules at all: only --version runs.
+        from unittest.mock import patch
+        workspace, root, _ = self._hex_fixture("no-modules")
+        cli = root / "bin" / "hex"
+        version_ok = subprocess.CompletedProcess(args=["hex", "--version"], returncode=0, stdout="hex 1.0.0\n", stderr="")
+        with patch.object(INSTALL, "_run_self_check", return_value=version_ok) as run_mock:
+            INSTALL._self_check_published_cli(cli, INSTALL.PRODUCTS["hex"], root)
+        run_mock.assert_called_once_with(cli, ["--version"], INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS)
+
+    def test_module_verify_runs_after_version_and_commits_install(self):
+        # (b) modules dir with one worker file, verify returns 0: install commits,
+        # both commands ran in order with HEX_DIR pointed at the workspace (not root).
+        from unittest.mock import patch
+        workspace, root, install_kwargs = self._hex_fixture("has-modules", with_module=True)
+        version_ok = subprocess.CompletedProcess(args=["hex", "--version"], returncode=0, stdout="hex 1.0.0\n", stderr="")
+        verify_ok = subprocess.CompletedProcess(args=["hex", "module", "verify"], returncode=0, stdout="module verify: OK\n", stderr="")
+
+        def fake_run(cli, args, timeout, env=None):
+            return verify_ok if args == ["module", "verify"] else version_ok
+
+        with patch.object(INSTALL, "_run_self_check", side_effect=fake_run) as run_mock:
+            result = INSTALL.install("hex", root, self.source, self.signer, **install_kwargs)
+
+        self.assertEqual(result["product"], "hex")
+        self.assertFalse(result["self_check_failed"])
+        paths = INSTALL.product_paths("hex", root)
+        self.assertEqual(run_mock.call_count, 2)
+        first_call, second_call = run_mock.call_args_list
+        self.assertEqual(first_call.args, (paths.cli, ["--version"], INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS))
+        self.assertEqual(first_call.kwargs, {})
+        self.assertEqual(second_call.args, (paths.cli, ["module", "verify"], INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS))
+        self.assertEqual(second_call.kwargs, {"env": {"HEX_DIR": str(workspace)}})
+
+    def test_module_verify_failure_rolls_back_install(self):
+        # (c) verify returns 1 with stderr naming the missing module: rollback,
+        # InstallError text names "module verify", self_check_failed True.
+        from unittest.mock import patch
+        workspace, root, install_kwargs = self._hex_fixture("modules-missing", with_module=True)
+        version_ok = subprocess.CompletedProcess(args=["hex", "--version"], returncode=0, stdout="hex 1.0.0\n", stderr="")
+        verify_fail = subprocess.CompletedProcess(
+            args=["hex", "module", "verify"], returncode=1, stdout="",
+            stderr="module verify: MISSING orbstack_prune.worker.rs — on disk but not "
+                   "compiled into this binary; build with --features personal")
+
+        def fake_run(cli, args, timeout, env=None):
+            return verify_fail if args == ["module", "verify"] else version_ok
+
+        with patch.object(INSTALL, "_run_self_check", side_effect=fake_run):
+            with self.assertRaisesRegex(INSTALL.InstallError, "module verify") as caught:
+                INSTALL.install("hex", root, self.source, self.signer, **install_kwargs)
+
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertIn("MISSING", str(caught.exception))
+        paths = INSTALL.product_paths("hex", root)
+        self.assertFalse(paths.app.exists())
+        self.assertFalse(paths.cli.exists())
+        self.assertFalse(paths.journal.exists())
+
+    def test_module_verify_never_runs_for_non_hex_product(self):
+        # (d) product "boi" with a modules dir present: verify never runs.
+        from unittest.mock import patch
+        modules_dir = self.root.parent / ".hex" / "modules"
+        modules_dir.mkdir(parents=True)
+        (modules_dir / "orbstack_prune.worker.rs").write_text("// w", encoding="utf-8")
+        version_ok = subprocess.CompletedProcess(args=["boi", "--version"], returncode=0, stdout="boi 1.0.0\n", stderr="")
+        with patch.object(INSTALL, "_run_self_check", return_value=version_ok) as run_mock:
+            result = self.install()
+        self.assertFalse(result["self_check_failed"])
+        run_mock.assert_called_once_with(
+            INSTALL.product_paths("boi", self.root).cli, ["--version"], INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS)
 
     def test_self_check_oserror_on_first_attempt_restores_previous_app_and_cli(self):
         from unittest.mock import patch
