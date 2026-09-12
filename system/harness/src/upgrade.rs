@@ -12,6 +12,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use walkdir::WalkDir;
 
@@ -23,6 +24,7 @@ struct Args {
     dry_run: bool,
     repo_url: Option<String>,
     local_path: Option<String>,
+    rebuild: bool,
 }
 
 struct SourceDirs {
@@ -58,11 +60,16 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut dry_run = false;
     let mut repo_url = None;
     let mut local_path = None;
+    let mut rebuild = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--dry-run" => {
                 dry_run = true;
+                i += 1;
+            }
+            "--rebuild" => {
+                rebuild = true;
                 i += 1;
             }
             "--repo" => {
@@ -94,16 +101,18 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         dry_run,
         repo_url,
         local_path,
+        rebuild,
     })
 }
 
 fn print_help() {
-    println!("Usage: hex upgrade [--dry-run] [--repo URL] [--local PATH]");
+    println!("Usage: hex upgrade [--dry-run] [--repo URL] [--local PATH] [--rebuild]");
     println!();
     println!("Options:");
     println!("  --dry-run    Show what would change without applying");
     println!("  --repo URL   Override repo URL");
     println!("  --local PATH Use a local hex-foundation checkout");
+    println!("  --rebuild    Force a binary rebuild even if version/SHA/overlay match");
 }
 
 fn hex_dir_from_env() -> Option<PathBuf> {
@@ -594,8 +603,53 @@ fn get_source_dir(args: &Args, hex_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
+    // The cache refresh above succeeded (pulled or freshly cloned). Best-effort
+    // sweep of any `.upgrade-cache.corrupt-*` residue a prior clear_cache_dir()
+    // left behind — never lets residue block or fail this upgrade.
+    let _ = sweep_corrupt_cache_residue(hex_dir);
+
     println!("  [OK] Source ready");
     Ok(cache_dir)
+}
+
+/// Remove any `.upgrade-cache.corrupt-*` directories under `<hex_dir>/.hex`
+/// left behind by a prior `clear_cache_dir()` move-aside. Best-effort: a
+/// directory that can't be removed (e.g. OS-protected) is logged with a WARN
+/// and returned in `failed`, never turned into an upgrade failure. The live
+/// `.upgrade-cache` dir itself is never touched — only names starting with
+/// `.upgrade-cache.corrupt-` match.
+fn sweep_corrupt_cache_residue(hex_dir: &Path) -> (usize, Vec<PathBuf>) {
+    let dot_hex = hex_dir.join(".hex");
+    let mut removed = 0usize;
+    let mut failed = Vec::new();
+
+    let entries = match fs::read_dir(&dot_hex) {
+        Ok(e) => e,
+        Err(_) => return (removed, failed),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_residue = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(".upgrade-cache.corrupt-"))
+            .unwrap_or(false);
+        if !is_residue {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        } else {
+            println!(
+                "  [WARN] Could not remove upgrade-cache residue at {}",
+                path.display()
+            );
+            failed.push(path);
+        }
+    }
+
+    (removed, failed)
 }
 
 /// A cache is healthy iff it owns its own git directory — i.e.
@@ -921,12 +975,20 @@ fn binary_is_stale(hex_dir: &Path, source_dir: &Path) -> io::Result<bool> {
         _ => read_optional_utf8(&hex_dot_dir.join("bin/hex.sha"))?,
     };
     let source_sha = read_source_sha(source_dir)?;
-    Ok(binary_needs_rebuild(
+    if binary_needs_rebuild(
         installed_ver.as_deref(),
         &cargo_ver,
         installed_sha.as_deref(),
         Some(&source_sha),
-    ))
+    ) {
+        return Ok(true);
+    }
+    // Third signal (OBS-028-style, personal-overlay flavor): version/SHA
+    // match, but a personal module edited under `.hex/modules/*.worker.rs`
+    // (or `.hex/harness-personal/`) is newer than the installed binary.
+    // Without this the gate below reports "nothing to do" and the overlay
+    // edit never gets built in.
+    Ok(personal_overlay_stale(&hex_dot_dir).is_some())
 }
 
 /// Report whether the managed foundation pin needs reconciliation. This is a
@@ -961,6 +1023,59 @@ fn detect_personal_overlay(hex_dot_dir: &Path) -> bool {
     hex_dot_dir.join("harness-personal").is_dir() || hex_dot_dir.join("modules").is_dir()
 }
 
+/// The overlay dirs `detect_personal_overlay` keys on, as a walkable list.
+/// Kept as a single source so the staleness check below never drifts from
+/// the overlay-detection dirs.
+fn personal_overlay_dirs(hex_dot_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        hex_dot_dir.join("modules"),
+        hex_dot_dir.join("harness-personal"),
+    ]
+}
+
+/// Pure decision: does any file under `overlay_dirs` have an mtime strictly
+/// newer than `binary_mtime`? Returns the first such file found.
+///
+/// `binary_needs_rebuild` only compares version + source SHA — a personal
+/// module edit under `.hex/modules/*.worker.rs` (compiled in via `--features
+/// personal`, see `detect_personal_overlay`) changes neither, so it never
+/// tripped a rebuild (`hex upgrade --local` printed "no rebuild needed" right
+/// after such an edit). This is the third signal: overlay mtime vs. the
+/// installed binary's mtime. A missing or non-directory entry in
+/// `overlay_dirs` is simply skipped (no overlay there yet), matching
+/// `detect_personal_overlay`'s own presence-based keying.
+fn personal_overlay_newer_than(overlay_dirs: &[PathBuf], binary_mtime: SystemTime) -> Option<PathBuf> {
+    for dir in overlay_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let mtime = match fs::metadata(entry.path()).and_then(|m| m.modified()) {
+                Ok(mtime) => mtime,
+                Err(_) => continue,
+            };
+            if mtime > binary_mtime {
+                return Some(entry.into_path());
+            }
+        }
+    }
+    None
+}
+
+/// Glue: the first personal-overlay file newer than the installed binary at
+/// `hex_dot_dir.join("bin/hex")`, or `None` when the binary is missing/
+/// unreadable (existing version/SHA signals already treat an absent binary
+/// as needing a build — this check adds nothing there) or nothing overlay-
+/// side changed.
+fn personal_overlay_stale(hex_dot_dir: &Path) -> Option<PathBuf> {
+    let installed_bin = hex_dot_dir.join("bin/hex");
+    let binary_mtime = fs::metadata(&installed_bin).and_then(|m| m.modified()).ok()?;
+    personal_overlay_newer_than(&personal_overlay_dirs(hex_dot_dir), binary_mtime)
+}
+
 /// Sync VERSIONS and rebuild/swap the hex binary when stale. Returns `true`
 /// when the binary step is HEALTHY (rebuilt+swapped, or legitimately up to
 /// date / not applicable) and `false` when the installed binary may be stale
@@ -973,13 +1088,14 @@ fn sync_versions_file(
     source_dir: &Path,
     backup_dir: &Path,
 ) -> Result<(), BinaryStepFailure> {
-    sync_versions_file_protected(hex_dir, source_dir, backup_dir, None, None)
+    sync_versions_file_protected(hex_dir, source_dir, backup_dir, false, None, None)
 }
 
 fn sync_versions_file_protected(
     hex_dir: &Path,
     source_dir: &Path,
     backup_dir: &Path,
+    force_rebuild: bool,
     protection: Option<(&Path, &UpgradeGitSnapshot)>,
     mut owned: Option<&mut HashMap<PathBuf, Option<Vec<u8>>>>,
 ) -> Result<(), BinaryStepFailure> {
@@ -1091,27 +1207,37 @@ fn sync_versions_file_protected(
     // `version_mismatch` drives the human-readable reason below; the actual
     // rebuild decision is `binary_needs_rebuild` (shared with the upstream gate).
     let version_mismatch = installed_ver.as_deref() != Some(&cargo_ver);
-
-    if binary_needs_rebuild(
+    let needs_rebuild = binary_needs_rebuild(
         installed_ver.as_deref(),
         &cargo_ver,
         installed_sha.as_deref(),
         source_sha.as_deref(),
-    ) {
+    );
+    // Third signal: version/SHA match, but a personal-overlay file is newer
+    // than the installed binary (see `personal_overlay_newer_than`).
+    let overlay_change = personal_overlay_stale(&hex_dot_dir);
+
+    // `--rebuild requested` is printed once, in `run()` where `binary_stale`
+    // is computed (so it also shows under `--dry-run`) — not here.
+    if force_rebuild || needs_rebuild || overlay_change.is_some() {
         let harness_dst = source_dir.join("system/harness");
-        let reason = if version_mismatch {
-            format!(
-                "version mismatch ({} → {cargo_ver})",
-                installed_ver.as_deref().unwrap_or("none")
-            )
-        } else {
-            format!(
-                "SHA mismatch ({} → {} at v{cargo_ver})",
-                installed_sha.as_deref().unwrap_or("none"),
-                source_sha.as_deref().unwrap_or("unknown")
-            )
-        };
-        println!("  → hex binary {reason} — rebuilding...");
+        if needs_rebuild {
+            let reason = if version_mismatch {
+                format!(
+                    "version mismatch ({} → {cargo_ver})",
+                    installed_ver.as_deref().unwrap_or("none")
+                )
+            } else {
+                format!(
+                    "SHA mismatch ({} → {} at v{cargo_ver})",
+                    installed_sha.as_deref().unwrap_or("none"),
+                    source_sha.as_deref().unwrap_or("unknown")
+                )
+            };
+            println!("  → hex binary {reason} — rebuilding...");
+        } else if overlay_change.is_some() {
+            println!("  → Personal overlay changed since the installed binary — rebuilding");
+        }
         // Build directly from the selected source checkout. Its sibling
         // code-intel crate and bridge module are therefore staged together
         // without writing into the live instance before cargo succeeds.
@@ -2153,6 +2279,10 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if cfg.rebuild {
+        println!("  → --rebuild requested");
+    }
+    let binary_stale = binary_stale || cfg.rebuild;
     let versions_pin_stale = match versions_pin_is_stale(&hex_dir, &source_dir) {
         Ok(stale) => stale,
         Err(e) => {
@@ -2236,6 +2366,7 @@ pub fn run(args: &[String]) -> i32 {
         &hex_dir,
         &source_dir,
         &backup_dir,
+        cfg.rebuild,
         protection,
         Some(&mut owned_paths),
     );
@@ -3290,6 +3421,113 @@ mod tests {
         ));
     }
 
+    // OBS-028-personal-overlay: a personal module edit under
+    // `.hex/modules/*.worker.rs` changes neither Cargo version nor source
+    // SHA, so `binary_needs_rebuild` alone can never see it. These pin
+    // `personal_overlay_newer_than`'s mtime comparison in isolation.
+
+    fn set_mtime(path: &Path, time: SystemTime) {
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(time)).unwrap();
+    }
+
+    #[test]
+    fn personal_overlay_newer_than_finds_file_newer_than_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let overlay = tmp.path().join(".hex/modules");
+        let overlay_file = overlay.join("x_oauth2_refresh.worker.rs");
+        write_file(&overlay_file, "// worker");
+
+        let binary_mtime = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(&overlay_file, SystemTime::now());
+
+        let found = personal_overlay_newer_than(&[overlay], binary_mtime);
+        assert_eq!(found, Some(overlay_file));
+    }
+
+    #[test]
+    fn personal_overlay_newer_than_none_when_older() {
+        let tmp = tempfile::tempdir().unwrap();
+        let overlay = tmp.path().join(".hex/modules");
+        let overlay_file = overlay.join("old.worker.rs");
+        write_file(&overlay_file, "// worker");
+
+        let binary_mtime = SystemTime::now();
+        set_mtime(&overlay_file, binary_mtime - Duration::from_secs(60));
+
+        assert_eq!(personal_overlay_newer_than(&[overlay], binary_mtime), None);
+    }
+
+    #[test]
+    fn personal_overlay_newer_than_none_when_equal() {
+        // Strict `>`: an overlay file with the SAME mtime as the binary must
+        // not be treated as newer (avoids rebuilding forever on a filesystem
+        // with coarse mtime resolution where writes land on the same tick).
+        let tmp = tempfile::tempdir().unwrap();
+        let overlay = tmp.path().join(".hex/modules");
+        let overlay_file = overlay.join("same.worker.rs");
+        write_file(&overlay_file, "// worker");
+
+        let binary_mtime = SystemTime::now();
+        set_mtime(&overlay_file, binary_mtime);
+
+        assert_eq!(personal_overlay_newer_than(&[overlay], binary_mtime), None);
+    }
+
+    #[test]
+    fn personal_overlay_newer_than_none_when_dirs_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join(".hex/modules");
+        assert_eq!(
+            personal_overlay_newer_than(&[missing], SystemTime::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn personal_overlay_newer_than_checks_every_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modules = tmp.path().join(".hex/modules");
+        let harness_personal = tmp.path().join(".hex/harness-personal");
+        write_file(&modules.join("old.worker.rs"), "// worker");
+        let newer_file = harness_personal.join("probe.rs");
+        write_file(&newer_file, "// probe");
+
+        let binary_mtime = SystemTime::now();
+        set_mtime(&modules.join("old.worker.rs"), binary_mtime - Duration::from_secs(60));
+        set_mtime(&newer_file, binary_mtime + Duration::from_secs(60));
+
+        assert_eq!(
+            personal_overlay_newer_than(&[modules, harness_personal], binary_mtime),
+            Some(newer_file)
+        );
+    }
+
+    #[test]
+    fn preflight_treats_newer_personal_overlay_as_stale() {
+        if in_private_upgrade_test(
+            "upgrade::tests::preflight_treats_newer_personal_overlay_as_stale",
+        ) {
+            return;
+        }
+        let _env = crate::test_env::isolate_hex_dir();
+        test_child::stage("upgrade:preflight-overlay-stale-body").expect("test-child stage must flush");
+        let (_tmp, source, instance) = binary_preflight_fixture();
+        // Fixture's installed binary is written, then its overlay file below
+        // is written strictly after — filesystem mtime order proves the
+        // "newer" comparison rather than racing the clock.
+        let overlay_file = instance.join(".hex/modules/example.worker.rs");
+        write_file(&overlay_file, "// personal worker");
+        let binary_mtime = fs::metadata(instance.join(".hex/bin/hex"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        set_mtime(&overlay_file, binary_mtime + Duration::from_secs(60));
+        assert!(
+            binary_is_stale(&instance, &source).unwrap(),
+            "a personal overlay file newer than the installed binary must be stale"
+        );
+    }
+
     #[test]
     fn test_hooks_sync_lands_in_target() {
         // Core requirement: v2 layout hook files must sync to .hex/hooks/
@@ -3405,6 +3643,20 @@ mod tests {
             cfg.repo_url.as_deref(),
             Some("https://example.com/repo.git")
         );
+    }
+
+    #[test]
+    fn test_parse_args_rebuild() {
+        let args = vec!["--rebuild".to_string()];
+        let cfg = parse_args(&args).unwrap();
+        assert!(cfg.rebuild);
+        assert!(!cfg.dry_run);
+    }
+
+    #[test]
+    fn test_parse_args_rebuild_defaults_false() {
+        let cfg = parse_args(&[]).unwrap();
+        assert!(!cfg.rebuild);
     }
 
     #[test]
@@ -3641,6 +3893,76 @@ mod tests {
             !cache_is_healthy(&corrupt),
             "a headless .git shell must be unhealthy (must not resolve up-tree)"
         );
+    }
+
+    /// A removable `.upgrade-cache.corrupt-*` residue directory is swept away
+    /// and counted as removed. The live `.upgrade-cache` dir itself is left
+    /// untouched.
+    #[test]
+    fn sweep_removes_removable_residue_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hex_dir = tmp.path();
+        let dot_hex = hex_dir.join(".hex");
+        let residue = dot_hex.join(".upgrade-cache.corrupt-0");
+        write_file(&residue.join("CLAUDE.md"), "stale");
+        let live_cache = dot_hex.join(".upgrade-cache");
+        write_file(&live_cache.join(".git/config"), "[core]\n");
+
+        let (removed, failed) = sweep_corrupt_cache_residue(hex_dir);
+
+        assert_eq!(removed, 1);
+        assert!(failed.is_empty());
+        assert!(!residue.exists(), "residue dir must be gone");
+        assert!(live_cache.exists(), "live cache dir must be untouched");
+    }
+
+    /// A residue dir that cannot be removed is collected into `failed`
+    /// without panicking. Reproduced by stripping write permission on the
+    /// residue's parent (`.hex`), which blocks unlinking the directory entry
+    /// even though its contents are still readable — the same shape as an
+    /// OS-protected residue dir on the live instance.
+    #[test]
+    fn sweep_collects_unremovable_residue_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hex_dir = tmp.path();
+        let dot_hex = hex_dir.join(".hex");
+        let residue = dot_hex.join(".upgrade-cache.corrupt-0");
+        write_file(&residue.join("CLAUDE.md"), "stale");
+
+        let mut perms = fs::metadata(&dot_hex).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&dot_hex, perms).unwrap();
+
+        // Confirm the restriction actually bites in this test environment.
+        // Running as root (a CI container, a release runner) ignores
+        // directory write permission entirely, which would make a hard
+        // `removed == 0` assertion below false-fail rather than test
+        // anything. Mirrors the `test_cache_is_healthy` pattern of gating an
+        // environment-dependent assertion on a live probe.
+        let probe = dot_hex.join("root-write-probe");
+        let enforced = fs::write(&probe, b"probe").is_err();
+        let _ = fs::remove_file(&probe);
+
+        let (removed, failed) = sweep_corrupt_cache_residue(hex_dir);
+
+        // Restore write perms so the tempdir can clean itself up on drop.
+        let mut perms = fs::metadata(&dot_hex).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dot_hex, perms).unwrap();
+
+        // The one guarantee this test makes regardless of environment: a
+        // removal failure is collected, never panics.
+        if enforced {
+            assert_eq!(removed, 0);
+            assert_eq!(failed, vec![residue]);
+        } else {
+            assert_eq!(
+                removed, 1,
+                "permission restriction unenforced in this env (likely root); \
+                 residue should have been removed instead"
+            );
+            assert!(failed.is_empty());
+        }
     }
 
     /// The binary step must report health honestly: an up-to-date skip is

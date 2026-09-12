@@ -25,6 +25,15 @@ done
 
 TARGET_DIR="${TARGET_DIR:-$HOME/hex}"
 TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
+# Canonicalize: the signed-app installer refuses symlinked workspaces
+# (/tmp -> /private/tmp on macOS), so resolve the real path up front.
+if [ -d "$TARGET_DIR" ]; then
+    TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
+else
+    _parent="$(mkdir -p "$(dirname "$TARGET_DIR")" && cd "$(dirname "$TARGET_DIR")" && pwd -P)" || { echo "ERROR: cannot resolve parent of $TARGET_DIR" >&2; exit 1; }
+    TARGET_DIR="$_parent/$(basename "$TARGET_DIR")"
+    unset _parent
+fi
 
 # macOS signed-install integration is deliberately a thin caller boundary.
 # The common transaction owns mode detection, policy checks, staging,
@@ -852,7 +861,17 @@ print("%s\t%s" % (revision, version))
 
     write_boi_wrapper
 }
-install_or_upgrade_boi
+# HEX_INSTALL_SKIP_BOI=1: never touch the live ~/.boi companion. Set by the
+# codex-parity suite, whose fresh-install run into /tmp otherwise reinstalls BOI
+# pinned to VERSIONS into $HOME/.boi (2026-09-12: downgraded a develop build to
+# v3.9.0 mid-release and broke every managed Cargo gate on the machine).
+# HEX_INSTALL_SKIP_COMPANIONS=1 skips BOI and code-intel; the older
+# HEX_INSTALL_SKIP_BOI=1 still skips BOI alone.
+if [ "${HEX_INSTALL_SKIP_COMPANIONS:-0}" = "1" ] || [ "${HEX_INSTALL_SKIP_BOI:-0}" = "1" ]; then
+    echo "  BOI companion     SKIPPED (HEX_INSTALL_SKIP_COMPANIONS/HEX_INSTALL_SKIP_BOI)"
+else
+    install_or_upgrade_boi
+fi
 
 # ── Phase 5: Register install ──────────────────────────────────────
 
@@ -958,6 +977,13 @@ _harness_build_from_source() {
         # Record the source SHA that produced THIS binary (atomic tmp+rename) so
         # `hex upgrade` can verify binary freshness. Never fails the install (S6).
         write_hex_sha_sidecar
+    fi
+    # The code-intel companion lands in the LIVE $HOME/.codeintel (cq, scipd and
+    # its launchd service), not under $TARGET_DIR. A throwaway install (the
+    # codex-parity suite) must never reconcile it.
+    if [ "${HEX_INSTALL_SKIP_COMPANIONS:-0}" = "1" ]; then
+        echo "  code-intel        SKIPPED (HEX_INSTALL_SKIP_COMPANIONS=1)"
+        return 0
     fi
     _code_intel_build_and_deploy "$hex_target_dir" "$codeintel_cli_managed_at_start" "$codeintel_daemon_managed_at_start" "$source_revision" "$codeintel_cli_mode_at_start" "$codeintel_daemon_mode_at_start" "$codeintel_cli_revision_at_start" "$codeintel_daemon_revision_at_start" || {
         if [ "$MACOS_APP_MANAGED" = true ]; then

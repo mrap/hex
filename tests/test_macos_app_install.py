@@ -88,11 +88,40 @@ class MacAppInstallTests(unittest.TestCase):
         self.source = Path(self.temp.name) / "boi-source"
         self.source.write_bytes(b"candidate bytes")
         self.signer = FakeSigner()
+        # FakeSigner.stage() copies opaque bytes into the candidate executable, so a
+        # real self-check subprocess would always fail here. Default it to a clean
+        # pass; tests of the self-check itself override this patch.
+        from unittest.mock import patch
+        self._self_check_patch = patch.object(
+            INSTALL, "_run_self_check",
+            return_value=subprocess.CompletedProcess(args=["cli", "--version"], returncode=0, stdout="ok\n", stderr=""))
+        self._self_check_patch.start()
+        self.addCleanup(self._self_check_patch.stop)
         self.addCleanup(self.temp.cleanup)
 
     def install(self):
         sources = {name: self.root / "libexec" / name for name in self.helpers}
         return INSTALL.install("boi", self.root, self.source, self.signer, policy_path=self.policy, helper_provenance=self.helpers, helper_sources=sources, source_revision="e" * 40)
+
+    def _hex_fixture(self, workspace_name, *, with_module=False):
+        # install.sh convention: root = <workspace>/.hex, workspace holds CLAUDE.md
+        # and .hex/modules -- see _module_verify_workspace's docstring.
+        workspace = Path(self.temp.name) / workspace_name
+        root = workspace / ".hex"
+        root.mkdir(parents=True)
+        (root / "libexec").mkdir()
+        helpers = {}
+        sources = {}
+        for name in ("macos-signing.py", "macos-app-install.py"):
+            path = root / "libexec" / name
+            path.write_text(name, encoding="utf-8")
+            helpers[name] = {"sha256": INSTALL._sha256(path), "source_revision": "f" * 40}
+            sources[name] = path
+        if with_module:
+            (root / "modules").mkdir()
+            (root / "modules" / "orbstack_prune.worker.rs").write_text("// w", encoding="utf-8")
+        install_kwargs = dict(policy_path=self.policy, helper_provenance=helpers, helper_sources=sources, source_revision="e" * 40)
+        return workspace, root, install_kwargs
 
     def test_empty_publication_uses_fixed_paths_and_state(self):
         result = self.install()
@@ -148,6 +177,222 @@ class MacAppInstallTests(unittest.TestCase):
             INSTALL._atomic_swap = original_swap
         self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
         self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_success_reports_not_failed(self):
+        result = self.install()
+        self.assertFalse(result["self_check_failed"])
+        paths = INSTALL.product_paths("boi", self.root)
+        self.assertFalse(json.loads(paths.state.read_text())["self_check_failed"])
+
+    def test_self_check_nonzero_exit_restores_previous_app_and_cli(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        old_app_hash = INSTALL._tree_sha256(paths.app)
+        old_cli_target = os.readlink(paths.cli)
+        failing = subprocess.CompletedProcess(args=["cli", "--version"], returncode=1, stdout="", stderr="boom")
+        with patch.object(INSTALL, "_run_self_check", return_value=failing):
+            with self.assertRaisesRegex(INSTALL.InstallError, "self-check failed") as caught:
+                self.install()
+        # Self-check runs after every swap (KTD1), so unlike a staging-time failure
+        # this transaction did touch public state before rolling back -- published
+        # stays true, matching every other post-swap failure path in this function.
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertTrue(caught.exception.published)
+        self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
+        self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_failure_clears_journal_so_next_install_succeeds(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        failing = subprocess.CompletedProcess(args=["cli", "--version"], returncode=1, stdout="", stderr="boom")
+        with patch.object(INSTALL, "_run_self_check", return_value=failing):
+            with self.assertRaisesRegex(INSTALL.InstallError, "self-check failed"):
+                self.install()
+        # The rollback above restored public state cleanly (no rollback
+        # errors), so the journal must not be left behind blocking the next
+        # install -- previously it was, and a later install() refused with
+        # "open install journal requires recovery" until an operator ran
+        # abandon-staging by hand.
+        self.assertFalse(paths.journal.exists())
+        # A second, good install succeeds with no manual recovery step.
+        result = self.install()
+        self.assertEqual(result["bundle_identifier"], "com.mrap.boi")
+
+    def test_self_check_times_out_twice_restores_previous_app(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        old_app_hash = INSTALL._tree_sha256(paths.app)
+        old_cli_target = os.readlink(paths.cli)
+        timeout_exc = subprocess.TimeoutExpired(cmd=["cli", "--version"], timeout=10)
+        with patch.object(INSTALL, "_run_self_check", side_effect=timeout_exc), \
+                patch.object(INSTALL, "_self_check_sleep") as sleep_mock:
+            with self.assertRaisesRegex(INSTALL.InstallError, "timed out twice") as caught:
+                self.install()
+        sleep_mock.assert_called_once()
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
+        self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_times_out_once_then_succeeds(self):
+        from unittest.mock import patch
+        timeout_exc = subprocess.TimeoutExpired(cmd=["cli", "--version"], timeout=10)
+        ok = subprocess.CompletedProcess(args=["cli", "--version"], returncode=0, stdout="ok\n", stderr="")
+        with patch.object(INSTALL, "_run_self_check", side_effect=[timeout_exc, ok]), \
+                patch.object(INSTALL, "_self_check_sleep") as sleep_mock:
+            result = self.install()
+        sleep_mock.assert_called_once()
+        self.assertFalse(result["self_check_failed"])
+
+    def test_self_check_skips_product_without_cli_path(self):
+        # No current product configures cli_relative=None (Product.cli_relative is not
+        # Optional), so this exercises the guard directly rather than through install().
+        from unittest.mock import patch
+        with patch.object(INSTALL, "_run_self_check") as run_mock:
+            INSTALL._self_check_published_cli(None, INSTALL.PRODUCTS["boi"], self.root)
+        run_mock.assert_not_called()
+
+    def test_module_verify_skipped_without_modules_dir(self):
+        # (a) No .hex/modules at all: only --version runs.
+        from unittest.mock import patch
+        workspace, root, _ = self._hex_fixture("no-modules")
+        cli = root / "bin" / "hex"
+        version_ok = subprocess.CompletedProcess(args=["hex", "--version"], returncode=0, stdout="hex 1.0.0\n", stderr="")
+        with patch.object(INSTALL, "_run_self_check", return_value=version_ok) as run_mock:
+            INSTALL._self_check_published_cli(cli, INSTALL.PRODUCTS["hex"], root)
+        run_mock.assert_called_once_with(cli, ["--version"], INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS)
+
+    def test_module_verify_runs_after_version_and_commits_install(self):
+        # (b) modules dir with one worker file, verify returns 0: install commits,
+        # both commands ran in order with HEX_DIR pointed at the workspace (not root).
+        from unittest.mock import patch
+        workspace, root, install_kwargs = self._hex_fixture("has-modules", with_module=True)
+        version_ok = subprocess.CompletedProcess(args=["hex", "--version"], returncode=0, stdout="hex 1.0.0\n", stderr="")
+        verify_ok = subprocess.CompletedProcess(args=["hex", "module", "verify"], returncode=0, stdout="module verify: OK\n", stderr="")
+
+        def fake_run(cli, args, timeout, env=None):
+            return verify_ok if args == ["module", "verify"] else version_ok
+
+        with patch.object(INSTALL, "_run_self_check", side_effect=fake_run) as run_mock:
+            result = INSTALL.install("hex", root, self.source, self.signer, **install_kwargs)
+
+        self.assertEqual(result["product"], "hex")
+        self.assertFalse(result["self_check_failed"])
+        paths = INSTALL.product_paths("hex", root)
+        self.assertEqual(run_mock.call_count, 2)
+        first_call, second_call = run_mock.call_args_list
+        self.assertEqual(first_call.args, (paths.cli, ["--version"], INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS))
+        self.assertEqual(first_call.kwargs, {})
+        self.assertEqual(second_call.args, (paths.cli, ["module", "verify"], INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS))
+        self.assertEqual(second_call.kwargs, {"env": {"HEX_DIR": str(workspace)}})
+
+    def test_module_verify_failure_rolls_back_install(self):
+        # (c) verify returns 1 with stderr naming the missing module: rollback,
+        # InstallError text names "module verify", self_check_failed True.
+        from unittest.mock import patch
+        workspace, root, install_kwargs = self._hex_fixture("modules-missing", with_module=True)
+        version_ok = subprocess.CompletedProcess(args=["hex", "--version"], returncode=0, stdout="hex 1.0.0\n", stderr="")
+        verify_fail = subprocess.CompletedProcess(
+            args=["hex", "module", "verify"], returncode=1, stdout="",
+            stderr="module verify: MISSING orbstack_prune.worker.rs — on disk but not "
+                   "compiled into this binary; build with --features personal")
+
+        def fake_run(cli, args, timeout, env=None):
+            return verify_fail if args == ["module", "verify"] else version_ok
+
+        with patch.object(INSTALL, "_run_self_check", side_effect=fake_run):
+            with self.assertRaisesRegex(INSTALL.InstallError, "module verify") as caught:
+                INSTALL.install("hex", root, self.source, self.signer, **install_kwargs)
+
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertIn("MISSING", str(caught.exception))
+        paths = INSTALL.product_paths("hex", root)
+        self.assertFalse(paths.app.exists())
+        self.assertFalse(paths.cli.exists())
+        self.assertFalse(paths.journal.exists())
+
+    def test_module_verify_never_runs_for_non_hex_product(self):
+        # (d) product "boi" with a modules dir present: verify never runs.
+        from unittest.mock import patch
+        modules_dir = self.root.parent / ".hex" / "modules"
+        modules_dir.mkdir(parents=True)
+        (modules_dir / "orbstack_prune.worker.rs").write_text("// w", encoding="utf-8")
+        version_ok = subprocess.CompletedProcess(args=["boi", "--version"], returncode=0, stdout="boi 1.0.0\n", stderr="")
+        with patch.object(INSTALL, "_run_self_check", return_value=version_ok) as run_mock:
+            result = self.install()
+        self.assertFalse(result["self_check_failed"])
+        run_mock.assert_called_once_with(
+            INSTALL.product_paths("boi", self.root).cli, ["--version"], INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS)
+
+    def test_self_check_oserror_on_first_attempt_restores_previous_app_and_cli(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        old_app_hash = INSTALL._tree_sha256(paths.app)
+        old_cli_target = os.readlink(paths.cli)
+        with patch.object(INSTALL, "_run_self_check", side_effect=OSError("no such file")):
+            with self.assertRaisesRegex(INSTALL.InstallError, "could not execute") as caught:
+                self.install()
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
+        self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_oserror_after_retry_restores_previous_app_and_cli(self):
+        from unittest.mock import patch
+        self.install()
+        paths = INSTALL.product_paths("boi", self.root)
+        old_app_hash = INSTALL._tree_sha256(paths.app)
+        old_cli_target = os.readlink(paths.cli)
+        timeout_exc = subprocess.TimeoutExpired(cmd=["cli", "--version"], timeout=10)
+        with patch.object(INSTALL, "_run_self_check", side_effect=[timeout_exc, OSError("no such file")]), \
+                patch.object(INSTALL, "_self_check_sleep") as sleep_mock:
+            with self.assertRaisesRegex(INSTALL.InstallError, "could not execute") as caught:
+                self.install()
+        sleep_mock.assert_called_once()
+        self.assertTrue(caught.exception.self_check_failed)
+        self.assertEqual(INSTALL._tree_sha256(paths.app), old_app_hash)
+        self.assertEqual(os.readlink(paths.cli), old_cli_target)
+
+    def test_self_check_timeout_secs_env_parsing(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(INSTALL.SELF_CHECK_TIMEOUT_ENV, None)
+            self.assertEqual(
+                INSTALL._self_check_timeout_secs(), INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS)
+        with patch.dict(os.environ, {INSTALL.SELF_CHECK_TIMEOUT_ENV: "garbage"}):
+            self.assertEqual(
+                INSTALL._self_check_timeout_secs(), INSTALL.SELF_CHECK_DEFAULT_TIMEOUT_SECS)
+        with patch.dict(os.environ, {INSTALL.SELF_CHECK_TIMEOUT_ENV: "3.5"}):
+            self.assertEqual(INSTALL._self_check_timeout_secs(), 3.5)
+
+    def test_install_error_payload_reports_self_check_failed(self):
+        from unittest.mock import patch
+        self.install()
+        failing = subprocess.CompletedProcess(args=["cli", "--version"], returncode=1, stdout="", stderr="boom")
+        with patch.object(INSTALL, "_run_self_check", return_value=failing):
+            with self.assertRaises(INSTALL.InstallError) as caught:
+                self.install()
+        self.assertTrue(INSTALL._install_error_payload(caught.exception)["self_check_failed"])
+
+        # An unrelated rollback failure (not a self-check) must report False.
+        original_swap = INSTALL._atomic_swap
+        calls = {"count": 0}
+
+        def fail_cli(parent_fd, source, destination):
+            calls["count"] += 1
+            if calls["count"] == 4:
+                raise INSTALL.InstallError("injected compatibility swap failure")
+            return original_swap(parent_fd, source, destination)
+
+        INSTALL._atomic_swap = fail_cli
+        try:
+            with self.assertRaises(INSTALL.InstallError) as unrelated:
+                self.install()
+        finally:
+            INSTALL._atomic_swap = original_swap
+        self.assertFalse(INSTALL._install_error_payload(unrelated.exception)["self_check_failed"])
 
     def test_rollback_refuses_actor_replacement(self):
         self.install()
@@ -511,7 +756,11 @@ class MacAppInstallTests(unittest.TestCase):
                 self.install()
         finally:
             INSTALL._fsync_dir = original
-        self.assertNotEqual(json.loads(paths.journal.read_text())["phase"], "committed")
+        # Rollback restores public state cleanly here, so the journal is
+        # cleared (2026-09-11 fix) instead of being left behind at whatever
+        # pre-committed phase it last reached -- either way, "committed" is
+        # never written to disk.
+        self.assertFalse(paths.journal.exists())
         self.assertEqual(paths.executable.read_bytes(), old_bytes)
 
     def test_inherited_lock_requires_held_lock_and_expected_inode(self):
@@ -545,7 +794,12 @@ class MacAppInstallCLITests(unittest.TestCase):
         self.policy.parent.mkdir(parents=True)
         self.policy.write_text(json.dumps({"schema_version": 1, "certificate_sha1": "A" * 40, "team_id": "TEAM123456"}), encoding="utf-8")
         self.source = base / "source"
-        self.source.write_bytes(b"cli candidate")
+        # This flows straight through the fake signing CLI into the published
+        # bin/<product> symlink target below, and the real install() now runs that
+        # published binary as a post-publish self-check -- so it must actually be
+        # able to execute, unlike the in-process FakeSigner fixtures above.
+        self.source.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.source.chmod(0o755)
         self.script = base / "macos-app-install.py"
         shutil.copy2(SOURCE, self.script)
         helper = base / "macos-signing.py"

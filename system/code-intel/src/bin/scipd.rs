@@ -28,7 +28,47 @@ fn fail(code: &str, message: String, hint: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// An early, before-startup flag that short-circuits normal daemon startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EarlyFlag {
+    Version,
+    Help,
+}
+
+/// Pure: does `args` (argv, excluding argv0) request an early exit? Checked
+/// at the very top of `main`, before `codeintel_home()` or `Daemon::bind`,
+/// so `--version`/`--help` work even when the daemon config/home can't be
+/// resolved — and so `scipd --version` never falls through to daemon
+/// startup and hits `BindError::AlreadyRunning` (exit 1) when a daemon is
+/// already serving. The installer's post-install self-check runs `<cli>
+/// --version` and rolled back the scipd install on exactly that exit-1.
+/// No clap parser here (unlike `cq`, which gets `--version` for free via
+/// `#[command(version)]`) — scipd takes no other CLI flags, so a manual
+/// scan is the whole story.
+fn early_flag(args: &[String]) -> Option<EarlyFlag> {
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        return Some(EarlyFlag::Version);
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Some(EarlyFlag::Help);
+    }
+    None
+}
+
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match early_flag(&args) {
+        Some(EarlyFlag::Version) => {
+            println!("scipd {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Some(EarlyFlag::Help) => {
+            println!("scipd — live code-intel daemon. Usage: scipd [--version|-V] [--help|-h]");
+            return ExitCode::SUCCESS;
+        }
+        None => {}
+    }
+
     let home = match codeintel_home() {
         Ok(home) => home,
         Err(e) => {
@@ -150,5 +190,43 @@ fn main() -> ExitCode {
             format!("accept loop failed: {e}"),
             "launchd KeepAlive will restart scipd; check ~/.codeintel/logs",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_version_flags() {
+        assert_eq!(
+            early_flag(&["--version".to_string()]),
+            Some(EarlyFlag::Version)
+        );
+        assert_eq!(early_flag(&["-V".to_string()]), Some(EarlyFlag::Version));
+    }
+
+    #[test]
+    fn recognizes_help_flags() {
+        assert_eq!(early_flag(&["--help".to_string()]), Some(EarlyFlag::Help));
+        assert_eq!(early_flag(&["-h".to_string()]), Some(EarlyFlag::Help));
+    }
+
+    #[test]
+    fn other_args_are_not_early_flags() {
+        assert_eq!(early_flag(&[]), None);
+        assert_eq!(early_flag(&["--foo".to_string()]), None);
+        assert_eq!(
+            early_flag(&["serve".to_string(), "--bar".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn version_takes_priority_when_both_present() {
+        assert_eq!(
+            early_flag(&["--help".to_string(), "--version".to_string()]),
+            Some(EarlyFlag::Version)
+        );
     }
 }

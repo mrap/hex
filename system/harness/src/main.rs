@@ -588,6 +588,9 @@ enum ModuleCommands {
     /// Disable a module: it stays scheduled, but every fire logs a loud skip
     /// and does nothing (takes effect at its next fire; no restart)
     Disable { name: String },
+    /// Exit 1 if any .hex/modules/*.worker.rs on disk is missing from this
+    /// binary's registry (built without --features personal, most commonly).
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -1168,11 +1171,13 @@ fn main() {
                     memory::search::run(&hex_dir, &args)
                 }
                 MemoryCommands::Index { full, stats, max } => {
-                    // --stats is a cheap read; only throttle the heavy index path.
-                    if !*stats {
-                        throttle::apply("memory index", *max);
-                    }
-                    memory::index::run(&hex_dir, *full, *stats)
+                    // KTD7: the throttle decision now lives behind
+                    // memory::index::run_index_cli's pending-file pre-pass
+                    // (via memory::index::run). `throttle::apply` is passed
+                    // in as a fn pointer because `memory` is a lib-crate
+                    // module and `throttle` is a bin-crate-only module (see
+                    // the doc comment on memory::index::run_index_cli).
+                    memory::index::run(&hex_dir, *full, *stats, *max, throttle::apply)
                 }
                 MemoryCommands::ParseTranscripts {
                     file,
@@ -1491,6 +1496,24 @@ fn main() {
             }
             ModuleCommands::Disable { name } => {
                 std::process::exit(module_set_enabled(&name, false));
+            }
+            ModuleCommands::Verify => {
+                let hex_dir = get_hex_dir();
+                let compiled = hex::failures::compiled_module_basenames();
+                let missing = hex::failures::modules_not_landed(&hex_dir, &compiled);
+                if !missing.is_empty() {
+                    for file in &missing {
+                        eprintln!(
+                            "module verify: MISSING {file} — on disk but not compiled into this binary; build with --features personal"
+                        );
+                    }
+                    std::process::exit(1);
+                }
+                println!(
+                    "module verify: OK — {} compiled module(s), 0 missing",
+                    compiled.len()
+                );
+                std::process::exit(0)
             }
         },
         Commands::Charter { command } => {
@@ -2238,7 +2261,8 @@ fn run_failures(window: i64, alert: bool) -> i32 {
             return 2;
         }
     };
-    let sigs = hex::failures::failure_signatures(now, window).unwrap_or_default();
+    let (sigs, storms) =
+        hex::failures::failure_and_storm_signatures(now, window).unwrap_or_default();
     let dups = hex::failures::duplicate_fires(&exp, now).unwrap_or_default();
     let compiled = hex::failures::compiled_module_basenames();
     let not_landed = hex::failures::modules_not_landed(&hex_dir, &compiled);
@@ -2333,6 +2357,37 @@ fn run_failures(window: i64, alert: bool) -> i32 {
                 s.first_seen,
                 s.last_seen
             );
+        }
+    }
+    if !storms.is_empty() {
+        bad = true;
+        println!(
+            "\nFAILURE STORMS (same error across {}+ distinct workers):",
+            hex::failures::storm_min_workers()
+        );
+        for s in &storms {
+            println!(
+                "  {}x across {} workers  {}  first {}  last {}  e.g. {}",
+                s.total_rows,
+                s.distinct_fids,
+                s.head,
+                s.first_ts,
+                s.last_ts,
+                s.sample_fids.join(", ")
+            );
+            if alert {
+                hex::alert::notify_with_class(
+                    &hex::failures::storm_alert_key(&s.head),
+                    "hex failure storm: same error across multiple workers",
+                    &format!(
+                        "{} across {} workers: {}",
+                        s.head,
+                        s.distinct_fids,
+                        s.sample_fids.join(", ")
+                    ),
+                    hex::alert::AlertClass::HarnessDown,
+                );
+            }
         }
     }
     if !dups.is_empty() {

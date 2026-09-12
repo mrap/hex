@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity installs go to /tmp; never let them reinstall the live ~/.boi companion.
+export HEX_INSTALL_SKIP_COMPANIONS=1
 # run-all.sh — Orchestrator for the codex-parity E2E suite.
 #
 # Usage (local):

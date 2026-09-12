@@ -231,6 +231,52 @@ pub fn signature_head(detail: &str) -> String {
     out
 }
 
+/// One `events` row already reduced to what `failure_signatures` and
+/// `storm_signatures` both need: the fid, status, normalized signature head
+/// (via [`signature_head`]), and ts. Both functions run the identical
+/// `SELECT ... WHERE status IN (...) ORDER BY ts` query and the identical
+/// per-row `signature_head` call — [`fetch_failure_rows`] runs that once so
+/// callers only differ in how they group the rows.
+#[derive(Debug, Clone)]
+struct FailureRow {
+    fid: String,
+    status: String,
+    head: String,
+    ts: String,
+}
+
+/// Fetch and pre-normalize every failing `events` row, oldest first (rows
+/// arrive `ORDER BY ts`, which both callers rely on to fold `first_ts`/
+/// `last_ts` without an explicit min/max comparison).
+fn fetch_failure_rows(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<FailureRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT event, status, COALESCE(detail,''), ts FROM events
+         WHERE status IN ('error','panic','failed') ORDER BY ts",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (fid, status, detail, ts) = r?;
+        let head = signature_head(&detail);
+        out.push(FailureRow { fid, status, head, ts });
+    }
+    Ok(out)
+}
+
+/// RFC3339 cutoff for "active in the last `window_hours`", shared by
+/// `failure_signatures` and `storm_signatures` (both filter/flag against it
+/// via plain string comparison against RFC3339 `ts` values).
+fn window_start(now: DateTime<Utc>, window_hours: i64) -> String {
+    (now - chrono::Duration::hours(window_hours)).to_rfc3339()
+}
+
 /// Failures grouped by (fid, signature head), with is_new flagged when
 /// first_seen falls inside the last `window_hours`. Only signatures ACTIVE in
 /// the window are returned. status semantics: error/panic/failed = failures;
@@ -243,38 +289,33 @@ pub fn failure_signatures(
         return Ok(Vec::new());
     }
     let conn = crate::telemetry::open_ro()?;
-    let mut stmt = conn.prepare(
-        "SELECT event, status, COALESCE(detail,''), ts FROM events
-         WHERE status IN ('error','panic','failed') ORDER BY ts",
-    )?;
+    let rows = fetch_failure_rows(&conn)?;
+    Ok(build_failure_signatures(&rows, now, window_hours))
+}
+
+fn build_failure_signatures(
+    rows: &[FailureRow],
+    now: DateTime<Utc>,
+    window_hours: i64,
+) -> Vec<FailureSignature> {
     let mut map: std::collections::BTreeMap<(String, String), FailureSignature> =
         Default::default();
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    })?;
     for r in rows {
-        let (fid, status, detail, ts) = r?;
-        let head = signature_head(&detail);
         let e = map
-            .entry((fid.clone(), head.clone()))
-            .or_insert(FailureSignature {
-                fid,
-                head,
-                status,
+            .entry((r.fid.clone(), r.head.clone()))
+            .or_insert_with(|| FailureSignature {
+                fid: r.fid.clone(),
+                head: r.head.clone(),
+                status: r.status.clone(),
                 count: 0,
-                first_seen: ts.clone(),
-                last_seen: ts.clone(),
+                first_seen: r.ts.clone(),
+                last_seen: r.ts.clone(),
                 is_new: false,
             });
         e.count += 1;
-        e.last_seen = ts;
+        e.last_seen = r.ts.clone();
     }
-    let window_start = (now - chrono::Duration::hours(window_hours)).to_rfc3339();
+    let window_start = window_start(now, window_hours);
     let mut out: Vec<_> = map
         .into_values()
         .filter(|s| s.last_seen >= window_start)
@@ -284,7 +325,152 @@ pub fn failure_signatures(
         })
         .collect();
     out.sort_by_key(|b| std::cmp::Reverse((b.is_new, b.count)));
-    Ok(out)
+    out
+}
+
+/// Default minimum count of DISTINCT workers (fids) failing with the same
+/// normalized error head, inside the failures window, before it counts as a
+/// cross-worker "storm" (R3/R4, KTD3/KTD4). Overridable via
+/// `HEX_FAILURES_STORM_MIN_WORKERS`; a missing, non-numeric, or zero value
+/// falls back to this default.
+pub const STORM_MIN_WORKERS: usize = 3;
+
+/// Effective storm threshold (see [`STORM_MIN_WORKERS`] doc above): the
+/// `HEX_FAILURES_STORM_MIN_WORKERS` override when set to a valid positive
+/// integer, else the default. Callers that print the threshold (e.g. the
+/// `run_failures` banner) must call this, not the const directly, or the
+/// printed number can disagree with what was actually applied.
+pub fn storm_min_workers() -> usize {
+    std::env::var("HEX_FAILURES_STORM_MIN_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(STORM_MIN_WORKERS)
+}
+
+#[derive(Debug, Clone)]
+pub struct StormSignature {
+    pub head: String,
+    pub distinct_fids: usize,
+    /// Up to 5 sample fids that hit this head, for the alert/print text.
+    pub sample_fids: Vec<String>,
+    pub first_ts: String,
+    pub last_ts: String,
+    pub total_rows: i64,
+}
+
+/// Cross-worker failure storms: rows grouped by `signature_head` ALONE
+/// (unlike `failure_signatures`, which groups by (fid, head)) — the same
+/// root cause hitting `storm_min_workers()`-or-more DISTINCT workers inside
+/// `window_hours` is one storm, so the caller can fire one alert naming the
+/// error and the worker count instead of one alert per worker (KTD3/KTD4;
+/// R3/R4). Only rows whose own `ts` falls inside the window are grouped at
+/// all (filtered before grouping, not after) — a group must not accrue
+/// distinct fids from outside the window just because some other row in the
+/// same head landed inside it.
+pub fn storm_signatures(
+    now: DateTime<Utc>,
+    window_hours: i64,
+) -> rusqlite::Result<Vec<StormSignature>> {
+    if !crate::telemetry::db_exists() {
+        return Ok(Vec::new());
+    }
+    let conn = crate::telemetry::open_ro()?;
+    let rows = fetch_failure_rows(&conn)?;
+    Ok(build_storm_signatures(&rows, now, window_hours))
+}
+
+struct StormGroup {
+    fids: BTreeSet<String>,
+    total_rows: i64,
+    first_ts: String,
+    last_ts: String,
+}
+
+fn build_storm_signatures(
+    rows: &[FailureRow],
+    now: DateTime<Utc>,
+    window_hours: i64,
+) -> Vec<StormSignature> {
+    // Compute the cutoff BEFORE grouping and skip out-of-window rows up
+    // front: `rows` is every failing row ever fetched (fetch_failure_rows has
+    // no time bound), and grouping by head alone (unlike
+    // build_failure_signatures's (fid, head) grouping) previously let a
+    // distinct fid from a stale row count toward the storm threshold as long
+    // as SOME row in that head's group was recent — a group's `last_ts` could
+    // be inside the window while its `fids` set included workers whose only
+    // rows were hours or days old. Filtering here means every row folded into
+    // a group is already known to be in-window, so the group's fid count is
+    // genuinely an in-window count and no post-hoc filter is needed.
+    let window_start = window_start(now, window_hours);
+    let mut map: std::collections::BTreeMap<String, StormGroup> = Default::default();
+    for r in rows {
+        if r.ts.as_str() < window_start.as_str() {
+            continue;
+        }
+        let g = map.entry(r.head.clone()).or_insert_with(|| StormGroup {
+            fids: BTreeSet::new(),
+            total_rows: 0,
+            first_ts: r.ts.clone(),
+            last_ts: r.ts.clone(),
+        });
+        g.fids.insert(r.fid.clone());
+        g.total_rows += 1;
+        // Rows arrive ORDER BY ts (fetch_failure_rows), so first_ts is fixed
+        // at group creation above and last_ts is simply the latest row seen —
+        // mirrors build_failure_signatures (no min/max comparison needed).
+        g.last_ts = r.ts.clone();
+    }
+    // Read the threshold here, at the point of use — not hoisted into
+    // fetch_failure_rows or cached — so an env override still applies
+    // per-call (storm_min_workers_env_override_and_garbage_fallback flips the
+    // env var between two calls in the same test and expects each to see it).
+    let threshold = storm_min_workers();
+    let mut out: Vec<StormSignature> = map
+        .into_iter()
+        .filter(|(_, g)| g.fids.len() >= threshold)
+        .map(|(head, g)| {
+            let sample_fids: Vec<String> = g.fids.iter().take(5).cloned().collect();
+            StormSignature {
+                head,
+                distinct_fids: g.fids.len(),
+                sample_fids,
+                first_ts: g.first_ts,
+                last_ts: g.last_ts,
+                total_rows: g.total_rows,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.distinct_fids
+            .cmp(&a.distinct_fids)
+            .then_with(|| a.head.cmp(&b.head))
+    });
+    out
+}
+
+/// Fetch failure rows once and build both groupings from the same data
+/// (`run_failures` calls `failure_signatures` and `storm_signatures` back to
+/// back today, each re-running the same query and the same per-row
+/// `signature_head`). The two single-purpose functions above stay for tests
+/// and any other caller that only needs one grouping.
+///
+/// Note: unlike the two calls it replaces, a read failure here fails both
+/// groupings together (the two separate calls could previously fail
+/// independently) — same query against the same store, so in practice they
+/// fail together anyway.
+pub fn failure_and_storm_signatures(
+    now: DateTime<Utc>,
+    window_hours: i64,
+) -> rusqlite::Result<(Vec<FailureSignature>, Vec<StormSignature>)> {
+    if !crate::telemetry::db_exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let conn = crate::telemetry::open_ro()?;
+    let rows = fetch_failure_rows(&conn)?;
+    let sigs = build_failure_signatures(&rows, now, window_hours);
+    let storms = build_storm_signatures(&rows, now, window_hours);
+    Ok((sigs, storms))
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +534,29 @@ pub fn alert_key(kind: &str, ident: &str) -> String {
         .collect::<Vec<_>>()
         .join("-");
     format!("failures-{kind}-{safe}")
+}
+
+/// Tiny dependency-free FNV-1a (32-bit) hash, used only to disambiguate
+/// [`storm_alert_key`]'s dedupe key — not for anything security-sensitive.
+fn fnv1a32(s: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in s.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Storm-specific alert key. [`alert_key`]'s sanitization is lossy — all
+/// punctuation and whitespace collapse to `-` and runs of `-` collapse
+/// further — so two distinct signature heads that differ only in
+/// punctuation/spacing (e.g. "foo: bar" vs "foo bar") can sanitize to the
+/// same key. That collapses two distinct storms into one dedupe key, so the
+/// second storm never alerts within `alert::notify`'s dedupe window. Appending
+/// a short stable hash of the RAW (pre-sanitize) head keeps distinct heads
+/// distinct while staying stable for the same head across calls.
+pub fn storm_alert_key(head: &str) -> String {
+    alert_key("storm", &format!("{head}-{:08x}", fnv1a32(head)))
 }
 
 #[cfg(test)]
@@ -595,6 +804,208 @@ mod signature_tests {
         assert!(duplicate_fires(&exp, now)
             .expect("dup_fires must not Err")
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod storm_tests {
+    use super::testutil::*;
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn storm_detected_when_three_distinct_fids_share_head() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        seed_schema();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        for fid in ["a::x", "b::y", "c::z"] {
+            row_d(
+                fid,
+                now - Duration::hours(1),
+                "error",
+                "spawn failed for `hex`: No such file or directory (os error 2)",
+            );
+        }
+        let storms = storm_signatures(now, 24).unwrap();
+        assert_eq!(storms.len(), 1, "{:?}", storms);
+        assert_eq!(storms[0].distinct_fids, 3);
+    }
+
+    #[test]
+    fn two_distinct_fids_is_not_a_storm() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        seed_schema();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        for fid in ["a::x", "b::y"] {
+            row_d(
+                fid,
+                now - Duration::hours(1),
+                "error",
+                "spawn failed for `hex`: No such file or directory (os error 2)",
+            );
+        }
+        let storms = storm_signatures(now, 24).unwrap();
+        assert!(storms.is_empty(), "{:?}", storms);
+    }
+
+    #[test]
+    fn three_rows_from_one_fid_is_not_a_storm() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        seed_schema();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        for _ in 0..3 {
+            row_d(
+                "a::x",
+                now - Duration::hours(1),
+                "error",
+                "spawn failed for `hex`: No such file or directory (os error 2)",
+            );
+        }
+        let storms = storm_signatures(now, 24).unwrap();
+        assert!(storms.is_empty(), "{:?}", storms);
+    }
+
+    #[test]
+    fn storm_collapses_digit_variation_in_head() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        seed_schema();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        row_d(
+            "a::x",
+            now - Duration::hours(1),
+            "error",
+            "`hex` exited 1: spawn failed",
+        );
+        row_d(
+            "b::y",
+            now - Duration::hours(1),
+            "error",
+            "`hex` exited 2: spawn failed",
+        );
+        row_d(
+            "c::z",
+            now - Duration::hours(1),
+            "error",
+            "`hex` exited 3: spawn failed",
+        );
+        let storms = storm_signatures(now, 24).unwrap();
+        assert_eq!(
+            storms.len(),
+            1,
+            "signature_head must collapse the differing exit-code digit: {:?}",
+            storms
+        );
+        assert_eq!(storms[0].distinct_fids, 3);
+    }
+
+    #[test]
+    fn stale_fids_outside_window_do_not_count_toward_storm_threshold() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        seed_schema();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        let head = "spawn failed for `hex`: No such file or directory (os error 2)";
+        // Two distinct fids, both 100h old — well outside a 24h window.
+        for fid in ["old::a", "old::b"] {
+            row_d(fid, now - Duration::hours(100), "error", head);
+        }
+        // One fid inside the window — same head.
+        row_d("new::c", now - Duration::hours(1), "error", head);
+        let storms = storm_signatures(now, 24).unwrap();
+        assert!(
+            storms.is_empty(),
+            "2 stale fids + 1 in-window fid must NOT count as a 3-worker storm: {:?}",
+            storms
+        );
+
+        // Three distinct fids all inside the window IS a storm.
+        for fid in ["new::d", "new::e"] {
+            row_d(fid, now - Duration::hours(1), "error", head);
+        }
+        let storms = storm_signatures(now, 24).unwrap();
+        assert_eq!(
+            storms.len(),
+            1,
+            "3 distinct fids inside the window must be a storm: {:?}",
+            storms
+        );
+        assert_eq!(storms[0].distinct_fids, 3);
+    }
+
+    #[test]
+    fn storm_alert_key_disambiguates_heads_that_alert_key_collapses() {
+        // Punctuation/whitespace differ only in a way alert_key's sanitizer
+        // collapses both to: verify that collision actually happens first,
+        // so this test documents the exact failure storm_alert_key defends
+        // against, then verify storm_alert_key tells them apart.
+        let head1 = "foo: bar";
+        let head2 = "foo bar";
+        assert_eq!(
+            alert_key("storm", head1),
+            alert_key("storm", head2),
+            "precondition: alert_key must collapse these two distinct heads to the same key"
+        );
+        let key1 = storm_alert_key(head1);
+        let key2 = storm_alert_key(head2);
+        assert_ne!(
+            key1, key2,
+            "storm_alert_key must keep distinct heads apart even when alert_key would collapse them"
+        );
+        assert_eq!(
+            storm_alert_key(head1),
+            storm_alert_key(head1),
+            "storm_alert_key must be deterministic for the same head"
+        );
+    }
+
+    #[test]
+    fn storm_alert_key_is_stable_and_sanitized() {
+        let head = "spawn failed for `hex`: No such file or directory (os error 2)";
+        let key1 = alert_key("storm", head);
+        let key2 = alert_key("storm", head);
+        assert_eq!(key1, key2, "alert_key must be deterministic for the same head");
+        assert!(key1.starts_with("failures-storm-"));
+        assert!(
+            key1
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'),
+            "alert key must be path-safe: {key1}"
+        );
+        assert!(!key1.contains(' ') && !key1.contains('`') && !key1.contains(':'));
+    }
+
+    #[test]
+    fn storm_min_workers_env_override_and_garbage_fallback() {
+        let (_t, _g) = crate::telemetry::test_support::isolate();
+        seed_schema();
+        let now = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+        for fid in ["a::x", "b::y"] {
+            row_d(
+                fid,
+                now - Duration::hours(1),
+                "error",
+                "spawn failed for `hex`: No such file or directory (os error 2)",
+            );
+        }
+
+        std::env::set_var("HEX_FAILURES_STORM_MIN_WORKERS", "2");
+        let storms = storm_signatures(now, 24).unwrap();
+        assert_eq!(
+            storms.len(),
+            1,
+            "env override to 2 must make 2 distinct fids a storm: {:?}",
+            storms
+        );
+        assert_eq!(storms[0].distinct_fids, 2);
+
+        std::env::set_var("HEX_FAILURES_STORM_MIN_WORKERS", "garbage");
+        let storms_garbage = storm_signatures(now, 24).unwrap();
+        assert!(
+            storms_garbage.is_empty(),
+            "garbage env value must fall back to the default of 3: {:?}",
+            storms_garbage
+        );
+
+        std::env::remove_var("HEX_FAILURES_STORM_MIN_WORKERS");
     }
 }
 

@@ -42,40 +42,7 @@ pub fn run(hex_dir: &Path) -> i32 {
     }
 
     // 4. Orphan project dirs
-    let projects_dir = hex_dir.join("projects");
-    if projects_dir.is_dir() {
-        match fs::read_dir(&projects_dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str == "_archive" {
-                        continue;
-                    }
-                    let has_context = path.join("context.md").exists();
-                    let has_checkpoint = path.join("checkpoint.md").exists();
-                    // charter.yaml is no longer required: the agent fleet and per-project
-                    // charters were removed in the fleet teardown. Requiring it would flag
-                    // every project as ORPHAN.
-                    if !has_context || !has_checkpoint {
-                        let msg = format!("ORPHAN: projects/{name_str} missing required files (context.md, checkpoint.md)");
-                        lines.push(msg.clone());
-                        issues.push(msg);
-                    }
-                }
-            }
-            Err(e) => {
-                let msg = format!("ISSUE: cannot read projects/ dir: {e}");
-                lines.push(msg.clone());
-                issues.push(msg);
-            }
-        }
-    } else {
-        let msg = "ISSUE: projects/ directory does not exist".to_string();
+    for msg in orphan_project_issues(hex_dir) {
         lines.push(msg.clone());
         issues.push(msg);
     }
@@ -121,6 +88,47 @@ pub fn run(hex_dir: &Path) -> i32 {
     } else {
         1
     }
+}
+
+/// Scan `hex_dir/projects/*` for orphaned project directories: any dir (other
+/// than `_archive`) missing its required file(s). Returns one ORPHAN/ISSUE
+/// message per problem found, in the same form `run()` reports them.
+fn orphan_project_issues(hex_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let projects_dir = hex_dir.join("projects");
+    if projects_dir.is_dir() {
+        match fs::read_dir(&projects_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str == "_archive" {
+                        continue;
+                    }
+                    let has_context = path.join("context.md").exists();
+                    // charter.yaml is no longer required: the agent fleet and per-project
+                    // charters were removed in the fleet teardown. Requiring it would flag
+                    // every project as ORPHAN.
+                    // checkpoint.md is no longer required either: it belonged to the same
+                    // retired fleet era. CLAUDE.md names context.md as the canonical
+                    // project file, so that's the only file we require here.
+                    if !has_context {
+                        out.push(format!("ORPHAN: projects/{name_str} missing context.md"));
+                    }
+                }
+            }
+            Err(e) => {
+                out.push(format!("ISSUE: cannot read projects/ dir: {e}"));
+            }
+        }
+    } else {
+        out.push("ISSUE: projects/ directory does not exist".to_string());
+    }
+    out
 }
 
 fn chrono_utc_now() -> String {
@@ -320,6 +328,48 @@ fn check_audit_freshness(hex_dir: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_project_with_context_only_is_not_orphan() {
+        let (td, _g) = crate::telemetry::test_support::isolate();
+        let proj = td.path().join("projects").join("alpha");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("context.md"), "hi").unwrap();
+        let issues = orphan_project_issues(td.path());
+        assert!(
+            issues.is_empty(),
+            "project with context.md only must not be ORPHAN: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn orphan_project_with_neither_file_is_orphan() {
+        let (td, _g) = crate::telemetry::test_support::isolate();
+        let proj = td.path().join("projects").join("beta");
+        fs::create_dir_all(&proj).unwrap();
+        let issues = orphan_project_issues(td.path());
+        assert_eq!(issues.len(), 1, "expected exactly one ORPHAN issue: {issues:?}");
+        assert!(
+            issues[0].contains("context.md"),
+            "message must name context.md: {issues:?}"
+        );
+        assert!(
+            !issues[0].contains("checkpoint.md"),
+            "message must not name checkpoint.md: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn orphan_archive_dir_is_skipped() {
+        let (td, _g) = crate::telemetry::test_support::isolate();
+        let archive = td.path().join("projects").join("_archive");
+        fs::create_dir_all(&archive).unwrap();
+        let issues = orphan_project_issues(td.path());
+        assert!(
+            issues.is_empty(),
+            "_archive dir must be skipped even with no files: {issues:?}"
+        );
+    }
 
     #[test]
     fn consolidate_prose_parens_not_extracted() {

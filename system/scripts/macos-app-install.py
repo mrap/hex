@@ -46,14 +46,19 @@ MAX_HELPER_BYTES = 1024 * 1024
 MAX_PLIST_BYTES = 64 * 1024
 MAX_LAUNCHCTL_BYTES = 64 * 1024
 SCIPD_LAUNCHD_LABEL = "com.hex.scipd"
+SERVICE_BOOTOUT_WAIT_SECS = 10.0
+SERVICE_BOOTOUT_POLL_INTERVAL_SECS = 0.2
+SERVICE_BOOTSTRAP_MAX_ATTEMPTS = 5
+SERVICE_BOOTSTRAP_RETRY_PAUSE_SECS = 1.0
 
 
 class InstallError(RuntimeError):
     """A bounded, operator-facing install or recovery failure."""
 
-    def __init__(self, message: str, *, published: Optional[bool] = None):
+    def __init__(self, message: str, *, published: Optional[bool] = None, self_check_failed: Optional[bool] = None):
         super().__init__(message)
         self.published = published
+        self.self_check_failed = self_check_failed
 
 
 class Signer(Protocol):
@@ -662,6 +667,45 @@ def _launchctl_program(output: str) -> Optional[str]:
     return values[0]
 
 
+def _service_reload_sleep(seconds: float) -> None:
+    """The post-bootout poll / bootstrap-retry pause, isolated so tests can patch it and run fast."""
+    time.sleep(seconds)
+
+
+def _wait_for_service_bootout(launchctl: Callable[[list[str]], tuple[int, str, str]], domain: str) -> None:
+    """`launchctl bootout` returns once launchd accepts the request, not once the old
+    process has actually exited. Bootstrapping the new plist while the old instance is
+    still mid-exit can return "Bootstrap failed: 5: Input/output error" (observed
+    2026-09-12; a manual bootstrap of the identical plist 30s later succeeded). Poll
+    `launchctl print` for the domain until it reports the service gone, bounded to
+    SERVICE_BOOTOUT_WAIT_SECS -- a stuck teardown is surfaced by the bootstrap retry
+    that follows, not swallowed here.
+    """
+    deadline = time.monotonic() + SERVICE_BOOTOUT_WAIT_SECS
+    while True:
+        loaded, _ = _launchctl_loaded(launchctl, domain)
+        if not loaded:
+            return
+        if time.monotonic() >= deadline:
+            return
+        _service_reload_sleep(SERVICE_BOOTOUT_POLL_INTERVAL_SECS)
+
+
+def _bootstrap_service_with_retry(launchctl: Callable[[list[str]], tuple[int, str, str]], gui_domain: str, plist: Path) -> None:
+    """Bootstrap can transiently fail with an I/O error while launchd is still tearing
+    down the just-booted-out service (see `_wait_for_service_bootout`). Retry a bounded
+    number of fresh bootstrap attempts, spaced out, before giving up.
+    """
+    stderr = ""
+    for attempt in range(1, SERVICE_BOOTSTRAP_MAX_ATTEMPTS + 1):
+        returncode, _, stderr = launchctl(["bootstrap", gui_domain, str(plist.absolute())])
+        if not returncode:
+            return
+        if attempt < SERVICE_BOOTSTRAP_MAX_ATTEMPTS:
+            _service_reload_sleep(SERVICE_BOOTSTRAP_RETRY_PAUSE_SECS)
+    raise InstallError(f"service bootstrap failed after plist publication: {stderr.strip()[-500:]} after {SERVICE_BOOTSTRAP_MAX_ATTEMPTS} attempts", published=True)
+
+
 def _replace_bound(parent_fd: int, temporary: Path, destination: Path) -> None:
     os.rename(temporary.name, destination.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
@@ -863,9 +907,8 @@ def service_reconcile(product: str, root: Path, signer: Signer, *, policy_path: 
                 returncode, _, stderr = launchctl(["bootout", domain])
                 if returncode:
                     raise InstallError(f"service bootout failed after plist publication: {stderr.strip()[-500:]}", published=True)
-            returncode, _, stderr = launchctl(["bootstrap", f"gui/{os.getuid()}", str(plist.absolute())])
-            if returncode:
-                raise InstallError(f"service bootstrap failed after plist publication: {stderr.strip()[-500:]}", published=True)
+                _wait_for_service_bootout(launchctl, domain)
+            _bootstrap_service_with_retry(launchctl, f"gui/{os.getuid()}", plist)
             verified_loaded, verified_output = _launchctl_loaded(launchctl, domain)
             if not verified_loaded or _launchctl_program(verified_output) != owner["executable_path"]:
                 raise InstallError("service reload did not load the verified scipd executable", published=True)
@@ -1057,6 +1100,118 @@ def abandon_staging(product: str, root: Path) -> dict[str, Any]:
         raise StagingRecoveryError(str(exc), archive) from exc
 
 
+SELF_CHECK_TIMEOUT_ENV = "HEX_APP_INSTALL_SELF_CHECK_TIMEOUT_SECS"
+SELF_CHECK_DEFAULT_TIMEOUT_SECS = 10.0
+SELF_CHECK_RETRY_PAUSE_SECS = 5.0
+
+
+def _self_check_timeout_secs() -> float:
+    """KTD2: 10s default. Overridable so a slow first Gatekeeper launch can be tuned without a code change."""
+    raw = os.environ.get(SELF_CHECK_TIMEOUT_ENV)
+    if raw is None:
+        return SELF_CHECK_DEFAULT_TIMEOUT_SECS
+    try:
+        value = float(raw)
+    except ValueError:
+        return SELF_CHECK_DEFAULT_TIMEOUT_SECS
+    return value if value > 0 else SELF_CHECK_DEFAULT_TIMEOUT_SECS
+
+
+def _run_self_check(cli: Path, args: list[str], timeout: float, env: Optional[Mapping[str, str]] = None) -> subprocess.CompletedProcess:
+    """Spawn the just-published CLI with `args`. Tests patch this so no real binary runs."""
+    run_env = None
+    if env is not None:
+        run_env = dict(os.environ)
+        run_env.update(env)
+    return subprocess.run([str(cli), *args], capture_output=True, text=True, timeout=timeout, env=run_env)
+
+
+def _self_check_sleep(seconds: float) -> None:
+    """The KTD2 retry pause, isolated so tests can patch it and run fast."""
+    time.sleep(seconds)
+
+
+def _module_verify_workspace(product: Product, root: Path) -> Optional[Path]:
+    """R2: the hex workspace to gate `module verify` on, or None to skip it.
+
+    `root` here is the product's fixed install root (Paths.root) -- for the hex
+    product that is, by install.sh convention, `<workspace>/.hex` (it invokes
+    `_macos_app_install hex "$TARGET_DIR/.hex" ...`, and TARGET_DIR is the hex
+    workspace containing CLAUDE.md; confirmed against this instance, where
+    `.hex/bin/hex` is the published symlink and CLAUDE.md sits one level up).
+    Personal worker files live at `<workspace>/.hex/modules/*.worker.rs`, and
+    `hex module verify`'s HEX_DIR must be the workspace itself --
+    get_hex_dir() requires CLAUDE.md directly under it, so HEX_DIR=root (the
+    plan's literal notation) would always fail; HEX_DIR=root/modules would
+    always be empty. Only the hex product carries this convention, and only
+    when root's name is literally ".hex" -- skip defensively otherwise rather
+    than gate on a guessed path.
+    """
+    if product.name != "hex" or root.name != ".hex":
+        return None
+    workspace = root.parent
+    modules_dir = workspace / ".hex" / "modules"
+    if not modules_dir.is_dir():
+        return None
+    if not any(modules_dir.rglob("*.worker.rs")):
+        return None
+    return workspace
+
+
+def _self_check_published_cli(cli: Optional[Path], product: Product, root: Path) -> None:
+    """R1/R2: confirm the just-published CLI can execute before the journal commits.
+
+    One retry after a pause, on timeout only (KTD2) -- a freshly signed app's first
+    launch can stall on Gatekeeper validation. A second timeout or a non-zero exit
+    raises InstallError(self_check_failed=True); the caller's existing
+    `except Exception` handler turns that into a full rollback. A product with no
+    CLI path is skipped.
+
+    R2/KTD2: after --version succeeds, when `_module_verify_workspace` finds an
+    on-disk personal worker file for the hex product, also runs
+    `<cli> module verify` with HEX_DIR set to that workspace -- catches a binary
+    published without the personal modules those files belong to.
+    """
+    if cli is None:
+        return
+    timeout = _self_check_timeout_secs()
+    try:
+        result = _run_self_check(cli, ["--version"], timeout)
+    except subprocess.TimeoutExpired:
+        _self_check_sleep(SELF_CHECK_RETRY_PAUSE_SECS)
+        try:
+            result = _run_self_check(cli, ["--version"], timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise InstallError(f"self-check timed out twice after {timeout}s: {cli} --version", self_check_failed=True) from exc
+        except OSError as exc:
+            raise InstallError(f"self-check could not execute {cli}: {exc}", self_check_failed=True) from exc
+    except OSError as exc:
+        raise InstallError(f"self-check could not execute {cli}: {exc}", self_check_failed=True) from exc
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise InstallError(f"self-check failed: {cli} --version exited {result.returncode}: {stderr}", self_check_failed=True)
+
+    workspace = _module_verify_workspace(product, root)
+    if workspace is None:
+        return
+    verify_env = {"HEX_DIR": str(workspace)}
+    try:
+        verify_result = _run_self_check(cli, ["module", "verify"], timeout, env=verify_env)
+    except subprocess.TimeoutExpired:
+        _self_check_sleep(SELF_CHECK_RETRY_PAUSE_SECS)
+        try:
+            verify_result = _run_self_check(cli, ["module", "verify"], timeout, env=verify_env)
+        except subprocess.TimeoutExpired as exc:
+            raise InstallError(f"self-check timed out twice after {timeout}s: {cli} module verify", self_check_failed=True) from exc
+        except OSError as exc:
+            raise InstallError(f"self-check could not execute {cli}: {exc}", self_check_failed=True) from exc
+    except OSError as exc:
+        raise InstallError(f"self-check could not execute {cli}: {exc}", self_check_failed=True) from exc
+    if verify_result.returncode != 0:
+        stderr = (verify_result.stderr or "").strip()
+        raise InstallError(f"self-check: {cli} module verify failed: {stderr[-500:]}", self_check_failed=True)
+
+
 def install(product: str, root: Path, source: Path, signer: Signer, *, policy_path: Optional[Path] = None, helper_provenance: Optional[Mapping[str, Any]] = None, helper_sources: Optional[Mapping[str, Path]] = None, source_revision: Optional[str] = None, version: str = "1.0.0") -> dict[str, Any]:
     """Stage and publish one complete app. The caller owns no service action."""
     item = PRODUCTS.get(product)
@@ -1212,7 +1367,7 @@ def install(product: str, root: Path, source: Path, signer: Signer, *, policy_pa
                     _atomic_new(cli_fd, alias_candidate, paths.alias)
                     published_alias = _entry_identity(paths.alias)
                     published.append((cli_fd, paths.alias, "previous-alias", False, published_alias, None))
-            state = {"schema_version": STATE_SCHEMA_VERSION, "product": product, "mode": "signed-current", "bundle_identifier": item.bundle_identifier, "bundle_path": str(paths.app.absolute()), "executable_path": str(paths.executable.absolute()), "compatibility_path": str(paths.cli.absolute()), "generation": transaction_id, "transaction_id": transaction_id, "version": verified["version"], "bundle_sha256": _tree_sha256(paths.app), "executable_sha256": _sha256(paths.executable), "previous_compatibility": old_cli, "team_id": verified.get("team_id"), "certificate_sha1": verified.get("certificate_sha1"), "designated_requirements": verified.get("designated_requirements"), "mach_o_uuids": verified.get("mach_o_uuids"), "source_revision": source_revision, "signer_helper_sha256": verified.get("signer_helper_sha256"), "helpers": dict(helper_provenance or {})}
+            state = {"schema_version": STATE_SCHEMA_VERSION, "product": product, "mode": "signed-current", "bundle_identifier": item.bundle_identifier, "bundle_path": str(paths.app.absolute()), "executable_path": str(paths.executable.absolute()), "compatibility_path": str(paths.cli.absolute()), "generation": transaction_id, "transaction_id": transaction_id, "version": verified["version"], "bundle_sha256": _tree_sha256(paths.app), "executable_sha256": _sha256(paths.executable), "previous_compatibility": old_cli, "team_id": verified.get("team_id"), "certificate_sha1": verified.get("certificate_sha1"), "designated_requirements": verified.get("designated_requirements"), "mach_o_uuids": verified.get("mach_o_uuids"), "source_revision": source_revision, "signer_helper_sha256": verified.get("signer_helper_sha256"), "helpers": dict(helper_provenance or {}), "self_check_failed": False}
             state_temp = paths.state.with_name(paths.state.name + f".tmp-{transaction_id}")
             _write_private(state_temp, (json.dumps(state, sort_keys=True, indent=2) + "\n").encode())
             journal["phase"] = "state-swap"
@@ -1236,6 +1391,7 @@ def install(product: str, root: Path, source: Path, signer: Signer, *, policy_pa
             with _open_dir(rollback) as rollback_fd:
                 for directory_fd in (helper_fd, cli_fd, rollback_fd, app_fd):
                     _fsync_dir(directory_fd)
+            _self_check_published_cli(paths.cli, item, paths.root)
             journal["phase"] = "committed"
             _write_journal(paths, journal)
             _clear_journal(paths, transaction_id)
@@ -1261,12 +1417,25 @@ def install(product: str, root: Path, source: Path, signer: Signer, *, policy_pa
                         _restore_public(parent_fd, target, rollback, old_name, had_old, transaction_id, expected_current, fallback)
                     except Exception as rollback_exc:
                         rollback_errors.append(str(rollback_exc))
+                if not rollback_errors:
+                    # Public state is fully restored to its pre-transaction
+                    # identity, so the journal is no longer needed to block a
+                    # later install() -- clear it the same way the success
+                    # path does (same ownership/transaction guard), or a
+                    # post-publish failure (e.g. a failed self-check) leaves a
+                    # clean rollback behind an "open install journal requires
+                    # recovery" error that only abandon-staging can clear.
+                    try:
+                        _clear_journal(paths, transaction_id)
+                    except Exception as clear_exc:
+                        rollback_errors.append(f"journal cleanup failed: {clear_exc}")
             detail = str(exc)
             if staging_evidence_error:
                 detail += "; " + staging_evidence_error
             if rollback_errors:
-                detail += "; rollback failed: " + "; ".join(rollback_errors)
-            raise InstallError(detail, published=bool(published) or bool(rollback_errors)) from exc
+                detail += "; rollback failed: " + "; ".join(rollback_errors) + "; journal left in place, recovery required"
+            raise InstallError(detail, published=bool(published) or bool(rollback_errors),
+                                self_check_failed=bool(getattr(exc, "self_check_failed", False))) from exc
 
 
 # Private entrypoints remain in this provenance-checked helper. No environment
@@ -1810,6 +1979,14 @@ def _emit(value: Mapping[str, Any]) -> int:
     return 0
 
 
+def _install_error_payload(exc: InstallError) -> dict[str, Any]:
+    """The JSON body main() prints to stderr for an InstallError. Exposed so tests can
+    check self_check_failed threading without a full signed install through main()."""
+    return {"schema_version": STATE_SCHEMA_VERSION, "error": str(exc),
+            "published": bool(exc.published) if exc.published is not None else False,
+            "self_check_failed": bool(getattr(exc, "self_check_failed", False))}
+
+
 def _validate_lock_fd(fd: int, paths: Paths) -> None:
     try:
         actual = os.fstat(fd)
@@ -2123,7 +2300,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(dict(exc.result, error=str(exc))), file=sys.stderr)
         return 1
     except InstallError as exc:
-        print(json.dumps({"schema_version": STATE_SCHEMA_VERSION, "error": str(exc), "published": bool(exc.published) if exc.published is not None else False}), file=sys.stderr)
+        print(json.dumps(_install_error_payload(exc)), file=sys.stderr)
         return 1
 
 

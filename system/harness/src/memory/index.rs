@@ -1,7 +1,7 @@
 use chrono::{Local, NaiveDate};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -944,14 +944,124 @@ fn run_budget() -> Option<std::time::Duration> {
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
-pub fn run_index(hex_root: &Path, full: bool) -> i32 {
-    let t0 = std::time::Instant::now();
+/// KTD7 priority decision returned by [`escalation_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escalation {
+    /// Apply the background-priority throttle as usual.
+    Throttle,
+    /// Skip the throttle and run at normal priority. `pending`/`threshold` are
+    /// carried through for the log line even when the decision was forced by
+    /// `--max` rather than an actual backlog — `forced_by_max` tells the log
+    /// line which case it is, so it never claims a backlog crossed the
+    /// threshold when `--max` is what actually forced normal priority.
+    Normal {
+        pending: usize,
+        threshold: usize,
+        forced_by_max: bool,
+    },
+}
+
+/// Default for `HEX_INDEX_BACKLOG_ESCALATE` (KTD7).
+const DEFAULT_BACKLOG_ESCALATE: usize = 1000;
+
+/// Parse `HEX_INDEX_BACKLOG_ESCALATE`. `None` = escalation disabled (the env
+/// value was exactly "0", so the run always throttles unless `--max`);
+/// `Some(n)` = the pending-file threshold to escalate above (unset or an
+/// unparsable value falls back to [`DEFAULT_BACKLOG_ESCALATE`], never panics).
+fn backlog_escalate_threshold(env_value: Option<&str>) -> Option<usize> {
+    match env_value.map(str::trim) {
+        None => Some(DEFAULT_BACKLOG_ESCALATE),
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_BACKLOG_ESCALATE),
+        },
+    }
+}
+
+/// Pure R8/R9 priority decision (KTD7). `max` always forces
+/// [`Escalation::Normal`] (still carrying `pending`/`threshold` for the log
+/// line, with `forced_by_max: true` so the log line doesn't claim a backlog
+/// crossed the threshold when `--max` is what forced it). Otherwise the run
+/// escalates only when `pending` exceeds the parsed threshold
+/// (`forced_by_max: false`); an env value of exactly "0" disables escalation
+/// entirely (always [`Escalation::Throttle`] unless `--max`).
+fn escalation_decision(pending: usize, max: bool, env_value: Option<&str>) -> Escalation {
+    let threshold = backlog_escalate_threshold(env_value);
+    if max {
+        return Escalation::Normal {
+            pending,
+            threshold: threshold.unwrap_or(DEFAULT_BACKLOG_ESCALATE),
+            forced_by_max: true,
+        };
+    }
+    match threshold {
+        None => Escalation::Throttle,
+        Some(threshold) if pending > threshold => Escalation::Normal {
+            pending,
+            threshold,
+            forced_by_max: false,
+        },
+        Some(_) => Escalation::Throttle,
+    }
+}
+
+/// KTD7 pending pre-pass: count files whose mtime differs from the stored
+/// mtime, or that are absent from `existing` entirely (a new file). Mtime-only
+/// — no content reads — so this is a cheap upper-bound estimate; the real
+/// loop's content-hash stage (below) may still skip a file whose mtime moved
+/// but whose content didn't change.
+fn count_pending_files(
+    file_mtimes: &[(String, f64)],
+    existing: &HashMap<String, (f64, String)>,
+) -> usize {
+    file_mtimes
+        .iter()
+        .filter(|(rel_path, mtime)| match existing.get(rel_path) {
+            None => true,
+            Some((prev_mtime, _)) => (*prev_mtime - *mtime).abs() >= 1e-6,
+        })
+        .count()
+}
+
+/// Compute `(rel_path, mtime)` once per discovered file, for the CLI pending
+/// pre-pass ([`count_pending_files`]) only. The indexing loop in
+/// [`run_index_body`] always calls [`file_mtime`] fresh at the point it
+/// processes each file rather than reusing this snapshot — reusing it used to
+/// let a file edited between this pre-pass and the loop reaching it be judged
+/// against a stale mtime and silently deferred a tick (fixed 2026-09-11).
+fn rel_path_mtimes(file_tuples: &[(PathBuf, String)], hex_root: &Path) -> Vec<(String, f64)> {
+    file_tuples
+        .iter()
+        .filter_map(|(filepath, _)| {
+            filepath
+                .strip_prefix(hex_root)
+                .ok()
+                .map(|r| (r.to_string_lossy().to_string(), file_mtime(filepath)))
+        })
+        .collect()
+}
+
+/// Discovery + DB-open + existing-record lookup shared by [`run_index`] and
+/// [`run_index_cli`] (KTD7), so the pending pre-pass and the indexing loop see
+/// the same `file_tuples`/`existing` without a second full DB read.
+struct IndexRunSetup {
+    _lock: std::fs::File,
+    conn: Connection,
+    file_tuples: Vec<(PathBuf, String)>,
+    existing: HashMap<String, (f64, String)>,
+}
+
+/// `Err(code)` means the caller should return `code` immediately without
+/// running the indexing body: `0` when another run already holds the
+/// single-instance lock (overlap is normal), `1` on a hard setup failure.
+fn setup_index_run(hex_root: &Path) -> Result<IndexRunSetup, i32> {
     let db_path = super::db_path(hex_root);
 
     if let Some(parent) = db_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!("hex memory index: cannot create .hex dir: {e}");
-            return 1;
+            return Err(1);
         }
     }
 
@@ -972,14 +1082,13 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
                 "hex memory index: cannot open lock {}: {e}",
                 lock_path.display()
             );
-            return 1;
+            return Err(1);
         }
     };
     if lock_file.try_lock_exclusive().is_err() {
         println!("hex memory index: another run is in progress — skipping");
-        return 0;
+        return Err(0);
     }
-    let _index_lock = lock_file; // released when run_index returns
 
     // Discovery must complete before DB setup, model construction, indexing, or
     // stale-record cleanup. An incomplete source list cannot authorize deletion.
@@ -987,7 +1096,7 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
         Ok(files) => files,
         Err(error) => {
             eprintln!("hex memory index: source discovery failed: {error}");
-            return 1;
+            return Err(1);
         }
     };
 
@@ -995,25 +1104,17 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
         Ok(c) => c,
         Err(e) => {
             eprintln!("hex memory index: cannot open {}: {e}", db_path.display());
-            return 1;
+            return Err(1);
         }
     };
 
     if let Err(e) = init_db(&conn) {
         eprintln!("hex memory index: schema init failed: {e}");
-        return 1;
+        return Err(1);
     }
 
-    let embedder = match super::embed::Embedder::new(hex_root) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("hex memory index: embedding model failed to load: {e}");
-            return 1;
-        }
-    };
-
     // Build lookup of existing records: path → (mtime, content_hash)
-    let existing: std::collections::HashMap<String, (f64, String)> = {
+    let existing: HashMap<String, (f64, String)> = {
         let mut stmt = conn
             .prepare("SELECT path, mtime, content_hash FROM files")
             .unwrap();
@@ -1028,6 +1129,104 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
         .flatten()
         .map(|(p, m, h)| (p, (m, h)))
         .collect()
+    };
+
+    Ok(IndexRunSetup {
+        _lock: lock_file,
+        conn,
+        file_tuples,
+        existing,
+    })
+}
+
+pub fn run_index(hex_root: &Path, full: bool) -> i32 {
+    let t0 = std::time::Instant::now();
+    let setup = match setup_index_run(hex_root) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    run_index_body(hex_root, full, t0, setup)
+}
+
+/// CLI-only entry point (KTD7, R8/R9), reached solely from the `hex memory
+/// index` command via [`run`] (`main.rs`'s `Index` arm → `run` → here). Runs
+/// the same mtime-only pending pre-pass, decides escalation via
+/// [`escalation_decision`], applies or skips the injected `throttle` callback
+/// accordingly, then continues into the same indexing body as [`run_index`].
+///
+/// `throttle` is injected rather than called as `crate::throttle::apply`
+/// directly: `throttle.rs` is declared via `mod throttle;` in `main.rs` (the
+/// *binary* crate), while this module lives under `pub mod memory;` in
+/// `lib.rs` (the *library* crate) — `crate::throttle` does not resolve from
+/// here (confirmed: `error[E0433]: cannot find `throttle` in `crate``). The
+/// binary crate's `consolidate.rs` can call `crate::throttle::apply` directly
+/// only because it is declared as a sibling `mod` in `main.rs` itself. Callers
+/// pass `throttle::apply` (its signature, `fn(task: &str, max: bool)`, matches
+/// this parameter) so the actual OS-priority syscall still runs in-process,
+/// before the indexing loop below starts, without this lib module depending
+/// on a bin-only module.
+///
+/// `run_index` itself never throttles — `doctor/consolidate.rs`'s
+/// `run_index(hex_dir, false)` call and its tests keep their exact signature
+/// and behavior; the consolidate path is already throttled process-wide
+/// (unchanged, per KTD7).
+pub fn run_index_cli(hex_root: &Path, full: bool, max: bool, throttle: fn(&str, bool)) -> i32 {
+    let t0 = std::time::Instant::now();
+    let setup = match setup_index_run(hex_root) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let file_mtimes = rel_path_mtimes(&setup.file_tuples, hex_root);
+    let pending = count_pending_files(&file_mtimes, &setup.existing);
+    let env_value = std::env::var("HEX_INDEX_BACKLOG_ESCALATE").ok();
+
+    match escalation_decision(pending, max, env_value.as_deref()) {
+        Escalation::Normal {
+            pending,
+            threshold,
+            forced_by_max: true,
+        } => {
+            println!(
+                "hex memory index: --max set, running at normal priority ({pending} pending, threshold {threshold})"
+            );
+        }
+        Escalation::Normal {
+            pending,
+            threshold,
+            forced_by_max: false,
+        } => {
+            println!(
+                "hex memory index: {pending} pending > {threshold}, running at normal priority"
+            );
+        }
+        Escalation::Throttle => {
+            throttle("memory index", false);
+        }
+    }
+
+    run_index_body(hex_root, full, t0, setup)
+}
+
+fn run_index_body(
+    hex_root: &Path,
+    full: bool,
+    t0: std::time::Instant,
+    setup: IndexRunSetup,
+) -> i32 {
+    let IndexRunSetup {
+        _lock,
+        conn,
+        file_tuples,
+        existing,
+    } = setup;
+
+    let embedder = match super::embed::Embedder::new(hex_root) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("hex memory index: embedding model failed to load: {e}");
+            return 1;
+        }
     };
 
     println!("Found {} files to check", file_tuples.len());
@@ -1063,6 +1262,11 @@ pub fn run_index(hex_root: &Path, full: bool) -> i32 {
             Ok(r) => r.to_string_lossy().to_string(),
             Err(_) => continue,
         };
+        // Always read a fresh mtime here rather than reusing any pre-pass
+        // snapshot: a file edited between the CLI pending pre-pass
+        // (rel_path_mtimes) and the loop reaching it here must be judged
+        // against its current mtime, not a stale one, or the edit silently
+        // waits for the next tick (fixed 2026-09-11).
         let mtime = file_mtime(filepath);
 
         if !full {
@@ -1393,7 +1597,10 @@ pub fn show_stats(hex_root: &Path) -> i32 {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub fn run(hex_root: &Path, full: bool, stats: bool) -> i32 {
+/// `throttle` is `fn(task: &str, max: bool)` so callers pass `throttle::apply`
+/// (a bin-crate module — see the doc comment on [`run_index_cli`] for why this
+/// is a function pointer rather than a direct call).
+pub fn run(hex_root: &Path, full: bool, stats: bool, max: bool, throttle: fn(&str, bool)) -> i32 {
     if stats {
         show_stats(hex_root)
     } else {
@@ -1403,7 +1610,7 @@ pub fn run(hex_root: &Path, full: bool, stats: bool) -> i32 {
             "Incremental index"
         };
         println!("{mode}...");
-        run_index(hex_root, full)
+        run_index_cli(hex_root, full, max, throttle)
     }
 }
 
@@ -2223,6 +2430,162 @@ mod tests {
             "garbage falls back to the default, never panics"
         );
         std::env::remove_var("HEX_INDEX_BUDGET_SECS");
+    }
+
+    // ── KTD7: index backlog priority escalation (U4) ─────────────────────────
+
+    #[test]
+    fn escalation_decision_env_unset_low_pending_throttles() {
+        assert_eq!(escalation_decision(10, false, None), Escalation::Throttle);
+    }
+
+    #[test]
+    fn escalation_decision_env_unset_high_pending_escalates() {
+        assert_eq!(
+            escalation_decision(5000, false, None),
+            Escalation::Normal {
+                pending: 5000,
+                threshold: 1000,
+                forced_by_max: false
+            }
+        );
+    }
+
+    #[test]
+    fn escalation_decision_env_zero_disables_escalation() {
+        // "0" disables escalation entirely: always throttle unless --max, no
+        // matter how large the backlog.
+        assert_eq!(
+            escalation_decision(5000, false, Some("0")),
+            Escalation::Throttle
+        );
+    }
+
+    #[test]
+    fn escalation_decision_garbage_env_falls_back_to_default() {
+        assert_eq!(
+            escalation_decision(5000, false, Some("abc")),
+            Escalation::Normal {
+                pending: 5000,
+                threshold: 1000,
+                forced_by_max: false
+            },
+            "garbage env value falls back to the default threshold (1000), never panics"
+        );
+        assert_eq!(
+            escalation_decision(500, false, Some("abc")),
+            Escalation::Throttle,
+            "500 pending is under the default-1000 fallback threshold"
+        );
+    }
+
+    #[test]
+    fn escalation_decision_max_forces_normal_even_with_tiny_backlog() {
+        assert_eq!(
+            escalation_decision(1, true, None),
+            Escalation::Normal {
+                pending: 1,
+                threshold: 1000,
+                forced_by_max: true
+            },
+            "--max always escalates, regardless of pending count"
+        );
+    }
+
+    #[test]
+    fn count_pending_files_counts_new_and_changed_not_unchanged() {
+        let mut existing = HashMap::new();
+        existing.insert("me/unchanged.md".to_string(), (100.0, "h1".to_string()));
+        existing.insert("me/changed.md".to_string(), (100.0, "h2".to_string()));
+        // "me/new.md" is absent from `existing` entirely.
+
+        let file_mtimes = vec![
+            ("me/unchanged.md".to_string(), 100.0),
+            ("me/changed.md".to_string(), 200.0),
+            ("me/new.md".to_string(), 50.0),
+        ];
+
+        assert_eq!(
+            count_pending_files(&file_mtimes, &existing),
+            2,
+            "new file + changed-mtime file are pending; unchanged-mtime file is not"
+        );
+    }
+
+    #[test]
+    fn count_pending_files_against_seeded_db_and_real_discovery() {
+        // Exercises the real (non-embedder) half of the KTD7 pre-pass: real
+        // `get_indexable_files` discovery + a DB `files` table seeded directly
+        // (no `run_index`/embedder involved, so this needs no ML model and
+        // isn't #[ignore]d).
+        let tmp = TempDir::new().unwrap();
+        let hex_root = tmp.path();
+        std::fs::create_dir_all(hex_root.join("me")).unwrap();
+        std::fs::create_dir_all(hex_root.join(".hex")).unwrap();
+        std::fs::write(hex_root.join("CLAUDE.md"), "# ws\n").unwrap();
+
+        let unchanged = hex_root.join("me/unchanged.md");
+        std::fs::write(&unchanged, "# Unchanged\ncontent").unwrap();
+        let changed = hex_root.join("me/changed.md");
+        std::fs::write(&changed, "# Changed\ncontent").unwrap();
+        let new_file = hex_root.join("me/new.md");
+        std::fs::write(&new_file, "# New\ncontent").unwrap();
+
+        let conn = super::super::open_db(&hex_root.join(".hex/memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        // Seed "unchanged" (and the CLAUDE.md discovery seed itself — `.`  is
+        // one of `INDEX_DIRS`, so it is indexable too) with their real
+        // on-disk mtime (so the pre-pass sees no drift), and "changed" with a
+        // literal stale mtime (deterministic — avoids flaky filesystem mtime
+        // manipulation). "new" is left unseeded.
+        let unchanged_mtime = file_mtime(&unchanged);
+        let claude_md_mtime = file_mtime(&hex_root.join("CLAUDE.md"));
+        conn.execute(
+            "INSERT INTO files (path, mtime, content_hash, indexed_at, chunk_count) \
+             VALUES (?, ?, '', '', 0)",
+            params!["CLAUDE.md", claude_md_mtime],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, content_hash, indexed_at, chunk_count) \
+             VALUES (?, ?, '', '', 0)",
+            params!["me/unchanged.md", unchanged_mtime],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, content_hash, indexed_at, chunk_count) \
+             VALUES (?, ?, '', '', 0)",
+            params!["me/changed.md", 1.0_f64],
+        )
+        .unwrap();
+
+        let file_tuples = get_indexable_files(hex_root).unwrap();
+        let existing: HashMap<String, (f64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT path, mtime, content_hash FROM files")
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, String>(2).unwrap_or_default(),
+                ))
+            })
+            .unwrap()
+            .flatten()
+            .map(|(p, m, h)| (p, (m, h)))
+            .collect()
+        };
+
+        let file_mtimes = rel_path_mtimes(&file_tuples, hex_root);
+
+        assert_eq!(
+            count_pending_files(&file_mtimes, &existing),
+            2,
+            "me/new.md (absent) and me/changed.md (stale mtime) are pending; \
+             me/unchanged.md (matching mtime) is not"
+        );
     }
 
     // Codifies the e2e bail contract verified manually against the built binary
