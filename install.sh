@@ -852,7 +852,15 @@ print("%s\t%s" % (revision, version))
 
     write_boi_wrapper
 }
-install_or_upgrade_boi
+# HEX_INSTALL_SKIP_BOI=1: never touch the live ~/.boi companion. Set by the
+# codex-parity suite, whose fresh-install run into /tmp otherwise reinstalls BOI
+# pinned to VERSIONS into $HOME/.boi (2026-09-12: downgraded a develop build to
+# v3.9.0 mid-release and broke every managed Cargo gate on the machine).
+if [ "${HEX_INSTALL_SKIP_BOI:-0}" = "1" ]; then
+    echo "  BOI companion     SKIPPED (HEX_INSTALL_SKIP_BOI=1)"
+else
+    install_or_upgrade_boi
+fi
 
 # ── Phase 5: Register install ──────────────────────────────────────
 
