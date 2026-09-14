@@ -169,19 +169,29 @@ Any unrecognized field (typo, drifted-field) is rejected at parse time by
 
 Every worker phase's LLM settings are configurable at three layers, resolved
 field-by-field with precedence **spec override > pipeline override > phase
-TOML base** (`~/.boi/v2/phases/<phase>.toml`, base default today:
-`claude-opus-4-8`):
+TOML base** (`~/.boi/v2/phases/<phase>.toml`). Installed base defaults since the
+2026-09-14 Claude port (BOI runs Claude Code workers again; Codex is parked):
+
+| Phase | Model | Why |
+|---|---|---|
+| plan, review, plan_revision, propose_adjustment, review_adjustment | `claude-opus-5` | judgment work |
+| critique_plan | `claude-fable-5-1` | one call per spec; cross-model critique of the Opus plan |
+| write_red_tests, execute | `claude-sonnet-5` | bounded, well-specified work; override execute to Opus for hard tasks |
+
+Provider is `claude_code` only (daemon.toml `[worker_runtime_policy]`); approved models are
+`claude-opus-5`, `claude-sonnet-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`. Naming
+`codex` or an unapproved model in an override is a loud dispatch rejection.
 
 ```toml
 # In a spec TOML — run red-test authoring on a cheaper model for this spec:
 [overrides.write_red_tests.runtime]
 model = "claude-sonnet-5"
 
-[overrides.critique_plan.runtime]
-provider = "openrouter"
-model = "openai/gpt-5"
-effort = "high"                 # OpenAI reasoning-family only — see rules
+[overrides.execute.runtime]
+model = "claude-opus-5"         # hard task: lift execute from the Sonnet default
 extra = { temperature = 0.2 }   # passed verbatim into goose settings
+# `provider` must stay claude_code and `model` must be on the approved list;
+# `effort` has no effect on claude_code phases (no goose knob), so omit it.
 ```
 
 Rules that will bite you if ignored:
@@ -191,13 +201,13 @@ Rules that will bite you if ignored:
   wires it via a model-name suffix). The `claude-code` provider has NO effort
   knob in goose — BOI **rejects** `effort` on combos goose can't express
   rather than silently ignoring it. On Claude phases, the cost/quality lever
-  is per-phase MODEL choice (opus/sonnet/haiku).
+  is per-phase MODEL choice (opus/sonnet/fable/haiku).
 - `extra` accepts scalar keys goose recipes understand today (`temperature`,
   `max_turns`) and passes them through verbatim — future goose settings need
   no BOI change.
-- **Model-tier guidance (Standing Order 3b applied to specs):** phase defaults
-  run opus-tier; when a spec's work is mechanical (docs batches, config
-  sweeps, well-specified small fixes), downshift `write_red_tests` /
+- **Model-tier guidance (Standing Order 3b applied to specs):** judgment phases
+  run Opus, bounded phases run Sonnet (table above); when a spec's work is
+  mechanical (docs batches, config sweeps, well-specified small fixes), downshift `write_red_tests` /
   `critique_plan` / `review` to `claude-sonnet-5` via overrides and say so in
   the scope. Leave `execute` on the default unless the whole spec is trivial.
 - Survey of what goose recipes actually accept:
