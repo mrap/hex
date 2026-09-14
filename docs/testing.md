@@ -40,6 +40,24 @@ Current suites:
 | `test-messaging` | Message send/receive/filter with SQLite verification |
 | `test-doctor` | `hex-doctor` passes on healthy install, fails loudly on broken config |
 
+## Container test lane (`system/scripts/test-lane.sh`)
+
+The lane runs the workspace test suite with `cargo nextest` inside the `tests/lane/Dockerfile` image. It mounts the current worktree at `/work` and the named Docker volume `boi-target` at `/target`. Source and target paths are the same for every worktree, so cargo reuses compiled artifacts across worktrees. A second run with no source change compiles zero crates.
+
+```bash
+# Build the image if needed, then run the whole workspace
+bash system/scripts/test-lane.sh
+
+# Skip the image build, pass args to nextest
+bash system/scripts/test-lane.sh --no-build -- -p hex-harness
+```
+
+The script prints one receipt JSON line to stdout and everything else to stderr. Receipt fields: `schema`, `tree_hash`, `command`, `exit_code`, `crates_compiled`, `duration_secs`, `image`, `volume`, `started_at`. The exit code is the nextest exit code. If Docker is missing or not running, the script prints the reason and exits 2 with no receipt.
+
+`hex release cut` runs its `tests` gate through the lane when the script exists in the repo. Set `HEX_TEST_LANE=host` to force the host route (`cargo test --workspace` through managed Cargo) instead.
+
+The `hex-build-cache-guard` harness worker runs hourly at :15. It reads `cargo_target_dir` from `~/.boi/v2/daemon.toml`, deletes `.o` files older than 60 minutes in `<target>/debug/deps`, and fails loudly when more than 25,000 entries remain.
+
 ## Tests added in v0.2.4
 
 ### `tests/test_skill_frontmatter.sh`
