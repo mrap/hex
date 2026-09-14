@@ -2,17 +2,17 @@
 
 This document describes the test suite, what each test verifies, and how to run it locally.
 
+Rules for writing and reviewing tests: [testing-standard.md](testing-standard.md).
+
 ## Test categories
 
 | Category | Files | Needs API key |
 |----------|-------|:-------------:|
-| Static / unit | `test_skill_frontmatter.sh`, `test_skill_refs.sh`, `test_path_mapping.bats` | No |
+| Static / unit | `test_skill_frontmatter.sh`, `test_skill_refs.sh`, `test_doctor.bats`, `test_claude_runs_migration.bats`, `test_worktree_guard.sh` | No |
 | Core E2E (containerized) | `tests/core-e2e/run-all.sh` | BOI suites only |
 | Live eval — Claude Code | `test_skill_discovery.sh`, `test_e2e.sh`, `test_fullstack.sh` | Yes |
 | Live eval — Codex | `test_skill_discovery_codex.sh`, `test_codex_onboarding.sh` | Yes |
 | Codex parity (containerized) | `tests/codex-parity/run-all.sh` | No (structural); `OPENAI_API_KEY` for live |
-| Migration | `tests/migrate/test-migrate.sh` | No |
-| Memory | `test_memory.py` | No |
 
 ## Core E2E suite (`tests/core-e2e/`)
 
@@ -37,8 +37,7 @@ Current suites:
 | `test-boi-install` | Fresh BOI install: binary builds, `--help`/`--version`, smoke dispatch |
 | `test-boi-upgrade` | Upgrade path: version bump, stale-symlink detection, doctor catches dangling link |
 | `test-cli` | All `hex` subcommands reachable; version matches `Cargo.toml` |
-| `test-messaging` | Message send/receive/filter with SQLite verification |
-| `test-doctor` | `hex-doctor` passes on healthy install, fails loudly on broken config |
+| `test-questions` | Conversation-less question and reply, multi-conversation interleaving, with a fixture worker (no live LLM) |
 
 ## Container test lane (`system/scripts/test-lane.sh`)
 
@@ -127,8 +126,8 @@ cd /path/to/hex-foundation
 
 bash tests/test_skill_frontmatter.sh
 bash tests/test_skill_refs.sh
-bash tests/migrate/test-migrate.sh
-python3 tests/test_memory.py
+bash tests/test_worktree_guard.sh
+bats tests/test_doctor.bats tests/test_claude_runs_migration.bats
 ```
 
 ### Full Docker eval suite
