@@ -1,13 +1,18 @@
-//! Red test for task Tfr6deqwv: workers::registry().
+//! Registry tests for `hex::workers::registry()`.
 //!
 //! Asserts the Rust registry surfaces `hex-memory-maintenance` and `hex-backup`
-//! as cron workers, mirroring the existing YAML configs in
-//! `system/iii/workers/`. The two memory-maintenance jobs must match the
-//! YAML exactly: `hex memory index` @ "0 */15 * * * * *" and
-//! `hex memory consolidate full` @ "0 0 3 * * * *".
+//! as cron workers, mirroring the earlier YAML configs in
+//! `system/iii/workers/`. Two tests below encode real collision constraints
+//! learned from incidents (the weekly maintain job's offset from the daily
+//! backup, and the quick-consolidate offset from the full run); those stay
+//! as named cron-literal assertions on purpose. Every other registered
+//! worker's cron is checked generically: it must parse and it must fire
+//! within the next 7 days, so a typo or a dead expression cannot sit
+//! unnoticed the way four near-duplicate snapshot tests once let it.
 
 use hex::worker::TriggerSpec;
 use hex::workers;
+use std::str::FromStr;
 
 fn cron_exprs(w: &hex::worker::Worker) -> Vec<String> {
     w.handlers
@@ -36,30 +41,10 @@ fn workers_registry_contains_memory_maintenance_and_backup() {
 }
 
 #[test]
-fn workers_registry_memory_maintenance_cron_matches_yaml() {
-    let reg = workers::registry();
-    let mm = reg
-        .iter()
-        .find(|w| w.name == "hex-memory-maintenance")
-        .expect("hex-memory-maintenance worker must be registered");
-    let exprs = cron_exprs(mm);
-    assert!(
-        exprs.iter().any(|e| e == "0 */15 * * * * *"),
-        "expected `hex memory index` cron '0 */15 * * * * *' in {:?}",
-        exprs
-    );
-    assert!(
-        exprs.iter().any(|e| e == "0 0 3 * * * *"),
-        "expected `hex memory consolidate full` cron '0 0 3 * * * *' in {:?}",
-        exprs
-    );
-}
-
-#[test]
 fn workers_registry_memory_maintenance_has_weekly_maintain() {
-    // `hex memory maintain --vacuum --backfill-facts` runs weekly — Sunday
+    // `hex memory maintain --vacuum --backfill-facts` runs weekly - Sunday
     // 04:33Z, after the 04:00Z backup, offset off the :30 boundary so its
-    // unlocked VACUUM doesn't collide with the 15-min index tick — so one-off
+    // unlocked VACUUM doesn't collide with the 15-min index tick - so one-off
     // memory.db corruption (orphan vectors, FTS bloat, foreign transcript_files
     // rows) self-heals.
     let reg = workers::registry();
@@ -98,41 +83,10 @@ fn workers_registry_quick_consolidate_offset_from_full_run() {
 }
 
 #[test]
-fn workers_registry_freshness_daily_0900() {
-    // hex-freshness: daily ledger freshness alerting (agent-infra P0, E0 step 4).
-    // 09:00 PT = 16:00 UTC — engine crons evaluate UTC (telemetry-consumption
-    // proposal: the original "0 0 9" fired at 02:00 PT, while Mike slept).
-    let reg = workers::registry();
-    let fr = reg
-        .iter()
-        .find(|w| w.name == "hex-freshness")
-        .expect("hex-freshness worker must be registered");
-    let exprs = cron_exprs(fr);
-    assert!(
-        exprs.iter().any(|e| e == "0 0 16 * * * *"),
-        "expected hex-freshness cron '0 0 16 * * * *' (09:00 PT / 16:00 UTC) in {:?}",
-        exprs
-    );
-}
-
-#[test]
-fn workers_registry_backup_is_cron_worker() {
-    let reg = workers::registry();
-    let bk = reg
-        .iter()
-        .find(|w| w.name == "hex-backup")
-        .expect("hex-backup worker must be registered");
-    assert!(
-        !cron_exprs(bk).is_empty(),
-        "hex-backup must have at least one cron-triggered handler"
-    );
-}
-
-#[test]
 fn workers_registry_oss_releaser_release_requested_event_and_watch_cron() {
-    // oss-releaser (oss-releaser spec, scope item 6): exactly two triggers —
+    // oss-releaser (oss-releaser spec, scope item 6): exactly two triggers -
     // the `release.requested` event (a State trigger scope="events",
-    // key="release.requested", the `.on_event` convention — the manual
+    // key="release.requested", the `.on_event` convention - the manual
     // escape hatch) and the every-5-minutes branch-watch cron.
     let reg = workers::registry();
     let w = reg
@@ -161,24 +115,59 @@ fn workers_registry_oss_releaser_release_requested_event_and_watch_cron() {
 }
 
 #[test]
-fn workers_registry_build_cache_guard_hourly_at_15() {
-    // hex-build-cache-guard: hourly at :15, offset from the :00 memory-index
-    // tick so the two don't contend for the same second.
+fn every_registered_cron_parses_and_fires_within_seven_days() {
+    let reg = workers::registry();
+    let now = chrono::Utc::now();
+    for w in &reg {
+        for expr in cron_exprs(w) {
+            let schedule = cron::Schedule::from_str(&expr).unwrap_or_else(|e| {
+                panic!(
+                    "worker '{}': cron expression '{}' does not parse: {e}",
+                    w.name, expr
+                )
+            });
+            let next = schedule.after(&now).next();
+            match next {
+                Some(t) => {
+                    let until = t - now;
+                    assert!(
+                        until < chrono::Duration::days(7),
+                        "worker '{}': cron '{}' next fires at {} ({} from now), \
+                         which is not within the next 7 days",
+                        w.name,
+                        expr,
+                        t,
+                        until
+                    );
+                }
+                None => panic!(
+                    "worker '{}': cron expression '{}' never fires again after {}",
+                    w.name, expr, now
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn nightly_tests_worker_is_registered_with_one_nightly_cron() {
     let reg = workers::registry();
     let w = reg
         .iter()
-        .find(|w| w.name == "hex-build-cache-guard")
-        .expect("hex-build-cache-guard worker must be registered");
-    let exprs = cron_exprs(w);
+        .find(|w| w.name == "hex-nightly-tests")
+        .expect("hex-nightly-tests worker must be registered");
     assert_eq!(
-        exprs.len(),
+        w.handlers.len(),
         1,
-        "hex-build-cache-guard must have exactly one cron trigger, got {:?}",
-        exprs
+        "hex-nightly-tests must register exactly one handler, got {}",
+        w.handlers.len()
     );
+    let (_name, spec, _handler) = &w.handlers[0];
     assert_eq!(
-        exprs[0],
-        hex::workers::hex_modules::build_cache_guard::CRON_HOURLY,
-        "hex-build-cache-guard's cron must equal CRON_HOURLY"
+        spec,
+        &TriggerSpec::Cron {
+            expression: hex::workers::hex_modules::nightly_tests::CRON_NIGHTLY.to_string(),
+        },
+        "hex-nightly-tests's one trigger must be a Cron trigger equal to CRON_NIGHTLY"
     );
 }

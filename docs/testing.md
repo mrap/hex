@@ -57,6 +57,8 @@ The script prints one receipt JSON line to stdout and everything else to stderr.
 
 The `hex-build-cache-guard` harness worker runs hourly at :15. It reads `cargo_target_dir` from `~/.boi/v2/daemon.toml`, deletes `.o` files older than 60 minutes in `<target>/debug/deps`, and fails loudly when more than 25,000 entries remain.
 
+The `hex-nightly-tests` harness worker runs the container lane once a night, at 10:00 UTC, with `--run-ignored all` so the `#[ignore]`d tests run too. It tests the repo named by `$HEX_DIR/.hex/config/nightly-tests.toml` (`repo = "..."`), or falls back to `$HEX_DIR/.hex/.upgrade-cache` when that file is absent. It needs Docker running; when Docker is down, the lane exits 2 and the worker fails loudly instead of skipping quietly. The ignored model tests stay red until API keys are passed into the lane container, a known gap this worker does not close.
+
 ## Tests added in v0.2.4
 
 ### `tests/test_skill_frontmatter.sh`
