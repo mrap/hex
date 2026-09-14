@@ -49,7 +49,7 @@ struct SectionFields {
 
 fn builtin_model(use_case: &str) -> &'static str {
     match use_case {
-        "memory_extract" | "memory_judge" | "consolidate_audit" => "anthropic/claude-sonnet-4.5",
+        "memory_extract" | "memory_judge" | "consolidate_audit" => "anthropic/claude-sonnet-5",
         "health_check" => "anthropic/claude-haiku-4.5",
         _ => "unknown",
     }
@@ -215,7 +215,7 @@ mod tests {
         fs::create_dir_all(&cfg).unwrap();
         fs::write(
             cfg.join("llm.toml"),
-            "[defaults]\nmodel = \"anthropic/claude-sonnet-4.5\"\n",
+            "[defaults]\nmodel = \"anthropic/claude-sonnet-5\"\n",
         )
         .unwrap();
         let r = LlmConfigCheck.run(&ctx);

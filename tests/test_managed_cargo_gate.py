@@ -636,7 +636,7 @@ class ManagedCargoGateTests(unittest.TestCase):
         self.assertNotIn(" cargo build ", verifier)
         self.assertNotIn(" cargo test ", verifier)
         skill = (ROOT / "system/skills/boi-delegation/SKILL.md").read_text(encoding="utf-8")
-        block = "\n".join(skill.splitlines()[285:293]) + "\n"
+        block = "\n".join(skill.splitlines()[295:303]) + "\n"
         self.assertEqual(__import__("hashlib").sha256(block.encode("utf-8")).hexdigest(), "0208be562ae7c650b7f6719239cceb0271320c67a4d137aafe9dba4643dfe2a2")
         agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
         self.assertNotIn("cargo build --release -p scipd", agents)

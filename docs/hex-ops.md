@@ -256,9 +256,9 @@ schema with commented-out defaults for each known use case.
 
 | Use case            | What it backs                                 | Built-in default                  |
 |---------------------|-----------------------------------------------|-----------------------------------|
-| `memory_extract`    | `hex memory distill` — structured extraction  | `anthropic/claude-sonnet-4.5`     |
-| `memory_judge`      | `hex memory distill` — retention judge        | `anthropic/claude-sonnet-4.5`     |
-| `consolidate_audit` | `hex memory consolidate full` — audit pass    | `anthropic/claude-sonnet-4.5`     |
+| `memory_extract`    | `hex memory distill` — structured extraction  | `anthropic/claude-sonnet-5`     |
+| `memory_judge`      | `hex memory distill` — retention judge        | `anthropic/claude-sonnet-5`     |
+| `consolidate_audit` | `hex memory consolidate full` — audit pass    | `anthropic/claude-sonnet-5`     |
 | `health_check`      | `hex doctor` — cheap provider probe           | `anthropic/claude-haiku-4.5`      |
 
 ### Resolution order (highest wins)
@@ -300,7 +300,7 @@ verified recipe 2026-06-10):
 - Caveats: requires an unlocked login keychain in the `gui/<uid>` session
   (see LaunchAgents above); **`max_tokens` is NOT enforceable** in this
   transport (the CLI has no flag for it) — the cap is ignored; model ids are
-  mapped from registry form to CLI form (`anthropic/claude-sonnet-4.5` →
+  mapped from registry form to CLI form (`anthropic/claude-sonnet-5` →
   `claude-sonnet-4-5`), non-`anthropic/` ids pass through verbatim, so
   CLI aliases like `"sonnet"` work directly in `llm.toml`.
 - Unknown transport value (file or env override) is a hard `resolve()` error;
@@ -311,7 +311,7 @@ verified recipe 2026-06-10):
 
 ```toml
 [defaults]
-model       = "anthropic/claude-sonnet-4.5"
+model       = "anthropic/claude-sonnet-5"
 base_url    = "https://openrouter.ai/api/v1/chat/completions"
 api_key_env = "OPENROUTER_API_KEY"
 # transport = "http"                       # or "claude-cli"
