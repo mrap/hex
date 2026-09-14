@@ -159,3 +159,26 @@ fn workers_registry_oss_releaser_release_requested_event_and_watch_cron() {
         "oss-releaser must poll watched repos every 5 minutes"
     );
 }
+
+#[test]
+fn workers_registry_build_cache_guard_hourly_at_15() {
+    // hex-build-cache-guard: hourly at :15, offset from the :00 memory-index
+    // tick so the two don't contend for the same second.
+    let reg = workers::registry();
+    let w = reg
+        .iter()
+        .find(|w| w.name == "hex-build-cache-guard")
+        .expect("hex-build-cache-guard worker must be registered");
+    let exprs = cron_exprs(w);
+    assert_eq!(
+        exprs.len(),
+        1,
+        "hex-build-cache-guard must have exactly one cron trigger, got {:?}",
+        exprs
+    );
+    assert_eq!(
+        exprs[0],
+        hex::workers::hex_modules::build_cache_guard::CRON_HOURLY,
+        "hex-build-cache-guard's cron must equal CRON_HOURLY"
+    );
+}
