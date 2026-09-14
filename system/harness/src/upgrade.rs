@@ -20,6 +20,25 @@ use crate::path_map;
 
 const DEFAULT_REPO: &str = "https://github.com/mrap/hex-foundation.git";
 
+/// Foundation-shipped launchd jobs, other than the harness and its watchdog,
+/// that `hex upgrade` must reload after it swaps the hex binary. `restart_harness`
+/// already bounces `com.hex.harness` and VERIFIES the engine comes back;
+/// `com.hex.harness-watchdog` is never touched by upgrade. Each label here
+/// has a template under `system/templates/launchd/<label>.plist` (checked by
+/// `every_sanctioned_label_ships_a_launchd_template`).
+///
+/// Incident: `$HEX_DIR/projects/system-improvement/incidents/hex-launch-2026-09-09/`.
+/// `hex upgrade` swapped the hex binary and restarted `com.hex.harness`, but
+/// never refreshed the already loaded `com.hex.failures-probe` launchd job,
+/// which then crashed on a stale launch constraint. This list, and the
+/// reload call after every binary swap, closes that gap for every
+/// sanctioned peripheral job, not only the one that broke.
+pub(crate) const SANCTIONED_LAUNCHD_LABELS: [&str; 3] = [
+    "com.hex.failures-probe",
+    "com.hex.scipd",
+    "com.hex.hitl-nudge",
+];
+
 struct Args {
     dry_run: bool,
     repo_url: Option<String>,
@@ -1357,6 +1376,25 @@ fn sync_versions_file_protected(
                         if let Err(e) = restart_result {
                             return Err(BinaryStepFailure::RestartFailed(e));
                         }
+                        // The harness itself is back on the new binary. Now reload
+                        // the smaller, peripheral sanctioned jobs that `restart_harness`
+                        // does not touch (hex-launch-2026-09-09: com.hex.failures-probe
+                        // was left running the old binary's launch constraint after an
+                        // upgrade that only restarted the harness). Only jobs actually
+                        // installed on this box are reloaded (A2); an empty list prints
+                        // nothing.
+                        let launch_agents_dir = std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .unwrap_or_default()
+                            .join("Library/LaunchAgents");
+                        let launchd_jobs = sanctioned_launchd_jobs(&launch_agents_dir);
+                        if !launchd_jobs.is_empty() {
+                            if let Err(e) =
+                                reload_launchd_jobs_with(&launchd_jobs, reload_launchd_job)
+                            {
+                                return Err(BinaryStepFailure::LaunchdReloadFailed(e));
+                            }
+                        }
                         install_versions(&mut owned)
                     }
                     Err(e) => {
@@ -1434,6 +1472,69 @@ fn build_and_install_code_intel(hex_dot_dir: &Path, preserve_identity: bool) {
     }
 }
 
+/// Which sanctioned launchd jobs are actually installed on this box, in
+/// label order. A job counts as installed when its plist exists at
+/// `<launch_agents_dir>/<label>.plist`; an absent plist means it was never
+/// installed here, so there is nothing to reload (A2). Pure filesystem
+/// check, no `launchctl` call, so `--dry-run` and the real reload path
+/// answer "what would be reloaded" the same way.
+fn sanctioned_launchd_jobs(launch_agents_dir: &Path) -> Vec<(String, PathBuf)> {
+    SANCTIONED_LAUNCHD_LABELS
+        .iter()
+        .filter_map(|label| {
+            let plist = launch_agents_dir.join(format!("{label}.plist"));
+            plist.is_file().then(|| ((*label).to_string(), plist))
+        })
+        .collect()
+}
+
+/// Reload every job, even after an earlier one fails (S6: loud and
+/// complete, never stop at the first problem and hide the rest). Returns
+/// `Err` joining every failure as `"<label>: <reason>"` when one or more
+/// jobs failed to reload; `Ok` when all reloaded. An empty job list never
+/// calls `reload_fn`.
+fn reload_launchd_jobs_with<F>(jobs: &[(String, PathBuf)], mut reload_fn: F) -> Result<(), String>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    let mut failures = Vec::new();
+    for (label, _plist) in jobs {
+        match reload_fn(label) {
+            Ok(()) => println!("  [OK] reloaded {label}"),
+            Err(reason) => failures.push(format!("{label}: {reason}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Reload one sanctioned launchd job: bootout, then bootstrap, the same
+/// primitive `harness::supervise::restart_and_verify` uses for the harness
+/// itself (A3), via `daemon_green`'s `ServiceManager`. `stop` treats "not
+/// loaded" as success, so a job that was never running reloads as a no-op
+/// success, not a failure. `start` runs `bootstrap_robust` (waits out the
+/// async bootout, retries, `asuser` fallback) then `kickstart -k`.
+#[cfg(target_os = "macos")]
+fn reload_launchd_job(label: &str) -> Result<(), String> {
+    let mgr = daemon_green::native();
+    mgr.stop(label).map_err(|e| format!("stop: {e}"))?;
+    mgr.start(label).map_err(|e| format!("start: {e}"))?;
+    Ok(())
+}
+
+/// No launchd off macOS. Print a loud skip line rather than silently claim
+/// success over a reload that never happened (S6), and return `Ok` so a
+/// non-macOS `hex upgrade` (Linux dev box, CI) never fails on a job it has
+/// no way to manage.
+#[cfg(not(target_os = "macos"))]
+fn reload_launchd_job(label: &str) -> Result<(), String> {
+    println!("  [SKIP] launchd reload of {label}: not macOS");
+    Ok(())
+}
+
 /// Why the binary step of an upgrade failed. Kept distinct so `run()` can print
 /// the RIGHT loud message: a build/install failure means the binary was NOT
 /// swapped, but a restart failure means the binary WAS swapped yet the running
@@ -1448,6 +1549,11 @@ enum BinaryStepFailure {
     /// The binary WAS swapped, but restarting the harness to load it failed.
     /// Carries the underlying error so the operator can act on it.
     RestartFailed(String),
+    /// The binary WAS swapped and the harness restarted fine, but a
+    /// sanctioned peripheral launchd job (e.g. `com.hex.failures-probe`)
+    /// did not reload. Distinct from `RestartFailed`: the harness itself is
+    /// healthy here, only a peripheral job is stale (hex-launch-2026-09-09).
+    LaunchdReloadFailed(String),
 }
 
 /// Render the loud, operator-facing message for a binary-step failure. Pure
@@ -1467,6 +1573,11 @@ fn binary_step_failure_message(failure: &BinaryStepFailure) -> String {
              worker). New code is on disk but NOT live.\n  \
              Restart error: {err}\n  \
              Run `hex harness restart` manually to load the new binary."
+        ),
+        BinaryStepFailure::LaunchdReloadFailed(detail) => format!(
+            "hex binary swapped, harness restarted, but a sanctioned launchd job did not \
+             reload: {detail}. Reload it by hand: launchctl bootout gui/$(id -u)/<label> && \
+             launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist"
         ),
     }
 }
@@ -2321,6 +2432,23 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     if cfg.dry_run {
+        let launch_agents_dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join("Library/LaunchAgents");
+        let launchd_jobs = sanctioned_launchd_jobs(&launch_agents_dir);
+        if launchd_jobs.is_empty() {
+            println!("  → launchd jobs to reload after a binary swap: none installed");
+        } else {
+            let labels: Vec<&str> = launchd_jobs
+                .iter()
+                .map(|(label, _plist)| label.as_str())
+                .collect();
+            println!(
+                "  → launchd jobs to reload after a binary swap: {}",
+                labels.join(", ")
+            );
+        }
         println!("\n4. Dry Run Complete");
         println!("  → Run without --dry-run to apply changes.");
         return 0;
@@ -5027,5 +5155,156 @@ CUSTOM_INSTANCE_PIN=abc123
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&staged.stdout), "operator-staged\n");
+    }
+
+    // -----------------------------------------------------------------
+    // U4 (spec incident hex-launch-2026-09-09): `hex upgrade` reloads every
+    // sanctioned launchd job after a binary swap, not just com.hex.harness.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sanctioned_jobs_are_the_installed_subset_in_label_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let launch_agents = tmp.path().join("Library/LaunchAgents");
+        write_file(&launch_agents.join("com.hex.failures-probe.plist"), "x");
+        write_file(&launch_agents.join("com.hex.hitl-nudge.plist"), "x");
+        write_file(&launch_agents.join("com.other.plist"), "x");
+
+        let jobs = sanctioned_launchd_jobs(&launch_agents);
+        let labels: Vec<&str> = jobs.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["com.hex.failures-probe", "com.hex.hitl-nudge"],
+            "only the installed sanctioned jobs must be listed, in \
+             SANCTIONED_LAUNCHD_LABELS order, never com.other"
+        );
+    }
+
+    #[test]
+    fn reload_runs_every_job_and_reports_every_failure() {
+        let jobs = vec![
+            ("first".to_string(), PathBuf::from("/tmp/first.plist")),
+            ("second".to_string(), PathBuf::from("/tmp/second.plist")),
+        ];
+        let mut attempted = Vec::new();
+        let result = reload_launchd_jobs_with(&jobs, |label| {
+            attempted.push(label.to_string());
+            if label == "first" {
+                Err("boom".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            attempted,
+            vec!["first", "second"],
+            "both jobs must be attempted even though the first one fails"
+        );
+        let err = result.expect_err("a failed job must make the whole call Err");
+        assert!(
+            err.contains("first"),
+            "the error must name the failing label: {err}"
+        );
+        assert!(
+            !err.contains("second: "),
+            "the second job succeeded and must not be reported as a failure: {err}"
+        );
+    }
+
+    #[test]
+    fn reload_with_no_jobs_never_calls_reload_fn() {
+        let jobs: Vec<(String, PathBuf)> = Vec::new();
+        let result = reload_launchd_jobs_with(&jobs, |label| {
+            panic!("reload_fn must not be called for label {label}: job list is empty")
+        });
+        assert!(result.is_ok(), "an empty job list must report success");
+    }
+
+    #[test]
+    fn every_sanctioned_label_ships_a_launchd_template() {
+        let templates_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../system/templates/launchd");
+        for label in SANCTIONED_LAUNCHD_LABELS {
+            let template = templates_dir.join(format!("{label}.plist"));
+            assert!(
+                template.is_file(),
+                "SANCTIONED_LAUNCHD_LABELS names {label}, but no template exists at {}; \
+                 the constant and the shipped plist set have drifted",
+                template.display()
+            );
+        }
+    }
+
+    /// This test mutates `HOME` and `PATH` process-wide (through the
+    /// `daemon_green` calls inside `reload_launchd_job`), so, like the
+    /// other tests in this file that mutate process-wide env, it runs in
+    /// its own child process via `in_private_upgrade_test`, never in the
+    /// shared, multithreaded `cargo test` process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reload_launchd_job_boots_out_then_bootstraps_through_launchctl() {
+        if in_private_upgrade_test(
+            "upgrade::tests::reload_launchd_job_boots_out_then_bootstraps_through_launchctl",
+        ) {
+            return;
+        }
+        test_child::stage("upgrade:reload-launchd-job-body").expect("test-child stage must flush");
+        let home = PathBuf::from(std::env::var_os("HOME").expect("private HOME"));
+
+        write_file(
+            &home.join("Library/LaunchAgents/com.hex.failures-probe.plist"),
+            "<?xml version=\"1.0\"?>\n<!-- fixture plist, content unused by the spy -->\n",
+        );
+
+        // A spy `launchctl` that logs every invocation and always succeeds
+        // (`daemon_green::start` first runs `launchctl print gui/<uid>` to
+        // check the GUI session, then bootout/print/enable/bootstrap, then
+        // `kickstart -k`; the spy exits 0 for all of them). This child
+        // process is exclusive to this one test (`--exact`, no other test
+        // shares it), so it is safe to prepend the spy directory onto this
+        // process's own PATH here rather than needing a new env seam.
+        let spy_bin = home.join("bin");
+        let spy = spy_bin.join("launchctl");
+        write_file(
+            &spy,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/launchctl-calls\"\nexit 0\n",
+        );
+        fs::set_permissions(&spy, fs::Permissions::from_mode(0o755)).unwrap();
+        let existing_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{existing_path}", spy_bin.display()));
+
+        let result = reload_launchd_job("com.hex.failures-probe");
+        assert!(
+            result.is_ok(),
+            "reload_launchd_job must succeed against the spy: {result:?}"
+        );
+
+        let calls = fs::read_to_string(home.join("launchctl-calls"))
+            .expect("the spy must have logged at least one call");
+        let uid = unsafe { libc::getuid() };
+        let bootout_line = format!("bootout gui/{uid}/com.hex.failures-probe");
+        let bootout_index = calls
+            .lines()
+            .position(|line| line == bootout_line)
+            .unwrap_or_else(|| {
+                panic!("expected a launchctl call {bootout_line:?}; calls:\n{calls}")
+            });
+        let bootstrap_prefix = format!("bootstrap gui/{uid} ");
+        let bootstrap_index = calls
+            .lines()
+            .position(|line| {
+                line.starts_with(&bootstrap_prefix)
+                    && line.ends_with("/com.hex.failures-probe.plist")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a launchctl bootstrap call for com.hex.failures-probe \
+                     (prefix {bootstrap_prefix:?}); calls:\n{calls}"
+                )
+            });
+        assert!(
+            bootstrap_index > bootout_index,
+            "bootout must be logged before bootstrap; calls:\n{calls}"
+        );
     }
 }
