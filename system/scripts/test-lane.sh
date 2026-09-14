@@ -111,7 +111,10 @@ crates_compiled="${crates_compiled:-0}"
 
 # --- receipt -------------------------------------------------------------------
 json_escape() {
-  local s="$1"
+  # Drop control characters (a newline in a nextest arg would break the
+  # one-line receipt), then escape backslash and double quote.
+  local s
+  s="$(printf '%s' "$1" | tr -d '\000-\037')"
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
   printf '%s' "$s"
