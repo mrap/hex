@@ -177,6 +177,27 @@ mod tests {
         assert_eq!(hex_modules::applier::ARGV_WATCH, &["hex", "apply", "watch"]);
     }
 
+    /// Moved from the removed tests/module_discovery.rs: module discovery
+    /// against the real generated registry, checked by source path shape
+    /// rather than just by name.
+    #[test]
+    fn core_modules_are_discovered_with_source_paths() {
+        let paths = hex_modules::module_paths();
+        // memory_maintenance + backup were migrated into src/modules/ and must show up.
+        let names: Vec<&str> = paths.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"hex-memory-maintenance"), "got: {names:?}");
+        assert!(names.contains(&"hex-backup"), "got: {names:?}");
+        // Their source paths point at *.worker.rs under src/modules/.
+        for (name, path) in &paths {
+            if name == "hex-memory-maintenance" || name == "hex-backup" {
+                assert!(
+                    path.contains("/src/modules/") && path.ends_with(".worker.rs"),
+                    "{name} source should be a src/modules/*.worker.rs file, got {path}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn registry_includes_generated_module_registry() {
         // The generated module_registry() is a source of workers in registry().

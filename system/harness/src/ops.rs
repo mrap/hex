@@ -135,6 +135,29 @@ mod tests {
         assert_eq!(t.key, "foo.bar");
     }
 
+    /// Moved from the removed tests/ops_emit_target_test.rs: pins the full
+    /// EmitTarget shape (scope, key, envelope) for a realistic event, not
+    /// just its individual fields.
+    #[test]
+    fn emit_target_maps_event_to_state_scope_key_envelope() {
+        let data = json!({"spec_id": "Skt0r3dbg", "status": "ok"});
+        let target = emit_target("boi.spec.complete", "cli", "2026-06-04T00:00:00Z", &data);
+
+        assert_eq!(
+            target,
+            EmitTarget {
+                scope: "events".to_string(),
+                key: "boi.spec.complete".to_string(),
+                value: json!({
+                    "event": "boi.spec.complete",
+                    "producer": "cli",
+                    "ts": "2026-06-04T00:00:00Z",
+                    "data": data,
+                }),
+            }
+        );
+    }
+
     #[test]
     fn emit_target_is_pure() {
         let data = json!({"k": "v"});
