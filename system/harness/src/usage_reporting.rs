@@ -223,6 +223,15 @@ const CLAUDE_SUBSCRIPTION_PROVIDERS: &[&str] = &["claude-code", "claude_code", "
 /// listed explicitly. Longest-prefix (not first-match) keeps the result
 /// independent of table order.
 fn claude_rate(model: &str) -> Option<ClaudeTokenRates> {
+    // Normalize gateway spellings to Anthropic ids: OpenRouter writes
+    // `anthropic/claude-haiku-4.5`; the vendor prefix and dotted version
+    // carry no pricing information.
+    let normalized = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .replace('.', "-");
+    let model = normalized.as_str();
     if let Some(fact) = CLAUDE_API_RATES.iter().find(|r| r.model == model) {
         return Some(fact.rates);
     }
@@ -822,6 +831,16 @@ fn unavailable(unit: EstimateUnit, label: &str) -> Estimate {
 
 #[cfg(test)]
 mod tests {
+
+    /// OpenRouter model ids (`anthropic/claude-haiku-4.5`) must price like
+    /// the Anthropic id they name.
+    #[test]
+    fn claude_rate_normalizes_gateway_model_ids() {
+        assert_eq!(claude_rate("anthropic/claude-haiku-4.5"), claude_rate("claude-haiku-4-5"));
+        assert_eq!(claude_rate("anthropic/claude-sonnet-5"), claude_rate("claude-sonnet-5"));
+        assert!(claude_rate("anthropic/claude-haiku-4.5").is_some());
+        assert!(claude_rate("gpt-5.6-terra").is_none());
+    }
     use super::*;
     use crate::usage_ledger::{FrozenWindow, HalfOpenUtcWindow, ImportOptions, UsageLedger};
 
