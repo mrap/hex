@@ -175,10 +175,13 @@ pub fn format_battery_summary(outcomes: &[GateOutcome]) -> String {
 pub enum GateKind {
     /// `git status --porcelain` must be empty.
     CleanTree,
-    /// `cargo test --workspace` from the repo root — the unit/integration
-    /// suite for every workspace crate. Passes iff exit 0. The pre-release
-    /// last-line-of-defense so a red-suite change (a shipped flaky/broken
-    /// test) never merges to `main` under the release pipeline.
+    /// The workspace unit/integration suite for every workspace crate. Runs
+    /// in the container test lane (`system/scripts/test-lane.sh`, nextest in
+    /// Docker) when that script exists, otherwise `cargo test --workspace`
+    /// on the host; `HEX_TEST_LANE=host` forces the host route. Passes iff
+    /// exit 0. The pre-release last-line-of-defense so a red-suite change (a
+    /// shipped flaky/broken test) never merges to `main` under the release
+    /// pipeline.
     Tests,
     /// Both Docker suites: build+run `tests/Dockerfile.env`, then
     /// `tests/Dockerfile` with the doctor carve-out. Honors `--skip-e2e`.
@@ -861,13 +864,125 @@ fn gate_clean_tree(repo_root: &Path) -> GateResult {
 /// gate exists to keep red suites off `main` under the release pipeline — the
 /// full sibling audit (2026-07-16) found this battery had shipped zero test
 /// gates for months.
+///
+/// Two routes. When `system/scripts/test-lane.sh` exists in the repo, the
+/// gate runs the container test lane (nextest inside Docker, shared
+/// `boi-target` volume) and parses its receipt. `HEX_TEST_LANE=host` forces
+/// the host route through managed Cargo. A lane failure, including missing
+/// Docker, fails the gate. There is no silent fallback.
 fn gate_tests(repo_root: &Path) -> GateResult {
-    println!("  Running workspace tests (cargo test --workspace)...");
-    let request = match release_test_request(repo_root) {
-        Ok(request) => request,
-        Err(message) => return GateResult::Fail(message),
+    let env_override = std::env::var("HEX_TEST_LANE").ok();
+    match tests_gate_route(repo_root, env_override.as_deref()) {
+        TestsRoute::Lane(script) => {
+            println!(
+                "  Running workspace tests in the container lane ({})...",
+                script.display()
+            );
+            gate_tests_lane(repo_root, &script)
+        }
+        TestsRoute::Host => {
+            println!("  Running workspace tests (cargo test --workspace)...");
+            let request = match release_test_request(repo_root) {
+                Ok(request) => request,
+                Err(message) => return GateResult::Fail(message),
+            };
+            gate_tests_result(managed_cargo_bridge::run(&request))
+        }
+    }
+}
+
+/// Repo-relative path of the container test lane script.
+pub const TEST_LANE_SCRIPT: &str = "system/scripts/test-lane.sh";
+
+/// Which route the tests gate takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestsRoute {
+    /// Run the container lane script at this absolute path.
+    Lane(PathBuf),
+    /// Run `cargo test --workspace` on the host through managed Cargo.
+    Host,
+}
+
+/// Pick the tests-gate route. `env_override` is the value of `HEX_TEST_LANE`
+/// when set; `host` forces the host route. Otherwise the lane wins whenever
+/// the script file exists under `repo_root`.
+pub fn tests_gate_route(repo_root: &Path, env_override: Option<&str>) -> TestsRoute {
+    if env_override.map(str::trim) == Some("host") {
+        return TestsRoute::Host;
+    }
+    let script = repo_root.join(TEST_LANE_SCRIPT);
+    if script.is_file() {
+        TestsRoute::Lane(script)
+    } else {
+        TestsRoute::Host
+    }
+}
+
+/// The receipt the lane prints on stdout. Unknown fields are ignored.
+#[derive(Debug, Deserialize)]
+struct LaneReceipt {
+    exit_code: i32,
+    crates_compiled: u64,
+    duration_secs: f64,
+    tree_hash: String,
+}
+
+/// Run the lane script. stdout is captured for the receipt; stderr is
+/// inherited so the operator sees build and test progress.
+fn gate_tests_lane(repo_root: &Path, script: &Path) -> GateResult {
+    let out = Command::new("bash")
+        .arg(script)
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output();
+    let out = match out {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return GateResult::Fail("`bash`: tool not found".to_string());
+        }
+        Err(e) => return GateResult::Fail(format!("failed to run test lane: {e}")),
+        Ok(out) => out,
     };
-    gate_tests_result(managed_cargo_bridge::run(&request))
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    lane_gate_result(out.status.code(), &stdout)
+}
+
+/// Turn the lane's exit status and stdout into a gate result. Pure, so the
+/// rules are unit tested without Docker.
+fn lane_gate_result(code: Option<i32>, stdout: &str) -> GateResult {
+    let Some(code) = code else {
+        return GateResult::Fail("test lane: terminated by signal".to_string());
+    };
+    let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
+    if code == 2 && last_line.is_none() {
+        return GateResult::Fail(
+            "test lane could not start (exit 2); see stderr for the reason".to_string(),
+        );
+    }
+    let receipt: LaneReceipt = match last_line.map(serde_json::from_str) {
+        Some(Ok(receipt)) => receipt,
+        Some(Err(e)) => {
+            return GateResult::Fail(format!(
+                "test lane exited {code} without a readable receipt ({e}); stdout tail: {}",
+                output_tail(stdout, 400)
+            ))
+        }
+        None => {
+            return GateResult::Fail(format!("test lane exited {code} with no receipt on stdout"))
+        }
+    };
+    if code == 0 && receipt.exit_code == 0 {
+        println!(
+            "  lane: tree {} compiled {} crates in {:.0}s",
+            receipt.tree_hash, receipt.crates_compiled, receipt.duration_secs
+        );
+        return GateResult::Pass;
+    }
+    GateResult::Fail(format!(
+        "test lane failed (exit {code}, receipt exit {}); tree {}; compiled {} crates in {:.0}s",
+        receipt.exit_code, receipt.tree_hash, receipt.crates_compiled, receipt.duration_secs
+    ))
 }
 
 fn release_test_request(repo_root: &Path) -> std::result::Result<Request, String> {
@@ -2964,6 +3079,99 @@ mod tests {
             format!("cargo test --workspace failed (exit 9); output tail: {expected_tail}")
         );
         assert!(!message.contains("out-head") && !message.contains("err-head"));
+    }
+
+    // -- tests gate routing: container lane vs host managed cargo ------------
+
+    #[test]
+    fn tests_gate_route_prefers_lane_when_script_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join(TEST_LANE_SCRIPT);
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            tests_gate_route(dir.path(), None),
+            TestsRoute::Lane(script.clone())
+        );
+        assert_eq!(
+            tests_gate_route(dir.path(), Some("container")),
+            TestsRoute::Lane(script)
+        );
+    }
+
+    #[test]
+    fn tests_gate_route_host_override_wins_even_with_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join(TEST_LANE_SCRIPT);
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        assert_eq!(tests_gate_route(dir.path(), Some("host")), TestsRoute::Host);
+    }
+
+    #[test]
+    fn tests_gate_route_host_when_script_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(tests_gate_route(dir.path(), None), TestsRoute::Host);
+    }
+
+    fn receipt(exit_code: i32, crates: u64) -> String {
+        format!(
+            "{{\"schema\":\"hex.test-lane.receipt.v1\",\"tree_hash\":\"abc123\",\
+             \"command\":\"cargo nextest run --workspace --locked\",\"exit_code\":{exit_code},\
+             \"crates_compiled\":{crates},\"duration_secs\":42,\"image\":\"hex-test-lane\",\
+             \"volume\":\"boi-target\",\"started_at\":\"2026-09-14T00:00:00Z\"}}\n"
+        )
+    }
+
+    #[test]
+    fn lane_gate_result_passes_on_zero_exit_receipt() {
+        assert_eq!(lane_gate_result(Some(0), &receipt(0, 0)), GateResult::Pass);
+        // The receipt may follow other stdout noise; the last line wins.
+        let noisy = format!("warming up\n{}", receipt(0, 7));
+        assert_eq!(lane_gate_result(Some(0), &noisy), GateResult::Pass);
+    }
+
+    #[test]
+    fn lane_gate_result_fails_on_nonzero_exit_with_code_and_tree() {
+        let GateResult::Fail(message) = lane_gate_result(Some(1), &receipt(1, 3)) else {
+            panic!("expected failure")
+        };
+        assert!(message.contains("exit 1"), "{message}");
+        assert!(message.contains("abc123"), "{message}");
+    }
+
+    #[test]
+    fn lane_gate_result_precondition_failure_names_stderr() {
+        let GateResult::Fail(message) = lane_gate_result(Some(2), "") else {
+            panic!("expected failure")
+        };
+        assert!(message.contains("could not start"), "{message}");
+        assert!(message.contains("stderr"), "{message}");
+    }
+
+    #[test]
+    fn lane_gate_result_unparseable_receipt_carries_raw_text() {
+        let GateResult::Fail(message) = lane_gate_result(Some(0), "not json at all") else {
+            panic!("expected failure")
+        };
+        assert!(message.contains("not json at all"), "{message}");
+    }
+
+    #[test]
+    fn lane_gate_result_signal_is_loud() {
+        let GateResult::Fail(message) = lane_gate_result(None, &receipt(0, 0)) else {
+            panic!("expected failure")
+        };
+        assert!(message.contains("signal"), "{message}");
+    }
+
+    #[test]
+    fn lane_gate_result_exit_code_mismatch_trusts_the_process() {
+        // Receipt says 0 but the process exited 1: never pass.
+        assert!(matches!(
+            lane_gate_result(Some(1), &receipt(0, 0)),
+            GateResult::Fail(_)
+        ));
     }
 
     #[test]

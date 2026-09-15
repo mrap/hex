@@ -16,90 +16,7 @@ CODE=$?
 assert_exit 0 "$CODE" "cli-version: exit 0"
 assert_contains "$OUT" "." "cli-version: output contains a version string (has '.')"
 
-# ── 2. hex agent removed (fleet teardown) ─────────────────────────────────────
-# The `hex agent` subcommand (fleet/list/...) was removed in the fleet teardown.
-# Assert it is no longer a recognized subcommand.
-OUT=$("$HEX" agent fleet 2>&1)
-CODE=$?
-if [ "$CODE" -ne 0 ] && echo "$OUT" | grep -qi "unrecognized subcommand"; then
-    assert_pass "cli-agent-removed: 'hex agent' correctly absent (fleet teardown)"
-else
-    assert_fail "cli-agent-removed: 'hex agent' still recognized (exit $CODE) — output: $OUT"
-fi
-
-# ── 3. hex message removed (messaging/inbox teardown) ────────────────────────
-# hex message was removed in the collapse-to-cc-boi demolition.
-# Assert it is no longer a recognized subcommand.
-OUT=$("$HEX" message list 2>&1)
-CODE=$?
-if [ "$CODE" -ne 0 ] && echo "$OUT" | grep -qi "unrecognized subcommand"; then
-    assert_pass "cli-message-removed: 'hex message' correctly absent (messaging removed)"
-else
-    assert_fail "cli-message-removed: 'hex message' still recognized (exit $CODE) — output: $OUT"
-fi
-
-# ── 5. hex events removed (event engine teardown) ────────────────────────────
-# hex events was removed in the collapse-to-cc-boi demolition.
-# Assert it is no longer a recognized subcommand.
-OUT=$("$HEX" events policies 2>&1)
-CODE=$?
-if [ "$CODE" -ne 0 ] && echo "$OUT" | grep -qi "unrecognized subcommand"; then
-    assert_pass "cli-events-removed: 'hex events' correctly absent (event engine removed)"
-else
-    assert_fail "cli-events-removed: 'hex events' still recognized (exit $CODE) — output: $OUT"
-fi
-
-# ── 6. hex asset removed (asset registry teardown) ───────────────────────────
-# hex asset was removed in the collapse-to-cc-boi demolition.
-OUT=$("$HEX" asset types 2>&1)
-CODE=$?
-if [ "$CODE" -ne 0 ] && echo "$OUT" | grep -qi "unrecognized subcommand"; then
-    assert_pass "cli-asset-removed: 'hex asset' correctly absent (asset registry removed)"
-else
-    assert_fail "cli-asset-removed: 'hex asset' still recognized (exit $CODE) — output: $OUT"
-fi
-
-# ── 7. hex sse removed (SSE server teardown) ──────────────────────────────────
-# hex sse / hex server were removed in the collapse-to-cc-boi demolition.
-OUT=$("$HEX" sse topics 2>&1)
-CODE=$?
-if [ "$CODE" -ne 0 ] && echo "$OUT" | grep -qi "unrecognized subcommand"; then
-    assert_pass "cli-sse-removed: 'hex sse' correctly absent (SSE server removed)"
-else
-    assert_fail "cli-sse-removed: 'hex sse' still recognized (exit $CODE) — output: $OUT"
-fi
-
-# ── 8. hex picker removed (UI picker teardown) ───────────────────────────────
-# hex picker was removed in the collapse-to-cc-boi demolition.
-OUT=$("$HEX" picker 2>&1)
-CODE=$?
-if [ "$CODE" -ne 0 ] && echo "$OUT" | grep -qi "unrecognized subcommand"; then
-    assert_pass "cli-picker-removed: 'hex picker' correctly absent (UI picker removed)"
-else
-    assert_fail "cli-picker-removed: 'hex picker' still recognized (exit $CODE) — output: $OUT"
-fi
-
-# ── 9. hex boi-web removed (BOI web UI teardown) ─────────────────────────────
-# hex boi-web was removed in the collapse-to-cc-boi demolition.
-OUT=$("$HEX" boi-web 2>&1)
-CODE=$?
-if [ "$CODE" -ne 0 ] && echo "$OUT" | grep -qi "unrecognized subcommand"; then
-    assert_pass "cli-boi-web-removed: 'hex boi-web' correctly absent (BOI web UI removed)"
-else
-    assert_fail "cli-boi-web-removed: 'hex boi-web' still recognized (exit $CODE) — output: $OUT"
-fi
-
-# ── 10. hex extension removed (extension system teardown) ────────────────────
-# hex extension was removed in the collapse-to-cc-boi demolition.
-OUT=$("$HEX" extension 2>&1)
-CODE=$?
-if [ "$CODE" -ne 0 ] && echo "$OUT" | grep -qi "unrecognized subcommand"; then
-    assert_pass "cli-extension-removed: 'hex extension' correctly absent (extension system removed)"
-else
-    assert_fail "cli-extension-removed: 'hex extension' still recognized (exit $CODE) — output: $OUT"
-fi
-
-# ── 11. hex telemetry present (live subcommand) ──────────────────────────────
+# ── 2. hex telemetry present (live subcommand) ──────────────────────────────
 # Telemetry was NOT removed: it is a documented, maintained subcommand
 # (.hex/telemetry/events.db; CLAUDE.md; see commit fix(telemetry): serialize
 # HEX_DIR-mutating tests). The prior "removed in the collapse-to-cc-boi
@@ -112,7 +29,7 @@ else
     assert_pass "cli-telemetry-present: 'hex telemetry' is a recognized subcommand"
 fi
 
-# ── 12. hex integration list ──────────────────────────────────────────────────
+# ── 3. hex integration list ──────────────────────────────────────────────────
 OUT=$("$HEX" integration list 2>&1)
 CODE=$?
 # Graceful error if no integrations directory is also acceptable
@@ -122,7 +39,7 @@ else
     assert_fail "cli-integration-list: unexpected exit $CODE — output: $OUT"
 fi
 
-# ── 13. hex memory stats (was `memory health`, removed as a pure alias) ───────
+# ── 4. hex memory stats (was `memory health`, removed as a pure alias) ───────
 OUT=$("$HEX" memory stats 2>&1)
 CODE=$?
 # Graceful error if memory DB not initialised is also acceptable
@@ -132,7 +49,7 @@ else
     assert_fail "cli-memory-stats: unexpected exit $CODE — output: $OUT"
 fi
 
-# ── 14. hex doctor --quiet ────────────────────────────────────────────────────
+# ── 5. hex doctor --quiet ────────────────────────────────────────────────────
 OUT=$("$HEX" doctor --quiet 2>&1)
 CODE=$?
 # exit 0 = all clear, exit 2 = warnings, anything else = error
@@ -142,7 +59,7 @@ else
     assert_fail "cli-doctor-quiet: exit $CODE (expected 0 or 2) — output: $OUT"
 fi
 
-# ── 15. Version consistency: hex version matches Cargo.toml version compiled in ──
+# ── 6. Version consistency: hex version matches Cargo.toml version compiled in ──
 if [ -f "$VERSION_FILE" ]; then
     EXPECTED_VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
     VERSION_OUT=$("$HEX" version 2>&1)

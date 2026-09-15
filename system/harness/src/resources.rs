@@ -670,6 +670,9 @@ mod tests {
     /// both a CloudStorage subtree and an ordinary one — the built command
     /// includes `-I CloudStorage`, and running the real `du` on the fixture
     /// with that mask reports a smaller `Library` size than without it.
+    // `du -I` is a BSD flag. GNU du in the Linux test lane rejects it, so
+    // this test only runs where the production discovery pass runs: macOS.
+    #[cfg(target_os = "macos")]
     #[test]
     fn discovery_du_excludes_cloudstorage_mask() {
         let tmp = tempfile::tempdir().unwrap();

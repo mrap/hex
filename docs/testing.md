@@ -2,17 +2,17 @@
 
 This document describes the test suite, what each test verifies, and how to run it locally.
 
+Rules for writing and reviewing tests: [testing-standard.md](testing-standard.md).
+
 ## Test categories
 
 | Category | Files | Needs API key |
 |----------|-------|:-------------:|
-| Static / unit | `test_skill_frontmatter.sh`, `test_skill_refs.sh`, `test_path_mapping.bats` | No |
+| Static / unit | `test_skill_frontmatter.sh`, `test_skill_refs.sh`, `test_doctor.bats`, `test_claude_runs_migration.bats`, `test_worktree_guard.sh` | No |
 | Core E2E (containerized) | `tests/core-e2e/run-all.sh` | BOI suites only |
 | Live eval — Claude Code | `test_skill_discovery.sh`, `test_e2e.sh`, `test_fullstack.sh` | Yes |
 | Live eval — Codex | `test_skill_discovery_codex.sh`, `test_codex_onboarding.sh` | Yes |
 | Codex parity (containerized) | `tests/codex-parity/run-all.sh` | No (structural); `OPENAI_API_KEY` for live |
-| Migration | `tests/migrate/test-migrate.sh` | No |
-| Memory | `test_memory.py` | No |
 
 ## Core E2E suite (`tests/core-e2e/`)
 
@@ -37,8 +37,27 @@ Current suites:
 | `test-boi-install` | Fresh BOI install: binary builds, `--help`/`--version`, smoke dispatch |
 | `test-boi-upgrade` | Upgrade path: version bump, stale-symlink detection, doctor catches dangling link |
 | `test-cli` | All `hex` subcommands reachable; version matches `Cargo.toml` |
-| `test-messaging` | Message send/receive/filter with SQLite verification |
-| `test-doctor` | `hex-doctor` passes on healthy install, fails loudly on broken config |
+| `test-questions` | Conversation-less question and reply, multi-conversation interleaving, with a fixture worker (no live LLM) |
+
+## Container test lane (`system/scripts/test-lane.sh`)
+
+The lane runs the workspace test suite with `cargo nextest` inside the `tests/lane/Dockerfile` image. It mounts the current worktree at `/work` and the named Docker volume `boi-target` at `/target`. Source and target paths are the same for every worktree, so cargo reuses compiled artifacts across worktrees. A second run with no source change compiles zero crates.
+
+```bash
+# Build the image if needed, then run the whole workspace
+bash system/scripts/test-lane.sh
+
+# Skip the image build, pass args to nextest
+bash system/scripts/test-lane.sh --no-build -- -p hex-harness
+```
+
+The script prints one receipt JSON line to stdout and everything else to stderr. Receipt fields: `schema`, `tree_hash`, `command`, `exit_code`, `crates_compiled`, `duration_secs`, `image`, `volume`, `started_at`. The exit code is the nextest exit code. If Docker is missing or not running, the script prints the reason and exits 2 with no receipt.
+
+`hex release cut` runs its `tests` gate through the lane when the script exists in the repo. Set `HEX_TEST_LANE=host` to force the host route (`cargo test --workspace` through managed Cargo) instead.
+
+The `hex-build-cache-guard` harness worker runs hourly at :15. It reads `cargo_target_dir` from `~/.boi/v2/daemon.toml`, deletes `.o` files older than 60 minutes in `<target>/debug/deps`, and fails loudly when more than 25,000 entries remain.
+
+The `hex-nightly-tests` harness worker runs the container lane once a night, at 10:00 UTC, with `--run-ignored all` so the `#[ignore]`d tests run too. It tests the repo named by `$HEX_DIR/.hex/config/nightly-tests.toml` (`repo = "..."`), or falls back to `$HEX_DIR/.hex/.upgrade-cache` when that file is absent. It needs Docker running; when Docker is down, the lane exits 2 and the worker fails loudly instead of skipping quietly. The ignored model tests stay red until API keys are passed into the lane container, a known gap this worker does not close.
 
 ## Tests added in v0.2.4
 
@@ -109,8 +128,8 @@ cd /path/to/hex-foundation
 
 bash tests/test_skill_frontmatter.sh
 bash tests/test_skill_refs.sh
-bash tests/migrate/test-migrate.sh
-python3 tests/test_memory.py
+bash tests/test_worktree_guard.sh
+bats tests/test_doctor.bats tests/test_claude_runs_migration.bats
 ```
 
 ### Full Docker eval suite
