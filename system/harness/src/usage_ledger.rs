@@ -673,6 +673,20 @@ impl UsageLedger {
             .collect::<std::result::Result<_, _>>()?;
         Ok(ids)
     }
+    /// Highest numeric `response_id` already in the ledger for one
+    /// `account_scope` (0 when none). Sources whose response ids are
+    /// monotonically increasing integers (harness-llm-cost: `events.id`) use
+    /// this as their resume point, so the resume state lives in the ledger
+    /// itself and cannot drift from it (a sidecar cursor file written before
+    /// the import commits would skip rows forever after a failed import).
+    pub fn max_numeric_response_id(&self, account_scope: &str) -> Result<i64> {
+        let max: Option<i64> = self.conn.query_row(
+            "SELECT MAX(CAST(response_id AS INTEGER)) FROM canonical_responses              WHERE account_scope=?1 AND response_id GLOB '[0-9]*'",
+            params![account_scope],
+            |r| r.get(0),
+        )?;
+        Ok(max.unwrap_or(0))
+    }
     pub fn rows(&self, limit: usize, offset: usize) -> Result<Vec<UsageRow>> {
         let mut s=self.conn.prepare("SELECT provider,account_scope,response_id,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM canonical_responses ORDER BY event_at,provider,account_scope,response_id LIMIT ?1 OFFSET ?2")?;
         let rows = s

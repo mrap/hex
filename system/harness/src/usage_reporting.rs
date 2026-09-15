@@ -163,6 +163,45 @@ pub const CLAUDE_API_RATES: &[ClaudeRateFact] = &[
             output: 500,
         },
     },
+    // Previous generation still seen in the ledger (nightly agent-infra runs
+    // on Sonnet 4.6; Opus 4.6/4.7/4.8 share Opus 5's price). Anthropic API
+    // list, 2026-06-24.
+    ClaudeRateFact {
+        model: "claude-sonnet-4-6",
+        rates: ClaudeTokenRates {
+            fresh: 300,
+            cached: 30,
+            cache_write: 375,
+            output: 1_500,
+        },
+    },
+    ClaudeRateFact {
+        model: "claude-opus-4-8",
+        rates: ClaudeTokenRates {
+            fresh: 500,
+            cached: 50,
+            cache_write: 625,
+            output: 2_500,
+        },
+    },
+    ClaudeRateFact {
+        model: "claude-opus-4-7",
+        rates: ClaudeTokenRates {
+            fresh: 500,
+            cached: 50,
+            cache_write: 625,
+            output: 2_500,
+        },
+    },
+    ClaudeRateFact {
+        model: "claude-opus-4-6",
+        rates: ClaudeTokenRates {
+            fresh: 500,
+            cached: 50,
+            cache_write: 625,
+            output: 2_500,
+        },
+    },
 ];
 
 /// Providers whose Claude-priced rows are billed by subscription rather than

@@ -1253,11 +1253,12 @@ fn default_llm_cost_events_db() -> PathBuf {
 /// worker cadence) forever:
 ///
 /// 1. **High-water mark.** The `SELECT` below is `id > <cursor>`, not
-///    `ORDER BY id LIMIT ?` from the start. The cursor is a plain-text
-///    sibling file (`harness-llm-cost.cursor`, next to the staging JSONL —
-///    never fed into `import_jsonl`) holding the highest `events.id` this
-///    collector has ever looked at, updated after every batch that sees at
-///    least one row. Without this, once the live events.db held more than
+///    `ORDER BY id LIMIT ?` from the start. The cursor is the highest
+///    `events.id` already in the ledger for scope `harness`
+///    (`UsageLedger::max_numeric_response_id`), so the resume state lives in
+///    the ledger and cannot drift from it. Rows skipped for a malformed
+///    `event` shape above that mark are re-read on later calls (bounded,
+///    harmless). Without this, once the live events.db held more than
 ///    `max_records` llm-cost rows, rows past the first `max_records` could
 ///    never be reached — a silent `accepted=0`/`backlog=false` forever.
 /// 2. **Stable staging file.** Each matching row is re-expressed as one line
@@ -1295,8 +1296,9 @@ pub fn import_harness_llm_cost(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("harness-llm-cost.jsonl");
-    let cursor_path = llm_cost_cursor_path(&staging_path);
-    let high_water = read_llm_cost_cursor(&cursor_path)?;
+    // Resume point = the highest events.id the ledger already holds for this
+    // scope. No sidecar cursor: the ledger is the only state.
+    let high_water = ledger.max_numeric_response_id("harness")?;
 
     let mut stmt = conn.prepare(
         "SELECT id, ts, event, detail FROM events WHERE source = 'llm-cost' AND id > ?1 ORDER BY id LIMIT ?2",
@@ -1353,9 +1355,7 @@ pub fn import_harness_llm_cost(
     // cap there may be more rows beyond this batch still to collect.
     let sql_backlog = fetched >= max_records;
 
-    if fetched > 0 {
-        std::fs::write(&cursor_path, last_id.to_string())?;
-    }
+    let _ = last_id;
 
     if lines.is_empty() {
         return Ok(hex::usage_ledger::ImportResult {
@@ -1385,22 +1385,7 @@ pub fn import_harness_llm_cost(
     Ok(result)
 }
 
-/// Sibling cursor-marker path for the harness-llm-cost stable staging file —
-/// see `import_harness_llm_cost`'s doc comment. Plain integer text, never fed
-/// into `UsageLedger::import_jsonl`.
-fn llm_cost_cursor_path(staging_path: &Path) -> PathBuf {
-    staging_path.with_extension("cursor")
-}
 
-/// Read the harness-llm-cost high-water mark; `0` (import everything) if the
-/// cursor file has never been written yet.
-fn read_llm_cost_cursor(path: &Path) -> std::io::Result<i64> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(s.trim().parse().unwrap_or(0)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(e),
-    }
-}
 
 /// `headless-claude-json` source (task T05n056tm, spec Sk2wwjwpa): one ledger
 /// record per `claude -p --output-format json` result file dropped under the
