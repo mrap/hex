@@ -18,17 +18,31 @@ use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Every source kind `hex usage collect` knows, in the order a bare
+/// invocation runs them. Adding a kind = add it here, in `collect`'s match,
+/// and in docs/hex-ops.md "Usage sources".
+pub const ALL_SOURCE_KINDS: &[&str] = &[
+    "codex-jsonl",
+    "claude-transcripts",
+    "boi-phase-runs",
+    "harness-llm-cost",
+    "headless-claude-json",
+];
+
 #[derive(Subcommand)]
 pub enum UsageCommands {
     /// Import usage into the durable ledger from one or (by default) every
-    /// known source kind: `codex-jsonl` (local Codex JSONL transcripts) and
-    /// `claude-transcripts` (local Claude Code transcripts under
-    /// $HOME/.claude/projects, provider `claude-code`). Bare `hex usage
-    /// collect` runs every kind in sequence so no LLM path silently drops out
-    /// of the ledger (decision usage-ledger-provider-agnostic-2026-09-14).
+    /// known source kind: `codex-jsonl` (local Codex JSONL transcripts),
+    /// `claude-transcripts` (Claude Code transcripts under
+    /// $HOME/.claude/projects), `boi-phase-runs` (BOI worker phases from
+    /// boi.db), `harness-llm-cost` (llm-cost telemetry rows: OpenRouter,
+    /// claude-cli) and `headless-claude-json` (`claude -p --output-format
+    /// json` result files). Bare `hex usage collect` runs every kind in
+    /// sequence so no LLM path silently drops out of the ledger (decision
+    /// usage-ledger-provider-agnostic-2026-09-14).
     Collect {
         /// Restrict this run to one source kind. Omit to run all kinds.
-        #[arg(long, value_parser = ["codex-jsonl", "claude-transcripts"])]
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(ALL_SOURCE_KINDS))]
         source_kind: Option<String>,
         /// Explicit local JSONL source (codex-jsonl only). Defaults to
         /// $HEX_DIR/.hex/usage/codex.jsonl.
@@ -47,6 +61,22 @@ pub enum UsageCommands {
         /// Maximum complete records committed per source kind in this run.
         #[arg(long, default_value_t = 1_000)]
         max_records: usize,
+        /// BOI database (boi-phase-runs only; opened read-only). Defaults to
+        /// $HOME/.boi/v2/boi.db.
+        #[arg(long)]
+        boi_db: Option<PathBuf>,
+        /// BOI recipes directory for model lookup (boi-phase-runs only).
+        /// Defaults to $HOME/.boi/v2/recipes.
+        #[arg(long)]
+        boi_recipes: Option<PathBuf>,
+        /// Harness telemetry store (harness-llm-cost only; opened read-only).
+        /// Defaults to $HEX_DIR/.hex/telemetry/events.db.
+        #[arg(long)]
+        events_db: Option<PathBuf>,
+        /// headless-claude-json source directory. Defaults to
+        /// $HEX_DIR/.hex/logs/agent-infra.
+        #[arg(long)]
+        headless_claude_dir: Option<PathBuf>,
     },
     /// Write a deterministic local JSON usage summary
     Report {
@@ -381,7 +411,16 @@ pub fn run(cmd: UsageCommands) -> i32 {
             claude_root,
             ledger,
             max_records,
-        } => collect(source_kind, source, codex_root, claude_root, ledger, max_records),
+            boi_db,
+            boi_recipes,
+            events_db,
+            headless_claude_dir,
+        } => collect(
+            source_kind,
+            CollectPaths { source, codex_root, claude_root, boi_db, boi_recipes, events_db, headless_claude_dir },
+            ledger,
+            max_records,
+        ),
         UsageCommands::Report {
             ledger,
             output,
@@ -566,7 +605,6 @@ fn discover(codex_root: &Path) -> (Vec<PathBuf>, Vec<String>) {
 // the `collect()` dispatch arm and `--source-kind` CLI plumbing land in the
 // sibling task (Txv7phcj8) that also wires up "run all kinds" — allow the
 // otherwise-correct dead-code warning until that lands.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BoiPhaseRunRecord {
     response_id: String,
@@ -588,7 +626,6 @@ struct BoiPhaseRunRecord {
 /// silently break the ledger's byte-cursor incremental-import assumption
 /// (a stable prefix + newly appended rows) that `collect_boi_phase_runs`
 /// relies on.
-#[allow(dead_code)]
 fn discover_boi_phase_runs(
     boi_db: &Path,
     recipes_dir: &Path,
@@ -644,7 +681,6 @@ fn discover_boi_phase_runs(
 /// when the recipe file is missing, unreadable, or lacks that key — a
 /// missing recipe is expected (e.g. deleted after the run) and must not fail
 /// the whole source.
-#[allow(dead_code)]
 fn recipe_model_for(recipes_dir: &Path, id: &str) -> Option<String> {
     let path = recipes_dir.join(format!("recipe-{id}.yaml"));
     let content = std::fs::read_to_string(path).ok()?;
@@ -659,7 +695,6 @@ fn recipe_model_for(recipes_dir: &Path, id: &str) -> Option<String> {
 /// ("boi-phase-runs: source $HOME/.boi/v2/boi.db (read-only, path
 /// overridable)"). Overridable at the call site (e.g. a future
 /// `--boi-db` flag), never hardcoded past this one function.
-#[allow(dead_code)]
 fn default_boi_db() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     Path::new(&home).join(".boi/v2/boi.db")
@@ -667,7 +702,6 @@ fn default_boi_db() -> PathBuf {
 
 /// Default recipe directory for the **boi-phase-runs** model lookup:
 /// `$HOME/.boi/v2/recipes` (`recipe_model_for` joins `recipe-<id>.yaml`).
-#[allow(dead_code)]
 fn default_boi_recipes_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     Path::new(&home).join(".boi/v2/recipes")
@@ -676,7 +710,6 @@ fn default_boi_recipes_dir() -> PathBuf {
 /// The `--source-kind` value for this source (task Tsgmstjxk). The CLI enum
 /// and "run all kinds" dispatch land in sibling task Txv7phcj8; this
 /// constant is the shared literal both sides key off.
-#[allow(dead_code)]
 const BOI_PHASE_RUNS_SOURCE_KIND: &str = "boi-phase-runs";
 
 /// Renders one `BoiPhaseRunRecord` as a line in the ledger's existing
@@ -686,7 +719,6 @@ const BOI_PHASE_RUNS_SOURCE_KIND: &str = "boi-phase-runs";
 /// no new ledger insert API, no schema migration. `account_scope` is always
 /// `"boi"` per the attribution mapping; `provider` carries the worker's own
 /// value (e.g. `claude_code`, `codex`) through unchanged.
-#[allow(dead_code)]
 fn boi_phase_run_ledger_line(record: &BoiPhaseRunRecord) -> String {
     json!({
         "type": "token_usage_record",
@@ -712,7 +744,6 @@ fn boi_phase_run_ledger_line(record: &BoiPhaseRunRecord) -> String {
 /// `import_parsed` dedupes on the canonical (provider, account_scope,
 /// response_id) key regardless of which generation of the staging file
 /// carried them.
-#[allow(dead_code)]
 fn collect_boi_phase_runs(
     boi_db: &Path,
     recipes_dir: &Path,
@@ -745,36 +776,80 @@ fn collect_boi_phase_runs(
 /// usage-ledger-provider-agnostic-2026-09-14: no LLM path should silently sit
 /// outside the ledger. A failure in one kind is reported and reflected in the
 /// exit code, but never skips the remaining kinds.
-fn collect(
-    source_kind: Option<String>,
+/// Per-kind path overrides from the CLI. Each field belongs to exactly one
+/// source kind; an override narrows a bare invocation to that kind (see
+/// `collect`).
+#[derive(Default, Clone)]
+struct CollectPaths {
     source: Option<PathBuf>,
     codex_root: Option<PathBuf>,
     claude_root: Option<PathBuf>,
+    boi_db: Option<PathBuf>,
+    boi_recipes: Option<PathBuf>,
+    events_db: Option<PathBuf>,
+    headless_claude_dir: Option<PathBuf>,
+}
+
+fn collect(
+    source_kind: Option<String>,
+    paths: CollectPaths,
     ledger: Option<PathBuf>,
     max_records: usize,
 ) -> i32 {
-    let codex_explicit = source.is_some() || codex_root.is_some();
-    let claude_explicit = claude_root.is_some();
+    // Which kinds the override flags point at. Exactly one → narrow to it
+    // (keeps codex-only callers and tests on their prior behavior); none or
+    // several → run everything.
+    let mut implied: Vec<&str> = Vec::new();
+    if paths.source.is_some() || paths.codex_root.is_some() {
+        implied.push("codex-jsonl");
+    }
+    if paths.claude_root.is_some() {
+        implied.push("claude-transcripts");
+    }
+    if paths.boi_db.is_some() || paths.boi_recipes.is_some() {
+        implied.push("boi-phase-runs");
+    }
+    if paths.events_db.is_some() {
+        implied.push("harness-llm-cost");
+    }
+    if paths.headless_claude_dir.is_some() {
+        implied.push("headless-claude-json");
+    }
     let kinds: Vec<&str> = match source_kind.as_deref() {
-        Some("codex-jsonl") => vec!["codex-jsonl"],
-        Some("claude-transcripts") => vec!["claude-transcripts"],
+        Some(kind) if ALL_SOURCE_KINDS.contains(&kind) => vec![kind],
         Some(other) => {
             eprintln!("usage collect: unknown --source-kind {other}");
             return 1;
         }
-        None if codex_explicit && !claude_explicit => vec!["codex-jsonl"],
-        None if claude_explicit && !codex_explicit => vec!["claude-transcripts"],
-        None => vec!["codex-jsonl", "claude-transcripts"],
+        None if implied.len() == 1 => implied,
+        None => ALL_SOURCE_KINDS.to_vec(),
     };
     let mut exit = 0;
     for kind in kinds {
         let code = match kind {
-            "codex-jsonl" => {
-                collect_codex_jsonl(source.clone(), codex_root.clone(), ledger.clone(), max_records)
-            }
+            "codex-jsonl" => collect_codex_jsonl(
+                paths.source.clone(),
+                paths.codex_root.clone(),
+                ledger.clone(),
+                max_records,
+            ),
             "claude-transcripts" => {
-                collect_claude_transcripts(claude_root.clone(), ledger.clone(), max_records)
+                collect_claude_transcripts(paths.claude_root.clone(), ledger.clone(), max_records)
             }
+            "boi-phase-runs" => collect_boi_phase_runs_cli(
+                paths.boi_db.clone(),
+                paths.boi_recipes.clone(),
+                ledger.clone(),
+                max_records,
+            ),
+            "harness-llm-cost" => {
+                collect_harness_llm_cost_cli(paths.events_db.clone(), ledger.clone(), max_records)
+            }
+            "headless-claude-json" => collect_headless_claude_json(
+                paths.headless_claude_dir.clone().unwrap_or_else(default_headless_claude_dir),
+                ledger.clone().unwrap_or_else(default_ledger),
+                max_records,
+            ),
             _ => unreachable!("kinds is built from a closed set above"),
         };
         if code != 0 {
@@ -782,6 +857,103 @@ fn collect(
         }
     }
     exit
+}
+
+/// Opens (creating the parent dir) the ledger for one CLI collector; the
+/// failure is reported the same way for every kind (S6).
+fn open_ledger_for(kind: &str, ledger: Option<PathBuf>) -> Option<UsageLedger> {
+    let ledger_path = ledger.unwrap_or_else(default_ledger);
+    if let Some(parent) = ledger_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("usage collect: cannot create ledger directory: {e}");
+            return None;
+        }
+    }
+    match UsageLedger::open(&ledger_path) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!("usage collect: {kind}: failed to open ledger: {e:?}");
+            health("error", format!("kind={kind} ledger_open_failed"));
+            None
+        }
+    }
+}
+
+/// Reports one JSONL-staged collector's `ImportResult` on stdout + telemetry,
+/// mirroring `collect_codex_jsonl`'s summary line so every kind is equally
+/// visible.
+fn report_import_result(kind: &str, result: &ImportResult) -> i32 {
+    println!(
+        "usage collect: source={kind} accepted={} duplicates={} conflicts={} backlog={}",
+        result.accepted, result.duplicates, result.conflicts, result.backlog
+    );
+    health(
+        "ok",
+        format!(
+            "kind={kind} accepted={} duplicates={} conflicts={} backlog={}",
+            result.accepted, result.duplicates, result.conflicts, result.backlog
+        ),
+    );
+    0
+}
+
+/// `boi-phase-runs` CLI wrapper (task Tsgmstjxk). A missing boi.db is a quiet
+/// no-op: BOI may be uninstalled or paused, which is not a collection failure.
+fn collect_boi_phase_runs_cli(
+    boi_db: Option<PathBuf>,
+    boi_recipes: Option<PathBuf>,
+    ledger: Option<PathBuf>,
+    max_records: usize,
+) -> i32 {
+    let db = boi_db.unwrap_or_else(default_boi_db);
+    let recipes = boi_recipes.unwrap_or_else(default_boi_recipes_dir);
+    if !db.exists() {
+        println!("usage collect: boi-phase-runs: no boi.db at {}", db.display());
+        return 0;
+    }
+    let Some(mut opened) = open_ledger_for("boi-phase-runs", ledger) else {
+        return 1;
+    };
+    let staging = match opened.db_path() {
+        Ok(p) => p.with_file_name("boi-phase-runs.staging.jsonl"),
+        Err(e) => {
+            eprintln!("usage collect: boi-phase-runs: ledger path: {e:?}");
+            return 1;
+        }
+    };
+    match collect_boi_phase_runs(&db, &recipes, &staging, &mut opened, max_records) {
+        Ok(r) => report_import_result("boi-phase-runs", &r),
+        Err(e) => {
+            eprintln!("usage collect: boi-phase-runs import failed: {e}");
+            health("error", format!("kind=boi-phase-runs import_failed={e}"));
+            1
+        }
+    }
+}
+
+/// `harness-llm-cost` CLI wrapper (task Th19d8qvp). A missing events.db is a
+/// quiet no-op (fresh instance, telemetry not yet written).
+fn collect_harness_llm_cost_cli(
+    events_db: Option<PathBuf>,
+    ledger: Option<PathBuf>,
+    max_records: usize,
+) -> i32 {
+    let db = events_db.unwrap_or_else(default_llm_cost_events_db);
+    if !db.exists() {
+        println!("usage collect: harness-llm-cost: no events.db at {}", db.display());
+        return 0;
+    }
+    let Some(mut opened) = open_ledger_for("harness-llm-cost", ledger) else {
+        return 1;
+    };
+    match import_harness_llm_cost(&db, &mut opened, max_records) {
+        Ok(r) => report_import_result("harness-llm-cost", &r),
+        Err(e) => {
+            eprintln!("usage collect: harness-llm-cost import failed: {e:?}");
+            health("error", format!("kind=harness-llm-cost import_failed={e:?}"));
+            1
+        }
+    }
 }
 
 /// `claude-transcripts` CLI wrapper: resolves defaults, opens the ledger, and
@@ -1058,7 +1230,6 @@ fn report(
 /// in task Txv7phcj8 ("bare `hex usage collect` runs all kinds"), which will
 /// call `import_harness_llm_cost(&default_llm_cost_events_db(), ...)` when no
 /// explicit path is given.
-#[allow(dead_code)]
 fn default_llm_cost_events_db() -> PathBuf {
     PathBuf::from(std::env::var("HEX_DIR").unwrap_or_else(|_| ".".into()))
         .join(".hex")
@@ -1110,7 +1281,6 @@ fn default_llm_cost_events_db() -> PathBuf {
 /// `--source-kind` plumbing in task Txv7phcj8 (bare `hex usage collect` runs
 /// all kinds), which will call this directly. Until then it's only exercised
 /// by its own fixture test below.
-#[allow(dead_code)]
 pub fn import_harness_llm_cost(
     events_db: &Path,
     ledger: &mut UsageLedger,
@@ -1232,6 +1402,239 @@ fn read_llm_cost_cursor(path: &Path) -> std::io::Result<i64> {
         Ok(s) => Ok(s.trim().parse().unwrap_or(0)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(e) => Err(e),
+    }
+}
+
+/// `headless-claude-json` source (task T05n056tm, spec Sk2wwjwpa): one ledger
+/// record per `claude -p --output-format json` result file dropped under the
+/// source dir (default `$HEX_DIR/.hex/logs/agent-infra`) by headless harness
+/// `claude -p` runs (proposer/auditor). `provider` is always
+/// `"claude-code"`, `account_scope` is always `"headless"`.
+/// `root_task_family` is the file-name role prefix (`proposer`/`auditor`).
+/// `response_id` is the result's `session_id`. Token counts come from the
+/// result's `usage` block; `model` comes from the first key of the result's
+/// `modelUsage` map (a headless `claude -p` run is single-model).
+///
+/// Claude's `usage` block reports `input_tokens` and
+/// `cache_read_input_tokens` as *exclusive* counts, but this record's (and
+/// the ledger's) `input_tokens`/`cached_input_tokens` are *inclusive* —
+/// `cached_input_tokens` is a subset of `input_tokens`, per the ledger's
+/// validity predicate (usage_ledger.rs `summary_groups`) and
+/// usage_reporting.rs's `complete()`. `input_tokens` here is therefore
+/// `usage.input_tokens + usage.cache_read_input_tokens`, and
+/// `cached_input_tokens` is `usage.cache_read_input_tokens` —
+/// `cache_write_input_tokens` maps straight from
+/// `usage.cache_creation_input_tokens` (already inclusive/orthogonal, no
+/// fold needed). Same normalization as the claude-transcripts source.
+///
+/// `total_cost_usd` is intentionally NOT captured by this record: the
+/// ledger's `canonical_responses` table (usage_ledger.rs SCHEMA) has no
+/// dollar-denominated column today — `total_tokens`/`provider_total` are
+/// token counts, not cost, so there is no existing "provider_total/credits
+/// field family" to reuse. Persisting `total_cost_usd` needs a reviewed
+/// schema migration (e.g. a nullable `total_cost_usd_micro INTEGER` column on
+/// `canonical_responses`, added the same additive way
+/// `cache_write_input_tokens`/`total_tokens`/`session_id` were added via
+/// `ALTER TABLE ... ADD COLUMN` in `UsageLedger::open`). Per the task's STOP
+/// condition ("stop and report if total_cost_usd needs a schema migration"),
+/// that migration is proposed here, not applied — see the write_red_tests
+/// verdict for this task.
+///
+/// `event_at` is NOT present in the `claude -p --output-format json` result
+/// payload (no `session_id`/`total_cost_usd`/`usage`/`modelUsage`/`num_turns`
+/// field carries a timestamp), so this source derives it from the result
+/// file's mtime — the same "file write time stands in for event time when
+/// the payload has none" pattern already used for the cheap window prefilter
+/// in `window_spend` above (`DateTime::<Utc>::from(meta.modified())`). This
+/// is an unresolved design choice flagged for the execute phase, not a given:
+/// if headless harness runs ever batch-write result files well after the
+/// run completed, mtime-as-event_at would misattribute the record to the
+/// wrong report window.
+#[derive(Debug, PartialEq)]
+struct HeadlessClaudeRecord {
+    provider: String,
+    account_scope: String,
+    response_id: String,
+    root_task_family: String,
+    event_at: DateTime<Utc>,
+    model: Option<String>,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
+    output_tokens: i64,
+}
+
+/// Default source dir for `headless-claude-json`: `$HEX_DIR/.hex/logs/agent-infra`.
+fn default_headless_claude_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HEX_DIR").unwrap_or_else(|_| ".".into()))
+        .join(".hex")
+        .join("logs")
+        .join("agent-infra")
+}
+
+/// Parse one `claude -p --output-format json` result file into a
+/// `HeadlessClaudeRecord`. Returns `Err(reason)` (loud and specific at the
+/// call site, not a silent skip — see `collect_headless_claude_json`) when
+/// the file cannot be read, is not valid JSON, or lacks a `session_id` or
+/// `usage` block: S6 ("every error must be loud") requires the *why*, not
+/// just a bare "unparseable" — a missing `session_id` and a missing `usage`
+/// block point an operator at completely different fixes.
+fn parse_headless_claude_result(path: &Path) -> Result<HeadlessClaudeRecord, String> {
+    let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read file: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("invalid json: {e}"))?;
+    let response_id = v
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing session_id".to_string())?
+        .to_string();
+    // root_task_family is the file-name role prefix, e.g.
+    // `proposer-sess-headless-abc123.json` -> "proposer".
+    let root_task_family = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "non-utf8 file name".to_string())?
+        .split('-')
+        .next()
+        .ok_or_else(|| "empty file name".to_string())?
+        .to_string();
+    let usage = v.get("usage").ok_or_else(|| "missing usage block".to_string())?;
+    let tok = |k: &str| usage.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+    let model = v
+        .get("modelUsage")
+        .and_then(|m| m.as_object())
+        .and_then(|obj| obj.keys().next())
+        .cloned();
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("cannot read file mtime: {e}"))?;
+    // Claude's usage block reports input_tokens and cache_read_input_tokens
+    // as exclusive counts (raw-new vs served-from-cache), but the ledger's
+    // input_tokens/cached_input_tokens columns are inclusive: the validity
+    // predicate in usage_ledger.rs (`input_tokens>=cached_input_tokens`,
+    // summary_groups) and usage_reporting.rs's `complete()` both assume
+    // cached tokens are a subset of input tokens. Fold cache_read into
+    // input_tokens here so real result files (where cache_read routinely
+    // dwarfs the raw input_tokens field) don't fail that predicate and get
+    // silently dropped from every aggregate — identical normalization to
+    // the claude-transcripts source (task Txv7phcj8), so both Claude
+    // sources report consistently.
+    let raw_input = tok("input_tokens");
+    let cache_read = tok("cache_read_input_tokens");
+    Ok(HeadlessClaudeRecord {
+        provider: "claude-code".to_string(),
+        account_scope: "headless".to_string(),
+        response_id,
+        root_task_family,
+        event_at: DateTime::<Utc>::from(mtime),
+        model,
+        input_tokens: raw_input + cache_read,
+        cached_input_tokens: cache_read,
+        cache_write_input_tokens: tok("cache_creation_input_tokens"),
+        output_tokens: tok("output_tokens"),
+    })
+}
+
+/// Collect the `headless-claude-json` source: every `*.json` file directly
+/// under `dir` (non-recursive — `claude -p` result files land flat per run,
+/// one file per proposer/auditor invocation) is parsed into a
+/// `HeadlessClaudeRecord` and imported into the ledger. A parse failure for
+/// one file is a loud per-file issue (S6: no quiet skip) and makes this run's
+/// exit non-zero, but does not stop the remaining files from being collected.
+///
+/// `total_cost_usd` is NOT persisted — see the `HeadlessClaudeRecord` doc
+/// comment above: the ledger's `canonical_responses` table has no
+/// dollar-denominated column, so capturing it needs a reviewed additive
+/// schema migration (STOP condition; not applied here).
+fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usize) -> i32 {
+    if !dir.exists() {
+        // A configured-but-absent source dir mirrors the Codex "no local
+        // sources discovered" no-op: nothing has run yet, not a failure.
+        println!("usage collect: headless-claude-json: no source dir at {}", dir.display());
+        return 0;
+    }
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(read) => read
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect(),
+        Err(e) => {
+            eprintln!("usage collect: headless-claude-json: cannot read {}: {e}", dir.display());
+            return 1;
+        }
+    };
+    entries.sort();
+    if let Some(parent) = ledger.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("usage collect: cannot create ledger directory: {e}");
+            return 1;
+        }
+    }
+    let mut l = match UsageLedger::open(&ledger) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("usage collect: headless-claude-json: failed to open ledger: {e:?}");
+            return 1;
+        }
+    };
+    let mut accepted = 0u64;
+    let mut empty = 0u64;
+    let mut issues = Vec::new();
+    for path in entries.into_iter().take(max_records) {
+        // A zero-byte result file is a run that died before `claude -p`
+        // wrote anything (the run's own telemetry row already carries that
+        // failure). There is no usage to record, so it is a counted skip,
+        // not a collection error that would re-fire every 5 minutes forever.
+        if std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(false) {
+            empty += 1;
+            continue;
+        }
+        let record = match parse_headless_claude_result(&path) {
+            Ok(record) => record,
+            Err(reason) => {
+                issues.push(format!("unparseable={}: {reason}", path.display()));
+                continue;
+            }
+        };
+        let source_key = path.to_string_lossy().to_string();
+        let canonical = CanonicalRow {
+            provider: record.provider,
+            account_scope: record.account_scope,
+            response_id: record.response_id,
+            parent_response_id: None,
+            root_task_family: Some(record.root_task_family),
+            event_at: Some(record.event_at.to_rfc3339()),
+            model: record.model,
+            effort: None,
+            input_tokens: Some(record.input_tokens),
+            cached_input_tokens: Some(record.cached_input_tokens),
+            cache_write_input_tokens: Some(record.cache_write_input_tokens),
+            output_tokens: Some(record.output_tokens),
+            reasoning_output_tokens: None,
+            total_tokens: None,
+        };
+        match l.import_canonical_rows(&source_key, vec![canonical]) {
+            Ok(r) => accepted += r.accepted,
+            Err(e) => issues.push(format!("import_failed={}: {e:?}", path.display())),
+        }
+    }
+    println!(
+        "usage collect: headless-claude-json: accepted={accepted} empty_skipped={empty} issues={}",
+        issues.len()
+    );
+    if issues.is_empty() {
+        health("ok", format!("kind=headless-claude-json accepted={accepted} empty_skipped={empty}"));
+        0
+    } else {
+        for issue in &issues {
+            eprintln!("usage collect: headless-claude-json: {issue}");
+        }
+        health(
+            "error",
+            format!("kind=headless-claude-json accepted={accepted} issues={}", issues.len()),
+        );
+        1
     }
 }
 
@@ -1877,5 +2280,217 @@ mod tests {
         assert!(price("").is_none());
         // Unknown future claude model: falls back to top-tier rates, never $0.
         assert!(price("claude-zephyr-6").unwrap().0 == 10.0);
+    }
+
+    /// Default headless-claude-json source dir is `$HEX_DIR/.hex/logs/agent-infra`
+    /// (task T05n056tm). Pure path glue — this part is real, not scaffolding.
+    #[test]
+    fn default_headless_claude_dir_is_hex_dir_logs_agent_infra() {
+        let prior = std::env::var("HEX_DIR").ok();
+        std::env::set_var("HEX_DIR", "/tmp/some-hex-dir");
+        let dir = default_headless_claude_dir();
+        match prior {
+            Some(v) => std::env::set_var("HEX_DIR", v),
+            None => std::env::remove_var("HEX_DIR"),
+        }
+        assert_eq!(dir, Path::new("/tmp/some-hex-dir/.hex/logs/agent-infra"));
+    }
+
+    /// (task T05n056tm): a `claude -p --output-format json` result file
+    /// under the headless-claude-json source dir must parse into a
+    /// `HeadlessClaudeRecord` with provider `claude-code`, account_scope
+    /// `headless`, root_task_family from the file-name role prefix,
+    /// response_id from `session_id`, model from the `modelUsage` map,
+    /// token counts from `usage`, and `event_at` from the result file's
+    /// mtime (the result payload itself carries no timestamp field — see the
+    /// `HeadlessClaudeRecord` doc comment).
+    #[test]
+    fn parses_headless_claude_json_result_file_into_ledger_attribution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agent-infra");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "num_turns": 3,
+            "session_id": "sess-headless-abc123",
+            "total_cost_usd": 0.4217,
+            "usage": {
+                "input_tokens": 11,
+                "cache_creation_input_tokens": 32928,
+                "cache_read_input_tokens": 223456,
+                "output_tokens": 2217
+            },
+            "modelUsage": {
+                "claude-sonnet-4-6": {
+                    "inputTokens": 11,
+                    "outputTokens": 2217
+                }
+            }
+        });
+        let path = dir.join("proposer-sess-headless-abc123.json");
+        std::fs::write(&path, fixture.to_string()).unwrap();
+        // Pin mtime explicitly (truncated to whole seconds — filesystem mtime
+        // granularity is not sub-second-reliable on every platform) so the
+        // expected event_at is exact, not a `now()`-proximity fuzz match.
+        let pinned_mtime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_system_time(pinned_mtime.into()),
+        )
+        .unwrap();
+
+        let record = parse_headless_claude_result(&path)
+            .expect("headless-claude-json result file must parse into a ledger record");
+
+        assert_eq!(record.provider, "claude-code");
+        assert_eq!(record.account_scope, "headless");
+        assert_eq!(record.response_id, "sess-headless-abc123");
+        assert_eq!(record.root_task_family, "proposer");
+        assert_eq!(record.event_at, pinned_mtime);
+        assert_eq!(record.model.as_deref(), Some("claude-sonnet-4-6"));
+        // Claude's usage block is exclusive (input_tokens=11 is just the raw
+        // new tokens; cache_read_input_tokens=223456 dwarfs it, as in real
+        // proposer result files); the ledger's input_tokens is inclusive, so
+        // it must fold cache_read in or every real row fails the ledger's
+        // input_tokens>=cached_input_tokens validity predicate.
+        assert_eq!(record.input_tokens, 11 + 223456);
+        assert_eq!(record.cached_input_tokens, 223456);
+        assert_eq!(record.cache_write_input_tokens, 32928);
+        assert_eq!(record.output_tokens, 2217);
+    }
+
+    /// S6 ("every error must be loud"): a parse failure must say *why*, not
+    /// just "unparseable" — invalid JSON and a missing `session_id` are
+    /// different bugs with different fixes, and an operator triaging a
+    /// non-zero `collect` exit needs to tell them apart from the message
+    /// alone (task T05n056tm).
+    #[test]
+    fn parse_headless_claude_result_carries_a_specific_failure_reason() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let bad_json_path = tmp.path().join("proposer-bad.json");
+        std::fs::write(&bad_json_path, "{not valid json").unwrap();
+        let err = parse_headless_claude_result(&bad_json_path).unwrap_err();
+        assert!(err.contains("json"), "reason should name the JSON problem, got: {err}");
+
+        let no_session_path = tmp.path().join("proposer-no-session.json");
+        std::fs::write(&no_session_path, json!({"usage": {}}).to_string()).unwrap();
+        let err = parse_headless_claude_result(&no_session_path).unwrap_err();
+        assert!(
+            err.contains("session_id"),
+            "reason should name the missing session_id, got: {err}"
+        );
+    }
+
+    /// Collect wiring (task T05n056tm): `collect_headless_claude_json` reads
+    /// every `*.json` result file under the source dir and lands one ledger
+    /// row per file, attributed exactly as `HeadlessClaudeRecord` documents —
+    /// proven by reading the ledger back via `UsageLedger::rows`, not just by
+    /// checking the collector's own reported `accepted` count. Re-running
+    /// collect against the same fixture dir must be idempotent (no
+    /// duplicate/second row for the same file).
+    #[test]
+    fn collect_headless_claude_json_lands_one_row_per_result_file_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agent-infra");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = json!({
+            "session_id": "sess-collect-xyz",
+            "total_cost_usd": 0.1,
+            "usage": {
+                "input_tokens": 11,
+                "cache_creation_input_tokens": 32928,
+                "cache_read_input_tokens": 223456,
+                "output_tokens": 2217
+            },
+            "modelUsage": {"claude-sonnet-4-6": {"inputTokens": 11, "outputTokens": 2217}}
+        });
+        std::fs::write(
+            dir.join("auditor-sess-collect-xyz.json"),
+            fixture.to_string(),
+        )
+        .unwrap();
+        let ledger_path = tmp.path().join("usage.db");
+
+        let code = collect_headless_claude_json(dir.clone(), ledger_path.clone(), 1_000);
+        assert_eq!(code, 0, "collect must succeed against a clean fixture");
+
+        let ledger = UsageLedger::open(&ledger_path).unwrap();
+        let rows = ledger.rows(100, 0).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one row for the one result file");
+        let row = &rows[0];
+        assert_eq!(row.provider, "claude-code");
+        assert_eq!(row.account_scope, "headless");
+        assert_eq!(row.response_id, "sess-collect-xyz");
+        assert_eq!(row.root_task_family.as_deref(), Some("auditor"));
+        assert_eq!(row.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(row.input_tokens, Some(11 + 223456));
+        assert_eq!(row.cached_input_tokens, Some(223456));
+        assert_eq!(row.cache_write_input_tokens, Some(32928));
+        assert_eq!(row.output_tokens, Some(2217));
+
+        // Re-import must not duplicate the row.
+        let code = collect_headless_claude_json(dir, ledger_path.clone(), 1_000);
+        assert_eq!(code, 0, "re-collect must stay a success (duplicates are not failures)");
+        let ledger = UsageLedger::open(&ledger_path).unwrap();
+        let rows = ledger.rows(100, 0).unwrap();
+        assert_eq!(rows.len(), 1, "re-import must be idempotent, not a duplicate row");
+    }
+
+    /// A missing source dir is a no-op, not a failure (S6: distinguishes "no
+    /// headless runs happened yet" from a real collection error).
+    /// A zero-byte result file (a headless run that died before writing) is
+    /// skipped and counted, not an error: otherwise the 5-minute worker would
+    /// report a failure on every fire for as long as the file exists.
+    #[test]
+    fn collect_headless_claude_json_skips_empty_result_files_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("agent-infra");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("auditor-2026-09-11T041500Z.json"), b"").unwrap();
+        let ledger = dir.path().join("usage.db");
+        let code = collect_headless_claude_json(src, ledger.clone(), 100);
+        assert_eq!(code, 0, "an empty result file must not fail the collector");
+        let l = UsageLedger::open(&ledger).unwrap();
+        assert!(l.rows(10, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn collect_headless_claude_json_missing_dir_is_a_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let code = collect_headless_claude_json(
+            tmp.path().join("does-not-exist"),
+            tmp.path().join("usage.db"),
+            1_000,
+        );
+        assert_eq!(code, 0);
+    }
+
+    /// An unparseable file is a loud per-file issue and a non-zero exit, but
+    /// does not stop other files in the same run from being collected (S6:
+    /// no quiet skip, and one bad source must not silently mask the rest).
+    #[test]
+    fn collect_headless_claude_json_reports_unparseable_files_loudly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agent-infra");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposer-broken.json"), "{not valid json").unwrap();
+        let fixture = json!({
+            "session_id": "sess-good",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"claude-sonnet-4-6": {}}
+        });
+        std::fs::write(dir.join("proposer-sess-good.json"), fixture.to_string()).unwrap();
+        let ledger_path = tmp.path().join("usage.db");
+
+        let code = collect_headless_claude_json(dir, ledger_path.clone(), 1_000);
+        assert_eq!(code, 1, "an unparseable file must make the run's exit non-zero");
+
+        let ledger = UsageLedger::open(&ledger_path).unwrap();
+        let rows = ledger.rows(100, 0).unwrap();
+        assert_eq!(rows.len(), 1, "the parseable file must still be collected");
+        assert_eq!(rows[0].response_id, "sess-good");
     }
 }
