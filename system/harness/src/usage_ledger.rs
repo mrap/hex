@@ -84,10 +84,21 @@ pub struct ContributorDetailCursor {
 /// coordinates, so a summary read never decodes every ledger row.
 #[derive(Debug, Clone)]
 pub struct UsageSummaryGroup {
-    pub model: Option<String>, pub family: Option<String>, pub child: bool,
-    pub complete: i64, pub input: i64, pub cached: i64, pub output: i64,
-    pub cache_write: i64, pub reasoning: i64, pub provider_total: i64,
-    pub invalid: i64, pub missing_cache_write: i64, pub missing_reasoning: i64,
+    pub provider: String,
+    pub account_scope: String,
+    pub model: Option<String>,
+    pub family: Option<String>,
+    pub child: bool,
+    pub complete: i64,
+    pub input: i64,
+    pub cached: i64,
+    pub output: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub provider_total: i64,
+    pub invalid: i64,
+    pub missing_cache_write: i64,
+    pub missing_reasoning: i64,
     pub missing_provider_total: i64,
 }
 
@@ -107,9 +118,9 @@ impl FrozenUsageRead<'_> {
     pub fn summary_groups(&self, window: FrozenWindow) -> Result<Vec<UsageSummaryGroup>> {
         let w = self.windows[match window { FrozenWindow::First => 0, FrozenWindow::Second => 1 }];
         let valid = "input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL AND output_tokens IS NOT NULL AND input_tokens>=cached_input_tokens AND cached_input_tokens>=0 AND output_tokens>=0";
-        let sql = format!("SELECT model,root_task_family,parent_response_id IS NOT NULL, SUM(CASE WHEN {valid} THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN {valid} THEN input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN cached_input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN output_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(cache_write_input_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(reasoning_output_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(total_tokens,0) ELSE 0 END),0), SUM(CASE WHEN {valid} THEN 0 ELSE 1 END), SUM(CASE WHEN {valid} AND cache_write_input_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND reasoning_output_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND total_tokens IS NULL THEN 1 ELSE 0 END) FROM canonical_responses WHERE event_at>=?1 AND event_at<?2 GROUP BY model,root_task_family,parent_response_id IS NOT NULL");
+        let sql = format!("SELECT provider,account_scope,model,root_task_family,parent_response_id IS NOT NULL, SUM(CASE WHEN {valid} THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN {valid} THEN input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN cached_input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN output_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(cache_write_input_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(reasoning_output_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(total_tokens,0) ELSE 0 END),0), SUM(CASE WHEN {valid} THEN 0 ELSE 1 END), SUM(CASE WHEN {valid} AND cache_write_input_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND reasoning_output_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND total_tokens IS NULL THEN 1 ELSE 0 END) FROM canonical_responses WHERE event_at>=?1 AND event_at<?2 GROUP BY provider,account_scope,model,root_task_family,parent_response_id IS NOT NULL");
         let mut statement = self.transaction.prepare(&sql)?;
-        let groups = statement.query_map(params![w.start.to_rfc3339(), w.end.to_rfc3339()], |r| Ok(UsageSummaryGroup { model:r.get(0)?, family:r.get(1)?, child:r.get(2)?, complete:r.get(3)?, input:r.get(4)?, cached:r.get(5)?, output:r.get(6)?, cache_write:r.get(7)?, reasoning:r.get(8)?, provider_total:r.get(9)?, invalid:r.get(10)?, missing_cache_write:r.get(11)?, missing_reasoning:r.get(12)?, missing_provider_total:r.get(13)? }))?.collect::<std::result::Result<_,_>>()?;
+        let groups = statement.query_map(params![w.start.to_rfc3339(), w.end.to_rfc3339()], |r| Ok(UsageSummaryGroup { provider:r.get(0)?, account_scope:r.get(1)?, model:r.get(2)?, family:r.get(3)?, child:r.get(4)?, complete:r.get(5)?, input:r.get(6)?, cached:r.get(7)?, output:r.get(8)?, cache_write:r.get(9)?, reasoning:r.get(10)?, provider_total:r.get(11)?, invalid:r.get(12)?, missing_cache_write:r.get(13)?, missing_reasoning:r.get(14)?, missing_provider_total:r.get(15)? }))?.collect::<std::result::Result<_,_>>()?;
         Ok(groups)
     }
     pub fn for_each_window_page<F>(
@@ -321,6 +332,23 @@ pub struct Coverage {
     pub quarantined: u64,
     pub pending_sources: u64,
     pub stale_sources: u64,
+    /// One entry per distinct `(provider, account_scope)` pair ever seen in
+    /// `canonical_responses`, ledger-wide (not scoped to a report window).
+    /// Derived live from the existing table — no schema migration.
+    pub sources: Vec<SourceCoverage>,
+}
+
+/// One row of [`Coverage::sources`]: how many canonical rows a
+/// `(provider, account_scope)` pair has contributed, and the event-time span
+/// they cover. `first_event_at`/`last_event_at` are `None` only when every
+/// row for that pair has a null `event_at`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceCoverage {
+    pub provider: String,
+    pub account_scope: String,
+    pub records: u64,
+    pub first_event_at: Option<String>,
+    pub last_event_at: Option<String>,
 }
 pub struct UsageLedger {
     conn: Connection,
@@ -715,6 +743,22 @@ impl UsageLedger {
             [],
             |r| r.get(0),
         )?;
+        let mut sources_stmt = self.conn.prepare(
+            "SELECT provider, account_scope, COUNT(*), MIN(event_at), MAX(event_at) \
+             FROM canonical_responses GROUP BY provider, account_scope \
+             ORDER BY provider, account_scope",
+        )?;
+        c.sources = sources_stmt
+            .query_map([], |r| {
+                Ok(SourceCoverage {
+                    provider: r.get(0)?,
+                    account_scope: r.get(1)?,
+                    records: r.get(2)?,
+                    first_event_at: r.get(3)?,
+                    last_event_at: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
         Ok(c)
     }
 }
