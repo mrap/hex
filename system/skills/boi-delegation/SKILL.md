@@ -49,11 +49,11 @@ Before making your second file edit, STOP. Count how many files you plan to
 touch total. If 3 or more → abandon inline editing immediately, write a TOML
 spec, dispatch. No exceptions, no "just one more edit."
 
-## Brainstorm → Plan → Dispatch (MANDATORY)
+## Brainstorm → Plan → Dispatch (MANDATORY — PARKED while BOI is paused; step 3 is now "build in Claude Code")
 
 1. **Brainstorm** — List 2-3 approaches. Pick the best. Write it down.
 2. **Plan** — Write the spec TOML: `[contract]` block + `[[tasks]]` array.
-3. **Dispatch** — `~/.boi/bin/boi dispatch <spec.toml>`
+3. **Dispatch** — `~/.boi/bin/boi dispatch <spec.toml>` (parked; while paused: build the plan in Claude Code)
 
 Problem → spec (skipping brainstorm) is not acceptable. The brainstorm step is
 not optional overhead — it's a required gate.
