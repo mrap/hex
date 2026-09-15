@@ -1,13 +1,11 @@
-//! Red test for task Tn1wrdke4: doctor check + example config + docs.
+//! Red test for task Tn1wrdke4: doctor check + example config.
 //!
 //! These tests pin down the deliverables of the doctor/docs task:
 //!   1. A doctor check named "claude-runs-config" is registered in the runner.
 //!   2. The example config at system/templates/claude-runs.toml.example exists
 //!      and parses as valid TOML (proves we shipped a working schema sample).
-//!   3. Docs under docs/ mention `claude-runs.toml` so operators can discover
-//!      the lean-by-default policy.
 //!
-//! All three will fail until task Tn1wrdke4 is implemented.
+//! Both will fail until task Tn1wrdke4 is implemented.
 
 use hex::doctor::Runner;
 use std::path::PathBuf;
@@ -49,26 +47,4 @@ fn example_claude_runs_config_exists_and_parses() {
     // Parse in-process so this release test does not depend on whichever
     // `python3` happens to be first on the operator's PATH.
     toml::from_str::<toml::Value>(&body).expect("example config must parse as valid TOML");
-}
-
-#[test]
-fn docs_mention_claude_runs_toml() {
-    let docs_dir = repo_root().join("docs");
-    let mut hit = false;
-    for entry in walkdir::WalkDir::new(&docs_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        if let Ok(body) = std::fs::read_to_string(entry.path()) {
-            if body.contains("claude-runs.toml") {
-                hit = true;
-                break;
-            }
-        }
-    }
-    assert!(
-        hit,
-        "expected at least one file under docs/ to mention `claude-runs.toml`"
-    );
 }

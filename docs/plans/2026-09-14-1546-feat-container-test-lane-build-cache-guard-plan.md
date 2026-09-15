@@ -72,7 +72,7 @@ Everything in R1 to R14. A short section in `docs/testing.md` on how to run the 
 ### Out of scope (this PR)
 
 - BOI repo items from section 7: spec lint, build broker, `[contract].runner = "container"`, receipts in `boi.db`. BOI is read-only from hex.
-- mrap-hex instance items: spec template rewrite, worktree prune, cache delete, canary spec, `daemon.toml` changes.
+- personal-instance items: spec template rewrite, worktree prune, cache delete, canary spec, `daemon.toml` changes.
 - Days 31 to 90 foundation items: host lane trigger, nightly harness worker in the lane, `nextest.toml` retries and quarantine, metrics table, `hex test stats`.
 - Changing the CI workflows. `ci.yml` keeps `cargo test --workspace` on the GitHub runner.
 
@@ -229,8 +229,8 @@ docs/plans/2026-09-14-1546-feat-container-test-lane-build-cache-guard-plan.md  t
 **Patterns to follow:** `system/scripts/hex-integration-check.sh` for shell style. Verify-gate rules in the hex instance `CLAUDE.md` (preserve exit codes, never pipe through `tail` before checking status).
 
 **Test scenarios:**
-- Happy path: run 1 on a clean worktree exits 0 and the receipt has `crates_compiled` greater than 0.
-- Happy path: run 2 with no change exits 0 and the receipt has `crates_compiled: 0` and the same `tree_hash`.
+- Success path: run 1 on a clean worktree exits 0 and the receipt has `crates_compiled` greater than 0.
+- Success path: run 2 with no change exits 0 and the receipt has `crates_compiled: 0` and the same `tree_hash`.
 - Edge: a one-line edit to a harness source file changes `tree_hash` and makes `crates_compiled` small and nonzero.
 - Error: `PATH` without docker and no docker at the two known paths prints a message naming docker and exits 2 with no stdout.
 - Error: `--no-build` with no image present exits 2 with a message naming the image and no stdout.

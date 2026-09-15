@@ -51,13 +51,13 @@ root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git wor
 [ -f "$root/$DOCKERFILE" ] || die "missing $DOCKERFILE under $root"
 
 docker_bin=""
-for candidate in "$(command -v docker 2>/dev/null || true)" /usr/local/bin/docker /opt/homebrew/bin/docker; do
+for candidate in "${HEX_DOCKER_BIN:-}" "$(command -v docker 2>/dev/null || true)" /usr/local/bin/docker; do
   if [ -n "$candidate" ] && [ -x "$candidate" ]; then
     docker_bin="$candidate"
     break
   fi
 done
-[ -n "$docker_bin" ] || die "docker not found on PATH, /usr/local/bin/docker, or /opt/homebrew/bin/docker. Install or start OrbStack."
+[ -n "$docker_bin" ] || die "docker not found on PATH or /usr/local/bin/docker. Install or start OrbStack, or set HEX_DOCKER_BIN."
 
 if ! "$docker_bin" info >/dev/null 2>&1; then
   die "docker daemon not reachable via $docker_bin. Start OrbStack and retry."
@@ -82,7 +82,7 @@ GIT_INDEX_FILE="$tmp_index" git -C "$root" add -A >/dev/null 2>&1
 tree_hash="$(GIT_INDEX_FILE="$tmp_index" git -C "$root" write-tree)"
 
 # --- run -----------------------------------------------------------------------
-# The `+` expansion keeps macOS bash 3.2 happy with an empty array under set -u.
+# The `+` expansion works on macOS bash 3.2 with an empty array under set -u.
 nextest_cmd=(cargo nextest run --workspace --locked ${nextest_args[@]+"${nextest_args[@]}"})
 command_str="${nextest_cmd[*]}"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
