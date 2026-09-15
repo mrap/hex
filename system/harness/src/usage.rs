@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use clap::Subcommand;
-use hex::usage_ledger::{CanonicalRow, ImportOptions, UsageLedger};
+use hex::usage_ledger::{CanonicalRow, ImportOptions, ImportResult, UsageLedger};
 use hex::usage_reporting;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -553,6 +553,189 @@ fn discover(codex_root: &Path) -> (Vec<PathBuf>, Vec<String>) {
     paths.dedup();
     (paths, issues)
 }
+/// One eligible `phase_runs` row from the **boi-phase-runs** usage source
+/// (decision: usage-ledger-provider-agnostic-2026-09-14, task Tsgmstjxk).
+///
+/// Attribution mapping: `account_scope` is always `"boi"`; `response_id` is
+/// `phase_runs.id`; `root_task_family` is `phase_runs.spec_id`; `event_at`
+/// is `phase_runs.started_at` (as stored, unparsed). `model` is resolved
+/// from `<recipes_dir>/recipe-<id>.yaml` (`settings.goose_model`) when that
+/// recipe file exists, else `None` — never a schema migration, since every
+/// field maps onto ledger columns that already exist.
+// Only `mod tests` calls into this source kind's discovery function today;
+// the `collect()` dispatch arm and `--source-kind` CLI plumbing land in the
+// sibling task (Txv7phcj8) that also wires up "run all kinds" — allow the
+// otherwise-correct dead-code warning until that lands.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoiPhaseRunRecord {
+    response_id: String,
+    provider: String,
+    root_task_family: Option<String>,
+    event_at: Option<String>,
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+/// Reads eligible **boi-phase-runs** rows: a read-only SQLite open of
+/// `boi_db` (`SQLITE_OPEN_READ_ONLY` — never the live write lock), filtered
+/// to worker rows (`provider != 'deterministic'`) with measured token usage
+/// (`tokens_in > 0 OR tokens_out > 0`). See `BoiPhaseRunRecord` for the
+/// attribution mapping. `ORDER BY id` makes the result — and therefore
+/// `collect_boi_phase_runs`'s staged JSONL bytes — deterministic across
+/// calls: a query plan is otherwise free to reorder rows, which would
+/// silently break the ledger's byte-cursor incremental-import assumption
+/// (a stable prefix + newly appended rows) that `collect_boi_phase_runs`
+/// relies on.
+#[allow(dead_code)]
+fn discover_boi_phase_runs(
+    boi_db: &Path,
+    recipes_dir: &Path,
+) -> std::result::Result<Vec<BoiPhaseRunRecord>, String> {
+    // S6: always a read-only open — this is someone else's live, actively
+    // written database (never our write lock).
+    let conn = rusqlite::Connection::open_with_flags(
+        boi_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("boi_db_unreadable={e}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, spec_id, provider, tokens_in, tokens_out, started_at \
+             FROM phase_runs \
+             WHERE provider IS NOT NULL AND provider != 'deterministic' \
+               AND (COALESCE(tokens_in, 0) > 0 OR COALESCE(tokens_out, 0) > 0) \
+             ORDER BY id",
+        )
+        .map_err(|e| format!("boi_db_schema={e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .map_err(|e| format!("boi_db_query={e}"))?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, spec_id, provider, tokens_in, tokens_out, started_at) =
+            row.map_err(|e| format!("boi_db_row={e}"))?;
+        let model = recipe_model_for(recipes_dir, &id);
+        records.push(BoiPhaseRunRecord {
+            response_id: id,
+            provider,
+            root_task_family: spec_id,
+            event_at: started_at,
+            model,
+            input_tokens: tokens_in,
+            output_tokens: tokens_out,
+        });
+    }
+    Ok(records)
+}
+
+/// Resolves `model` for a `boi-phase-runs` record from
+/// `<recipes_dir>/recipe-<id>.yaml`'s `settings.goose_model`. Returns `None`
+/// when the recipe file is missing, unreadable, or lacks that key — a
+/// missing recipe is expected (e.g. deleted after the run) and must not fail
+/// the whole source.
+#[allow(dead_code)]
+fn recipe_model_for(recipes_dir: &Path, id: &str) -> Option<String> {
+    let path = recipes_dir.join(format!("recipe-{id}.yaml"));
+    let content = std::fs::read_to_string(path).ok()?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
+    doc.get("settings")?
+        .get("goose_model")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Default **boi-phase-runs** source path: `$HOME/.boi/v2/boi.db`, per spec
+/// ("boi-phase-runs: source $HOME/.boi/v2/boi.db (read-only, path
+/// overridable)"). Overridable at the call site (e.g. a future
+/// `--boi-db` flag), never hardcoded past this one function.
+#[allow(dead_code)]
+fn default_boi_db() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    Path::new(&home).join(".boi/v2/boi.db")
+}
+
+/// Default recipe directory for the **boi-phase-runs** model lookup:
+/// `$HOME/.boi/v2/recipes` (`recipe_model_for` joins `recipe-<id>.yaml`).
+#[allow(dead_code)]
+fn default_boi_recipes_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    Path::new(&home).join(".boi/v2/recipes")
+}
+
+/// The `--source-kind` value for this source (task Tsgmstjxk). The CLI enum
+/// and "run all kinds" dispatch land in sibling task Txv7phcj8; this
+/// constant is the shared literal both sides key off.
+#[allow(dead_code)]
+const BOI_PHASE_RUNS_SOURCE_KIND: &str = "boi-phase-runs";
+
+/// Renders one `BoiPhaseRunRecord` as a line in the ledger's existing
+/// provider-agnostic ingestion format (`usage_ledger::parse_event`'s flat
+/// `"type":"token_usage_record"` branch, used whenever `payload` is absent).
+/// This is the bridge from a SQLite row to the ledger's JSONL import path —
+/// no new ledger insert API, no schema migration. `account_scope` is always
+/// `"boi"` per the attribution mapping; `provider` carries the worker's own
+/// value (e.g. `claude_code`, `codex`) through unchanged.
+#[allow(dead_code)]
+fn boi_phase_run_ledger_line(record: &BoiPhaseRunRecord) -> String {
+    json!({
+        "type": "token_usage_record",
+        "provider": record.provider,
+        "account_scope": "boi",
+        "response_id": record.response_id,
+        "root_task_family": record.root_task_family,
+        "event_at": record.event_at,
+        "model": record.model,
+        "input_tokens": record.input_tokens,
+        "output_tokens": record.output_tokens,
+    })
+    .to_string()
+}
+
+/// Collects the **boi-phase-runs** source end to end: reads eligible rows
+/// from `boi_db` (read-only), resolves each row's model from `recipes_dir`,
+/// stages them at `staging_path` in the ledger's generic JSONL format, and
+/// imports that staging file into `ledger` — reusing the existing
+/// requestId-equivalent (provider+scope+response_id) dedupe so re-collection
+/// is idempotent. `staging_path` is rewritten on every call; re-imports of
+/// already-accepted rows land as `duplicate`, not a second insert, because
+/// `import_parsed` dedupes on the canonical (provider, account_scope,
+/// response_id) key regardless of which generation of the staging file
+/// carried them.
+#[allow(dead_code)]
+fn collect_boi_phase_runs(
+    boi_db: &Path,
+    recipes_dir: &Path,
+    staging_path: &Path,
+    ledger: &mut UsageLedger,
+    max_records: usize,
+) -> std::result::Result<ImportResult, String> {
+    let records = discover_boi_phase_runs(boi_db, recipes_dir)?;
+    let mut body = String::new();
+    for record in &records {
+        body.push_str(&boi_phase_run_ledger_line(record));
+        body.push('\n');
+    }
+    if let Some(parent) = staging_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("boi_staging_dir={e}"))?;
+    }
+    std::fs::write(staging_path, body).map_err(|e| format!("boi_staging_write={e}"))?;
+    ledger
+        .import_jsonl(staging_path, ImportOptions { max_records, abort_before_commit: false })
+        .map_err(|e| format!("boi_ledger_import={e:?}"))
+}
+
+
 /// Dispatch `hex usage collect` across one or every source kind. `--source
 /// <path>` and `--codex-root <dir>` are codex-jsonl-specific overrides — their
 /// presence (without an explicit `--claude-root`) narrows a bare invocation to
@@ -1130,6 +1313,160 @@ mod tests {
         assert!(collector_status_is_stale(Some("error")));
         assert!(collector_status_is_stale(Some("alert")));
         assert!(!collector_status_is_stale(Some("ok")));
+    }
+
+    /// RED (task Tsgmstjxk): the **boi-phase-runs** source must read
+    /// `phase_runs` from a fixture boi.db, excluding the `deterministic`
+    /// worker and the zero-token row, and must resolve `model` from the
+    /// matching `recipe-<id>.yaml`'s `settings.goose_model`. Currently fails
+    /// because `discover_boi_phase_runs` is an unimplemented stub — this
+    /// pins the required filtering + attribution behavior for execute().
+    #[test]
+    fn boi_phase_runs_filters_and_resolves_model_from_recipe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("boi.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE phase_runs (id TEXT PRIMARY KEY, spec_id TEXT, provider TEXT, tokens_in INTEGER, tokens_out INTEGER, started_at TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO phase_runs (id, spec_id, provider, tokens_in, tokens_out, started_at) VALUES ('run1','specA','claude_code',1200,340,'2026-09-14T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+            // Deterministic worker: excluded regardless of tokens (spec: "a
+            // worker provider (not \"deterministic\")").
+            conn.execute(
+                "INSERT INTO phase_runs (id, spec_id, provider, tokens_in, tokens_out, started_at) VALUES ('run2','specA','deterministic',500,500,'2026-09-14T10:05:00Z')",
+                [],
+            )
+            .unwrap();
+            // Zero-token worker row: excluded (spec: "tokens_in or tokens_out
+            // > 0").
+            conn.execute(
+                "INSERT INTO phase_runs (id, spec_id, provider, tokens_in, tokens_out, started_at) VALUES ('run3','specA','codex',0,0,'2026-09-14T10:10:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let recipes_dir = tmp.path().join("recipes");
+        std::fs::create_dir_all(&recipes_dir).unwrap();
+        std::fs::write(
+            recipes_dir.join("recipe-run1.yaml"),
+            "settings:\n  goose_provider: claude-code\n  goose_model: claude-opus-4-8\n",
+        )
+        .unwrap();
+        // run3 has no recipe file — model must come back None, not an error.
+
+        let records = discover_boi_phase_runs(&db_path, &recipes_dir)
+            .expect("boi-phase-runs discovery should succeed against a read-only fixture db");
+
+        assert_eq!(
+            records.len(),
+            1,
+            "only the non-deterministic, token-bearing row is eligible: {records:?}"
+        );
+        let r = &records[0];
+        assert_eq!(r.response_id, "run1");
+        assert_eq!(r.provider, "claude_code");
+        assert_eq!(r.root_task_family.as_deref(), Some("specA"));
+        assert_eq!(r.event_at.as_deref(), Some("2026-09-14T10:00:00Z"));
+        assert_eq!(
+            r.model.as_deref(),
+            Some("claude-opus-4-8"),
+            "model must resolve from recipe-run1.yaml settings.goose_model"
+        );
+        assert_eq!(r.input_tokens, Some(1200));
+        assert_eq!(r.output_tokens, Some(340));
+    }
+
+    /// End-to-end (task Tsgmstjxk): `collect_boi_phase_runs` must actually
+    /// land the eligible fixture row in a real ledger — proving the source
+    /// kind is wired to the ledger's existing generic JSONL import path
+    /// (`usage_ledger::parse_event`'s flat `token_usage_record` branch), not
+    /// just discoverable-but-unused. Uses only temp-dir fixtures per the
+    /// spec's hard constraint (never the live boi.db, recipes dir, or
+    /// ledger).
+    #[test]
+    fn collect_boi_phase_runs_writes_eligible_rows_into_the_ledger() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("boi.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE phase_runs (id TEXT PRIMARY KEY, spec_id TEXT, provider TEXT, tokens_in INTEGER, tokens_out INTEGER, started_at TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO phase_runs (id, spec_id, provider, tokens_in, tokens_out, started_at) VALUES ('run1','specA','claude_code',1200,340,'2026-09-14T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let recipes_dir = tmp.path().join("recipes");
+        std::fs::create_dir_all(&recipes_dir).unwrap();
+        std::fs::write(
+            recipes_dir.join("recipe-run1.yaml"),
+            "settings:\n  goose_model: claude-opus-4-8\n",
+        )
+        .unwrap();
+        let staging_path = tmp.path().join("staging.jsonl");
+        let ledger_path = tmp.path().join("usage.db");
+        let mut ledger = UsageLedger::open(&ledger_path).unwrap();
+
+        let result =
+            collect_boi_phase_runs(&db_path, &recipes_dir, &staging_path, &mut ledger, 1_000)
+                .expect("collect_boi_phase_runs should succeed against fixture-only paths");
+        assert_eq!(result.accepted, 1, "the one eligible row must be accepted: {result:?}");
+
+        let rows = ledger.rows(10, 0).unwrap();
+        assert_eq!(rows.len(), 1, "ledger must contain exactly the imported row: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.provider, "claude_code");
+        assert_eq!(row.account_scope, "boi", "account_scope must always be \"boi\"");
+        assert_eq!(row.response_id, "run1");
+        assert_eq!(row.root_task_family.as_deref(), Some("specA"));
+        assert_eq!(row.event_at.as_deref(), Some("2026-09-14T10:00:00Z"));
+        assert_eq!(row.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(row.input_tokens, Some(1200));
+        assert_eq!(row.output_tokens, Some(340));
+
+        // Re-collecting against an UNCHANGED boi.db must be a true no-op: the
+        // staging file's bytes are identical to the prior run, so the
+        // ledger's byte-cursor importer recognizes there is nothing new to
+        // scan (not even a duplicate observation) and the row count stays 1.
+        let result2 =
+            collect_boi_phase_runs(&db_path, &recipes_dir, &staging_path, &mut ledger, 1_000)
+                .expect("re-collection should succeed");
+        assert_eq!(result2.accepted, 0, "re-collection over unchanged data must not re-accept: {result2:?}");
+        assert_eq!(ledger.rows(10, 0).unwrap().len(), 1, "row count must stay 1 after a no-op re-collection");
+
+        // Growth (a new eligible phase_run appears) must be picked up
+        // incrementally, without disturbing the already-imported row.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO phase_runs (id, spec_id, provider, tokens_in, tokens_out, started_at) VALUES ('run4','specB','codex',400,120,'2026-09-14T11:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let result3 =
+            collect_boi_phase_runs(&db_path, &recipes_dir, &staging_path, &mut ledger, 1_000)
+                .expect("collection after growth should succeed");
+        assert_eq!(result3.accepted, 1, "the newly-eligible row must be accepted: {result3:?}");
+        let rows3 = ledger.rows(10, 0).unwrap();
+        assert_eq!(rows3.len(), 2, "ledger must now hold both rows: {rows3:?}");
+        assert!(
+            rows3.iter().any(|r| r.response_id == "run1"),
+            "the original row must still be present: {rows3:?}"
+        );
+        assert!(
+            rows3.iter().any(|r| r.response_id == "run4" && r.provider == "codex"),
+            "the newly-collected row must be present: {rows3:?}"
+        );
     }
 
     /// Models are priced per their own table; synthetic/unknown rows skipped.
