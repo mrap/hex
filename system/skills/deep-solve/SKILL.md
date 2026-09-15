@@ -140,5 +140,7 @@ for the date rather than assuming it.
 
 ## Handoff
 
-The skill ends at the converged proposal. Implementation ships separately — in hex, a BOI
-spec whose `[contract].scope` references both documents by path.
+The skill ends at the converged proposal. Implementation ships separately — in hex, built in
+Claude Code (a `Workflow` or Sonnet subagents in a worktree) from a plan that references both
+documents by path. (BOI is paused, 2026-09-15, Standing Order 6; when it resumes, that plan
+becomes a spec whose `[contract].scope` references both documents.)

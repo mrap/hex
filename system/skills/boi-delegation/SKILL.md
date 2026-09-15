@@ -1,12 +1,14 @@
 ---
 name: boi-delegation
 description: >
-  Delegate tasks to BOI v2. Covers TOML spec authoring, dispatch, context
-  wiring, and monitoring. Use when delegating any non-trivial task — code
-  changes, research, generation, or multi-step work.
+  PAUSED 2026-09-15 (Standing Order 6): BOI is not in use; do not dispatch.
+  Multi-step work is built in Claude Code (inline in a worktree, Sonnet
+  subagents, or a Workflow). This skill is parked reference for BOI v2 TOML
+  spec authoring, dispatch, and monitoring, kept for when BOI resumes.
 tags: boi, delegation, dispatch, specs
 trigger: >
-  User asks to delegate work, dispatch a task, or you need to send work to BOI.
+  Only when Mike explicitly un-pauses BOI with a decision file. Until then,
+  "delegate" / "dispatch" / multi-step work means Claude Code, not BOI.
 version: "2"
 ---
 
@@ -15,7 +17,9 @@ version: "2"
 
 # BOI Delegation
 
-## BOI Is the Default — Always
+> **PAUSED 2026-09-15 (Mike: "It's not reliable").** Do not dispatch. Build multi-step work in Claude Code: inline edits in a worktree (SO 7), `Agent` subagents on Sonnet (SO 3b), or a `Workflow`. Testing standard (S8) applies. Decision: `me/decisions/pause-boi-build-with-claude-code-2026-09-15.md`. Everything below is parked reference for when BOI resumes.
+
+## BOI Is the Default — Always (PARKED while paused)
 
 BOI is the default for ALL non-trivial work. Not just code — research, analysis,
 creative synthesis, brainstorming, everything.

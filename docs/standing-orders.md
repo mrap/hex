@@ -4,19 +4,21 @@ These are the behavioral enforcement mechanisms that make the Standing Orders op
 
 ---
 
-## BOI Delegation Check
+## BOI Delegation Check (PAUSED 2026-09-15: route step 3 to Claude Code)
+
+> **BOI is PAUSED (Mike, 2026-09-15: "It's not reliable"; Standing Order 6).** Do not dispatch BOI specs. Build multi-step work in Claude Code: inline edits in a worktree (SO 7), `Agent` subagents on Sonnet (SO 3b), or a `Workflow`. Testing standard applies. Resume needs Mike's explicit call plus a decision file. Step 3 below is parked reference; while paused, multi-step work → build in Claude Code.
 
 **When this activates:** Before executing any multi-step implementation (3+ file edits, 3+ sequential commands, brew install, pip install, or any task that would take more than 2 minutes to execute inline).
 
 **Decision tree (answer each → act):**
 1. Is this a single-line edit? → Do it inline.
 2. Is this recurring or scheduled? → Author a hex harness worker (`Worker::new(...).on_cron(...)`) — never a new launchd/cron entry (sanctioned launchd surface: `docs/hex-ops.md`). NEVER use CronCreate or polling loops.
-3. Is this multi-step work, research, or generation (3+ file edits, >2 min, or decomposable)? → **Write a TOML BOI spec and dispatch** with `~/.boi/bin/boi dispatch <spec.toml>`. NEVER code inline for multi-file projects.
+3. Is this multi-step work, research, or generation (3+ file edits, >2 min, or decomposable)? → **Build it in Claude Code** (BOI paused 2026-09-15): inline edits in a dedicated worktree (SO 7), `Agent` subagents on Sonnet (SO 3b) for independent pieces, or a `Workflow` for DAG-shaped work with review/verify stages. Plan first (SO 4), adversarial pass, then build. Testing standard applies. (Parked: write a TOML BOI spec and dispatch with `~/.boi/bin/boi dispatch <spec.toml>`.)
 4. Is it a one-time lookup or simple edit? → Do it inline.
 
 **Additional fail-safes:**
-- Am I about to run `brew install`, `pip install`, create multiple files, or build infrastructure? → **Definitely BOI.**
-- Am I tempted to spawn Claude Code's `Agent` tool for work that belongs to BOI? → **STOP. Use BOI.**
+- Am I about to run `brew install`, `pip install`, create multiple files, or build infrastructure? → Worktree + plan + review in Claude Code. (Parked: Definitely BOI.)
+- Am I tempted to spawn Claude Code's `Agent` tool for work that belongs to BOI? → While BOI is paused, `Agent` (Sonnet) or `Workflow` IS the right tool. (Parked: STOP. Use BOI.)
 
 This is Core Rule #7 (BOI default) with teeth. R-013 has recurred twice. If this check fails to prevent a third recurrence, escalate to a pre-tool-call hook.
 

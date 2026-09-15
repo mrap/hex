@@ -2,12 +2,16 @@
 name: vibe-to-prod
 description: >
   Run the vibe-to-production pipeline on any Python project. Assesses code quality,
-  generates characterization tests, prioritizes refactoring targets, and dispatches
-  BOI specs for each phase. Use when the user says "vibe to prod", "harden this",
+  generates characterization tests, prioritizes refactoring targets, and runs each
+  phase as Claude Code work (Workflow or Sonnet subagents; BOI dispatch is paused
+  2026-09-15, the spec templates remain the phase briefs). Use when the user says "vibe to prod", "harden this",
   "production-ready", "assess this project", "run assessment", or references the
   vibe-to-production playbook.
 version: 1.0.0
 ---
+
+> **BOI is PAUSED (2026-09-15, Standing Order 6).** Where this skill says "dispatch a BOI spec", build that phase in Claude Code instead: a `Workflow` (one `agent()` per task, Sonnet) or Sonnet subagents in a worktree. Keep the spec templates as the phase briefs. Decision: `me/decisions/pause-boi-build-with-claude-code-2026-09-15.md`.
+
 
 # Vibe-to-Production Pipeline
 
@@ -62,7 +66,7 @@ each dispatched as BOI specs.
     PROJECT_NAME=$PROJECT_NAME \
     OUTPUT_DIR=$OUTPUT_DIR
   ```
-- Dispatch: `boi dispatch $OUTPUT_DIR/assess-$PROJECT_NAME.spec.toml`
+- Run in Claude Code (BOI paused): use the spec as the brief for a `Workflow`/Sonnet subagents. (Parked: Dispatch: `boi dispatch $OUTPUT_DIR/assess-$PROJECT_NAME.spec.toml`)
 - On completion: run priority computation script, save `$OUTPUT_DIR/priorities.json`
 - Update pipeline state
 
@@ -79,7 +83,7 @@ each dispatched as BOI specs.
     OUTPUT_DIR=$OUTPUT_DIR \
     MODULE_LIST=$MODULE_LIST
   ```
-- Dispatch: `boi dispatch $OUTPUT_DIR/characterize-$PROJECT_NAME.spec.toml`
+- Run in Claude Code (BOI paused): use the spec as the brief for a `Workflow`/Sonnet subagents. (Parked: Dispatch: `boi dispatch $OUTPUT_DIR/characterize-$PROJECT_NAME.spec.toml`)
 - On completion: verify all characterization tests pass
 - Update pipeline state
 
@@ -106,7 +110,7 @@ each dispatched as BOI specs.
   ```
 - One BOI spec per module, one concern per task within the spec
 - Dispatch sequentially (each spec must pass char tests before next):
-  `boi dispatch $OUTPUT_DIR/refactor-$MODULE_NAME.spec.toml`
+  Run in Claude Code (BOI paused); parked: `boi dispatch $OUTPUT_DIR/refactor-$MODULE_NAME.spec.toml`
 - Update pipeline state after each module completes
 
 #### Phase 5: Verification
