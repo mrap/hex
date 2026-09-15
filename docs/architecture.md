@@ -26,6 +26,8 @@ checks (`system/harness/`, exposed as `boi dashboard` and a handful of
 
 ## System Diagram
 
+> BOI dispatch is paused (2026-09-15, Standing Order 6). The orchestrator box below is parked; multi-step work runs in Claude Code (worktree, Sonnet subagents, or a `Workflow`).
+
 ```
   ┌──────────────────────────────────────────────────────────────────┐
   │  Claude Code session                                             │

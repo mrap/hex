@@ -168,7 +168,7 @@ If your runtime exposes structured file/search tools, use them. If it only gives
 | Search contents | Grep | `grep -rn` / `rg` | `rg` preferred if available |
 | Fetch a URL | WebFetch | `curl -sSL <url>` | Pipe to `jq` for JSON |
 | Web search | WebSearch | Often unavailable | Use `curl` + public APIs, or note the limitation |
-| Delegate work | Subagent | `boi dispatch <spec>` | BOI handles all delegation |
+| Delegate work | Subagent / `Workflow` | Subagent / `Workflow` (BOI paused 2026-09-15) | Claude Code handles delegation while BOI is paused |
 | Track todos | TodoWrite | Write to `todo.md` | Same format, manual file write |
 
 **If web search is unavailable in your runtime:** for research tasks requiring web access, write a BOI spec and note the limitation in `[contract].scope`.
@@ -360,7 +360,7 @@ Consolidated 2026-04-29 (39 → 18 rules). Lineage tags trace to pre-consolidati
 | 3 | **Parallel by default.** 2+ independent tasks run simultaneously. Decompose into DAG before multi-phase dispatch. Analyze dependencies. Default to maximum parallelism. (consolidates #3, S2) |
 | 4 | **Plan, conjecture, critique.** Non-trivial implementation needs a reviewed plan. Consequential decisions get conjecture-criticism first. Adversarial pass on all recommendations: weakest assumption, skeptic attacks, missing evidence. Fix gaps yourself. (consolidates #4, #12, #13) |
 | 5 | **Communication gates.** Flag unreplied pings — surface messages awaiting response. Map meetings to outcomes; meetings without a landing get flagged; update landings whenever status changes. First contact with any person requires explicit approval. Don't publish creative content without explicit "go." (consolidates #6, #19, S9) |
-| 6 | **BOI is the default.** Planning, research, brainstorming, generation → dispatch to BOI. Only single-line exacto fixes stay inline. Dispatch on clear directives without asking. When in doubt, dispatch. (replaces #7) |
+| 6 | **Build in Claude Code. BOI is PAUSED (Mike, 2026-09-15: "It's not reliable"). Do not dispatch BOI specs.** Multi-step work runs in Claude Code: inline in a worktree, `Agent` subagents on Sonnet (SO 3b), or a `Workflow`. Rules 7 and S8 still apply. Parked BOI-default text follows for resume: Planning, research, brainstorming, generation → dispatch to BOI. Only single-line exacto fixes stay inline. Dispatch on clear directives without asking. When in doubt, dispatch. (replaces #7) |
 | 7 | **Execute safely — all work in worktrees, any git repo, any worker.** ALL repository work — every edit to ANY git repo, by ANY worker (interactive session, subagent/workflow worker, BOI worker, harness worker) — happens in a dedicated isolated git worktree (minimum) or container (preferred), never the shared checkout. Concurrent agents in one working tree silently clobber each other's uncommitted edits and tangle the shared index. Enforced mechanically by `hex hook worktree-guard` — any git repo, only the `$HEX_DIR` workspace exempt. Never mutate production in place. Review integrations for exfiltration/injection before wiring up. Never connect untested code to credentials. (consolidates #8, #15) |
 | 8 | **Cap effort and avoid idle cycles.** After 3 failed attempts, spawn a subagent — your mental model is likely wrong. 3 failures or 30 minutes without progress on new integrations → stop and escalate. Cap retry loops at 5, then escalate with pattern and recommendation. Do productive work each cycle or STOP. Escalate blockers in one message. (consolidates #9, #10, #11, #20) |
 | 9 | **Measure before dismissing.** "Overkill" requires evidence. Question uniform results — perfect scores mean broken measurement. (replaces #16) |
@@ -392,7 +392,7 @@ Enforcement checkpoints with "teeth" — they activate automatically, not on req
 
 | Mechanism | Activates | Action |
 |-----------|-----------|--------|
-| **BOI Delegation** | Before: 3+ edits, 3+ commands, or >2 min inline | Single edit → inline. Multi-step/research → BOI spec. TOML only. (Rule #6) |
+| **BOI Delegation (PAUSED 2026-09-15)** | Before: 3+ edits, 3+ commands, or >2 min inline | Single edit → inline. Multi-step/research → build in Claude Code (worktree, Sonnet subagents, or Workflow). BOI path parked. (Rule #6) |
 | **Pre-Output Critique** | Before: recommendations, "done" claims, benchmarks, architecture | Name weakest assumption. Preempt follow-ups. Cite evidence. Question uniform/perfect results. Challenge inbound completion claims. (Rules #1, #9) |
 | **Verbal-to-Mechanical** | After: correction, coaching, or self-identified pattern | If response is purely verbal ("Got it"), STOP — write the file or config change NOW. (Rule #10) |
 | **Landings Update** | After: completing work mapped to a landing item | Update landings file before responding. (Rule #2) |
@@ -409,9 +409,11 @@ Recurring and scheduled work runs as **hex workers** — never as new LaunchAgen
 
 ## BOI: Delegation System
 
+> **BOI is PAUSED (Mike, 2026-09-15: "It's not reliable"; Standing Order 6).** Do not dispatch BOI specs. Build multi-step work in Claude Code: inline edits in a worktree (SO 7), `Agent` subagents on Sonnet (SO 3b), or a `Workflow`. Testing standard applies. Resume needs Mike's explicit call plus a decision file. The BOI material below is parked reference.
+
 BOI is the **ONLY** delegation system in hex. Multi-step work, research, generation, refactoring, implementation — dispatched to BOI workers. You plan; BOI executes.
 
-### MUST dispatch to BOI (hard triggers)
+### MUST dispatch to BOI (hard triggers) — PARKED while BOI is paused; these triggers now mean "build in Claude Code"
 
 - 3+ file edits in one task
 - 3+ sequential commands

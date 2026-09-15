@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -266,6 +267,34 @@ pub struct ImportResult {
     pub backlog: bool,
     pub bytes_read: u64,
 }
+/// An already-canonical usage row from a non-JSONL source (Claude Code
+/// transcripts, BOI phase_runs, harness llm-cost telemetry, headless `claude
+/// -p` JSON results — decision `usage-ledger-provider-agnostic-2026-09-14`).
+/// Fields mirror `UsageRow`, but this is an input shape, not a query result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalRow {
+    pub provider: String,
+    pub account_scope: String,
+    pub response_id: String,
+    pub parent_response_id: Option<String>,
+    pub root_task_family: Option<String>,
+    pub event_at: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalImportResult {
+    pub accepted: u64,
+    pub duplicates: u64,
+    pub conflicts: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageRow {
     pub provider: String,
@@ -516,6 +545,82 @@ impl UsageLedger {
         }
         tx.commit()?;
         Ok(out)
+    }
+    /// Import rows a caller has already normalized into canonical shape, for
+    /// sources with no raw JSONL stream to replay (Claude Code transcripts,
+    /// BOI `phase_runs`, harness `llm-cost` telemetry, headless `claude -p`
+    /// JSON results). Reuses `import_jsonl`'s accept/duplicate/conflict rules
+    /// — dedupe on the `(provider, account_scope, response_id)` primary key —
+    /// but the record hash is computed over the row's normalized fields
+    /// rather than a raw source line, because these sources can re-persist
+    /// the same logical record's surrounding bytes (e.g. Claude Code
+    /// rewriting a transcript on resume) without changing its usage; hashing
+    /// raw bytes would misreport an unchanged record as a conflict and
+    /// destroy the canonical row (see `import_parsed`'s conflict branch).
+    ///
+    /// `source_key` scopes the bookkeeping `observations` rows this call
+    /// writes (distinct per source kind, e.g. `"claude-transcripts"`) so two
+    /// source kinds can never collide on the same `(source_key, byte_offset)`
+    /// primary key. The synthetic `byte_offset` for each row is a stable hash
+    /// of its `response_id` — every re-import of the same row lands on the
+    /// same `observations` slot (safe: `observe`'s upsert handles that), but
+    /// idempotency and conflict detection both actually come from
+    /// `import_parsed`'s own hash comparison against `canonical_responses`,
+    /// keyed on `(provider, account_scope, response_id)`.
+    pub fn import_canonical_rows(
+        &mut self,
+        source_key: &str,
+        rows: Vec<CanonicalRow>,
+    ) -> Result<CanonicalImportResult> {
+        if self.requires_rebuild()? {
+            return Err(LedgerError::RebuildRequired);
+        }
+        let tx = self.conn.transaction()?;
+        let mut out = CanonicalImportResult::default();
+        for row in rows {
+            let offset = canonical_row_offset(&row.response_id);
+            let record_hash = hash(canonical_row_fingerprint(&row).as_bytes());
+            let parsed = Parsed {
+                provider: row.provider,
+                account_scope: row.account_scope,
+                response_id: row.response_id,
+                parent_response_id: row.parent_response_id,
+                root_task_family: row.root_task_family,
+                event_at: row.event_at,
+                model: row.model,
+                effort: row.effort,
+                input: row.input_tokens,
+                cached: row.cached_input_tokens,
+                cache_write: row.cache_write_input_tokens,
+                output: row.output_tokens,
+                reasoning: row.reasoning_output_tokens,
+                total: row.total_tokens,
+                session_id: None,
+            };
+            let mut part = ImportResult::default();
+            import_parsed(&tx, source_key, offset, &record_hash, parsed, &mut part)?;
+            out.accepted += part.accepted;
+            out.duplicates += part.duplicates;
+            out.conflicts += part.conflicts;
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+    /// Response ids already canonical for a `(provider, account_scope)` pair.
+    /// A bounded canonical-row scanner (e.g. `claude-transcripts`) uses this
+    /// to prioritize genuinely new rows within its `max_records` cap instead
+    /// of truncating in whatever order the caller happens to enumerate
+    /// candidates — otherwise a backlog larger than the cap can pin the same
+    /// already-known rows in the budget forever and never make room for new
+    /// ones.
+    pub fn response_ids(&self, provider: &str, account_scope: &str) -> Result<HashSet<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT response_id FROM canonical_responses WHERE provider=?1 AND account_scope=?2",
+        )?;
+        let ids = statement
+            .query_map(params![provider, account_scope], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(ids)
     }
     pub fn rows(&self, limit: usize, offset: usize) -> Result<Vec<UsageRow>> {
         let mut s=self.conn.prepare("SELECT provider,account_scope,response_id,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM canonical_responses ORDER BY event_at,provider,account_scope,response_id LIMIT ?1 OFFSET ?2")?;
@@ -1090,7 +1195,14 @@ fn observe(
     reason: Option<&str>,
     r: Option<&Parsed>,
 ) -> Result<()> {
-    tx.execute("INSERT INTO observations(source_key,byte_offset,record_hash,verdict,reason,provider,account_scope,response_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![source,offset,hash,verdict,reason,r.map(|x|&x.provider),r.map(|x|&x.account_scope),r.map(|x|&x.response_id)])?;
+    // ON CONFLICT DO UPDATE (rather than a bare INSERT) so a canonical-row
+    // source (see `import_canonical_rows`, whose synthetic `byte_offset` is
+    // derived from `response_id` and can therefore legitimately be observed
+    // more than once for the same source_key) stays idempotent instead of
+    // hitting the `observations` primary key's UNIQUE constraint. The JSONL
+    // path never re-observes a byte_offset it has already recorded (guarded
+    // upstream in `import_event`), so this is a no-op there.
+    tx.execute("INSERT INTO observations(source_key,byte_offset,record_hash,verdict,reason,provider,account_scope,response_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(source_key,byte_offset) DO UPDATE SET record_hash=excluded.record_hash,verdict=excluded.verdict,reason=excluded.reason,provider=excluded.provider,account_scope=excluded.account_scope,response_id=excluded.response_id",params![source,offset,hash,verdict,reason,r.map(|x|&x.provider),r.map(|x|&x.account_scope),r.map(|x|&x.response_id)])?;
     Ok(())
 }
 fn insert(tx: &Transaction<'_>, r: &Parsed, hash: &str) -> Result<()> {
@@ -1099,6 +1211,40 @@ fn insert(tx: &Transaction<'_>, r: &Parsed, hash: &str) -> Result<()> {
 }
 fn hash(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
+}
+/// Deterministic `observations.byte_offset` stand-in for a canonical-row
+/// import, keyed purely on `response_id` so it is stable across re-scans
+/// regardless of how a caller orders or batches rows.
+fn canonical_row_offset(response_id: &str) -> i64 {
+    let digest = Sha256::digest(response_id.as_bytes());
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(buf)
+}
+/// Fingerprint over just `(provider, account_scope, response_id, model,
+/// tokens)` — deliberately NOT the full `CanonicalRow`, and deliberately not
+/// raw source bytes (see `import_canonical_rows`'s doc comment for why raw
+/// bytes are wrong here). It also excludes `event_at`/`root_task_family`/
+/// `parent_response_id`/`effort`: a resumed Claude Code transcript can carry
+/// the same `requestId` into a copy with a different `sessionId` or a
+/// differently-generated timestamp while reporting identical usage, and
+/// including those fields would flip the hash on re-scan, routing an
+/// unchanged record into `import_parsed`'s conflict branch — which DELETEs
+/// the canonical row with no later import able to restore it.
+fn canonical_row_fingerprint(row: &CanonicalRow) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}",
+        row.provider,
+        row.account_scope,
+        row.response_id,
+        row.model.as_deref().unwrap_or(""),
+        row.input_tokens,
+        row.cached_input_tokens,
+        row.cache_write_input_tokens,
+        row.output_tokens,
+        row.reasoning_output_tokens,
+        row.total_tokens,
+    )
 }
 fn prefix_hash(path: &Path) -> Result<(String, u64)> {
     let mut f = File::open(path)?;
@@ -1148,3 +1294,79 @@ CREATE TABLE IF NOT EXISTS canonical_responses (provider TEXT NOT NULL,account_s
 CREATE TABLE IF NOT EXISTS codex_session_state (source_key TEXT NOT NULL,session_id TEXT NOT NULL,model TEXT,effort TEXT,root_task_family TEXT,parent_thread_id TEXT,cumulative_input INTEGER NOT NULL DEFAULT 0,cumulative_cached INTEGER NOT NULL DEFAULT 0,cumulative_cache_write INTEGER,cumulative_output INTEGER NOT NULL DEFAULT 0,cumulative_reasoning INTEGER,cumulative_total INTEGER,PRIMARY KEY(source_key,session_id));
 CREATE TABLE IF NOT EXISTS codex_stream_events (source_key TEXT NOT NULL,byte_offset INTEGER NOT NULL,event_at TEXT,session_id TEXT,kind TEXT NOT NULL,PRIMARY KEY(source_key,byte_offset));
 CREATE INDEX IF NOT EXISTS observations_identity ON observations(provider,account_scope,response_id);CREATE INDEX IF NOT EXISTS canonical_time ON canonical_responses(event_at);CREATE INDEX IF NOT EXISTS canonical_time_response ON canonical_responses(event_at,response_id);CREATE INDEX IF NOT EXISTS canonical_family ON canonical_responses(root_task_family);"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(response_id: &str, session: &str, input: i64, cached: i64, output: i64) -> CanonicalRow {
+        CanonicalRow {
+            provider: "claude-code".into(),
+            account_scope: "local-claude-code".into(),
+            response_id: response_id.into(),
+            parent_response_id: None,
+            root_task_family: Some(session.into()),
+            event_at: Some("2026-09-14T10:00:00Z".into()),
+            model: Some("claude-sonnet-4-6".into()),
+            effort: None,
+            input_tokens: Some(input),
+            cached_input_tokens: Some(cached),
+            cache_write_input_tokens: Some(0),
+            output_tokens: Some(output),
+            reasoning_output_tokens: None,
+            total_tokens: None,
+        }
+    }
+
+    /// `import_canonical_rows` is the crate-visible seam the `claude-transcripts`
+    /// source kind (task Txv7phcj8) uses instead of replaying raw JSONL: one
+    /// canonical row is accepted per distinct response id, and a second import
+    /// of the same rows (as `hex usage collect` re-scanning `~/.claude/projects`
+    /// would do) must be a no-op rather than duplicating or conflicting the
+    /// existing canonical_responses row.
+    #[test]
+    fn import_canonical_rows_supports_claude_transcripts_rescan_idempotently() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ledger = UsageLedger::open(tmp.path().join("usage.db")).unwrap();
+
+        let rows = vec![
+            row("req-1", "sess-a", 18_100, 18_000, 55),
+            row("req-2", "sess-a", 120, 200, 10),
+        ];
+        let first = ledger.import_canonical_rows("claude-transcripts", rows.clone()).unwrap();
+        assert_eq!(first, CanonicalImportResult { accepted: 2, duplicates: 0, conflicts: 0 });
+
+        let stored = ledger.rows(100, 0).unwrap();
+        assert_eq!(stored.iter().filter(|r| r.provider == "claude-code").count(), 2);
+
+        // Re-import of the identical rows must not duplicate or conflict.
+        let second = ledger.import_canonical_rows("claude-transcripts", rows).unwrap();
+        assert_eq!(second.accepted, 0, "unchanged rows must not be re-accepted");
+        assert_eq!(second.conflicts, 0, "unchanged rows must never be reported as a conflict");
+        let stored_after = ledger.rows(100, 0).unwrap();
+        assert_eq!(
+            stored_after.iter().filter(|r| r.provider == "claude-code").count(),
+            2,
+            "re-import must not duplicate canonical rows"
+        );
+    }
+
+    /// A row whose usage actually changed between two collection passes (the
+    /// normal case for a source that legitimately corrects a prior value) must
+    /// still go through `import_parsed`'s conflict handling rather than being
+    /// silently skipped by the canonical-row seam's own bookkeeping.
+    #[test]
+    fn import_canonical_rows_reports_conflict_on_changed_usage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ledger = UsageLedger::open(tmp.path().join("usage.db")).unwrap();
+
+        ledger
+            .import_canonical_rows("claude-transcripts", vec![row("req-1", "sess-a", 100, 0, 10)])
+            .unwrap();
+        let changed = ledger
+            .import_canonical_rows("claude-transcripts", vec![row("req-1", "sess-a", 200, 0, 10)])
+            .unwrap();
+        assert_eq!(changed.conflicts, 1);
+        assert_eq!(changed.accepted, 0);
+    }
+}
