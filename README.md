@@ -281,7 +281,7 @@ hex-foundation/
 
 ## Testing
 
-The test suite verifies installation, migration, skill discovery, and Codex parity. See [`docs/testing.md`](./docs/testing.md) for the full matrix and how to run locally.
+The test suite verifies installation, migration, skill discovery, and Codex parity. See [`docs/testing.md`](./docs/testing.md) for the full matrix and how to run locally. The rules for writing and reviewing tests are in [`docs/testing-standard.md`](./docs/testing-standard.md).
 
 Key test files:
 

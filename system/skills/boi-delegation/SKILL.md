@@ -7,7 +7,7 @@ description: >
 tags: boi, delegation, dispatch, specs
 trigger: >
   User asks to delegate work, dispatch a task, or you need to send work to BOI.
-version: 2
+version: "2"
 ---
 
 > **Updated 2026-07-22 for BOI v3.5.0 (per-phase runtime config) + v3.4.0 (lifecycle hardening).**
@@ -361,6 +361,39 @@ outputs in the task worktree). Don't test system state the worker can't see
 (deployed binaries, fleet count from main `$HEX_DIR`). When invoking any
 binary, prepend the PATH for that binary. When chaining, use `&&` — never lose
 exit codes through pipes.
+
+## Verification Scope Rule
+
+From `docs/testing-standard.md` (hex-foundation). A reviewer checks these
+four points on every spec before dispatch:
+
+- A task-level verification names a crate (`-p <crate>`) or a test binary
+  (`--test <file>`) and proves a behavior by running code.
+- `--workspace` and `--all-targets` appear only in `[contract].verifications`.
+  Full-workspace runs go through `system/scripts/test-lane.sh`.
+- No verification greps `src/` or `docs/` text as a test. A `grep` on source is
+  allowed only as a lint-class gate at contract level, next to a behavioral
+  test for the same change.
+- A bug fix starts with a failing test. Its task `behavior` cites the incident
+  path (`$HEX_DIR/projects/system-improvement/incidents/<name>`) and the
+  failing-test commit lands before the fix commit.
+
+Bad (task level):
+
+```toml
+verifications = [
+  { name = "throttle-surface", command = "grep -q 'pub fn apply' system/harness/src/throttle.rs" },
+  { name = "all-tests", command = "export PATH=\"/opt/homebrew/bin:$PATH\" && cargo test --workspace" },
+]
+```
+
+Good (task level):
+
+```toml
+verifications = [
+  { name = "doctor-flags-large-files", command = "export PATH=\"/opt/homebrew/bin:$PATH\" && cargo test -p hex-harness --test doctor_large_files" },
+]
+```
 
 ## Task Sizing Rule
 

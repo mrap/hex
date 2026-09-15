@@ -48,6 +48,7 @@ fn registry() -> Vec<Box<dyn DoctorCheck>> {
         Box::new(checks::hex_structure::HexSkillsPopulated),
         Box::new(checks::git::GitInitialized),
         Box::new(checks::git::HooksPathConfigured),
+        Box::new(checks::large_files::LargeUnignoredFiles),
         Box::new(checks::symlinks::AgentsSkillsSymlink),
         Box::new(checks::symlinks::NoBrokenSymlinks),
         Box::new(checks::memory_db::MemoryDbExists),

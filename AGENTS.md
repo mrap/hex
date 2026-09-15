@@ -95,7 +95,7 @@ spec's own `verifications` block declares (each task carries them), plus
 `hex doctor` for system-level health and the supported local Cargo gate for
 harness behavior.
 
-Full test matrix — unit, core-e2e, codex-parity, containerized — in [docs/testing.md](docs/testing.md); read it before running or adding tests.
+Full test matrix — unit, core-e2e, codex-parity, containerized — in [docs/testing.md](docs/testing.md); read it before running or adding tests. Rules for what to test and how to verify a change: [docs/testing-standard.md](docs/testing-standard.md).
 
 ---
 
