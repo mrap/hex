@@ -206,6 +206,7 @@ expectation is checked by `hex failures` (MISSED/NEVER-RAN detection).
 | `hex-failures` | daily 13:30 UTC (≈06:30 PT) | unexpected-failure digest (see `hex failures` above) |
 | `resources` | hourly | disk sampler + pressure rules (see Resources above) |
 | `boi-spec-watch` | every 5 min (`0 */5 * * * * *`) | watches BOI spec/task state above phase level |
+| `hex-usage-tracking` | every 5 min (`0 */5 * * * * *`) | collects usage into the ledger (see [Usage tracking](#usage-tracking-hex-usage) below) |
 
 ### `boi-spec-watch`
 
@@ -237,6 +238,90 @@ observed already-terminal is not alerted.
 This supersedes any ad-hoc BOI watching (e.g. the reverted standalone
 `boi-spec-watch.py` launchd watcher) — recurring/scheduled work is a hex
 worker, never a new LaunchAgent.
+
+---
+
+## Usage tracking (`hex usage`)
+
+`hex usage collect` imports usage records from five source kinds into one
+durable ledger: `$HEX_DIR/.hex/usage/usage.db`. The ledger dedupes each
+record on `(provider, account_scope, response_id)`, so a collector can
+re-run safely — a repeat run reports the same rows as duplicates, not new
+ones. `hex usage report` reads the ledger and writes a deterministic
+summary. `hex usage burn` is a separate, older guardrail; see
+[Known caveats](#known-caveats) below.
+
+### Usage sources
+
+| Source kind | Default path | Override flag | Provider / account_scope | response_id / root_task_family | Model source | Read-only rule |
+|---|---|---|---|---|---|---|
+| `codex-jsonl` | `$HOME/.codex` (`sessions/`, `archived_sessions/`, plus rollout paths read from `state_5.sqlite`) | `--source <file>`, `--codex-root <dir>` | `codex` / `local-codex-history` | `response_id` comes from the JSONL payload; `root_task_family` is resolved from the session's thread/parent state | Codex session/thread state (`codex_session_state`), filled in after import | `state_5.sqlite` opens read-only; JSONL files are only read |
+| `claude-transcripts` | `$HOME/.claude/projects`, scanned recursively (includes `<session>/subagents/agent-*.jsonl`) | `--claude-root <dir>` | `claude-code` / `local-claude-code` | `response_id` = transcript `requestId`; `root_task_family` = transcript `sessionId` | the assistant turn's `message.model` field | transcript files are only read, never modified |
+| `boi-phase-runs` | `$HOME/.boi/v2/boi.db`, recipes at `$HOME/.boi/v2/recipes` | `--boi-db <path>`, `--boi-recipes <dir>` | `phase_runs.provider`'s own value (e.g. `claude_code`, `codex`), passed through / always `boi` | `response_id` = `phase_runs.id`; `root_task_family` = `phase_runs.spec_id` | `<recipes_dir>/recipe-<id>.yaml`'s `settings.goose_model`, or none if missing | `boi.db` opens `SQLITE_OPEN_READ_ONLY`; never takes BOI's live write lock |
+| `harness-llm-cost` | `$HEX_DIR/.hex/telemetry/events.db` | `--events-db <path>` | the transport prefix before `::` in the event name (e.g. `openrouter`, `claude-cli`) / always `harness` | `response_id` = `events.id`; `root_task_family` = the use case after `::` | the `model` key in the event's `detail` JSON | `events.db` opens `SQLITE_OPEN_READ_ONLY` |
+| `headless-claude-json` | `$HEX_DIR/.hex/logs/agent-infra` | `--headless-claude-dir <dir>` | always `claude-code` / always `headless` | `response_id` = the result file's `session_id`; `root_task_family` = the file-name role prefix (`proposer`, `auditor`) | the first key of the result's `modelUsage` map | result files are only read; zero-byte files are skipped, not parsed |
+
+Every collector follows the same rule: `boi.db` and `events.db` open
+read-only, and transcript and result files are never written back to.
+
+### Running collection
+
+A bare `hex usage collect` runs all five kinds, in this order: `codex-jsonl`,
+`claude-transcripts`, `boi-phase-runs`, `harness-llm-cost`,
+`headless-claude-json`. Pass `--source-kind <kind>` to run just one kind. A
+single path-override flag (for example `--claude-root`) also narrows the run
+to that kind; passing several override flags, or none, runs every kind.
+
+If one kind fails, the run reports the failure and keeps going — it never
+skips the remaining kinds. The command's exit code is non-zero if any kind
+failed, even when the others succeeded.
+
+### `hex-usage-tracking` worker
+
+A harness cron worker runs bare `hex usage collect --max-records 1000` every
+5 minutes (`0 */5 * * * * *`). It starts no daemon and sends no alerts.
+Failures show up as a telemetry row (`source=usage-tracking
+event=collect`), and repeated failures coalesce instead of filling the
+store. Each fire is auto-traced like any other harness worker, so `hex
+failures` covers it.
+
+### `hex usage report`
+
+`hex usage report` reads the ledger and writes a deterministic JSON summary
+to `$HEX_DIR/.hex/usage/report.json` (override with `--output`). The report
+covers a one-day window ending at `--cutoff` (default: now), compared
+against the preceding day.
+
+`report.json` today includes:
+
+- **`by_model`** and **`by_family`** — token totals and modeled credits, per
+  model and per task family.
+- **`coverage`** — ledger health counts: accepted, noncanonical, duplicate,
+  conflict, and quarantined records, plus source backlog and stale-source
+  counts.
+
+The same release adds, alongside these:
+
+- **`by_provider`** and **`by_source`** — token and credit totals grouped by
+  provider and by `account_scope`.
+- **`coverage.sources`** — one entry per provider/scope pair, carrying its
+  record count and first/last event time.
+- Anthropic API list-rate pricing for Claude models, so Claude usage gets an
+  API-equivalent cost figure even though Claude Code itself runs under a
+  subscription, not metered API billing.
+
+### Known caveats
+
+- **`hex usage burn` is unchanged.** It reads Claude Code transcripts
+  directly for a trailing-window spend rate; it does not read the ledger.
+  See the `hex-burn-guard` worker.
+- **Zero-byte headless result files are skipped, not errors.** A `claude -p`
+  run that died before writing output leaves an empty result file; the
+  collector counts it as a skip.
+- **`harness-llm-cost` output tokens can be 0** for some rows — a known gap
+  in `llm_cost.rs`, not a collection bug.
+- **BOI is paused (since 2026-09-15).** With no new BOI specs dispatching,
+  `boi-phase-runs` will usually report 0 new rows until BOI resumes.
 
 ---
 
