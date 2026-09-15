@@ -329,6 +329,15 @@ pub struct UsageLedger {
 impl UsageLedger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // Bounded busy_timeout, mirroring `main.rs::open_ledger` and
+        // `memory::open_db`'s rationale: SQLite's default busy_timeout is 0,
+        // so a concurrent open fails instantly with SQLITE_BUSY instead of
+        // waiting out another writer. This became a live risk once
+        // `hex-usage-tracking` started firing one `hex usage collect
+        // --source-kind <kind>` subprocess per kind on the same cron tick —
+        // up to 5 processes can now open this ledger at once (2026-09-15,
+        // usage-tracking per-kind-handler split).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // journal_mode returns a row, so use query_row rather than pragma_update.
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
@@ -1312,6 +1321,23 @@ CREATE INDEX IF NOT EXISTS observations_identity ON observations(provider,accoun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `UsageLedger::open` must set a nonzero busy_timeout: SQLite's default
+    /// is 0, so a concurrent open would fail instantly with SQLITE_BUSY
+    /// rather than waiting out another writer. This is what keeps
+    /// `hex-usage-tracking`'s per-source-kind cron handlers (up to 5
+    /// `hex usage collect --source-kind <kind>` subprocesses opening this
+    /// ledger on the same tick) from lock-failing each other.
+    #[test]
+    fn open_sets_bounded_busy_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = UsageLedger::open(tmp.path().join("usage.db")).unwrap();
+        let ms: i64 = ledger
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5000, "ledger opens must wait out a concurrent writer");
+    }
 
     fn row(response_id: &str, session: &str, input: i64, cached: i64, output: i64) -> CanonicalRow {
         CanonicalRow {
