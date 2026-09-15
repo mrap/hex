@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -84,10 +84,21 @@ pub struct ContributorDetailCursor {
 /// coordinates, so a summary read never decodes every ledger row.
 #[derive(Debug, Clone)]
 pub struct UsageSummaryGroup {
-    pub model: Option<String>, pub family: Option<String>, pub child: bool,
-    pub complete: i64, pub input: i64, pub cached: i64, pub output: i64,
-    pub cache_write: i64, pub reasoning: i64, pub provider_total: i64,
-    pub invalid: i64, pub missing_cache_write: i64, pub missing_reasoning: i64,
+    pub provider: String,
+    pub account_scope: String,
+    pub model: Option<String>,
+    pub family: Option<String>,
+    pub child: bool,
+    pub complete: i64,
+    pub input: i64,
+    pub cached: i64,
+    pub output: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub provider_total: i64,
+    pub invalid: i64,
+    pub missing_cache_write: i64,
+    pub missing_reasoning: i64,
     pub missing_provider_total: i64,
 }
 
@@ -107,9 +118,9 @@ impl FrozenUsageRead<'_> {
     pub fn summary_groups(&self, window: FrozenWindow) -> Result<Vec<UsageSummaryGroup>> {
         let w = self.windows[match window { FrozenWindow::First => 0, FrozenWindow::Second => 1 }];
         let valid = "input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL AND output_tokens IS NOT NULL AND input_tokens>=cached_input_tokens AND cached_input_tokens>=0 AND output_tokens>=0";
-        let sql = format!("SELECT model,root_task_family,parent_response_id IS NOT NULL, SUM(CASE WHEN {valid} THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN {valid} THEN input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN cached_input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN output_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(cache_write_input_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(reasoning_output_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(total_tokens,0) ELSE 0 END),0), SUM(CASE WHEN {valid} THEN 0 ELSE 1 END), SUM(CASE WHEN {valid} AND cache_write_input_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND reasoning_output_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND total_tokens IS NULL THEN 1 ELSE 0 END) FROM canonical_responses WHERE event_at>=?1 AND event_at<?2 GROUP BY model,root_task_family,parent_response_id IS NOT NULL");
+        let sql = format!("SELECT provider,account_scope,model,root_task_family,parent_response_id IS NOT NULL, SUM(CASE WHEN {valid} THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN {valid} THEN input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN cached_input_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN output_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(cache_write_input_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(reasoning_output_tokens,0) ELSE 0 END),0), COALESCE(SUM(CASE WHEN {valid} THEN COALESCE(total_tokens,0) ELSE 0 END),0), SUM(CASE WHEN {valid} THEN 0 ELSE 1 END), SUM(CASE WHEN {valid} AND cache_write_input_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND reasoning_output_tokens IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN {valid} AND total_tokens IS NULL THEN 1 ELSE 0 END) FROM canonical_responses WHERE event_at>=?1 AND event_at<?2 GROUP BY provider,account_scope,model,root_task_family,parent_response_id IS NOT NULL");
         let mut statement = self.transaction.prepare(&sql)?;
-        let groups = statement.query_map(params![w.start.to_rfc3339(), w.end.to_rfc3339()], |r| Ok(UsageSummaryGroup { model:r.get(0)?, family:r.get(1)?, child:r.get(2)?, complete:r.get(3)?, input:r.get(4)?, cached:r.get(5)?, output:r.get(6)?, cache_write:r.get(7)?, reasoning:r.get(8)?, provider_total:r.get(9)?, invalid:r.get(10)?, missing_cache_write:r.get(11)?, missing_reasoning:r.get(12)?, missing_provider_total:r.get(13)? }))?.collect::<std::result::Result<_,_>>()?;
+        let groups = statement.query_map(params![w.start.to_rfc3339(), w.end.to_rfc3339()], |r| Ok(UsageSummaryGroup { provider:r.get(0)?, account_scope:r.get(1)?, model:r.get(2)?, family:r.get(3)?, child:r.get(4)?, complete:r.get(5)?, input:r.get(6)?, cached:r.get(7)?, output:r.get(8)?, cache_write:r.get(9)?, reasoning:r.get(10)?, provider_total:r.get(11)?, invalid:r.get(12)?, missing_cache_write:r.get(13)?, missing_reasoning:r.get(14)?, missing_provider_total:r.get(15)? }))?.collect::<std::result::Result<_,_>>()?;
         Ok(groups)
     }
     pub fn for_each_window_page<F>(
@@ -321,6 +332,23 @@ pub struct Coverage {
     pub quarantined: u64,
     pub pending_sources: u64,
     pub stale_sources: u64,
+    /// One entry per distinct `(provider, account_scope)` pair ever seen in
+    /// `canonical_responses`, ledger-wide (not scoped to a report window).
+    /// Derived live from the existing table — no schema migration.
+    pub sources: Vec<SourceCoverage>,
+}
+
+/// One row of [`Coverage::sources`]: how many canonical rows a
+/// `(provider, account_scope)` pair has contributed, and the event-time span
+/// they cover. `first_event_at`/`last_event_at` are `None` only when every
+/// row for that pair has a null `event_at`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceCoverage {
+    pub provider: String,
+    pub account_scope: String,
+    pub records: u64,
+    pub first_event_at: Option<String>,
+    pub last_event_at: Option<String>,
 }
 pub struct UsageLedger {
     conn: Connection,
@@ -329,6 +357,15 @@ pub struct UsageLedger {
 impl UsageLedger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // Bounded busy_timeout, mirroring `main.rs::open_ledger` and
+        // `memory::open_db`'s rationale: SQLite's default busy_timeout is 0,
+        // so a concurrent open fails instantly with SQLITE_BUSY instead of
+        // waiting out another writer. This became a live risk once
+        // `hex-usage-tracking` started firing one `hex usage collect
+        // --source-kind <kind>` subprocess per kind on the same cron tick —
+        // up to 5 processes can now open this ledger at once (2026-09-15,
+        // usage-tracking per-kind-handler split).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // journal_mode returns a row, so use query_row rather than pragma_update.
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
@@ -391,6 +428,20 @@ impl UsageLedger {
             )?;
         }
         Ok(Self { conn })
+    }
+
+    /// Absolute path of the ledger's own database file (`PRAGMA
+    /// database_list`, `main` schema). Read-only lookup — used by collectors
+    /// (e.g. `usage.rs::import_harness_llm_cost`) that need a stable staging
+    /// location alongside the ledger itself, so re-staging the same rows on
+    /// every collect cycle doesn't create a fresh file identity each time.
+    pub fn db_path(&self) -> Result<PathBuf> {
+        let path: String = self.conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(PathBuf::from(path))
     }
 
     /// A pre-collection file-scoped ledger is intentionally never rewritten.
@@ -622,6 +673,20 @@ impl UsageLedger {
             .collect::<std::result::Result<_, _>>()?;
         Ok(ids)
     }
+    /// Highest numeric `response_id` already in the ledger for one
+    /// `account_scope` (0 when none). Sources whose response ids are
+    /// monotonically increasing integers (harness-llm-cost: `events.id`) use
+    /// this as their resume point, so the resume state lives in the ledger
+    /// itself and cannot drift from it (a sidecar cursor file written before
+    /// the import commits would skip rows forever after a failed import).
+    pub fn max_numeric_response_id(&self, account_scope: &str) -> Result<i64> {
+        let max: Option<i64> = self.conn.query_row(
+            "SELECT MAX(CAST(response_id AS INTEGER)) FROM canonical_responses              WHERE account_scope=?1 AND response_id GLOB '[0-9]*'",
+            params![account_scope],
+            |r| r.get(0),
+        )?;
+        Ok(max.unwrap_or(0))
+    }
     pub fn rows(&self, limit: usize, offset: usize) -> Result<Vec<UsageRow>> {
         let mut s=self.conn.prepare("SELECT provider,account_scope,response_id,parent_response_id,root_task_family,event_at,model,effort,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM canonical_responses ORDER BY event_at,provider,account_scope,response_id LIMIT ?1 OFFSET ?2")?;
         let rows = s
@@ -692,6 +757,22 @@ impl UsageLedger {
             [],
             |r| r.get(0),
         )?;
+        let mut sources_stmt = self.conn.prepare(
+            "SELECT provider, account_scope, COUNT(*), MIN(event_at), MAX(event_at) \
+             FROM canonical_responses GROUP BY provider, account_scope \
+             ORDER BY provider, account_scope",
+        )?;
+        c.sources = sources_stmt
+            .query_map([], |r| {
+                Ok(SourceCoverage {
+                    provider: r.get(0)?,
+                    account_scope: r.get(1)?,
+                    records: r.get(2)?,
+                    first_event_at: r.get(3)?,
+                    last_event_at: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
         Ok(c)
     }
 }
@@ -1298,6 +1379,23 @@ CREATE INDEX IF NOT EXISTS observations_identity ON observations(provider,accoun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `UsageLedger::open` must set a nonzero busy_timeout: SQLite's default
+    /// is 0, so a concurrent open would fail instantly with SQLITE_BUSY
+    /// rather than waiting out another writer. This is what keeps
+    /// `hex-usage-tracking`'s per-source-kind cron handlers (up to 5
+    /// `hex usage collect --source-kind <kind>` subprocesses opening this
+    /// ledger on the same tick) from lock-failing each other.
+    #[test]
+    fn open_sets_bounded_busy_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = UsageLedger::open(tmp.path().join("usage.db")).unwrap();
+        let ms: i64 = ledger
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5000, "ledger opens must wait out a concurrent writer");
+    }
 
     fn row(response_id: &str, session: &str, input: i64, cached: i64, output: i64) -> CanonicalRow {
         CanonicalRow {
