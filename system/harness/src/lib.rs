@@ -39,6 +39,7 @@ pub mod rule_registry;
 pub mod sanitize;
 pub mod telemetry;
 pub mod types;
+pub mod usage_kinds;
 pub mod usage_ledger;
 pub mod usage_reporting;
 pub mod wild;

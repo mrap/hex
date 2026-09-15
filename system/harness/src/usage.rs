@@ -20,14 +20,10 @@ use std::path::{Path, PathBuf};
 
 /// Every source kind `hex usage collect` knows, in the order a bare
 /// invocation runs them. Adding a kind = add it here, in `collect`'s match,
-/// and in docs/hex-ops.md "Usage sources".
-pub const ALL_SOURCE_KINDS: &[&str] = &[
-    "codex-jsonl",
-    "claude-transcripts",
-    "boi-phase-runs",
-    "harness-llm-cost",
-    "headless-claude-json",
-];
+/// and in docs/hex-ops.md "Usage sources". Canonical definition lives in the
+/// lib crate at `hex::usage_kinds::ALL_SOURCE_KINDS` so `usage_tracking.worker.rs`
+/// (compiled into the lib, not this bin-only module) can share it.
+pub use hex::usage_kinds::ALL_SOURCE_KINDS;
 
 #[derive(Subcommand)]
 pub enum UsageCommands {
