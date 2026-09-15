@@ -76,7 +76,7 @@ impl Ctx {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| anyhow!("Ctx::run called with empty argv"))?;
-        let out = std::process::Command::new(program)
+        let out = std::process::Command::new(resolve_program(program))
             .args(args)
             .output()
             .map_err(|e| anyhow!("Ctx::run spawn failed for `{program}`: {e}"))?;
@@ -163,6 +163,19 @@ impl StateHandle {
     }
 }
 
+/// A bare `hex` resolves to the running harness binary, not to PATH. Workers are compiled
+/// into `hex` itself, and the service PATH is rendered by whoever last ran
+/// `hex harness start|ensure` (2026-09-15: a launchd-context re-render dropped `.hex/bin`
+/// and six workers failed for 6.5 h). Any other program name passes through unchanged.
+fn resolve_program(program: &str) -> std::ffi::OsString {
+    if program == "hex" {
+        if let Ok(exe) = std::env::current_exe() {
+            return exe.into_os_string();
+        }
+    }
+    std::ffi::OsString::from(program)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +183,15 @@ mod tests {
     use serde_json::json;
     use serde_json::Value;
     use tempfile::tempdir;
+
+    /// A bare `hex` must resolve to the running binary, never to PATH (regression 2026-09-15:
+    /// the service PATH lost `.hex/bin` and every `Ctx::run(["hex", ...])` failed to spawn).
+    #[test]
+    fn bare_hex_resolves_to_current_exe_not_path() {
+        let resolved = resolve_program("hex");
+        assert_eq!(resolved, std::env::current_exe().unwrap().into_os_string());
+        assert_eq!(resolve_program("git"), std::ffi::OsString::from("git"));
+    }
 
     /// StateHandle exposes get/set/delete returning anyhow::Result. This test
     /// only checks the API compiles and is shaped as expected; live behavior is

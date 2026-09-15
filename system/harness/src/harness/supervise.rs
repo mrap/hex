@@ -231,13 +231,22 @@ fn acquire_bootstrap_lock(hex_dir: &Path) -> std::io::Result<std::fs::File> {
 // Service specs
 // ---------------------------------------------------------------------------
 
-fn path_env() -> String {
+/// PATH for the rendered services. `<hex_dir>/.hex/bin` is ALWAYS first, regardless of
+/// the invoking shell: workers spawn `hex` by bare name (`Ctx::run(["hex", ...])`), and the
+/// plist is re-rendered by whoever calls `hex harness start|restart|ensure`, including the
+/// watchdog under launchd whose PATH has no `.hex/bin`. Incident 2026-09-15: a re-render at
+/// 07:41 dropped `.hex/bin`; six workers (usage-tracking, burn-guard, memory-maintenance,
+/// freshness, resources, failures) failed every fire for 6.5 h with "spawn failed for `hex`".
+fn path_env(hex_dir: &Path) -> String {
+    let hex_bin_dir = hex_dir.join(".hex").join("bin");
+    let hex_bin_dir = hex_bin_dir.to_string_lossy();
     let base = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
-    if base.split(':').any(|p| p == "/opt/homebrew/bin") {
-        base
-    } else {
-        format!("/opt/homebrew/bin:{base}")
+    let mut parts: Vec<&str> = vec![hex_bin_dir.as_ref()];
+    if !base.split(':').any(|p| p == "/opt/homebrew/bin") {
+        parts.push("/opt/homebrew/bin");
     }
+    parts.extend(base.split(':').filter(|p| !p.is_empty() && *p != hex_bin_dir.as_ref()));
+    parts.join(":")
 }
 
 /// Platform-neutral spec for `com.hex.harness` (`hex harness serve`). Mirrors the historical
@@ -252,7 +261,7 @@ pub fn build_harness_spec(hex_dir: &Path) -> daemon_green::ServiceSpec {
         .args(["harness", "serve"])
         .env("HEX_DIR", hex_dir.to_string_lossy().into_owned())
         .env("III_URL", "ws://127.0.0.1:49134")
-        .env("PATH", path_env())
+        .env("PATH", path_env(hex_dir))
         .env("GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND", "file")
         .working_dir(hex_dir)
         .keep_alive(true)
@@ -272,7 +281,7 @@ pub fn build_watchdog_spec(hex_dir: &Path) -> daemon_green::ServiceSpec {
     daemon_green::ServiceSpec::new(WATCHDOG_LABEL, hex_bin)
         .args(["harness", "watchdog"])
         .env("HEX_DIR", hex_dir.to_string_lossy().into_owned())
-        .env("PATH", path_env())
+        .env("PATH", path_env(hex_dir))
         .working_dir(hex_dir)
         .keep_alive(true)
         .run_at_load(true)
@@ -603,6 +612,31 @@ mod tests {
             build_watchdog_spec(temp.path()),
         ]) {
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
+    }
+
+    #[test]
+    fn path_env_always_leads_with_hex_bin_dir() {
+        // Regression (2026-09-15): the harness plist was re-rendered from a launchd context
+        // whose PATH had no `.hex/bin`; every worker spawning `hex` by name failed for 6.5 h.
+        let temp = tempfile::tempdir().unwrap();
+        let hex_bin = temp.path().join(".hex").join("bin");
+        let hex_bin = hex_bin.to_string_lossy().into_owned();
+        let rendered = path_env(temp.path());
+        let parts: Vec<&str> = rendered.split(':').collect();
+        assert_eq!(parts[0], hex_bin, "hex bin dir must be first: {rendered}");
+        assert!(
+            parts.contains(&"/opt/homebrew/bin"),
+            "homebrew must stay on PATH: {rendered}"
+        );
+        assert_eq!(
+            parts.iter().filter(|p| **p == hex_bin).count(),
+            1,
+            "hex bin dir must not be duplicated: {rendered}"
+        );
+        for spec in [build_harness_spec(temp.path()), build_watchdog_spec(temp.path())] {
+            let path = spec.env.get("PATH").expect("PATH env on rendered service");
+            assert!(path.starts_with(&hex_bin), "{}: {path}", spec.label);
         }
     }
 
