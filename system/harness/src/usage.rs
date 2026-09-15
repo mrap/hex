@@ -1052,6 +1052,189 @@ fn report(
     }
 }
 
+/// Default events.db path for the harness-llm-cost source:
+/// `$HEX_DIR/.hex/telemetry/events.db` (see `telemetry.rs`'s own store path).
+/// Not yet wired to a CLI flag — that lands with the `--source-kind` plumbing
+/// in task Txv7phcj8 ("bare `hex usage collect` runs all kinds"), which will
+/// call `import_harness_llm_cost(&default_llm_cost_events_db(), ...)` when no
+/// explicit path is given.
+#[allow(dead_code)]
+fn default_llm_cost_events_db() -> PathBuf {
+    PathBuf::from(std::env::var("HEX_DIR").unwrap_or_else(|_| ".".into()))
+        .join(".hex")
+        .join("telemetry")
+        .join("events.db")
+}
+
+/// harness-llm-cost source (task Th19d8qvp): reads `source = "llm-cost"` rows
+/// out of a harness telemetry `events.db` (default `$HEX_DIR/.hex/telemetry/events.db`,
+/// see `llm_cost.rs::record_llm_cost` for the row shape this reads) and imports
+/// them into the durable usage ledger.
+///
+/// `event` is `"<transport>::<use_case>"` — `provider` is the transport prefix
+/// (openrouter, claude-cli, …), `account_scope` is always `"harness"`, and
+/// `root_task_family` is the use case after `::`. `response_id` is the
+/// `events.id` row id. Tokens (`in_tokens`/`out_tokens`, `out_tokens` may
+/// legitimately be `0` per the caveat documented in `llm_cost.rs`) and `model`
+/// come from the `detail` JSON blob.
+///
+/// The events db is opened strictly read-only (`SQLITE_OPEN_READ_ONLY`) — this
+/// collector must never take a write lock on the live telemetry store.
+///
+/// Two things make this safe to call every 5 minutes (hex-usage-tracking
+/// worker cadence) forever:
+///
+/// 1. **High-water mark.** The `SELECT` below is `id > <cursor>`, not
+///    `ORDER BY id LIMIT ?` from the start. The cursor is a plain-text
+///    sibling file (`harness-llm-cost.cursor`, next to the staging JSONL —
+///    never fed into `import_jsonl`) holding the highest `events.id` this
+///    collector has ever looked at, updated after every batch that sees at
+///    least one row. Without this, once the live events.db held more than
+///    `max_records` llm-cost rows, rows past the first `max_records` could
+///    never be reached — a silent `accepted=0`/`backlog=false` forever.
+/// 2. **Stable staging file.** Each matching row is re-expressed as one line
+///    of the ledger's existing generic canonical-event JSON schema (the
+///    `token_usage_record` fallback branch in `usage_ledger::parse_event`,
+///    keyed by `provider`+`account_scope`+`response_id`) and *appended* to
+///    one stable file living next to the ledger's own database
+///    (`UsageLedger::db_path`'s directory), never a fresh tempfile per call.
+///    A fresh tempfile gives `import_jsonl` a brand-new file identity every
+///    run, so it inserts a new `source_files` row and re-observes every
+///    already-canonical line as a fresh `'duplicate'` — `UsageLedger::coverage()`
+///    then shows `duplicates` growing by N on every worker fire forever.
+///    Appending to one stable path lets the ledger's own byte cursor for
+///    that file identity do the dedupe instead: a re-collect that appends
+///    nothing new never calls `import_jsonl` at all, so it is a true no-op.
+///
+/// Not yet called from `main`/the CLI dispatch — that wiring lands with the
+/// `--source-kind` plumbing in task Txv7phcj8 (bare `hex usage collect` runs
+/// all kinds), which will call this directly. Until then it's only exercised
+/// by its own fixture test below.
+#[allow(dead_code)]
+pub fn import_harness_llm_cost(
+    events_db: &Path,
+    ledger: &mut UsageLedger,
+    max_records: usize,
+) -> hex::usage_ledger::Result<hex::usage_ledger::ImportResult> {
+    use std::io::Write as _;
+    let conn = rusqlite::Connection::open_with_flags(
+        events_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+
+    let staging_path = ledger
+        .db_path()?
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("harness-llm-cost.jsonl");
+    let cursor_path = llm_cost_cursor_path(&staging_path);
+    let high_water = read_llm_cost_cursor(&cursor_path)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, event, detail FROM events WHERE source = 'llm-cost' AND id > ?1 ORDER BY id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![high_water, max_records as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut fetched = 0usize;
+    let mut last_id = high_water;
+    for row in rows {
+        let (id, ts, event, detail) = row?;
+        fetched += 1;
+        // Advance the cursor past every row we looked at, including ones
+        // skipped below for having the wrong `event` shape — otherwise a
+        // single malformed row at the tail of a batch would be re-fetched
+        // (harmlessly, but pointlessly) on every subsequent call forever.
+        last_id = id;
+        let Some((provider, use_case)) = event.split_once("::") else {
+            // Not the "<transport>::<use_case>" shape record_llm_cost writes —
+            // skip rather than fabricate a provider.
+            continue;
+        };
+        let detail_value: serde_json::Value = detail
+            .as_deref()
+            .and_then(|d| serde_json::from_str(d).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let model = detail_value.get("model").and_then(serde_json::Value::as_str);
+        let input_tokens = detail_value.get("in_tokens").and_then(serde_json::Value::as_i64);
+        let output_tokens = detail_value.get("out_tokens").and_then(serde_json::Value::as_i64);
+        // "type":"token_usage_record" with no "payload" object routes this
+        // through parse_event's flat, provider-agnostic fallback schema
+        // rather than the Codex-specific `payload.response_id` branch.
+        let line = json!({
+            "type": "token_usage_record",
+            "provider": provider,
+            "account_scope": "harness",
+            "response_id": id.to_string(),
+            "root_task_family": use_case,
+            "event_at": ts,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        });
+        lines.push(line.to_string());
+    }
+    // The SQL LIMIT capped us at max_records rows fetched — if we hit that
+    // cap there may be more rows beyond this batch still to collect.
+    let sql_backlog = fetched >= max_records;
+
+    if fetched > 0 {
+        std::fs::write(&cursor_path, last_id.to_string())?;
+    }
+
+    if lines.is_empty() {
+        return Ok(hex::usage_ledger::ImportResult {
+            backlog: sql_backlog,
+            ..Default::default()
+        });
+    }
+
+    {
+        let mut staging = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&staging_path)?;
+        for line in &lines {
+            writeln!(staging, "{line}")?;
+        }
+        staging.flush()?;
+    }
+    let mut result = ledger.import_jsonl(
+        &staging_path,
+        ImportOptions {
+            max_records: max_records.max(lines.len()),
+            abort_before_commit: false,
+        },
+    )?;
+    result.backlog = result.backlog || sql_backlog;
+    Ok(result)
+}
+
+/// Sibling cursor-marker path for the harness-llm-cost stable staging file —
+/// see `import_harness_llm_cost`'s doc comment. Plain integer text, never fed
+/// into `UsageLedger::import_jsonl`.
+fn llm_cost_cursor_path(staging_path: &Path) -> PathBuf {
+    staging_path.with_extension("cursor")
+}
+
+/// Read the harness-llm-cost high-water mark; `0` (import everything) if the
+/// cursor file has never been written yet.
+fn read_llm_cost_cursor(path: &Path) -> std::io::Result<i64> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(s.trim().parse().unwrap_or(0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,6 +1490,20 @@ mod tests {
         );
     }
 
+    /// harness-llm-cost (task Th19d8qvp): the default events.db path always
+    /// resolves under `.hex/telemetry/events.db`, whatever `$HEX_DIR` is set
+    /// to in this process — checked by suffix only (no env mutation; other
+    /// tests in this binary run concurrently and share the process env).
+    #[test]
+    fn default_llm_cost_events_db_targets_hex_telemetry_store() {
+        let path = default_llm_cost_events_db();
+        assert!(
+            path.ends_with(".hex/telemetry/events.db"),
+            "got {}",
+            path.display()
+        );
+    }
+
     #[test]
     fn failed_collector_makes_report_stale_until_success() {
         assert!(!collector_status_is_stale(None));
@@ -1467,6 +1664,207 @@ mod tests {
             rows3.iter().any(|r| r.response_id == "run4" && r.provider == "codex"),
             "the newly-collected row must be present: {rows3:?}"
         );
+    }
+
+    /// Build a fixture events.db with the same shape as telemetry::open()'s
+    /// schema, so the harness-llm-cost collector reads real column names.
+    fn write_events_fixture(path: &Path, rows: &[(i64, &str, &str, &str, &str)]) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                 id          INTEGER PRIMARY KEY,
+                 ts          TEXT    NOT NULL,
+                 source      TEXT    NOT NULL,
+                 event       TEXT    NOT NULL,
+                 status      TEXT    NOT NULL,
+                 duration_ms INTEGER,
+                 exit_code   INTEGER,
+                 detail      TEXT
+             )",
+        )
+        .unwrap();
+        for (id, ts, source, event, detail) in rows {
+            conn.execute(
+                "INSERT INTO events (id, ts, source, event, status, duration_ms, exit_code, detail)
+                 VALUES (?1, ?2, ?3, ?4, 'ok', NULL, NULL, ?5)",
+                rusqlite::params![id, ts, source, event, detail],
+            )
+            .unwrap();
+        }
+    }
+
+    /// harness-llm-cost (task Th19d8qvp): source `$HEX_DIR/.hex/telemetry/events.db`
+    /// rows with `source = "llm-cost"` (`llm_cost.rs::record_llm_cost`'s own
+    /// shape — `event = "<transport>::<use_case>"`, `detail` = {in_tokens,
+    /// out_tokens, cost_usd, model}). provider = the event prefix before
+    /// "::", account_scope = "harness", root_task_family = the use case
+    /// after "::", response_id = the events.id, tokens from detail JSON.
+    ///
+    /// This collector must NOT open the live telemetry events.db through
+    /// `hex::telemetry` (that module's `open()`/`health()` seam always
+    /// resolves `$HEX_DIR/.hex/telemetry/events.db` and has no read-only or
+    /// `#[cfg(test)]`-isolated mode reachable from this bin target — see
+    /// `burn_alert_class`'s doc comment on why pure/explicit-path seams are
+    /// used for bin-level unit tests here). Instead it takes an explicit
+    /// events-db path and an already-open ledger, entirely by fixture.
+    #[test]
+    fn harness_llm_cost_source_imports_events_db_rows_idempotently() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let events_db = tmp.path().join("events.db");
+        write_events_fixture(
+            &events_db,
+            &[
+                (
+                    7,
+                    "2026-09-10T00:00:00Z",
+                    "llm-cost",
+                    "openrouter::extract",
+                    r#"{"in_tokens":1200,"out_tokens":340,"cost_usd":0.0425,"model":"anthropic/claude-fable-5"}"#,
+                ),
+                (
+                    8,
+                    "2026-09-10T00:05:00Z",
+                    "llm-cost",
+                    "claude-cli::proposer",
+                    // out_tokens=0 is the documented llm_cost.rs caveat (some
+                    // paths report 0) — must be recorded as-is, not dropped
+                    // or treated as "no output tokens observed" (None).
+                    r#"{"in_tokens":500,"out_tokens":0,"cost_usd":0.01,"model":"claude-sonnet-4-6"}"#,
+                ),
+                (
+                    9,
+                    "2026-09-10T00:06:00Z",
+                    "other-source",
+                    "openrouter::extract",
+                    r#"{"in_tokens":999,"out_tokens":999,"cost_usd":9.0,"model":"ignored"}"#,
+                ),
+            ],
+        );
+        let ledger_path = tmp.path().join("usage.db");
+        let mut ledger = UsageLedger::open(&ledger_path).unwrap();
+
+        let first = import_harness_llm_cost(&events_db, &mut ledger, 1_000).unwrap();
+        assert_eq!(first.accepted, 2, "only the two llm-cost rows are canonical");
+
+        let rows = ledger.rows(10, 0).unwrap();
+        assert_eq!(rows.len(), 2, "the other-source row must not be imported");
+
+        let extract = rows
+            .iter()
+            .find(|r| r.response_id == "7")
+            .expect("openrouter::extract row (events.id=7) imported");
+        assert_eq!(extract.provider, "openrouter");
+        assert_eq!(extract.account_scope, "harness");
+        assert_eq!(extract.root_task_family.as_deref(), Some("extract"));
+        assert_eq!(extract.event_at.as_deref(), Some("2026-09-10T00:00:00Z"));
+        assert_eq!(extract.model.as_deref(), Some("anthropic/claude-fable-5"));
+        assert_eq!(extract.input_tokens, Some(1200));
+        assert_eq!(extract.output_tokens, Some(340));
+
+        let proposer = rows
+            .iter()
+            .find(|r| r.response_id == "8")
+            .expect("claude-cli::proposer row (events.id=8) imported");
+        assert_eq!(proposer.provider, "claude-cli");
+        assert_eq!(proposer.account_scope, "harness");
+        assert_eq!(proposer.root_task_family.as_deref(), Some("proposer"));
+        assert_eq!(proposer.input_tokens, Some(500));
+        assert_eq!(
+            proposer.output_tokens,
+            Some(0),
+            "out_tokens=0 must be recorded as-is (llm_cost.rs caveat), not dropped or nulled"
+        );
+
+        assert!(
+            !rows.iter().any(|r| r.response_id == "9"),
+            "the other-source row (events.id=9) must never reach the ledger"
+        );
+
+        // Re-import must be idempotent: same two rows, no duplication, no
+        // conflict-driven deletion. A non-deterministic synthesized record
+        // (e.g. a collection-time timestamp baked into the hashed line)
+        // would make the second import's hash differ from the first and
+        // take import_parsed's conflict arm, which DELETEs the canonical
+        // row instead of deduping it — so this must hold record-for-record.
+        // Whether the implementation recognizes the two rows as duplicates
+        // (fresh staging file each run) or as an already-advanced cursor
+        // (stable staging file, re-collected with nothing new to read) is a
+        // mechanism detail. Either is a valid idempotent strategy. What must
+        // hold regardless: nothing new accepted, no conflict-driven delete,
+        // and the ledger content itself is unchanged row-for-row.
+        let second = import_harness_llm_cost(&events_db, &mut ledger, 1_000).unwrap();
+        assert_eq!(second.accepted, 0, "second import must add nothing new");
+        assert_eq!(second.conflicts, 0, "re-import must never conflict-delete a canonical row");
+        let rows_after = ledger.rows(10, 0).unwrap();
+        assert_eq!(rows_after, rows, "ledger content must be unchanged by re-import");
+
+        // The high-water mark plus stable staging file must make a re-collect
+        // a TRUE no-op: nothing new appended to the staging file means
+        // import_jsonl is never even called, so coverage().duplicates must
+        // stay at 0 forever, not grow by 2 on every 5-minute worker fire.
+        let coverage = ledger.coverage().unwrap();
+        assert_eq!(
+            coverage.duplicates, 0,
+            "a re-collect with nothing new must not re-observe already-canonical rows as duplicates"
+        );
+    }
+
+    /// The high-water mark must let a re-collect reach rows past the first
+    /// `max_records` llm-cost rows ever recorded, instead of restarting the
+    /// `SELECT ... LIMIT` at the lowest id forever (the original defect: once
+    /// events.db held more than `max_records` llm-cost rows, newer rows could
+    /// never be imported and collect silently returned accepted=0/backlog=false).
+    #[test]
+    fn harness_llm_cost_high_water_mark_reaches_remaining_rows_on_next_call() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let events_db = tmp.path().join("events.db");
+        write_events_fixture(
+            &events_db,
+            &[
+                (
+                    1,
+                    "2026-09-10T00:00:00Z",
+                    "llm-cost",
+                    "openrouter::extract",
+                    r#"{"in_tokens":100,"out_tokens":10,"cost_usd":0.001,"model":"m1"}"#,
+                ),
+                (
+                    2,
+                    "2026-09-10T00:01:00Z",
+                    "llm-cost",
+                    "openrouter::extract",
+                    r#"{"in_tokens":100,"out_tokens":10,"cost_usd":0.001,"model":"m1"}"#,
+                ),
+                (
+                    3,
+                    "2026-09-10T00:02:00Z",
+                    "llm-cost",
+                    "openrouter::extract",
+                    r#"{"in_tokens":100,"out_tokens":10,"cost_usd":0.001,"model":"m1"}"#,
+                ),
+            ],
+        );
+        let ledger_path = tmp.path().join("usage.db");
+        let mut ledger = UsageLedger::open(&ledger_path).unwrap();
+
+        // max_records=2 is smaller than the 3-row fixture: the first call can
+        // only ever see the lowest 2 ids.
+        let first = import_harness_llm_cost(&events_db, &mut ledger, 2).unwrap();
+        assert_eq!(first.accepted, 2, "first call is capped at max_records rows");
+        assert!(first.backlog, "hitting the max_records cap must report backlog=true");
+        let rows_after_first = ledger.rows(10, 0).unwrap();
+        assert_eq!(rows_after_first.len(), 2);
+        assert!(!rows_after_first.iter().any(|r| r.response_id == "3"));
+
+        // A second call with the SAME max_records must reach the row the
+        // first call couldn't — not restart at id=1 and see the same two
+        // rows again (the original bug: LIMIT from the lowest id forever).
+        let second = import_harness_llm_cost(&events_db, &mut ledger, 2).unwrap();
+        assert_eq!(second.accepted, 1, "second call must reach the remaining row (id=3)");
+        assert!(!second.backlog, "no rows remain beyond this call");
+        let rows_after_second = ledger.rows(10, 0).unwrap();
+        assert_eq!(rows_after_second.len(), 3, "all three rows must be reachable across calls");
+        assert!(rows_after_second.iter().any(|r| r.response_id == "3"));
     }
 
     /// Models are priced per their own table; synthetic/unknown rows skipped.

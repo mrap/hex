@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -391,6 +391,20 @@ impl UsageLedger {
             )?;
         }
         Ok(Self { conn })
+    }
+
+    /// Absolute path of the ledger's own database file (`PRAGMA
+    /// database_list`, `main` schema). Read-only lookup — used by collectors
+    /// (e.g. `usage.rs::import_harness_llm_cost`) that need a stable staging
+    /// location alongside the ledger itself, so re-staging the same rows on
+    /// every collect cycle doesn't create a fresh file identity each time.
+    pub fn db_path(&self) -> Result<PathBuf> {
+        let path: String = self.conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(PathBuf::from(path))
     }
 
     /// A pre-collection file-scoped ledger is intentionally never rewritten.
