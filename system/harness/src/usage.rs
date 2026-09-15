@@ -492,22 +492,29 @@ fn default_report() -> PathBuf {
     usage_dir().join("report.json")
 }
 
-fn health(status: &str, detail: String) {
-    // Failures are coalesced locally: repeat the same last collector failure
-    // does not fill telemetry. No alert or outbound transport is invoked.
+/// Telemetry event name for one source kind's collection health.
+fn health_event(kind: &str) -> String {
+    format!("collect:{kind}")
+}
+
+fn health(kind: &str, status: &str, detail: String) {
+    // Failures are coalesced locally PER KIND: a repeat of the same kind's
+    // last failure does not fill telemetry, but a different kind failing on
+    // the same tick is a new row. No alert or outbound transport is invoked.
+    let event = health_event(kind);
     let repeated = status == "error"
         && hex::telemetry::recent(50)
             .ok()
             .and_then(|rows| {
                 rows.into_iter()
-                    .find(|r| r.source == "usage-tracking" && r.event == "collect")
+                    .find(|r| r.source == "usage-tracking" && r.event == event)
             })
             .map(|r| r.status == status)
             .unwrap_or(false);
     if !repeated {
         let _ = hex::telemetry::record(&hex::telemetry::TelemetryEvent {
             source: "usage-tracking".into(),
-            event: "collect".into(),
+            event,
             status: status.into(),
             duration_ms: None,
             exit_code: Some(if status == "ok" { 0 } else { 1 }),
@@ -520,14 +527,14 @@ fn health(status: &str, detail: String) {
 /// until a later successful collection replaces that health event. This keeps
 /// the report honest even when the underlying source file remains readable.
 fn collector_is_stale() -> bool {
-    let status = hex::telemetry::recent(50)
-        .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|row| row.source == "usage-tracking" && row.event == "collect")
-        })
-        .map(|row| row.status);
-    collector_status_is_stale(status.as_deref())
+    // Stale if ANY kind's most recent health row is a failure. Rows are
+    // newest-first; the first row seen per event is that kind's latest.
+    let rows = hex::telemetry::recent(50).unwrap_or_default();
+    let mut seen = HashSet::new();
+    rows.iter()
+        .filter(|row| row.source == "usage-tracking" && row.event.starts_with("collect"))
+        .filter(|row| seen.insert(row.event.clone()))
+        .any(|row| collector_status_is_stale(Some(row.status.as_str())))
 }
 
 fn collector_status_is_stale(status: Option<&str>) -> bool {
@@ -597,10 +604,6 @@ fn discover(codex_root: &Path) -> (Vec<PathBuf>, Vec<String>) {
 /// from `<recipes_dir>/recipe-<id>.yaml` (`settings.goose_model`) when that
 /// recipe file exists, else `None` — never a schema migration, since every
 /// field maps onto ledger columns that already exist.
-// Only `mod tests` calls into this source kind's discovery function today;
-// the `collect()` dispatch arm and `--source-kind` CLI plumbing land in the
-// sibling task (Txv7phcj8) that also wires up "run all kinds" — allow the
-// otherwise-correct dead-code warning until that lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BoiPhaseRunRecord {
     response_id: String,
@@ -703,11 +706,6 @@ fn default_boi_recipes_dir() -> PathBuf {
     Path::new(&home).join(".boi/v2/recipes")
 }
 
-/// The `--source-kind` value for this source (task Tsgmstjxk). The CLI enum
-/// and "run all kinds" dispatch land in sibling task Txv7phcj8; this
-/// constant is the shared literal both sides key off.
-const BOI_PHASE_RUNS_SOURCE_KIND: &str = "boi-phase-runs";
-
 /// Renders one `BoiPhaseRunRecord` as a line in the ledger's existing
 /// provider-agnostic ingestion format (`usage_ledger::parse_event`'s flat
 /// `"type":"token_usage_record"` branch, used whenever `payload` is absent).
@@ -725,6 +723,10 @@ fn boi_phase_run_ledger_line(record: &BoiPhaseRunRecord) -> String {
         "event_at": record.event_at,
         "model": record.model,
         "input_tokens": record.input_tokens,
+        // BOI phase_runs carries no cache split. 0 (not absent) keeps the row
+        // valid for the report's `cached_input_tokens IS NOT NULL` predicate;
+        // an absent key would store NULL and drop the row from every total.
+        "cached_input_tokens": 0,
         "output_tokens": record.output_tokens,
     })
     .to_string()
@@ -869,7 +871,7 @@ fn open_ledger_for(kind: &str, ledger: Option<PathBuf>) -> Option<UsageLedger> {
         Ok(l) => Some(l),
         Err(e) => {
             eprintln!("usage collect: {kind}: failed to open ledger: {e:?}");
-            health("error", format!("kind={kind} ledger_open_failed"));
+            health(kind, "error", format!("kind={kind} ledger_open_failed"));
             None
         }
     }
@@ -884,6 +886,7 @@ fn report_import_result(kind: &str, result: &ImportResult) -> i32 {
         result.accepted, result.duplicates, result.conflicts, result.backlog
     );
     health(
+        kind,
         "ok",
         format!(
             "kind={kind} accepted={} duplicates={} conflicts={} backlog={}",
@@ -905,6 +908,7 @@ fn collect_boi_phase_runs_cli(
     let recipes = boi_recipes.unwrap_or_else(default_boi_recipes_dir);
     if !db.exists() {
         println!("usage collect: boi-phase-runs: no boi.db at {}", db.display());
+        health("boi-phase-runs", "ok", "no_source accepted=0".into());
         return 0;
     }
     let Some(mut opened) = open_ledger_for("boi-phase-runs", ledger) else {
@@ -921,7 +925,7 @@ fn collect_boi_phase_runs_cli(
         Ok(r) => report_import_result("boi-phase-runs", &r),
         Err(e) => {
             eprintln!("usage collect: boi-phase-runs import failed: {e}");
-            health("error", format!("kind=boi-phase-runs import_failed={e}"));
+            health("boi-phase-runs", "error", format!("kind=boi-phase-runs import_failed={e}"));
             1
         }
     }
@@ -937,6 +941,7 @@ fn collect_harness_llm_cost_cli(
     let db = events_db.unwrap_or_else(default_llm_cost_events_db);
     if !db.exists() {
         println!("usage collect: harness-llm-cost: no events.db at {}", db.display());
+        health("harness-llm-cost", "ok", "no_source accepted=0".into());
         return 0;
     }
     let Some(mut opened) = open_ledger_for("harness-llm-cost", ledger) else {
@@ -946,7 +951,7 @@ fn collect_harness_llm_cost_cli(
         Ok(r) => report_import_result("harness-llm-cost", &r),
         Err(e) => {
             eprintln!("usage collect: harness-llm-cost import failed: {e:?}");
-            health("error", format!("kind=harness-llm-cost import_failed={e:?}"));
+            health("harness-llm-cost", "error", format!("kind=harness-llm-cost import_failed={e:?}"));
             1
         }
     }
@@ -973,14 +978,14 @@ fn collect_claude_transcripts(
         Ok(l) => l,
         Err(e) => {
             eprintln!("usage collect: failed: {e:?}");
-            health("error", "kind=claude-transcripts ledger_open_failed".into());
+            health("claude-transcripts", "error", "kind=claude-transcripts ledger_open_failed".into());
             return 1;
         }
     };
     let result = import_claude_transcripts(&root, &mut opened, max_records);
     if let Some(err) = &result.error {
         eprintln!("usage collect: claude-transcripts import failed: {err}");
-        health("error", format!("kind=claude-transcripts import_failed={err}"));
+        health("claude-transcripts", "error", format!("kind=claude-transcripts import_failed={err}"));
         return 1;
     }
     println!(
@@ -988,6 +993,7 @@ fn collect_claude_transcripts(
         result.accepted, result.duplicates, result.conflicts, result.truncated
     );
     health(
+        "claude-transcripts",
         "ok",
         format!(
             "kind=claude-transcripts accepted={} duplicates={} conflicts={} truncated={}",
@@ -1016,7 +1022,7 @@ fn collect_codex_jsonl(
     let ledger = ledger.unwrap_or_else(default_ledger);
     if max_records == 0 {
         eprintln!("usage collect: no local sources discovered");
-        health("error", "no_sources".into());
+        health("codex-jsonl", "error", "no_sources".into());
         return 1;
     }
     // A configured local Codex root can legitimately have no live sessions,
@@ -1024,12 +1030,12 @@ fn collect_codex_jsonl(
     // collection then completes as a visible no-op, not an unhealthy worker.
     if discovered_sources && sources.is_empty() {
         println!("usage collect: accepted=0 backlog=false issues=0");
-        health("ok", "backlog=false accepted=0 issues=".into());
+        health("codex-jsonl", "ok", "backlog=false accepted=0 issues=".into());
         return 0;
     }
     if sources.is_empty() {
         eprintln!("usage collect: no local sources discovered");
-        health("error", "no_sources".into());
+        health("codex-jsonl", "error", "no_sources".into());
         return 1;
     }
     if let Some(parent) = ledger.parent() {
@@ -1081,6 +1087,7 @@ fn collect_codex_jsonl(
                 issues.len()
             );
             health(
+                "codex-jsonl",
                 if issues.is_empty() { "ok" } else { "error" },
                 format!(
                     "backlog={} accepted={} issues={}",
@@ -1097,7 +1104,7 @@ fn collect_codex_jsonl(
         }
         Err(e) => {
             eprintln!("usage collect: failed: {e:?}");
-            health("error", "ledger_open_failed".into());
+            health("codex-jsonl", "error", "ledger_open_failed".into());
             1
         }
     }
@@ -1223,10 +1230,7 @@ fn report(
 
 /// Default events.db path for the harness-llm-cost source:
 /// `$HEX_DIR/.hex/telemetry/events.db` (see `telemetry.rs`'s own store path).
-/// Not yet wired to a CLI flag — that lands with the `--source-kind` plumbing
-/// in task Txv7phcj8 ("bare `hex usage collect` runs all kinds"), which will
-/// call `import_harness_llm_cost(&default_llm_cost_events_db(), ...)` when no
-/// explicit path is given.
+/// `collect_harness_llm_cost_cli` uses it when `--events-db` is not given.
 fn default_llm_cost_events_db() -> PathBuf {
     PathBuf::from(std::env::var("HEX_DIR").unwrap_or_else(|_| ".".into()))
         .join(".hex")
@@ -1275,10 +1279,7 @@ fn default_llm_cost_events_db() -> PathBuf {
 ///    that file identity do the dedupe instead: a re-collect that appends
 ///    nothing new never calls `import_jsonl` at all, so it is a true no-op.
 ///
-/// Not yet called from `main`/the CLI dispatch — that wiring lands with the
-/// `--source-kind` plumbing in task Txv7phcj8 (bare `hex usage collect` runs
-/// all kinds), which will call this directly. Until then it's only exercised
-/// by its own fixture test below.
+/// Called by `collect_harness_llm_cost_cli` (the `harness-llm-cost` kind).
 pub fn import_harness_llm_cost(
     events_db: &Path,
     ledger: &mut UsageLedger,
@@ -1347,6 +1348,9 @@ pub fn import_harness_llm_cost(
             "event_at": ts,
             "model": model,
             "input_tokens": input_tokens,
+            // llm-cost rows carry no cache split; 0 keeps the row countable
+            // (NULL would exclude it from every report total).
+            "cached_input_tokens": 0,
             "output_tokens": output_tokens,
         });
         lines.push(line.to_string());
@@ -1355,6 +1359,8 @@ pub fn import_harness_llm_cost(
     // cap there may be more rows beyond this batch still to collect.
     let sql_backlog = fetched >= max_records;
 
+    // `last_id` is only a fetch-progress marker; the resume point is derived
+    // from the ledger (see the doc comment above), so it is not persisted.
     let _ = last_id;
 
     if lines.is_empty() {
@@ -1533,6 +1539,7 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
         // A configured-but-absent source dir mirrors the Codex "no local
         // sources discovered" no-op: nothing has run yet, not a failure.
         println!("usage collect: headless-claude-json: no source dir at {}", dir.display());
+        health("headless-claude-json", "ok", "no_source accepted=0".into());
         return 0;
     }
     let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
@@ -1560,10 +1567,26 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
             return 1;
         }
     };
+    // Known session ids so the `max_records` budget only spends on NEW files;
+    // otherwise, once the dir holds more files than the budget, the same
+    // lexicographically-first slice would be re-selected forever.
+    let known = match l.response_ids("claude-code", "headless") {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("usage collect: headless-claude-json: ledger read failed: {e:?}");
+            health("headless-claude-json", "error", format!("kind=headless-claude-json ledger_read_failed={e:?}"));
+            return 1;
+        }
+    };
     let mut accepted = 0u64;
     let mut empty = 0u64;
+    let mut truncated = false;
     let mut issues = Vec::new();
-    for path in entries.into_iter().take(max_records) {
+    for path in entries {
+        if accepted as usize >= max_records {
+            truncated = true;
+            break;
+        }
         // A zero-byte result file is a run that died before `claude -p`
         // wrote anything (the run's own telemetry row already carries that
         // failure). There is no usage to record, so it is a counted skip,
@@ -1579,6 +1602,9 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
                 continue;
             }
         };
+        if known.contains(&record.response_id) {
+            continue;
+        }
         let source_key = path.to_string_lossy().to_string();
         let canonical = CanonicalRow {
             provider: record.provider,
@@ -1602,17 +1628,18 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
         }
     }
     println!(
-        "usage collect: headless-claude-json: accepted={accepted} empty_skipped={empty} issues={}",
+        "usage collect: headless-claude-json: accepted={accepted} empty_skipped={empty} truncated={truncated} issues={}",
         issues.len()
     );
     if issues.is_empty() {
-        health("ok", format!("kind=headless-claude-json accepted={accepted} empty_skipped={empty}"));
+        health("headless-claude-json", "ok", format!("kind=headless-claude-json accepted={accepted} empty_skipped={empty} truncated={truncated}"));
         0
     } else {
         for issue in &issues {
             eprintln!("usage collect: headless-claude-json: {issue}");
         }
         health(
+            "headless-claude-json",
             "error",
             format!("kind=headless-claude-json accepted={accepted} issues={}", issues.len()),
         );
@@ -2053,6 +2080,99 @@ mod tests {
 
     /// Build a fixture events.db with the same shape as telemetry::open()'s
     /// schema, so the harness-llm-cost collector reads real column names.
+    /// Regression (review 2026-09-15, blocker): rows staged by the
+    /// boi-phase-runs and harness-llm-cost collectors must reach the report's
+    /// totals. They carry no cache split; an ABSENT `cached_input_tokens`
+    /// stored NULL, which the report's validity predicate rejects, so both
+    /// sources counted as zero tokens while `collect` printed `accepted=N`.
+    #[test]
+    fn boi_and_llm_cost_rows_count_in_report_totals() {
+        use hex::usage_ledger::{FrozenWindow, HalfOpenUtcWindow};
+        let tmp = tempfile::TempDir::new().unwrap();
+        // boi.db fixture: one eligible worker row.
+        let boi_db = tmp.path().join("boi.db");
+        {
+            let conn = rusqlite::Connection::open(&boi_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE phase_runs (id TEXT PRIMARY KEY, spec_id TEXT, provider TEXT, tokens_in INTEGER, tokens_out INTEGER, started_at TEXT);
+                 INSERT INTO phase_runs VALUES ('run1','specA','claude_code',1200,340,'2026-09-14T10:00:00Z');",
+            )
+            .unwrap();
+        }
+        // events.db fixture: one llm-cost row.
+        let events_db = tmp.path().join("events.db");
+        write_events_fixture(
+            &events_db,
+            &[(
+                7,
+                "2026-09-14T11:00:00Z",
+                "llm-cost",
+                "openrouter::extract",
+                r#"{"in_tokens":500,"out_tokens":50,"model":"anthropic/claude-sonnet-5"}"#,
+            )],
+        );
+        let ledger_path = tmp.path().join("usage.db");
+        let mut ledger = UsageLedger::open(&ledger_path).unwrap();
+        let staging = tmp.path().join("boi.staging.jsonl");
+        let boi = collect_boi_phase_runs(&boi_db, tmp.path(), &staging, &mut ledger, 100).unwrap();
+        assert_eq!(boi.accepted, 1);
+        let cost = import_harness_llm_cost(&events_db, &mut ledger, 100).unwrap();
+        assert_eq!(cost.accepted, 1);
+
+        let start = Utc.with_ymd_and_hms(2026, 9, 14, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 9, 15, 0, 0, 0).unwrap();
+        let read = ledger
+            .frozen_read([
+                HalfOpenUtcWindow { start, end },
+                HalfOpenUtcWindow { start: start - Duration::days(1), end: start },
+            ])
+            .unwrap();
+        let groups = read.summary_groups(FrozenWindow::First).unwrap();
+        drop(read);
+        let coverage = ledger.coverage().unwrap();
+        let mut acc = usage_reporting::ReportAccumulator::new(coverage, start, end, false);
+        acc.extend_summary_groups(&groups, false);
+        let r = acc.finish();
+        let tokens_for = |key: &str| -> i128 {
+            r.by_source
+                .iter()
+                .find(|c| c.key == key)
+                .map(|c| c.measured.input + c.measured.output)
+                .unwrap_or(0)
+        };
+        assert_eq!(tokens_for("boi"), 1200 + 340, "boi rows must count: {:?}", r.by_source);
+        assert_eq!(tokens_for("harness"), 500 + 50, "llm-cost rows must count: {:?}", r.by_source);
+    }
+
+    /// The headless budget must be spent on NEW files only, and a run that
+    /// stops at the budget must say so (`truncated=true`), otherwise a dir
+    /// with more files than `max_records` re-selects the same first slice
+    /// forever.
+    #[test]
+    fn collect_headless_claude_json_budget_skips_known_files_and_reports_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("agent-infra");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..3 {
+            let body = format!(
+                r#"{{"session_id":"s{i}","usage":{{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}},"modelUsage":{{"claude-haiku-4-5":{{}}}},"num_turns":1,"total_cost_usd":0.0}}"#
+            );
+            std::fs::write(src.join(format!("proposer-2026-09-1{i}T033000Z.json")), body).unwrap();
+        }
+        let ledger = dir.path().join("usage.db");
+        // Budget of 1: first call lands s0 and reports truncation.
+        assert_eq!(collect_headless_claude_json(src.clone(), ledger.clone(), 1), 0);
+        let l = UsageLedger::open(&ledger).unwrap();
+        assert_eq!(l.rows(10, 0).unwrap().len(), 1);
+        drop(l);
+        // Second and third calls must land s1 then s2, not re-select s0.
+        assert_eq!(collect_headless_claude_json(src.clone(), ledger.clone(), 1), 0);
+        assert_eq!(collect_headless_claude_json(src.clone(), ledger.clone(), 1), 0);
+        let l = UsageLedger::open(&ledger).unwrap();
+        let ids: Vec<String> = l.rows(10, 0).unwrap().into_iter().map(|r| r.response_id).collect();
+        assert_eq!(ids.len(), 3, "each budgeted call must reach a new file: {ids:?}");
+    }
+
     fn write_events_fixture(path: &Path, rows: &[(i64, &str, &str, &str, &str)]) {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch(

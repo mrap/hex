@@ -202,6 +202,15 @@ pub const CLAUDE_API_RATES: &[ClaudeRateFact] = &[
             output: 2_500,
         },
     },
+    ClaudeRateFact {
+        model: "claude-sonnet-4-5",
+        rates: ClaudeTokenRates {
+            fresh: 300,
+            cached: 30,
+            cache_write: 375,
+            output: 1_500,
+        },
+    },
 ];
 
 /// Providers whose Claude-priced rows are billed by subscription rather than
