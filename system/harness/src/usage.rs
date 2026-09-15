@@ -12,26 +12,39 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use clap::Subcommand;
-use hex::usage_ledger::{ImportOptions, UsageLedger};
+use hex::usage_ledger::{CanonicalRow, ImportOptions, UsageLedger};
 use hex::usage_reporting;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum UsageCommands {
-    /// Import one local Codex JSONL source into the durable usage ledger
+    /// Import usage into the durable ledger from one or (by default) every
+    /// known source kind: `codex-jsonl` (local Codex JSONL transcripts) and
+    /// `claude-transcripts` (local Claude Code transcripts under
+    /// $HOME/.claude/projects, provider `claude-code`). Bare `hex usage
+    /// collect` runs every kind in sequence so no LLM path silently drops out
+    /// of the ledger (decision usage-ledger-provider-agnostic-2026-09-14).
     Collect {
-        /// Explicit local JSONL source. Defaults to $HEX_DIR/.hex/usage/codex.jsonl.
+        /// Restrict this run to one source kind. Omit to run all kinds.
+        #[arg(long, value_parser = ["codex-jsonl", "claude-transcripts"])]
+        source_kind: Option<String>,
+        /// Explicit local JSONL source (codex-jsonl only). Defaults to
+        /// $HEX_DIR/.hex/usage/codex.jsonl.
         #[arg(long)]
         source: Option<PathBuf>,
-        /// Codex home for discovery. Defaults to $HOME/.codex.
+        /// Codex home for discovery (codex-jsonl only). Defaults to $HOME/.codex.
         #[arg(long)]
         codex_root: Option<PathBuf>,
+        /// Claude Code projects root to scan recursively (claude-transcripts
+        /// only). Defaults to $HOME/.claude/projects.
+        #[arg(long)]
+        claude_root: Option<PathBuf>,
         /// Ledger path. Defaults to $HEX_DIR/.hex/usage/usage.db.
         #[arg(long)]
         ledger: Option<PathBuf>,
-        /// Maximum complete records committed in this run.
+        /// Maximum complete records committed per source kind in this run.
         #[arg(long, default_value_t = 1_000)]
         max_records: usize,
     },
@@ -174,6 +187,172 @@ fn default_projects_dir() -> PathBuf {
     Path::new(&home).join(".claude/projects")
 }
 
+/// Result of one `claude-transcripts` collection pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClaudeTranscriptImport {
+    /// New canonical ledger rows written this pass (one per distinct
+    /// `requestId`, deduped across files — including nested subagent
+    /// transcripts under `<session>/subagents/agent-*.jsonl`).
+    accepted: u64,
+    duplicates: u64,
+    conflicts: u64,
+    /// The scan found more candidate rows than `max_records` allowed
+    /// committing this pass. Never silent (S6): new rows are prioritized
+    /// over already-canonical ones (see `import_claude_transcripts`) so a
+    /// sustained backlog still converges, but a caller must still surface
+    /// this rather than reporting a quiet, permanently-partial "ok".
+    truncated: bool,
+    /// Set when the ledger import itself failed (e.g. rebuild required).
+    /// A loud, non-zero-exit failure per S6 — never a silent skip.
+    error: Option<String>,
+}
+
+/// One deduped Claude Code assistant turn, keyed by `requestId`, pending
+/// translation into a `CanonicalRow`.
+struct ClaudeTurnCandidate {
+    event_at: String,
+    session_id: Option<String>,
+    model: Option<String>,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
+    output_tokens: i64,
+}
+
+/// `claude-transcripts` source (task Txv7phcj8): recursively scans
+/// `claude_root` (default `$HOME/.claude/projects`) for assistant-turn usage
+/// blocks — including nested subagent transcripts under
+/// `<session>/subagents/agent-*.jsonl`, the same shape `window_spend` (`hex
+/// usage burn`) already walks recursively — and imports one canonical
+/// `claude-code`/`local-claude-code` ledger row per distinct `requestId` via
+/// `UsageLedger::import_canonical_rows`. Re-import is idempotent: an
+/// unchanged transcript re-scan reports `accepted: 0`.
+fn import_claude_transcripts(
+    claude_root: &Path,
+    ledger: &mut UsageLedger,
+    max_records: usize,
+) -> ClaudeTranscriptImport {
+    if !claude_root.exists() {
+        return ClaudeTranscriptImport::default();
+    }
+    let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(claude_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl")
+        })
+        .map(|e| e.into_path())
+        .collect();
+    // Deterministic scan order: with several files sharing a requestId (a
+    // resumed session copies its transcript), the first file visited wins.
+    paths.sort();
+
+    let mut by_request: BTreeMap<String, ClaudeTurnCandidate> = BTreeMap::new();
+    for path in paths {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if !line.contains("\"usage\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+                continue;
+            }
+            let Some(request_id) = v.get("requestId").and_then(|r| r.as_str()) else {
+                continue;
+            };
+            if by_request.contains_key(request_id) {
+                continue;
+            }
+            let Some(event_at) = v.get("timestamp").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let msg = &v["message"];
+            let usage = &msg["usage"];
+            let tok = |k: &str| usage.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+            // Claude's `cache_read_input_tokens` is a SIBLING of
+            // `input_tokens`, but the ledger's `cached_input_tokens` must be
+            // a SUBSET of `input_tokens` (summary_groups's validity
+            // predicate requires input_tokens>=cached_input_tokens), so fold
+            // cache reads into the ledger's input total.
+            let raw_input = tok("input_tokens");
+            let cache_read = tok("cache_read_input_tokens");
+            by_request.insert(
+                request_id.to_string(),
+                ClaudeTurnCandidate {
+                    event_at: event_at.to_string(),
+                    session_id: v.get("sessionId").and_then(|s| s.as_str()).map(str::to_string),
+                    model: msg.get("model").and_then(|m| m.as_str()).map(str::to_string),
+                    input_tokens: raw_input + cache_read,
+                    cached_input_tokens: cache_read,
+                    cache_write_input_tokens: tok("cache_creation_input_tokens"),
+                    output_tokens: tok("output_tokens"),
+                },
+            );
+        }
+    }
+    // A backlog larger than `max_records` must not truncate in whatever
+    // order `by_request` happens to enumerate: prioritize requestIds not yet
+    // canonical (so a sustained backlog eventually covers every request
+    // instead of re-selecting the same lexicographically-first slice every
+    // run), then within each bucket prefer the most recent activity first.
+    let existing = ledger
+        .response_ids("claude-code", "local-claude-code")
+        .unwrap_or_default();
+    let (mut new_candidates, mut known_candidates): (Vec<_>, Vec<_>) = by_request
+        .into_iter()
+        .partition(|(request_id, _)| !existing.contains(request_id));
+    let by_recency = |a: &(String, ClaudeTurnCandidate), b: &(String, ClaudeTurnCandidate)| {
+        b.1.event_at.cmp(&a.1.event_at)
+    };
+    new_candidates.sort_by(by_recency);
+    known_candidates.sort_by(by_recency);
+    let total_candidates = new_candidates.len() + known_candidates.len();
+    let selected: Vec<_> = new_candidates
+        .into_iter()
+        .chain(known_candidates)
+        .take(max_records)
+        .collect();
+    let truncated = total_candidates > selected.len();
+
+    let rows: Vec<CanonicalRow> = selected
+        .into_iter()
+        .map(|(request_id, c)| CanonicalRow {
+            provider: "claude-code".into(),
+            account_scope: "local-claude-code".into(),
+            response_id: request_id,
+            parent_response_id: None,
+            root_task_family: c.session_id,
+            event_at: Some(c.event_at),
+            model: c.model,
+            effort: None,
+            input_tokens: Some(c.input_tokens),
+            cached_input_tokens: Some(c.cached_input_tokens),
+            cache_write_input_tokens: Some(c.cache_write_input_tokens),
+            output_tokens: Some(c.output_tokens),
+            reasoning_output_tokens: None,
+            total_tokens: None,
+        })
+        .collect();
+    match ledger.import_canonical_rows("claude-transcripts", rows) {
+        Ok(r) => ClaudeTranscriptImport {
+            accepted: r.accepted,
+            duplicates: r.duplicates,
+            conflicts: r.conflicts,
+            truncated,
+            error: None,
+        },
+        Err(e) => ClaudeTranscriptImport {
+            error: Some(format!("{e:?}")),
+            ..Default::default()
+        },
+    }
+}
+
 /// Class-selection seam for the burn guardrail's two alerts, keyed by the alert
 /// key each call site uses. The spend-rate breach (`burn-guard`) is the
 /// operator's spend signal → the `Spend` rail (push urgent + email). The
@@ -196,11 +375,13 @@ fn burn_alert_class(key: &str) -> crate::alert::AlertClass {
 pub fn run(cmd: UsageCommands) -> i32 {
     match cmd {
         UsageCommands::Collect {
+            source_kind,
             source,
             codex_root,
+            claude_root,
             ledger,
             max_records,
-        } => collect(source, codex_root, ledger, max_records),
+        } => collect(source_kind, source, codex_root, claude_root, ledger, max_records),
         UsageCommands::Report {
             ledger,
             output,
@@ -372,7 +553,100 @@ fn discover(codex_root: &Path) -> (Vec<PathBuf>, Vec<String>) {
     paths.dedup();
     (paths, issues)
 }
+/// Dispatch `hex usage collect` across one or every source kind. `--source
+/// <path>` and `--codex-root <dir>` are codex-jsonl-specific overrides — their
+/// presence (without an explicit `--claude-root`) narrows a bare invocation to
+/// codex-jsonl only, so existing codex-only callers and tests keep their exact
+/// prior behavior. A truly bare `hex usage collect` (no override flags at all)
+/// runs every known kind in sequence, per decision
+/// usage-ledger-provider-agnostic-2026-09-14: no LLM path should silently sit
+/// outside the ledger. A failure in one kind is reported and reflected in the
+/// exit code, but never skips the remaining kinds.
 fn collect(
+    source_kind: Option<String>,
+    source: Option<PathBuf>,
+    codex_root: Option<PathBuf>,
+    claude_root: Option<PathBuf>,
+    ledger: Option<PathBuf>,
+    max_records: usize,
+) -> i32 {
+    let codex_explicit = source.is_some() || codex_root.is_some();
+    let claude_explicit = claude_root.is_some();
+    let kinds: Vec<&str> = match source_kind.as_deref() {
+        Some("codex-jsonl") => vec!["codex-jsonl"],
+        Some("claude-transcripts") => vec!["claude-transcripts"],
+        Some(other) => {
+            eprintln!("usage collect: unknown --source-kind {other}");
+            return 1;
+        }
+        None if codex_explicit && !claude_explicit => vec!["codex-jsonl"],
+        None if claude_explicit && !codex_explicit => vec!["claude-transcripts"],
+        None => vec!["codex-jsonl", "claude-transcripts"],
+    };
+    let mut exit = 0;
+    for kind in kinds {
+        let code = match kind {
+            "codex-jsonl" => {
+                collect_codex_jsonl(source.clone(), codex_root.clone(), ledger.clone(), max_records)
+            }
+            "claude-transcripts" => {
+                collect_claude_transcripts(claude_root.clone(), ledger.clone(), max_records)
+            }
+            _ => unreachable!("kinds is built from a closed set above"),
+        };
+        if code != 0 {
+            exit = code;
+        }
+    }
+    exit
+}
+
+/// `claude-transcripts` CLI wrapper: resolves defaults, opens the ledger, and
+/// reports the result the same way `collect_codex_jsonl` does (stdout summary
+/// line + `usage-tracking`/`collect` telemetry health event) so a failure here
+/// is exactly as loud as a Codex collection failure (S6).
+fn collect_claude_transcripts(
+    claude_root: Option<PathBuf>,
+    ledger: Option<PathBuf>,
+    max_records: usize,
+) -> i32 {
+    let root = claude_root.unwrap_or_else(default_projects_dir);
+    let ledger_path = ledger.unwrap_or_else(default_ledger);
+    if let Some(parent) = ledger_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("usage collect: cannot create ledger directory: {e}");
+            return 1;
+        }
+    }
+    let mut opened = match UsageLedger::open(&ledger_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("usage collect: failed: {e:?}");
+            health("error", "kind=claude-transcripts ledger_open_failed".into());
+            return 1;
+        }
+    };
+    let result = import_claude_transcripts(&root, &mut opened, max_records);
+    if let Some(err) = &result.error {
+        eprintln!("usage collect: claude-transcripts import failed: {err}");
+        health("error", format!("kind=claude-transcripts import_failed={err}"));
+        return 1;
+    }
+    println!(
+        "usage collect: source=claude-transcripts accepted={} duplicates={} conflicts={} truncated={}",
+        result.accepted, result.duplicates, result.conflicts, result.truncated
+    );
+    health(
+        "ok",
+        format!(
+            "kind=claude-transcripts accepted={} duplicates={} conflicts={} truncated={}",
+            result.accepted, result.duplicates, result.conflicts, result.truncated
+        ),
+    );
+    0
+}
+
+fn collect_codex_jsonl(
     source: Option<PathBuf>,
     codex_root: Option<PathBuf>,
     ledger: Option<PathBuf>,
@@ -622,6 +896,131 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc::now()
+    }
+
+    /// Claude Code transcript line, field-for-field matching real
+    /// `~/.claude/projects/<proj>/<session>.jsonl` records (confirmed by
+    /// reading a live transcript during orientation, not a test read):
+    /// top-level `requestId`/`type`/`sessionId`/`timestamp`, and
+    /// `message.model`/`message.usage.{input_tokens,cache_creation_input_tokens,
+    /// cache_read_input_tokens,output_tokens}`.
+    fn claude_turn(
+        request_id: &str,
+        session_id: &str,
+        mins_ago: i64,
+        model: &str,
+        input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        output_tokens: u64,
+    ) -> String {
+        let ts = (now() - Duration::minutes(mins_ago)).to_rfc3339();
+        format!(
+            r#"{{"type":"assistant","requestId":"{request_id}","timestamp":"{ts}","sessionId":"{session_id}","message":{{"model":"{model}","usage":{{"input_tokens":{input_tokens},"cache_creation_input_tokens":{cache_creation_input_tokens},"cache_read_input_tokens":{cache_read_input_tokens},"output_tokens":{output_tokens}}}}}}}"#
+        )
+    }
+
+    /// Task Txv7phcj8 (claude-transcripts source kind): a recursive scan of a
+    /// fixture `~/.claude/projects`-shaped tree must import one canonical
+    /// `claude-code`/`local-claude-code` ledger row per distinct `requestId`
+    /// — including the nested `<session>/subagents/agent-*.jsonl` shape that
+    /// the 2026-06-12 burn-guard root-cause proved load-bearing — dedupe the
+    /// same requestId appearing in two files, attribute `root_task_family` to
+    /// the session id, and map Claude's `cache_read_input_tokens` (a SIBLING
+    /// of `input_tokens`) into the ledger's `cached_input_tokens` (a SUBSET of
+    /// `input_tokens`, enforced by `summary_groups`'s validity predicate) by
+    /// folding cache reads into the ledger's `input_tokens` total. Re-import
+    /// must be idempotent (no duplicate canonical rows).
+    ///
+    /// `import_claude_transcripts` is fully implemented (see its doc comment
+    /// above its definition): this test is GREEN, exercising the recursive
+    /// scan, nested-subagent discovery, requestId dedupe, and idempotent
+    /// re-import against a fixture tree — never the live `~/.claude/projects`.
+    #[test]
+    fn import_claude_transcripts_collects_assistant_usage_with_dedupe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_root = tmp.path().join("claude-projects");
+        let session = "sess-uuid-1";
+
+        // Main session transcript: one turn (req-1).
+        write_jsonl(
+            &claude_root.join("-proj/").join(format!("{session}.jsonl")),
+            &[claude_turn(
+                "req-1", session, 10, "claude-sonnet-4-6", 100, 7_000, 18_000, 55,
+            )],
+        );
+        // Nested subagent transcript for the SAME session (req-2). Subagent
+        // transcripts live under `<session>/subagents/agent-*.jsonl` — a
+        // one-level scan would miss this, same failure mode as burn's.
+        write_jsonl(
+            &claude_root
+                .join("-proj")
+                .join(session)
+                .join("subagents")
+                .join("agent-abc.jsonl"),
+            &[claude_turn(
+                "req-2", session, 5, "claude-haiku-4-5", 20, 100, 200, 10,
+            )],
+        );
+        // req-1 repeated in a different file — must dedupe to one row.
+        write_jsonl(
+            &claude_root.join("-proj/other.jsonl"),
+            &[claude_turn(
+                "req-1", session, 10, "claude-sonnet-4-6", 100, 7_000, 18_000, 55,
+            )],
+        );
+
+        let mut ledger = UsageLedger::open(tmp.path().join("usage.db")).unwrap();
+
+        let result = import_claude_transcripts(&claude_root, &mut ledger, 1_000);
+        assert_eq!(
+            result.accepted, 2,
+            "one accepted row per distinct requestId across main + nested subagent transcripts, req-1 deduped"
+        );
+
+        let rows = ledger.rows(100, 0).unwrap();
+        let claude_rows: Vec<_> = rows.iter().filter(|r| r.provider == "claude-code").collect();
+        assert_eq!(
+            claude_rows.len(),
+            2,
+            "expected 2 distinct claude-code ledger rows, got {claude_rows:?}"
+        );
+
+        let req1 = claude_rows
+            .iter()
+            .find(|r| r.response_id == "req-1")
+            .expect("req-1 present as a canonical row");
+        assert_eq!(req1.account_scope, "local-claude-code");
+        assert_eq!(
+            req1.root_task_family.as_deref(),
+            Some(session),
+            "root_task_family must be the Claude Code session id"
+        );
+        assert_eq!(req1.model.as_deref(), Some("claude-sonnet-4-6"));
+        // input_tokens(ledger) = raw input + cache_read (cache_read is a
+        // SIBLING in Claude's schema, but must become a SUBSET for the
+        // ledger's summary_groups validity predicate below).
+        assert_eq!(req1.input_tokens, Some(100 + 18_000));
+        assert_eq!(req1.cached_input_tokens, Some(18_000));
+        assert_eq!(req1.cache_write_input_tokens, Some(7_000));
+        assert_eq!(req1.output_tokens, Some(55));
+        assert!(
+            req1.input_tokens.unwrap() >= req1.cached_input_tokens.unwrap(),
+            "must satisfy summary_groups's input_tokens>=cached_input_tokens validity predicate"
+        );
+
+        // Re-import must be idempotent: no duplicate canonical rows.
+        let result2 = import_claude_transcripts(&claude_root, &mut ledger, 1_000);
+        assert_eq!(
+            result2.accepted, 0,
+            "re-import of unchanged transcripts must not add new canonical rows"
+        );
+        let rows_after = ledger.rows(100, 0).unwrap();
+        assert_eq!(
+            rows_after.iter().filter(|r| r.provider == "claude-code").count(),
+            2,
+            "re-import must not duplicate canonical claude-code rows"
+        );
     }
 
     /// Synthetic spike fixture: $120 of Fable output inside the window →
