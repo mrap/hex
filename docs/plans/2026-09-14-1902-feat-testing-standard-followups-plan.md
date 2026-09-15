@@ -37,7 +37,7 @@ The audit (`$HEX_DIR/projects/hex-ops/audits/test-audit-2026-09-14.md`) found th
 
 In scope: the items above, in hex-foundation only.
 
-Out of scope, not deferred: instance edits in mrap-hex (the instance copy of the standard stays as is and points at the foundation file by a later `/hex-upgrade`).
+Out of scope, not deferred: instance edits in the personal instance (the instance copy of the standard stays as is and points at the foundation file by a later `/hex-upgrade`).
 
 Why one PR: every unit traces to the same audit and Mike asked for the follow-ups as one changeset. The units declare no dependencies on each other so they can be reviewed and reverted commit by commit inside that one PR.
 

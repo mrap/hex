@@ -1,6 +1,6 @@
 # Testing standard for hex and every future project
 
-Version 1, 2026-09-14. Applies to hex-foundation, mrap-hex, BOI specs, and any new project in any language. Written to be checked by a reviewer, human or agent, without judgment calls. This file is the source of truth (SO S1). The instance copy at `$HEX_DIR/projects/hex-ops/standards/testing-standard.md` mirrors it. Background: `$HEX_DIR/projects/hex-ops/plans/cto-testing-posture-2026-09-14.md` (the pyramid), `$HEX_DIR/projects/hex-ops/audits/test-audit-2026-09-14.md` (the numbers behind these rules).
+Version 1, 2026-09-14. Applies to hex-foundation, the personal instance, BOI specs, and any new project in any language. Written to be checked by a reviewer, human or agent, without judgment calls. This file is the source of truth (SO S1). The instance copy at `$HEX_DIR/projects/hex-ops/standards/testing-standard.md` mirrors it. Background: `$HEX_DIR/projects/hex-ops/plans/cto-testing-posture-2026-09-14.md` (the pyramid), `$HEX_DIR/projects/hex-ops/audits/test-audit-2026-09-14.md` (the numbers behind these rules).
 
 ## 1. Principles
 
