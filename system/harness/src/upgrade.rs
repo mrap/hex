@@ -1383,11 +1383,7 @@ fn sync_versions_file_protected(
                         // upgrade that only restarted the harness). Only jobs actually
                         // installed on this box are reloaded (A2); an empty list prints
                         // nothing.
-                        let launch_agents_dir = std::env::var_os("HOME")
-                            .map(PathBuf::from)
-                            .unwrap_or_default()
-                            .join("Library/LaunchAgents");
-                        let launchd_jobs = sanctioned_launchd_jobs(&launch_agents_dir);
+                        let launchd_jobs = sanctioned_launchd_jobs(&default_launch_agents_dir());
                         if !launchd_jobs.is_empty() {
                             if let Err(e) =
                                 reload_launchd_jobs_with(&launchd_jobs, reload_launchd_job)
@@ -1470,6 +1466,15 @@ fn build_and_install_code_intel(hex_dot_dir: &Path, preserve_identity: bool) {
             "  [WARN] code-intel cargo build failed — cq/scipd not refreshed (hex swap unaffected)"
         ),
     }
+}
+
+/// The per-user LaunchAgents directory, `$HOME/Library/LaunchAgents`.
+/// An unset HOME yields a relative path that matches nothing.
+fn default_launch_agents_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Library/LaunchAgents")
 }
 
 /// Which sanctioned launchd jobs are actually installed on this box, in
@@ -2432,11 +2437,7 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     if cfg.dry_run {
-        let launch_agents_dir = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join("Library/LaunchAgents");
-        let launchd_jobs = sanctioned_launchd_jobs(&launch_agents_dir);
+        let launchd_jobs = sanctioned_launchd_jobs(&default_launch_agents_dir());
         if launchd_jobs.is_empty() {
             println!("  → launchd jobs to reload after a binary swap: none installed");
         } else {
