@@ -278,12 +278,14 @@ failed, even when the others succeeded.
 
 ### `hex-usage-tracking` worker
 
-A harness cron worker runs bare `hex usage collect --max-records 1000` every
-5 minutes (`0 */5 * * * * *`). It starts no daemon and sends no alerts.
-Failures show up as a telemetry row (`source=usage-tracking
-event=collect`), and repeated failures coalesce instead of filling the
-store. Each fire is auto-traced like any other harness worker, so `hex
-failures` covers it.
+A harness cron worker registers one handler per source kind, all on the
+same 5-minute schedule (`0 */5 * * * * *`). Each handler runs
+`hex usage collect --source-kind <kind> --max-records 1000`, so one kind
+failing never skips the others, and each kind gets its own telemetry row:
+`hex-usage-tracking::codex-jsonl`, `::claude-transcripts`,
+`::boi-phase-runs`, `::harness-llm-cost`, `::headless-claude-json`. The
+worker starts no daemon and sends no alerts. `hex failures` covers every
+handler like any other harness worker.
 
 ### `hex usage report`
 
