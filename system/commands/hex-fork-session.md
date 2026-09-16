@@ -32,12 +32,12 @@ Principle (operator correction, 2026-09-16): "When I ask you to fork into anothe
 3. Pipe it to the launcher (use a heredoc delimiter other than EOF if your shell block already uses EOF):
 
 ```bash
-cat <<'HANDOFF' | "$HEX_DIR"/.hex/scripts/hex-fork-session <name> --purpose "<one line for the fleet table>" [--model sonnet] [--effort medium]
+cat <<'HANDOFF' | "$HEX_DIR"/.hex/scripts/hex-fork-session <name> --purpose "<one line for the fleet table>" --kickoff "<work queue item 1, verbatim, as an instruction>" [--model sonnet] [--effort medium]
 <handoff markdown>
 HANDOFF
 ```
 
-What the launcher does: stages the handoff at `.hex/run/handoffs/<name>.md`; starts the detached tmux session; runs `hex-new <name> --fresh`; the SessionStart hook (`"$HEX_DIR"/.hex/scripts/hex-handoff-inject`, declared in `system/hooks/required-hooks.json`) prints the handoff into the new session's context and archives it to `projects/hex-ops/handoffs/<name>-<stamp>.md`; verifies the Claude Code banner; sends "Start on the first item in the handoff work queue."; registers the session in `projects/hex-ops/sessions.md`. Non-zero exit with the pane contents if anything fails.
+What the launcher does: stages the handoff at `.hex/run/handoffs/<name>.md`; starts the detached tmux session; runs `hex-new <name> --fresh`; the SessionStart hook (`"$HEX_DIR"/.hex/scripts/hex-handoff-inject`, declared in `system/hooks/required-hooks.json`) prints the handoff into the new session's context and archives it to `projects/hex-ops/handoffs/<name>-<stamp>.md`; verifies the Claude Code banner; sends the `--kickoff` prompt (pass work-queue item 1 verbatim so the session starts on the task instead of re-deriving context; default is the generic "Start on the first item in the handoff work queue."); registers the session in `projects/hex-ops/sessions.md`. Non-zero exit with the pane contents if anything fails.
 
 4. Report one line: name + `tmux attach -t <name>`. Then continue the original thread here.
 

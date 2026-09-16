@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hex-fork-session <name> [--purpose "one line"] [--launch CMD] [extra launcher flags...] < handoff.md
+# hex-fork-session <name> [--purpose "one line"] [--kickoff TEXT] [--launch CMD] [extra launcher flags...] < handoff.md
 #
 # Fork the current thread into its own hex session WITH its context. Stages the handoff so the
 # SessionStart hook (hex-handoff-inject) injects it, launches a detached tmux session, verifies
@@ -12,10 +12,12 @@ set -euo pipefail
 HEX_DIR="${HEX_DIR:-$HOME/hex}"
 name="${1:?usage: hex-fork-session <name> [--purpose TEXT] [--launch CMD] [flags...] < handoff.md}"; shift
 [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "ERR: name must be kebab-case (tmux forbids ':' and '.')" >&2; exit 2; }
+kickoff="Start on the first item in the handoff work queue."
 purpose="forked session"; launch="${HEX_FORK_LAUNCH:-hex-new @name@ --fresh}"; flags=()
 while (($#)); do case "$1" in
   --purpose) purpose="$2"; shift 2;;
   --launch) launch="$2"; shift 2;;
+  --kickoff) kickoff="$2"; shift 2;;
   *) flags+=("$1"); shift;;
 esac; done
 tmux has-session -t "$name" 2>/dev/null && { echo "ERR: tmux session '$name' already exists; not clobbering" >&2; exit 3; }
@@ -38,7 +40,7 @@ done
 for ((i=1; i<=10; i++)); do [[ -f "$stage/$name.md" ]] || break; sleep 1; done
 [[ -f "$stage/$name.md" ]] && echo "WARN: handoff still staged after launch; the SessionStart hook did not consume it (is hex-handoff-inject wired?)" >&2
 sleep "${HEX_FORK_KICKOFF_DELAY:-2}"
-tmux send-keys -t "$name" "Start on the first item in the handoff work queue." Enter
+tmux send-keys -t "$name" "$kickoff" Enter
 
 reg="${HEX_SESSION_REGISTRY:-$HEX_DIR/projects/hex-ops/sessions.md}"
 if [[ -f "$reg" ]]; then

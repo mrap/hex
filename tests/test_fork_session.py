@@ -97,6 +97,11 @@ class ForkTests(Base):
         self.assertEqual(r.returncode, 2); self.assertIn("empty handoff", r.stderr)
         self.assertFalse((self.hex / ".hex/run/handoffs/eps.md").exists())
 
+    def test_kickoff_flag_is_sent_verbatim(self):
+        r = self.run_fork("eta", "body\n", "--kickoff", "Do change #2: add since/expires/source.")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("send-keys -t eta Do change #2: add since/expires/source. Enter", self.calls.read_text())
+
     def test_no_registry_is_fine(self):
         r = self.run_fork("zeta", "body\n")
         self.assertEqual(r.returncode, 0, r.stderr); self.assertNotIn("Traceback", r.stderr)

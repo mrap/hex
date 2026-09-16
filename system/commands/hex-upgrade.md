@@ -41,6 +41,14 @@ If the upgrade script reports that the AGENTS.md template has changed:
 
 5. Show the user a summary of what changed in AGENTS.md and ask for confirmation before writing.
 
+## Step 2b: Merge required hooks into settings.json
+
+Hooks declared in the foundation manifest must reach existing instances too, not only fresh installs:
+```bash
+python3 "$HEX_DIR/.hex/scripts/hex-hooks-merge" "$HEX_DIR/.hex/hooks/required-hooks.json" "$HEX_DIR/.claude/settings.json"
+```
+It prints one line per hook it added (idempotent; nothing printed means already wired). Report any additions in Step 4.
+
 ## Step 3: Rebuild memory index
 
 After upgrade, rebuild the memory index to pick up any changes:

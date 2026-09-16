@@ -88,6 +88,7 @@ jobs:
           package-manager-cache: false
       - run: python3 -I -B tests/test_cleanup_verify.py
       - run: python3 -I -B tests/test_fork_session.py
+      - run: python3 -I -B tests/test_hooks_merge.py
 
   fmt:
     name: cargo fmt --check
