@@ -206,6 +206,7 @@ expectation is checked by `hex failures` (MISSED/NEVER-RAN detection).
 | `hex-failures` | daily 13:30 UTC (≈06:30 PT) | unexpected-failure digest (see `hex failures` above) |
 | `resources` | hourly | disk sampler + pressure rules (see Resources above) |
 | `boi-spec-watch` | every 5 min (`0 */5 * * * * *`) | watches BOI spec/task state above phase level |
+| `hex-watch` | every 5 min (`0 */5 * * * * *`) | the general watcher: polls every pending watch (Gmail, hex events), fires actions once, emits outcomes. Spec: [hex-watch.md](hex-watch.md) |
 | `hex-usage-tracking` | every 5 min (`0 */5 * * * * *`) | collects usage into the ledger (see [Usage tracking](#usage-tracking-hex-usage) below) |
 
 ### `boi-spec-watch`

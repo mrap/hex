@@ -14,6 +14,7 @@ mod integration_cmd;
 use hex::alert;
 use hex::memory;
 use hex::telemetry;
+use hex::watch;
 mod env;
 mod hook;
 mod learnings;
@@ -203,6 +204,14 @@ enum Commands {
     Hitl {
         #[command(subcommand)]
         command: HitlCommands,
+    },
+    /// General watcher (Standing Order S10: hex owns the wait). "When X
+    /// happens, do Y once, loudly, never forever." Sources: gmail, event.
+    /// Spec: docs/hex-watch.md.
+    #[command(display_order = 4)]
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommands,
     },
     /// Print resolved `claude -p` flags for a lean-run profile (spec Sf5bj7y1d).
     ///
@@ -703,6 +712,79 @@ enum TelemetryCommands {
     Prune {
         #[arg(long = "keep-days", default_value_t = 30)]
         keep_days: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum WatchCommands {
+    /// Create a pending watch. Prints the 8-char id.
+    Add {
+        /// Shell command run once on the first valid hit (exit 0 = done).
+        #[arg(long)]
+        action: Option<String>,
+        /// Deliver the hit into this hex session's inbox instead (default
+        /// action when --action is omitted).
+        #[arg(long, value_name = "SESSION")]
+        notify: Option<String>,
+        /// With --notify: also type the line into that tmux session now
+        /// (opt-in; it arrives as a prompt).
+        #[arg(long)]
+        nudge: bool,
+        /// gmail | event
+        #[arg(long, default_value = "gmail")]
+        source: String,
+        /// Source-specific match field, repeatable (event=<name>, query=..., account=...).
+        #[arg(long = "match", value_name = "K=V")]
+        r#match: Vec<String>,
+        /// gmail: the Gmail search query (shorthand for --match query=...).
+        #[arg(long)]
+        query: Option<String>,
+        /// gmail: which account (primary | legacy).
+        #[arg(long, default_value = "primary")]
+        account: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        /// ISO time; only events at/after this fire (default: now).
+        #[arg(long)]
+        since: Option<String>,
+        /// Duration from now like 30m, 12h, 7d (default from watch.toml, 14d).
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// Every live watch (pending/firing/failed/expired) with age, time to
+    /// expiry, last outcome. `--all` includes done.
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// One-line summary: counts, next expiry, last tick, poll fail streak.
+    Status,
+    /// One pass over pending watches. `--dry-run` prints matches, runs nothing.
+    Tick {
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Put a failed, stuck-firing, or expired watch back to pending.
+    Retry { id: String },
+    /// Close a watch by hand.
+    Done { id: String },
+    /// Delete a watch record.
+    Drop { id: String },
+    /// Deliver a line into a hex session's inbox (`all` = every tmux session).
+    /// `--now` also types it into that tmux pane (opt-in).
+    Notify {
+        session: String,
+        text: String,
+        #[arg(long)]
+        now: bool,
+    },
+    /// Print and clear this session's pending events (SessionStart hook).
+    /// `--peek` leaves them in place. Session from HEX_SESSION_NAME or tmux.
+    Inbox {
+        #[arg(long)]
+        peek: bool,
+        #[arg(long)]
+        session: Option<String>,
     },
 }
 
@@ -1384,6 +1466,9 @@ fn main() {
         }
         Commands::Hitl { command } => {
             std::process::exit(run_hitl(command));
+        }
+        Commands::Watch { command } => {
+            std::process::exit(run_watch(command));
         }
         Commands::Hook { command } => hook::run(command),
         Commands::Usage { command } => std::process::exit(usage::run(command)),
@@ -2903,6 +2988,346 @@ fn hitl_close(
         }
         Err(e) => {
             eprintln!("hex hitl: {e}");
+            1
+        }
+    }
+}
+
+fn run_watch(command: WatchCommands) -> i32 {
+    use hex::watch::{self, notify, store, tick};
+
+    let hex_dir = hitl_hex_dir();
+    let now = chrono::Utc::now();
+    let config = match watch::load_config(&hex_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hex watch: {e}");
+            return 2;
+        }
+    };
+    let rel = |t: Option<chrono::DateTime<chrono::Utc>>| -> String {
+        let Some(t) = t else { return "-".to_string() };
+        let d = (t - now).num_seconds();
+        let s = d.unsigned_abs();
+        // nearest unit, so a fresh 14d watch reads "in 14d", not "in 13d"
+        let txt = if s < 60 {
+            format!("{s}s")
+        } else if s < 3600 {
+            format!("{}m", (s + 30) / 60)
+        } else if s < 86_400 {
+            format!("{}h", (s + 1800) / 3600)
+        } else {
+            format!("{}d", (s + 43_200) / 86_400)
+        };
+        if d > 0 {
+            format!("in {txt}")
+        } else {
+            format!("{txt} ago")
+        }
+    };
+
+    match command {
+        WatchCommands::Add {
+            action,
+            notify: notify_session,
+            nudge,
+            source,
+            r#match,
+            query,
+            account,
+            note,
+            since,
+            expires,
+        } => {
+            let mut m = std::collections::BTreeMap::new();
+            for kv in r#match {
+                let Some((k, v)) = kv.split_once('=') else {
+                    eprintln!("hex watch add: --match needs K=V, got {kv:?}");
+                    return 2;
+                };
+                m.insert(k.to_string(), v.to_string());
+            }
+            if let Some(q) = query {
+                m.insert("query".to_string(), q);
+            }
+            match source.as_str() {
+                "gmail" => {
+                    if m.get("query").map(|q| q.trim().is_empty()).unwrap_or(true) {
+                        eprintln!(
+                            "hex watch add: gmail watch needs --query (or --match query=...)"
+                        );
+                        return 2;
+                    }
+                    m.entry("account".to_string()).or_insert(account);
+                }
+                "event" => {
+                    if m.get("event").map(|e| e.trim().is_empty()).unwrap_or(true) {
+                        eprintln!("hex watch add: event watch needs --match event=<name>");
+                        return 2;
+                    }
+                }
+                other => {
+                    eprintln!("hex watch add: unknown source {other:?} (gmail | event)");
+                    return 2;
+                }
+            }
+            let action = match (action, notify_session) {
+                (Some(a), _) => a,
+                // `$HEX_DIR/.hex/bin/hex` is the installed binary; PATH inside an
+                // action is the allowlisted parent PATH and may resolve an older hex.
+                (None, Some(sess)) => format!(
+                    "\"$HEX_DIR/.hex/bin/hex\" watch notify {} \"watch $WATCH_ID fired ($WATCH_SOURCE $WATCH_KEY): $WATCH_NOTE\"{}",
+                    hex::watch::sources::shell_quote(&sess),
+                    if nudge { " --now" } else { "" }
+                ),
+                (None, None) => {
+                    eprintln!("hex watch add: needs --action CMD or --notify SESSION");
+                    return 2;
+                }
+            };
+            let since = match since {
+                Some(s) => match store::parse_iso(&s) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        eprintln!("hex watch add: --since: {e}");
+                        return 2;
+                    }
+                },
+                None => None,
+            };
+            let expires_in = match store::parse_duration(
+                expires.as_deref().unwrap_or(&config.default_expires),
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("hex watch add: --expires: {e}");
+                    return 2;
+                }
+            };
+            match store::create(
+                &hex_dir,
+                store::NewWatch {
+                    source,
+                    r#match: m,
+                    action,
+                    note,
+                    since,
+                    expires_in,
+                },
+                now,
+            ) {
+                Ok(w) => {
+                    println!("{}", w.id);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("hex watch add: {e}");
+                    1
+                }
+            }
+        }
+        WatchCommands::List { all } => {
+            let ws = match store::load_all(&hex_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("hex watch list: {e}");
+                    return 1;
+                }
+            };
+            let ws: Vec<_> = ws
+                .into_iter()
+                .filter(|w| all || w.status.is_live())
+                .collect();
+            if ws.is_empty() {
+                println!("{}", if all { "no watches" } else { "no live watches" });
+                return 0;
+            }
+            println!(
+                "{:<8} {:<8} {:<9} {:<9} {:<9} NOTE | SOURCE MATCH",
+                "ID", "STATUS", "AGE", "EXPIRES", "FIRED"
+            );
+            let mut stuck = Vec::new();
+            for w in &ws {
+                let mut outcome = rel(w.fired);
+                if w.status == store::Status::Failed {
+                    outcome.push_str(" FAILED");
+                }
+                if w.status == store::Status::Firing {
+                    stuck.push(w.id.clone());
+                }
+                println!(
+                    "{:<8} {:<8} {:<9} {:<9} {:<9} {} | {} {}",
+                    w.id,
+                    w.status.as_str(),
+                    rel(Some(w.created)),
+                    rel(w.expires),
+                    outcome,
+                    if w.note.is_empty() { "-" } else { &w.note },
+                    w.source,
+                    serde_json::to_string(&w.r#match).unwrap_or_default()
+                );
+            }
+            if !stuck.is_empty() {
+                println!(
+                    "!! {} watch(es) stuck in 'firing' (worker died mid-action; `hex watch retry ID` to re-arm): {}",
+                    stuck.len(),
+                    stuck.join(" ")
+                );
+            }
+            0
+        }
+        WatchCommands::Status => {
+            let ws = match store::load_all(&hex_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("hex watch status: {e}");
+                    return 1;
+                }
+            };
+            let count = |st: store::Status| ws.iter().filter(|w| w.status == st).count();
+            let next = ws
+                .iter()
+                .filter(|w| w.status == store::Status::Pending)
+                .filter_map(|w| w.expires)
+                .min();
+            let state = store::load_state(&hex_dir).unwrap_or_default();
+            println!(
+                "hex-watch: {} pending, {} firing, {} failed, {} expired, {} done | next expiry {} | last tick {} | poll fail streak {}",
+                count(store::Status::Pending),
+                count(store::Status::Firing),
+                count(store::Status::Failed),
+                count(store::Status::Expired),
+                count(store::Status::Done),
+                rel(next),
+                if state.last_tick.is_some() { rel(state.last_tick) } else { "never".to_string() },
+                state.poll_fail_streak
+            );
+            0
+        }
+        WatchCommands::Tick { dry_run } => {
+            let substrate = tick::OpsSubstrate;
+            let shell = tick::ShShell;
+            let alerter = tick::RealAlerter {
+                hex_dir: hex_dir.clone(),
+            };
+            let env = tick::Env {
+                hex_dir: hex_dir.clone(),
+                config,
+                substrate: &substrate,
+                shell: &shell,
+                alerter: &alerter,
+                parent_env: tick::parent_env(),
+                dry_run,
+                log: &tick::log_stderr,
+            };
+            match tick::run(&env, now) {
+                Ok(rep) => {
+                    for line in &rep.would_fire {
+                        println!("DRY-RUN would fire {line}");
+                    }
+                    println!(
+                        "ticked {} pending watch(es): fired {}, failed {}, expired {}, poll failures {}",
+                        rep.pending, rep.fired, rep.failed, rep.expired, rep.poll_failures
+                    );
+                    if rep.poll_failures > 0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Err(e) => {
+                    eprintln!("hex watch tick: {e}");
+                    1
+                }
+            }
+        }
+        WatchCommands::Retry { id } => run_watch_transition(&hex_dir, "retry", &id),
+        WatchCommands::Done { id } => run_watch_transition(&hex_dir, "done", &id),
+        WatchCommands::Drop { id } => run_watch_transition(&hex_dir, "drop", &id),
+        WatchCommands::Notify {
+            session,
+            text,
+            now: type_now,
+        } => match notify::notify(&hex_dir, &notify::RealTmux, &session, &text, type_now) {
+            Ok(rep) => {
+                for s in &rep.not_running {
+                    eprintln!("hex watch notify: no tmux session '{s}'; inbox only (delivered on its next start)");
+                }
+                for e in &rep.errors {
+                    eprintln!("hex watch notify: {e}");
+                }
+                if rep.errors.is_empty() {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("hex watch notify: {e}");
+                1
+            }
+        },
+        WatchCommands::Inbox { peek, session } => {
+            let Some(session) = session.or_else(notify::current_session) else {
+                return 0;
+            };
+            match notify::drain(&hex_dir, &session, peek) {
+                Ok(Some(text)) => {
+                    print!("{text}");
+                    0
+                }
+                Ok(None) => 0,
+                Err(e) => {
+                    eprintln!("hex watch inbox: {e}");
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn run_watch_transition(hex_dir: &std::path::Path, verb: &str, id: &str) -> i32 {
+    use hex::watch::store;
+    let now = chrono::Utc::now();
+    let Some(mut w) = store::load(hex_dir, id).unwrap_or_else(|e| {
+        eprintln!("hex watch {verb}: {e}");
+        None
+    }) else {
+        eprintln!("hex watch {verb}: no watch {id}");
+        return 1;
+    };
+    let res = match verb {
+        "drop" => {
+            store::delete(hex_dir, id).and_then(|_| store::log(hex_dir, id, "drop", now, None))
+        }
+        "done" => {
+            w.status = store::Status::Done;
+            w.fired = Some(now);
+            store::save(hex_dir, &w)
+                .and_then(|_| store::log(hex_dir, id, "done", now, Some("manual")))
+        }
+        "retry" => {
+            if !w.status.is_retryable() {
+                eprintln!(
+                    "hex watch retry: watch {id} is {}; retry needs failed, firing or expired",
+                    w.status
+                );
+                return 2;
+            }
+            w.status = store::Status::Pending;
+            w.fired = None;
+            w.key = None;
+            w.error = None;
+            w.expired_at = None;
+            w.retried = Some(now);
+            store::save(hex_dir, &w).and_then(|_| store::log(hex_dir, id, "retry", now, None))
+        }
+        _ => unreachable!(),
+    };
+    match res {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("hex watch {verb}: {e}");
             1
         }
     }

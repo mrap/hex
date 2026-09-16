@@ -57,8 +57,31 @@ fn run_with_io<F>(
     };
 
     let outcome = crate::memory::recall::recall(&hex_dir, prompt, false);
-    if outcome.injected {
-        if let Err(error) = emit_context(output, &outcome.context) {
+    // hex-watch session inbox (docs/hex-watch.md, "Session delivery"): events
+    // delivered to this session land here, banner-wrapped, consumed once.
+    let inbox = match crate::watch::notify::current_session() {
+        Some(session) => match crate::watch::notify::drain(&hex_dir, &session, false) {
+            Ok(text) => text,
+            Err(error) => {
+                let _ = writeln!(
+                    error_output,
+                    "[hook/user-prompt-submit] session inbox: {error}"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let mut context = if outcome.injected {
+        outcome.context.clone()
+    } else {
+        String::new()
+    };
+    if let Some(text) = inbox {
+        context.push_str(&text);
+    }
+    if !context.is_empty() {
+        if let Err(error) = emit_context(output, &context) {
             let _ = writeln!(
                 error_output,
                 "[hook/user-prompt-submit] write hook output: {error}"
