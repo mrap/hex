@@ -9,6 +9,10 @@
     {
       "matcher": "",
       "command": "\"$HEX_DIR\"/.hex/scripts/hex-handoff-inject"
+    },
+    {
+      "matcher": "",
+      "command": "hex watch inbox"
     }
   ]
 }

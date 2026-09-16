@@ -42,6 +42,7 @@ pub mod types;
 pub mod usage_kinds;
 pub mod usage_ledger;
 pub mod usage_reporting;
+pub mod watch;
 pub mod wild;
 pub mod worker;
 pub mod workers;
