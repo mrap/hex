@@ -4,5 +4,11 @@
       "matcher": "Write|Edit|MultiEdit|NotebookEdit",
       "command": "hex hook worktree-guard"
     }
+  ],
+  "SessionStart": [
+    {
+      "matcher": "",
+      "command": "\"$HEX_DIR\"/.hex/scripts/hex-handoff-inject"
+    }
   ]
 }

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# hex-fork-session <name> [--purpose "one line"] [--launch CMD] [extra launcher flags...] < handoff.md
+#
+# Fork the current thread into its own hex session WITH its context. Stages the handoff so the
+# SessionStart hook (hex-handoff-inject) injects it, launches a detached tmux session, verifies
+# Claude Code came up, sends the kickoff prompt, and registers the session if a registry exists.
+# Principle: the new session boots already briefed; the operator never re-explains.
+#
+# Env: HEX_DIR (default ~/hex); HEX_FORK_LAUNCH (default "hex-new @name@ --fresh", @name@ substituted);
+#      HEX_SESSION_REGISTRY (default $HEX_DIR/projects/hex-ops/sessions.md; skipped if absent).
+set -euo pipefail
+HEX_DIR="${HEX_DIR:-$HOME/hex}"
+name="${1:?usage: hex-fork-session <name> [--purpose TEXT] [--launch CMD] [flags...] < handoff.md}"; shift
+[[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "ERR: name must be kebab-case (tmux forbids ':' and '.')" >&2; exit 2; }
+purpose="forked session"; launch="${HEX_FORK_LAUNCH:-hex-new @name@ --fresh}"; flags=()
+while (($#)); do case "$1" in
+  --purpose) purpose="$2"; shift 2;;
+  --launch) launch="$2"; shift 2;;
+  *) flags+=("$1"); shift;;
+esac; done
+tmux has-session -t "$name" 2>/dev/null && { echo "ERR: tmux session '$name' already exists; not clobbering" >&2; exit 3; }
+[ -t 0 ] && { echo "ERR: pipe the handoff markdown on stdin" >&2; exit 2; }
+
+stage="$HEX_DIR/.hex/run/handoffs"; mkdir -p "$stage"
+cat > "$stage/$name.md"
+[[ -s "$stage/$name.md" ]] || { rm -f "$stage/$name.md"; echo "ERR: empty handoff" >&2; exit 2; }
+
+tmux new-session -d -s "$name" -c "$HEX_DIR"
+tmux send-keys -t "$name" "${launch//@name@/$name} ${flags[*]:-}" Enter
+
+# Verify the runtime banner (S6: loud, show the pane on failure)
+timeout="${HEX_FORK_TIMEOUT:-20}"
+for ((i=1; i<=timeout; i++)); do
+  sleep 1
+  tmux capture-pane -t "$name" -p 2>/dev/null | grep -q "Claude Code" && break
+  if (( i == timeout )); then echo "ERR: Claude Code banner not seen in ${timeout}s. Pane:" >&2; tmux capture-pane -t "$name" -p >&2; exit 4; fi
+done
+for ((i=1; i<=10; i++)); do [[ -f "$stage/$name.md" ]] || break; sleep 1; done
+[[ -f "$stage/$name.md" ]] && echo "WARN: handoff still staged after launch; the SessionStart hook did not consume it (is hex-handoff-inject wired?)" >&2
+sleep "${HEX_FORK_KICKOFF_DELAY:-2}"
+tmux send-keys -t "$name" "Start on the first item in the handoff work queue." Enter
+
+reg="${HEX_SESSION_REGISTRY:-$HEX_DIR/projects/hex-ops/sessions.md}"
+if [[ -f "$reg" ]]; then
+  stamp="$(date '+%Y-%m-%d %H:%M')"
+  row="| \`$name\` | $purpose | $stamp | fresh, Claude Code up | Forked with handoff (hex-fork-session) |"
+  python3 - "$reg" "$row" "$name" "$stamp" <<'PY'
+import re, sys
+p, row, name, stamp = sys.argv[1:]
+s = open(p).read()
+m = re.search(r"^\| `[^`]+` \|.*\n(?=(?:\| `|\n|$))", s, re.M)  # first fleet-table row
+rows = list(re.finditer(r"^\| `[^`]+` \|.*$", s, re.M))
+if rows:
+    last = rows[-1].end(); s = s[:last] + "\n" + row + s[last:]
+s = s.rstrip("\n") + f"\n- {stamp} — Created `{name}` via hex-fork-session (handoff injected at SessionStart).\n"
+open(p, "w").write(s)
+PY
+fi
+echo "OK: session '$name' up with handoff. Attach: tmux attach -t $name"

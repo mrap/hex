@@ -671,3 +671,12 @@ would false-positive on gitignored build dirs. A non-git tree has no tracked
 paths (zero artifacts, correct); a genuine `git` failure is surfaced loudly. So
 `sanitize` catches a deny-set artifact that slips past the hook (e.g. committed
 before the hook was wired) before it can ship in a release.
+
+## Forking a session with context (`hex-fork-session`)
+
+"Hex owns the handoff." When the operator asks to fork the current thread into its own session, the new session must boot already briefed. Mechanism:
+
+- `system/scripts/hex-fork-session <name> [--purpose TEXT] < handoff.md` stages the handoff at `$HEX_DIR/.hex/run/handoffs/<name>.md`, starts a detached tmux session, launches the runtime (`HEX_FORK_LAUNCH`, default `hex-new @name@ --fresh`), verifies the Claude Code banner, sends the kickoff prompt, and appends a row to `$HEX_DIR/projects/hex-ops/sessions.md` if that registry exists.
+- `system/scripts/hex-handoff-inject` runs on `SessionStart` (declared in `system/hooks/required-hooks.json`). If a handoff is staged for this session name (`HEX_SESSION_NAME`, else tmux `#S`), it prints the handoff into context and moves it to `$HEX_DIR/projects/hex-ops/handoffs/<name>-<stamp>.md`. Consumed once; a restart does not re-inject.
+- Operator-facing procedure and handoff template: `system/commands/hex-fork-session.md`.
+- Tests: `tests/test_fork_session.py` (headless, fake tmux).
