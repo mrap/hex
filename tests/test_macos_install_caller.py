@@ -207,7 +207,7 @@ def test_boi_fast_path_uses_verified_state_without_raw_version_call() -> None:
             _function_source()
             + _block_source("_verify_pinned_checkout() {", "_macos_app_prepare() {")
             + _block_source("_resolve_git_tag() {", "# BOI —")
-            + _block_source("install_or_upgrade_boi() {", "\ninstall_or_upgrade_boi\n")
+            + _block_source("install_or_upgrade_boi() {", "\n# HEX_INSTALL_SKIP_BOI=1:")
             + """
 set -euo pipefail
 write_boi_wrapper() { :; }
@@ -250,7 +250,7 @@ def test_boi_signed_fast_path_prechecks_target_before_network_and_keeps_noop_rea
         boi.chmod(0o755)
         shell = temp / "fast-target.sh"
         shell.write_text(
-            _block_source("install_or_upgrade_boi() {", "\ninstall_or_upgrade_boi\n")
+            _block_source("install_or_upgrade_boi() {", "\n# HEX_INSTALL_SKIP_BOI=1:")
             + """
 set -euo pipefail
 write_boi_wrapper() { :; }
@@ -333,7 +333,7 @@ chmod +x "$CARGO_TARGET_DIR/release/boi"
             _function_source()
             + _block_source("_verify_pinned_checkout() {", "_macos_app_prepare() {")
             + _block_source("_resolve_git_tag() {", "# BOI —")
-            + _block_source("install_or_upgrade_boi() {", "\ninstall_or_upgrade_boi\n")
+            + _block_source("install_or_upgrade_boi() {", "\n# HEX_INSTALL_SKIP_BOI=1:")
             + """
 set -euo pipefail
 write_boi_wrapper() { :; }
@@ -396,7 +396,7 @@ def test_managed_boi_extracted_build_uses_fake_adapter_before_fake_cargo() -> No
             _function_source()
             + _block_source("_verify_pinned_checkout() {", "_macos_app_prepare() {")
             + _block_source("_resolve_git_tag() {", "# BOI —")
-            + _block_source("install_or_upgrade_boi() {", "\ninstall_or_upgrade_boi\n")
+            + _block_source("install_or_upgrade_boi() {", "\n# HEX_INSTALL_SKIP_BOI=1:")
             + """
 set -euo pipefail
 SCRIPT_DIR="$TEST_SOURCE"
@@ -788,7 +788,7 @@ fi
 
 
 def test_installer_target_first_check_refusal_precedes_build_side_effects() -> None:
-    boi = _block_source("install_or_upgrade_boi() {", "\ninstall_or_upgrade_boi\n")
+    boi = _block_source("install_or_upgrade_boi() {", "\n# HEX_INSTALL_SKIP_BOI=1:")
     boundary = boi.index("_managed_cargo_target")
     assert boundary < boi.index('mkdir -p "$HOME/.boi/bin"')
     assert boundary < boi.index('git clone "$BOI_REPO"')

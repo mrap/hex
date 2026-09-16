@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# hex-handoff-inject: SessionStart hook helper for forked sessions.
+# If a fork handoff is pending for this session name, print it into the new session's
+# context and archive it (consumed exactly once). Wire in settings.json SessionStart:
+#   "$HEX_DIR"/.hex/scripts/hex-handoff-inject
+# Session name: $HEX_SESSION_NAME (exported by the launcher) or the tmux session name.
+# Staging: $HEX_DIR/.hex/run/handoffs/<name>.md  ->  archive $HEX_DIR/projects/hex-ops/handoffs/
+set -uo pipefail
+HEX_DIR="${HEX_DIR:-$HOME/hex}"
+name="${HEX_SESSION_NAME:-}"
+[[ -z "$name" && -n "${TMUX:-}" ]] && name="$(tmux display-message -p '#S' 2>/dev/null)"
+[[ -z "$name" ]] && exit 0
+pending="$HEX_DIR/.hex/run/handoffs/$name.md"
+[[ -f "$pending" ]] || exit 0
+archive_dir="${HEX_HANDOFF_ARCHIVE:-$HEX_DIR/projects/hex-ops/handoffs}"; mkdir -p "$archive_dir"
+archive="$archive_dir/$name-$(date +%F-%H%M).md"
+printf '\n*** Fork handoff for session "%s" (archived at %s) ***\n\n' "$name" "${archive#$HEX_DIR/}"
+cat "$pending"
+printf '\n*** End handoff. You already have the context above; do not re-ask for it. On the first user turn, start the first item in the work queue. ***\n'
+mv "$pending" "$archive" || { echo "ERROR: could not archive handoff $pending" >&2; exit 1; }

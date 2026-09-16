@@ -364,61 +364,7 @@ if [ -d "$SCRIPT_DIR/system/hooks/scripts" ]; then
 fi
 if [ -f "$HOOKS_MANIFEST" ]; then
     mkdir -p "$TARGET_DIR/.claude"
-    MANIFEST_PATH="$HOOKS_MANIFEST" SETTINGS_PATH="$TARGET_DIR/.claude/settings.json" python3 << 'PYEOF'
-import json, os
-
-manifest_path = os.environ['MANIFEST_PATH']
-settings_path = os.environ['SETTINGS_PATH']
-
-with open(manifest_path) as f:
-    manifest = json.load(f)
-
-if os.path.exists(settings_path):
-    with open(settings_path) as f:
-        try:
-            settings = json.load(f)
-        except json.JSONDecodeError:
-            settings = {}
-else:
-    settings = {}
-
-if 'hooks' not in settings:
-    settings['hooks'] = {}
-
-hooks_section = settings['hooks']
-
-for event_type, hook_defs in manifest.items():
-    if event_type not in hooks_section:
-        hooks_section[event_type] = []
-    event_hooks = hooks_section[event_type]
-    for hook_def in hook_defs:
-        matcher = hook_def.get('matcher', '')
-        if 'command' in hook_def:
-            hook_command = hook_def['command']
-            is_present = any(
-                any(h.get('command', '') == hook_command for h in entry.get('hooks', []))
-                for entry in event_hooks
-            )
-        else:
-            script_rel = hook_def['script']
-            script_name = os.path.basename(script_rel)
-            hook_command = f'bash "$CLAUDE_PROJECT_DIR/{script_rel}"'
-            is_present = any(
-                any(script_name in h.get('command', '') for h in entry.get('hooks', []))
-                for entry in event_hooks
-            )
-        if not is_present:
-            event_hooks.append({
-                'matcher': matcher,
-                'hooks': [{'type': 'command', 'command': hook_command}]
-            })
-
-tmp = settings_path + '.tmp'
-os.makedirs(os.path.dirname(tmp), exist_ok=True)
-with open(tmp, 'w') as f:
-    json.dump(settings, f, indent=2)
-os.replace(tmp, settings_path)
-PYEOF
+    python3 "$SCRIPT_DIR/system/scripts/hex-hooks-merge" "$HOOKS_MANIFEST" "$TARGET_DIR/.claude/settings.json"
     echo "  Claude Code hooks   ✓"
 fi
 
