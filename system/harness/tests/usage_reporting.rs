@@ -8,6 +8,7 @@ use hex::usage_reporting::{
 fn t(s: &str) -> DateTime<Utc> {
     s.parse().unwrap()
 }
+#[allow(clippy::too_many_arguments)]
 fn row(
     id: &str,
     at: &str,
@@ -374,11 +375,47 @@ fn missing_provider_dimensions_are_labeled_unknown() {
 fn incremental_pages_keep_half_open_window_boundaries_and_preceding_change() {
     let start = t("2026-09-10T00:00:00Z");
     let end = t("2026-09-11T00:00:00Z");
-    let rows = vec![
-        row("before", "2026-09-08T23:59:59Z", Some("gpt-5.6-luna"), Some("x"), None, Some(1), Some(0), Some(1)),
-        row("preceding", "2026-09-09T00:00:00Z", Some("gpt-5.6-luna"), Some("x"), None, Some(2), Some(0), Some(1)),
-        row("current-start", "2026-09-10T00:00:00Z", Some("gpt-5.6-luna"), Some("x"), None, Some(3), Some(0), Some(1)),
-        row("current-end", "2026-09-11T00:00:00Z", Some("gpt-5.6-luna"), Some("x"), None, Some(5), Some(0), Some(1)),
+    let rows = [
+        row(
+            "before",
+            "2026-09-08T23:59:59Z",
+            Some("gpt-5.6-luna"),
+            Some("x"),
+            None,
+            Some(1),
+            Some(0),
+            Some(1),
+        ),
+        row(
+            "preceding",
+            "2026-09-09T00:00:00Z",
+            Some("gpt-5.6-luna"),
+            Some("x"),
+            None,
+            Some(2),
+            Some(0),
+            Some(1),
+        ),
+        row(
+            "current-start",
+            "2026-09-10T00:00:00Z",
+            Some("gpt-5.6-luna"),
+            Some("x"),
+            None,
+            Some(3),
+            Some(0),
+            Some(1),
+        ),
+        row(
+            "current-end",
+            "2026-09-11T00:00:00Z",
+            Some("gpt-5.6-luna"),
+            Some("x"),
+            None,
+            Some(5),
+            Some(0),
+            Some(1),
+        ),
     ];
     let mut accumulator = ReportAccumulator::new(Coverage::default(), start, end, false);
     accumulator.extend(&rows[..2]);

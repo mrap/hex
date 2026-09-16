@@ -1232,7 +1232,35 @@ fn gate_codex_parity(repo_root: &Path, skip: SkipFlags) -> GateResult {
     match run_checked("bash tests/codex-parity/run-all.sh", &mut cmd) {
         Err(msg) => GateResult::Fail(msg),
         Ok(r) if r.code == 0 => GateResult::Pass,
-        Ok(r) => GateResult::Fail(format!("codex parity failure (exit {})", r.code)),
+        // S6: the reason names WHICH parity tests failed plus the output tail.
+        // The 2026-09-16 v0.53.0 cut was blocked by "codex parity failure
+        // (exit 1)" with nothing else — the suite's output was captured and
+        // dropped, so the operator could not tell a flake from a regression.
+        Ok(r) => GateResult::Fail(format!(
+            "codex parity failure (exit {}): {}",
+            r.code,
+            parity_failure_detail(&r.combined())
+        )),
+    }
+}
+
+/// The `FAIL` lines of a codex-parity run (at most 8) followed by the output
+/// tail, so a blocked release says which tests failed, not just the exit code.
+fn parity_failure_detail(combined: &str) -> String {
+    let fails: Vec<&str> = combined
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("FAIL"))
+        .take(8)
+        .collect();
+    if fails.is_empty() {
+        output_tail(combined, 400)
+    } else {
+        format!(
+            "{}; tail: {}",
+            fails.join(" | "),
+            output_tail(combined, 200)
+        )
     }
 }
 
@@ -3471,6 +3499,34 @@ mod tests {
             GateResult::Skipped(msg) => assert!(msg.contains("not found"), "got: {msg}"),
             other => panic!("expected Skipped, got {other:?}"),
         }
+    }
+
+    /// Incident 2026-09-16: the v0.53.0 cut reported only "codex parity
+    /// failure (exit 1)"; the suite's own output was dropped. A failing
+    /// parity run must name the failed test in the gate reason.
+    #[test]
+    fn codex_parity_failure_reason_names_the_failed_test() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let suite = root.join("tests/codex-parity");
+        std::fs::create_dir_all(&suite).unwrap();
+        std::fs::write(
+            suite.join("run-all.sh"),
+            "echo 'PASS: something fine'\necho 'FAIL: widget missing'\necho '[FAIL] test-widget'\nexit 1\n",
+        )
+        .unwrap();
+        match gate_codex_parity(root, SkipFlags::default()) {
+            GateResult::Fail(msg) => {
+                assert!(msg.contains("exit 1"), "got: {msg}");
+                assert!(msg.contains("FAIL: widget missing"), "got: {msg}");
+                assert!(msg.contains("[FAIL] test-widget"), "got: {msg}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        assert_eq!(
+            parity_failure_detail("no markers here\nlast line"),
+            "no markers here | last line"
+        );
     }
 
     // -- profiles --------------------------------------------------------------

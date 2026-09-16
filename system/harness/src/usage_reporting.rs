@@ -4,8 +4,8 @@
 //! separates measured tokens from standard-rate credit comparisons and never
 //! calls an estimate an invoice or an account debit.
 
-use crate::usage_ledger::{Coverage, UsageRow};
 use crate::usage_ledger::UsageSummaryGroup;
+use crate::usage_ledger::{Coverage, UsageRow};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -226,11 +226,7 @@ fn claude_rate(model: &str) -> Option<ClaudeTokenRates> {
     // Normalize gateway spellings to Anthropic ids: OpenRouter writes
     // `anthropic/claude-haiku-4.5`; the vendor prefix and dotted version
     // carry no pricing information.
-    let normalized = model
-        .rsplit('/')
-        .next()
-        .unwrap_or(model)
-        .replace('.', "-");
+    let normalized = model.rsplit('/').next().unwrap_or(model).replace('.', "-");
     let model = normalized.as_str();
     if let Some(fact) = CLAUDE_API_RATES.iter().find(|r| r.model == model) {
         return Some(fact.rates);
@@ -426,7 +422,11 @@ impl ReportAccumulator {
     }
     pub fn extend_summary_groups(&mut self, groups: &[UsageSummaryGroup], preceding: bool) {
         for group in groups {
-            let target = if preceding { &mut self.previous } else { &mut self.current };
+            let target = if preceding {
+                &mut self.previous
+            } else {
+                &mut self.current
+            };
             target.add_group(group, self.include_ids);
         }
     }
@@ -436,8 +436,16 @@ impl ReportAccumulator {
     /// for a deterministic bounded-memory regression test.
     pub fn retained_response_ids(&self) -> usize {
         let ids = |accumulator: &Accumulator| {
-            accumulator.models.values().map(|bucket| bucket.response_ids.len()).sum::<usize>()
-                + accumulator.families.values().map(|bucket| bucket.response_ids.len()).sum::<usize>()
+            accumulator
+                .models
+                .values()
+                .map(|bucket| bucket.response_ids.len())
+                .sum::<usize>()
+                + accumulator
+                    .families
+                    .values()
+                    .map(|bucket| bucket.response_ids.len())
+                    .sum::<usize>()
                 + accumulator.children.response_ids.len()
         };
         ids(&self.current) + ids(&self.previous)
@@ -547,14 +555,64 @@ struct Accumulator {
 
 impl Accumulator {
     fn add_group(&mut self, g: &UsageSummaryGroup, include_ids: bool) {
-        if g.invalid > 0 { self.labels.insert("missing_or_invalid_usage".into()); self.invalid_usage = true; }
-        if g.complete == 0 { return; }
-        let add = |m: &mut MeasuredTokens| { let first=m.responses==0; m.responses+=g.complete as u64; m.input+=g.input as i128; m.cached_input+=g.cached as i128; m.uncached_input+=(g.input-g.cached) as i128; m.output+=g.output as i128; m.cache_write_input+=g.cache_write as i128; m.reasoning_output+=g.reasoning as i128; m.provider_total=if g.missing_provider_total>0 {None} else if first {Some(g.provider_total as i128)} else {m.provider_total.map(|v|v+g.provider_total as i128)}; };
-        add(&mut self.measured); self.credits.add_summary(g);
-        let model=g.model.clone().unwrap_or_else(||"unknown".into()); let family=g.family.clone().unwrap_or_else(||"unknown".into());
-        add_bucket_group(self.models.entry(model).or_default(),g,include_ids); add_bucket_group(self.families.entry(family).or_default(),g,include_ids); if g.child { add_bucket_group(&mut self.children,g,include_ids); }
-        add_bucket_group(self.providers.entry(g.provider.clone()).or_default(),g,include_ids); add_bucket_group(self.sources.entry(g.account_scope.clone()).or_default(),g,include_ids);
-        if g.model.is_none(){self.labels.insert("unknown_model".into());} if g.missing_cache_write>0 {self.labels.insert("missing_cache_write_input_tokens".into());} if g.missing_reasoning>0 {self.labels.insert("missing_reasoning_output_tokens".into());} if g.missing_provider_total>0 {self.labels.insert("missing_provider_total_tokens".into());} self.labels.insert("speed_unavailable_standard_rate_only".into());
+        if g.invalid > 0 {
+            self.labels.insert("missing_or_invalid_usage".into());
+            self.invalid_usage = true;
+        }
+        if g.complete == 0 {
+            return;
+        }
+        let add = |m: &mut MeasuredTokens| {
+            let first = m.responses == 0;
+            m.responses += g.complete as u64;
+            m.input += g.input as i128;
+            m.cached_input += g.cached as i128;
+            m.uncached_input += (g.input - g.cached) as i128;
+            m.output += g.output as i128;
+            m.cache_write_input += g.cache_write as i128;
+            m.reasoning_output += g.reasoning as i128;
+            m.provider_total = if g.missing_provider_total > 0 {
+                None
+            } else if first {
+                Some(g.provider_total as i128)
+            } else {
+                m.provider_total.map(|v| v + g.provider_total as i128)
+            };
+        };
+        add(&mut self.measured);
+        self.credits.add_summary(g);
+        let model = g.model.clone().unwrap_or_else(|| "unknown".into());
+        let family = g.family.clone().unwrap_or_else(|| "unknown".into());
+        add_bucket_group(self.models.entry(model).or_default(), g, include_ids);
+        add_bucket_group(self.families.entry(family).or_default(), g, include_ids);
+        if g.child {
+            add_bucket_group(&mut self.children, g, include_ids);
+        }
+        add_bucket_group(
+            self.providers.entry(g.provider.clone()).or_default(),
+            g,
+            include_ids,
+        );
+        add_bucket_group(
+            self.sources.entry(g.account_scope.clone()).or_default(),
+            g,
+            include_ids,
+        );
+        if g.model.is_none() {
+            self.labels.insert("unknown_model".into());
+        }
+        if g.missing_cache_write > 0 {
+            self.labels
+                .insert("missing_cache_write_input_tokens".into());
+        }
+        if g.missing_reasoning > 0 {
+            self.labels.insert("missing_reasoning_output_tokens".into());
+        }
+        if g.missing_provider_total > 0 {
+            self.labels.insert("missing_provider_total_tokens".into());
+        }
+        self.labels
+            .insert("speed_unavailable_standard_rate_only".into());
     }
     fn add(&mut self, row: &UsageRow, include_ids: bool) {
         if !complete(row) {
@@ -571,8 +629,16 @@ impl Accumulator {
             .unwrap_or_else(|| "unknown".into());
         add_bucket(self.models.entry(model).or_default(), row, include_ids);
         add_bucket(self.families.entry(family).or_default(), row, include_ids);
-        add_bucket(self.providers.entry(row.provider.clone()).or_default(), row, include_ids);
-        add_bucket(self.sources.entry(row.account_scope.clone()).or_default(), row, include_ids);
+        add_bucket(
+            self.providers.entry(row.provider.clone()).or_default(),
+            row,
+            include_ids,
+        );
+        add_bucket(
+            self.sources.entry(row.account_scope.clone()).or_default(),
+            row,
+            include_ids,
+        );
         if row.parent_response_id.is_some() {
             add_bucket(&mut self.children, row, include_ids);
         }
@@ -614,7 +680,30 @@ impl Accumulator {
         contributor("child_responses", &self.children)
     }
 }
-fn add_bucket_group(bucket:&mut Bucket,g:&UsageSummaryGroup,_:bool){ if g.complete==0{return}; let first=bucket.measured.responses==0; bucket.measured.responses+=g.complete as u64; bucket.measured.input+=g.input as i128; bucket.measured.cached_input+=g.cached as i128; bucket.measured.uncached_input+=(g.input-g.cached) as i128; bucket.measured.output+=g.output as i128; bucket.measured.cache_write_input+=g.cache_write as i128; bucket.measured.reasoning_output+=g.reasoning as i128; bucket.measured.provider_total=if g.missing_provider_total>0{None}else if first{Some(g.provider_total as i128)}else{bucket.measured.provider_total.map(|v|v+g.provider_total as i128)}; bucket.credits.add_summary(g); }
+fn add_bucket_group(bucket: &mut Bucket, g: &UsageSummaryGroup, _: bool) {
+    if g.complete == 0 {
+        return;
+    };
+    let first = bucket.measured.responses == 0;
+    bucket.measured.responses += g.complete as u64;
+    bucket.measured.input += g.input as i128;
+    bucket.measured.cached_input += g.cached as i128;
+    bucket.measured.uncached_input += (g.input - g.cached) as i128;
+    bucket.measured.output += g.output as i128;
+    bucket.measured.cache_write_input += g.cache_write as i128;
+    bucket.measured.reasoning_output += g.reasoning as i128;
+    bucket.measured.provider_total = if g.missing_provider_total > 0 {
+        None
+    } else if first {
+        Some(g.provider_total as i128)
+    } else {
+        bucket
+            .measured
+            .provider_total
+            .map(|v| v + g.provider_total as i128)
+    };
+    bucket.credits.add_summary(g);
+}
 
 fn add_bucket(bucket: &mut Bucket, row: &UsageRow, include_ids: bool) {
     bucket.measured.add(row);
@@ -836,8 +925,14 @@ mod tests {
     /// the Anthropic id they name.
     #[test]
     fn claude_rate_normalizes_gateway_model_ids() {
-        assert_eq!(claude_rate("anthropic/claude-haiku-4.5"), claude_rate("claude-haiku-4-5"));
-        assert_eq!(claude_rate("anthropic/claude-sonnet-5"), claude_rate("claude-sonnet-5"));
+        assert_eq!(
+            claude_rate("anthropic/claude-haiku-4.5"),
+            claude_rate("claude-haiku-4-5")
+        );
+        assert_eq!(
+            claude_rate("anthropic/claude-sonnet-5"),
+            claude_rate("claude-sonnet-5")
+        );
         assert!(claude_rate("anthropic/claude-haiku-4.5").is_some());
         assert!(claude_rate("gpt-5.6-terra").is_none());
     }
