@@ -26,16 +26,19 @@ class Base(unittest.TestCase):
 echo "$*" >> "{self.calls}"
 case "$1" in
   has-session) [[ "$3" == "$FAKE_EXISTING" ]] && exit 0 || exit 1 ;;
-  capture-pane) echo "Claude Code v9 banner" ;;
+  capture-pane) echo "Claude Code v9 banner"; [[ -f "{self.tmp}/submitted-$3" && -z "$FAKE_NO_SUBMIT" ]] && echo "⏺ working" ;;
   send-keys) if [[ "$4" == *"FAKE-LAUNCH"* ]]; then name="${{4#FAKE-LAUNCH }}"; name="${{name%% *}}";
-               HEX_SESSION_NAME="$name" HEX_DIR="{self.hex}" "{INJECT}" > "{self.tmp}/injected-$name.txt"; fi ;;
+               HEX_SESSION_NAME="$name" HEX_DIR="{self.hex}" "{INJECT}" > "{self.tmp}/injected-$name.txt"; fi
+             # A lone Enter after a literal (-l) kickoff send submits the prompt, like Claude Code does.
+             [[ "$4" == "Enter" && -f "{self.tmp}/typed-$3" ]] && touch "{self.tmp}/submitted-$3"
+             [[ "$4" == "-l" ]] && touch "{self.tmp}/typed-$3" ;;
 esac
 exit 0
 ''')
         os.chmod(self.bin / "tmux", 0o755)
         self.env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", HEX_DIR=str(self.hex),
-                        HEX_FORK_LAUNCH="FAKE-LAUNCH @name@", HEX_FORK_TIMEOUT="3", HEX_FORK_KICKOFF_DELAY="0",
-                        FAKE_EXISTING="")
+                        HEX_FORK_LAUNCH="FAKE-LAUNCH @name@", HEX_FORK_TIMEOUT="3", HEX_FORK_KICKOFF_DELAY="0", HEX_FORK_ENTER_DELAY="0", HEX_FORK_SUBMIT_TIMEOUT="1",
+                        FAKE_EXISTING="", FAKE_NO_SUBMIT="")
         self.env.pop("HEX_SESSION_NAME", None); self.env.pop("TMUX", None)
 
     def tearDown(self): shutil.rmtree(self.tmp)
@@ -100,7 +103,19 @@ class ForkTests(Base):
     def test_kickoff_flag_is_sent_verbatim(self):
         r = self.run_fork("eta", "body\n", "--kickoff", "Do change #2: add since/expires/source.")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("send-keys -t eta Do change #2: add since/expires/source. Enter", self.calls.read_text())
+        calls = self.calls.read_text().splitlines()
+        # Text and Enter are separate sends (2026-09-16: "text Enter" in one send was bundled as a paste
+        # by Claude Code and the prompt sat unsent in the input box).
+        i = calls.index("send-keys -t eta -l Do change #2: add since/expires/source.")
+        self.assertEqual(calls[i + 1], "send-keys -t eta Enter")
+        self.assertEqual(calls.count("send-keys -t eta Enter"), 1)                    # submitted first try, no retry
+
+    def test_unsubmitted_kickoff_retries_enter_once_then_fails_loudly(self):
+        self.env["FAKE_NO_SUBMIT"] = "1"
+        r = self.run_fork("theta", "body\n")
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self.assertEqual(self.calls.read_text().splitlines().count("send-keys -t theta Enter"), 2)
+        self.assertIn("NOT submitted", r.stderr); self.assertIn("tmux attach -t theta", r.stderr)
 
     def test_no_registry_is_fine(self):
         r = self.run_fork("zeta", "body\n")

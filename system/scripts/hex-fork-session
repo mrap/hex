@@ -6,6 +6,7 @@
 # Claude Code came up, sends the kickoff prompt, and registers the session if a registry exists.
 # Principle: the new session boots already briefed; the operator never re-explains.
 #
+# Exit codes: 2 usage, 3 name collision, 4 no Claude Code banner, 5 kickoff typed but not submitted.
 # Env: HEX_DIR (default ~/hex); HEX_FORK_LAUNCH (default "hex-new @name@ --fresh", @name@ substituted);
 #      HEX_SESSION_REGISTRY (default $HEX_DIR/projects/hex-ops/sessions.md; skipped if absent).
 set -euo pipefail
@@ -40,7 +41,20 @@ done
 for ((i=1; i<=10; i++)); do [[ -f "$stage/$name.md" ]] || break; sleep 1; done
 [[ -f "$stage/$name.md" ]] && echo "WARN: handoff still staged after launch; the SessionStart hook did not consume it (is hex-handoff-inject wired?)" >&2
 sleep "${HEX_FORK_KICKOFF_DELAY:-2}"
-tmux send-keys -t "$name" "$kickoff" Enter
+# Kickoff: text and Enter go as SEPARATE sends with a pause between. Claude Code bundles a burst of
+# keystrokes as a paste and swallows an Enter inside the burst, so "text Enter" in one send-keys left
+# the prompt typed but unsent (2026-09-16 fork-test on v0.52.10). Then verify the prompt was
+# submitted (activity marker in the pane); one retry of Enter, then fail loudly (S6).
+tmux send-keys -t "$name" -l "$kickoff"
+submitted=0
+for attempt in 1 2; do
+  sleep "${HEX_FORK_ENTER_DELAY:-1}"
+  tmux send-keys -t "$name" Enter
+  for ((i=1; i<=${HEX_FORK_SUBMIT_TIMEOUT:-10}; i++)); do
+    sleep 1
+    tmux capture-pane -t "$name" -p 2>/dev/null | grep -qE '⏺|esc to interrupt|✻' && { submitted=1; break 2; }
+  done
+done
 
 reg="${HEX_SESSION_REGISTRY:-$HEX_DIR/projects/hex-ops/sessions.md}"
 if [[ -f "$reg" ]]; then
@@ -57,5 +71,9 @@ if rows:
 s = s.rstrip("\n") + f"\n- {stamp} — Created `{name}` via hex-fork-session (handoff injected at SessionStart).\n"
 open(p, "w").write(s)
 PY
+fi
+if (( ! submitted )); then
+  echo "ERR: session '$name' is up and briefed but the kickoff prompt was typed and NOT submitted after 2 Enter attempts. Attach and press Enter: tmux attach -t $name. Pane:" >&2
+  tmux capture-pane -t "$name" -p >&2; exit 5
 fi
 echo "OK: session '$name' up with handoff. Attach: tmux attach -t $name"
