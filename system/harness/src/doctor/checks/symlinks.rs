@@ -161,7 +161,12 @@ mod tests {
         let ctx = ctx_for(&tmp);
         let result = NoBrokenSymlinks.run(&ctx);
 
-        assert_eq!(result.status, Status::Pass, "message was: {}", result.message);
+        assert_eq!(
+            result.status,
+            Status::Pass,
+            "message was: {}",
+            result.message
+        );
         assert!(
             result.message.contains("1 under upgrade residue ignored"),
             "message was: {}",
@@ -182,7 +187,12 @@ mod tests {
         let ctx = ctx_for(&tmp);
         let result = NoBrokenSymlinks.run(&ctx);
 
-        assert_eq!(result.status, Status::Fail, "message was: {}", result.message);
+        assert_eq!(
+            result.status,
+            Status::Fail,
+            "message was: {}",
+            result.message
+        );
         assert!(
             result.message.contains("1 broken symlink"),
             "message was: {}",
@@ -218,7 +228,12 @@ mod tests {
         let ctx = ctx_for(&tmp);
         let result = NoBrokenSymlinks.run(&ctx);
 
-        assert_eq!(result.status, Status::Fail, "message was: {}", result.message);
+        assert_eq!(
+            result.status,
+            Status::Fail,
+            "message was: {}",
+            result.message
+        );
         assert!(
             result.message.contains("1 broken symlink"),
             "message was: {}",

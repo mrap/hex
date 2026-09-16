@@ -119,7 +119,7 @@ pub fn files_over_limit<I: IntoIterator<Item = (PathBuf, u64)>>(
         .into_iter()
         .filter(|(_, size)| *size > limit)
         .collect();
-    kept.sort_by(|a, b| b.1.cmp(&a.1));
+    kept.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     kept
 }
 

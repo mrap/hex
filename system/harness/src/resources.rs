@@ -697,7 +697,7 @@ mod tests {
         );
 
         // du_sizes_discovery wires the mask through end-to-end.
-        let sizes = du_sizes_discovery(&[lib_str.clone()]);
+        let sizes = du_sizes_discovery(std::slice::from_ref(&lib_str));
         assert!(sizes.contains_key(&lib_str));
     }
 }

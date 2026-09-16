@@ -265,7 +265,12 @@ fn fetch_failure_rows(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Failu
     for r in rows {
         let (fid, status, detail, ts) = r?;
         let head = signature_head(&detail);
-        out.push(FailureRow { fid, status, head, ts });
+        out.push(FailureRow {
+            fid,
+            status,
+            head,
+            ts,
+        });
     }
     Ok(out)
 }
@@ -962,11 +967,13 @@ mod storm_tests {
         let head = "spawn failed for `hex`: No such file or directory (os error 2)";
         let key1 = alert_key("storm", head);
         let key2 = alert_key("storm", head);
-        assert_eq!(key1, key2, "alert_key must be deterministic for the same head");
+        assert_eq!(
+            key1, key2,
+            "alert_key must be deterministic for the same head"
+        );
         assert!(key1.starts_with("failures-storm-"));
         assert!(
-            key1
-                .chars()
+            key1.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'),
             "alert key must be path-safe: {key1}"
         );

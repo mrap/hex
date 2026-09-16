@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use hex::usage_ledger::{
-    ContributorDimension, FrozenWindow, HalfOpenUtcWindow, ImportOptions, LedgerError, ALL_CHILDREN,
-    UsageLedger,
+    ContributorDimension, FrozenWindow, HalfOpenUtcWindow, ImportOptions, LedgerError, UsageLedger,
+    ALL_CHILDREN,
 };
 use std::fs;
 use std::io::Write;
@@ -165,7 +165,15 @@ fn chunked_import_sums_noncanonical_outcomes() {
         fixture.push('\n');
     }
     fs::write(&path, fixture).unwrap();
-    let result = ledger.import_jsonl(&path, ImportOptions { max_records: 2_000, ..Default::default() }).unwrap();
+    let result = ledger
+        .import_jsonl(
+            &path,
+            ImportOptions {
+                max_records: 2_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(result.noncanonical, 1_025);
     assert_eq!(ledger.coverage().unwrap().noncanonical, 1_025);
 }
@@ -177,8 +185,17 @@ fn same_size_preserved_mtime_replacement_starts_new_generation() {
     ledger.import_jsonl(&path, Default::default()).unwrap();
     let modified = fs::metadata(&path).unwrap().modified().unwrap();
     fs::write(&path, format!("{}\n", line("two", None, 1))).unwrap();
-    fs::File::open(&path).unwrap().set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
-    assert_eq!(ledger.import_jsonl(&path, Default::default()).unwrap().accepted, 1);
+    fs::File::open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(
+        ledger
+            .import_jsonl(&path, Default::default())
+            .unwrap()
+            .accepted,
+        1
+    );
     assert_eq!(ledger.rows(10, 0).unwrap().len(), 2);
 }
 
@@ -189,39 +206,106 @@ fn legacy_file_scoped_ledger_requires_visible_rebuild() {
     fs::write(&path, format!("{}\n", line("old", None, 1))).unwrap();
     ledger.import_jsonl(&path, Default::default()).unwrap();
     drop(ledger);
-    rusqlite::Connection::open(&db).unwrap().execute("DELETE FROM ledger_metadata", []).unwrap();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM ledger_metadata", [])
+        .unwrap();
     let mut reopened = UsageLedger::open(&db).unwrap();
     assert!(reopened.requires_rebuild().unwrap());
-    assert!(matches!(reopened.import_jsonl(&path, Default::default()), Err(LedgerError::RebuildRequired)));
+    assert!(matches!(
+        reopened.import_jsonl(&path, Default::default()),
+        Err(LedgerError::RebuildRequired)
+    ));
 }
 
 #[test]
 fn frozen_reader_streams_two_windows_and_stable_detail_keysets() {
     let (_dir, mut ledger, path) = setup();
     let at = |id: &str, time: &str| line(id, None, 1).replace("2026-09-10T12:00:00Z", time);
-    let child = line("child", Some("root"), 1).replace("2026-09-10T12:00:00Z", "2026-09-10T01:00:00Z");
-    fs::write(&path, format!("{}\n{}\n{}\n{}\n", at("b", "2026-09-10T01:00:00Z"), at("a", "2026-09-10T01:00:00Z"), child, at("later", "2026-09-11T01:00:00Z"))).unwrap();
+    let child =
+        line("child", Some("root"), 1).replace("2026-09-10T12:00:00Z", "2026-09-10T01:00:00Z");
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            at("b", "2026-09-10T01:00:00Z"),
+            at("a", "2026-09-10T01:00:00Z"),
+            child,
+            at("later", "2026-09-11T01:00:00Z")
+        ),
+    )
+    .unwrap();
     ledger.import_jsonl(&path, Default::default()).unwrap();
     let utc = |value: &str| value.parse::<DateTime<Utc>>().unwrap();
-    let frozen = ledger.frozen_read([
-        HalfOpenUtcWindow { start: utc("2026-09-10T00:00:00Z"), end: utc("2026-09-11T00:00:00Z") },
-        HalfOpenUtcWindow { start: utc("2026-09-11T00:00:00Z"), end: utc("2026-09-12T00:00:00Z") },
-    ]).unwrap();
+    let frozen = ledger
+        .frozen_read([
+            HalfOpenUtcWindow {
+                start: utc("2026-09-10T00:00:00Z"),
+                end: utc("2026-09-11T00:00:00Z"),
+            },
+            HalfOpenUtcWindow {
+                start: utc("2026-09-11T00:00:00Z"),
+                end: utc("2026-09-12T00:00:00Z"),
+            },
+        ])
+        .unwrap();
     let mut first = Vec::new();
-    frozen.for_each_window_page(FrozenWindow::First, 1, |page| { first.extend(page.iter().map(|row| row.response_id.clone())); Ok(()) }).unwrap();
+    frozen
+        .for_each_window_page(FrozenWindow::First, 1, |page| {
+            first.extend(page.iter().map(|row| row.response_id.clone()));
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(first, ["a", "b", "child"]);
-    let detail = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Family, Some("build"), None, 1).unwrap();
+    let detail = frozen
+        .contributor_detail_page(
+            FrozenWindow::First,
+            ContributorDimension::Family,
+            Some("build"),
+            None,
+            1,
+        )
+        .unwrap();
     assert_eq!(detail.total_matches, 3);
     assert_eq!(detail.rows[0].response_id, "a");
-    let next = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Family, Some("build"), detail.next_cursor().as_ref(), 1).unwrap();
+    let next = frozen
+        .contributor_detail_page(
+            FrozenWindow::First,
+            ContributorDimension::Family,
+            Some("build"),
+            detail.next_cursor().as_ref(),
+            1,
+        )
+        .unwrap();
     assert_eq!(next.rows[0].response_id, "b");
-    let children = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Child, None, None, 1).unwrap();
+    let children = frozen
+        .contributor_detail_page(
+            FrozenWindow::First,
+            ContributorDimension::Child,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
     assert_eq!(children.total_matches, 1);
     assert_eq!(children.rows[0].response_id, "child");
-    let explicit_children = frozen.contributor_detail_page(FrozenWindow::First, ContributorDimension::Child, Some(ALL_CHILDREN), None, 1).unwrap();
+    let explicit_children = frozen
+        .contributor_detail_page(
+            FrozenWindow::First,
+            ContributorDimension::Child,
+            Some(ALL_CHILDREN),
+            None,
+            1,
+        )
+        .unwrap();
     assert_eq!(explicit_children.rows[0].response_id, "child");
     let mut second = Vec::new();
-    frozen.for_each_window_page(FrozenWindow::Second, 10, |page| { second.extend(page.iter().map(|row| row.response_id.clone())); Ok(()) }).unwrap();
+    frozen
+        .for_each_window_page(FrozenWindow::Second, 10, |page| {
+            second.extend(page.iter().map(|row| row.response_id.clone()));
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(second, ["later"]);
 }
 
@@ -257,11 +341,32 @@ fn append_revalidates_historical_source_before_cursor_reuse() {
         fixture.push('\n');
     }
     fs::write(&path, fixture).unwrap();
-    ledger.import_jsonl(&path, ImportOptions { max_records: 3_000, ..Default::default() }).unwrap();
+    ledger
+        .import_jsonl(
+            &path,
+            ImportOptions {
+                max_records: 3_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let metadata = fs::metadata(&path).unwrap().len();
     assert!(metadata > 100_000);
-    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", line("appended", None, 1)).unwrap();
-    let result = ledger.import_jsonl(&path, ImportOptions { max_records: 1_024, ..Default::default() }).unwrap();
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&path).unwrap(),
+        "{}",
+        line("appended", None, 1)
+    )
+    .unwrap();
+    let result = ledger
+        .import_jsonl(
+            &path,
+            ImportOptions {
+                max_records: 1_024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(result.accepted, 1);
     assert!(result.bytes_read >= metadata, "{}", result.bytes_read);
 }
@@ -277,7 +382,11 @@ fn longer_rewrite_preserving_head_and_old_end_starts_new_generation() {
     // This middle replacement preserves both the initial and old-end 4 KiB
     // checkpoints. Full historical revalidation must still restart the cursor.
     lines[50] = line("rewrite-0050", None, 1);
-    fs::write(&path, format!("{}\n{}\n", lines.join("\n"), line("appended", None, 1))).unwrap();
+    fs::write(
+        &path,
+        format!("{}\n{}\n", lines.join("\n"), line("appended", None, 1)),
+    )
+    .unwrap();
     let result = ledger.import_jsonl(&path, Default::default()).unwrap();
     assert_eq!(result.accepted, 2);
     assert_eq!(result.duplicates, 99);
