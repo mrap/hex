@@ -264,9 +264,7 @@ fn import_claude_transcripts(
     let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(claude_root)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl")
-        })
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
         .map(|e| e.into_path())
         .collect();
     // Deterministic scan order: with several files sharing a requestId (a
@@ -311,8 +309,14 @@ fn import_claude_transcripts(
                 request_id.to_string(),
                 ClaudeTurnCandidate {
                     event_at: event_at.to_string(),
-                    session_id: v.get("sessionId").and_then(|s| s.as_str()).map(str::to_string),
-                    model: msg.get("model").and_then(|m| m.as_str()).map(str::to_string),
+                    session_id: v
+                        .get("sessionId")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                    model: msg
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string),
                     input_tokens: raw_input + cache_read,
                     cached_input_tokens: cache_read,
                     cache_write_input_tokens: tok("cache_creation_input_tokens"),
@@ -413,7 +417,15 @@ pub fn run(cmd: UsageCommands) -> i32 {
             headless_claude_dir,
         } => collect(
             source_kind,
-            CollectPaths { source, codex_root, claude_root, boi_db, boi_recipes, events_db, headless_claude_dir },
+            CollectPaths {
+                source,
+                codex_root,
+                claude_root,
+                boi_db,
+                boi_recipes,
+                events_db,
+                headless_claude_dir,
+            },
             ledger,
             max_records,
         ),
@@ -631,11 +643,9 @@ fn discover_boi_phase_runs(
 ) -> std::result::Result<Vec<BoiPhaseRunRecord>, String> {
     // S6: always a read-only open — this is someone else's live, actively
     // written database (never our write lock).
-    let conn = rusqlite::Connection::open_with_flags(
-        boi_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| format!("boi_db_unreadable={e}"))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(boi_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("boi_db_unreadable={e}"))?;
     let mut stmt = conn
         .prepare(
             "SELECT id, spec_id, provider, tokens_in, tokens_out, started_at \
@@ -760,10 +770,15 @@ fn collect_boi_phase_runs(
     }
     std::fs::write(staging_path, body).map_err(|e| format!("boi_staging_write={e}"))?;
     ledger
-        .import_jsonl(staging_path, ImportOptions { max_records, abort_before_commit: false })
+        .import_jsonl(
+            staging_path,
+            ImportOptions {
+                max_records,
+                abort_before_commit: false,
+            },
+        )
         .map_err(|e| format!("boi_ledger_import={e:?}"))
 }
-
 
 /// Dispatch `hex usage collect` across one or every source kind. `--source
 /// <path>` and `--codex-root <dir>` are codex-jsonl-specific overrides — their
@@ -844,7 +859,10 @@ fn collect(
                 collect_harness_llm_cost_cli(paths.events_db.clone(), ledger.clone(), max_records)
             }
             "headless-claude-json" => collect_headless_claude_json(
-                paths.headless_claude_dir.clone().unwrap_or_else(default_headless_claude_dir),
+                paths
+                    .headless_claude_dir
+                    .clone()
+                    .unwrap_or_else(default_headless_claude_dir),
                 ledger.clone().unwrap_or_else(default_ledger),
                 max_records,
             ),
@@ -907,7 +925,10 @@ fn collect_boi_phase_runs_cli(
     let db = boi_db.unwrap_or_else(default_boi_db);
     let recipes = boi_recipes.unwrap_or_else(default_boi_recipes_dir);
     if !db.exists() {
-        println!("usage collect: boi-phase-runs: no boi.db at {}", db.display());
+        println!(
+            "usage collect: boi-phase-runs: no boi.db at {}",
+            db.display()
+        );
         health("boi-phase-runs", "ok", "no_source accepted=0".into());
         return 0;
     }
@@ -925,7 +946,11 @@ fn collect_boi_phase_runs_cli(
         Ok(r) => report_import_result("boi-phase-runs", &r),
         Err(e) => {
             eprintln!("usage collect: boi-phase-runs import failed: {e}");
-            health("boi-phase-runs", "error", format!("kind=boi-phase-runs import_failed={e}"));
+            health(
+                "boi-phase-runs",
+                "error",
+                format!("kind=boi-phase-runs import_failed={e}"),
+            );
             1
         }
     }
@@ -940,7 +965,10 @@ fn collect_harness_llm_cost_cli(
 ) -> i32 {
     let db = events_db.unwrap_or_else(default_llm_cost_events_db);
     if !db.exists() {
-        println!("usage collect: harness-llm-cost: no events.db at {}", db.display());
+        println!(
+            "usage collect: harness-llm-cost: no events.db at {}",
+            db.display()
+        );
         health("harness-llm-cost", "ok", "no_source accepted=0".into());
         return 0;
     }
@@ -951,7 +979,11 @@ fn collect_harness_llm_cost_cli(
         Ok(r) => report_import_result("harness-llm-cost", &r),
         Err(e) => {
             eprintln!("usage collect: harness-llm-cost import failed: {e:?}");
-            health("harness-llm-cost", "error", format!("kind=harness-llm-cost import_failed={e:?}"));
+            health(
+                "harness-llm-cost",
+                "error",
+                format!("kind=harness-llm-cost import_failed={e:?}"),
+            );
             1
         }
     }
@@ -978,14 +1010,22 @@ fn collect_claude_transcripts(
         Ok(l) => l,
         Err(e) => {
             eprintln!("usage collect: failed: {e:?}");
-            health("claude-transcripts", "error", "kind=claude-transcripts ledger_open_failed".into());
+            health(
+                "claude-transcripts",
+                "error",
+                "kind=claude-transcripts ledger_open_failed".into(),
+            );
             return 1;
         }
     };
     let result = import_claude_transcripts(&root, &mut opened, max_records);
     if let Some(err) = &result.error {
         eprintln!("usage collect: claude-transcripts import failed: {err}");
-        health("claude-transcripts", "error", format!("kind=claude-transcripts import_failed={err}"));
+        health(
+            "claude-transcripts",
+            "error",
+            format!("kind=claude-transcripts import_failed={err}"),
+        );
         return 1;
     }
     println!(
@@ -1030,7 +1070,11 @@ fn collect_codex_jsonl(
     // collection then completes as a visible no-op, not an unhealthy worker.
     if discovered_sources && sources.is_empty() {
         println!("usage collect: accepted=0 backlog=false issues=0");
-        health("codex-jsonl", "ok", "backlog=false accepted=0 issues=".into());
+        health(
+            "codex-jsonl",
+            "ok",
+            "backlog=false accepted=0 issues=".into(),
+        );
         return 0;
     }
     if sources.is_empty() {
@@ -1132,7 +1176,10 @@ fn report(
         None => Utc::now(),
     };
     let end = Utc.from_utc_datetime(
-        &cutoff.date_naive().and_hms_opt(0, 0, 0).expect("midnight is valid"),
+        &cutoff
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid"),
     );
     let start = end - Duration::days(1);
     let preceding_start = start - Duration::days(1);
@@ -1203,9 +1250,16 @@ fn report(
         report.incomplete_labels.insert("collector_failure".into());
     }
     let contributor = |item: &hex::usage_reporting::Contributor| json!({"key":item.key,"tokens":item.measured.total().to_string(),"credits_micro":item.credits.value.0.to_string()});
-    let optional_total = |value: i128, missing: &str| (!report.incomplete_labels.contains(missing)).then(|| value.to_string());
+    let optional_total = |value: i128, missing: &str| {
+        (!report.incomplete_labels.contains(missing)).then(|| value.to_string())
+    };
     let measured = |measured: &hex::usage_reporting::MeasuredTokens| json!({"responses":measured.responses,"input_tokens":measured.input.to_string(),"cached_input_tokens":measured.cached_input.to_string(),"output_tokens":measured.output.to_string(),"cache_write_input_tokens":optional_total(measured.cache_write_input,"missing_cache_write_input_tokens"),"reasoning_output_tokens":optional_total(measured.reasoning_output,"missing_reasoning_output_tokens"),"provider_total_tokens":measured.provider_total.map(|value|value.to_string())});
-    let unknown_fields = report.incomplete_labels.iter().filter(|label| label.starts_with("unknown_")).cloned().collect::<Vec<_>>();
+    let unknown_fields = report
+        .incomplete_labels
+        .iter()
+        .filter(|label| label.starts_with("unknown_"))
+        .cloned()
+        .collect::<Vec<_>>();
     let sources = report.coverage.sources.iter().map(|s| json!({"provider":s.provider,"account_scope":s.account_scope,"records":s.records,"first_event_at":s.first_event_at,"last_event_at":s.last_event_at})).collect::<Vec<_>>();
     let body=json!({"schema":"hex.usage-report.v2","cutoff":cutoff.to_rfc3339(),"windows":{"current":{"start":report.start.to_rfc3339(),"end":report.end.to_rfc3339(),"measured":measured(&report.measured)},"preceding":{"start":preceding_start.to_rfc3339(),"end":start.to_rfc3339(),"measured":measured(&report.preceding_measured)},"change_tokens":report.preceding_change_tokens.map(|value|value.to_string())},"modeled_credits":{"unit":"credit_equivalent","rate_version":report.modeled_credits.rate_version,"rate_source":report.modeled_credits.rate_source,"total_micro":report.modeled_credits.value.0.to_string(),"fresh_micro":report.modeled_credit_components.fresh.0.to_string(),"cached_micro":report.modeled_credit_components.cached.0.to_string(),"cache_write_micro":report.modeled_credit_components.cache_write.0.to_string(),"output_micro":report.modeled_credit_components.output.0.to_string(),"incomplete":report.modeled_credits.incomplete,"labels":report.modeled_credits.labels},"actual_billed_debited":{"value":serde_json::Value::Null,"unit":"api_usd","labels":report.actual_billed_debited.labels},"coverage":{"accepted":report.coverage.accepted,"noncanonical":report.coverage.noncanonical,"duplicates":report.coverage.duplicates,"conflicts":report.coverage.conflicts,"quarantined":report.coverage.quarantined,"source_backlog":report.coverage.pending_sources,"stale_sources":report.coverage.stale_sources,"unknown_fields":unknown_fields,"sources":sources},"completeness":if report.incomplete_labels.is_empty(){"complete"}else{"incomplete"},"incomplete":report.incomplete_labels,"by_model":report.by_model.iter().map(contributor).collect::<Vec<_>>(),"by_family":report.by_family.iter().map(contributor).collect::<Vec<_>>(),"by_provider":report.by_provider.iter().map(contributor).collect::<Vec<_>>(),"by_source":report.by_source.iter().map(contributor).collect::<Vec<_>>(),"child_coordination":{"share_millionths":report.child_coordination_share_millionths},"contributor_detail":detail}).to_string()+"\n";
     if let Some(parent) = output.parent() {
@@ -1333,9 +1387,15 @@ pub fn import_harness_llm_cost(
             .as_deref()
             .and_then(|d| serde_json::from_str(d).ok())
             .unwrap_or(serde_json::Value::Null);
-        let model = detail_value.get("model").and_then(serde_json::Value::as_str);
-        let input_tokens = detail_value.get("in_tokens").and_then(serde_json::Value::as_i64);
-        let output_tokens = detail_value.get("out_tokens").and_then(serde_json::Value::as_i64);
+        let model = detail_value
+            .get("model")
+            .and_then(serde_json::Value::as_str);
+        let input_tokens = detail_value
+            .get("in_tokens")
+            .and_then(serde_json::Value::as_i64);
+        let output_tokens = detail_value
+            .get("out_tokens")
+            .and_then(serde_json::Value::as_i64);
         // "type":"token_usage_record" with no "payload" object routes this
         // through parse_event's flat, provider-agnostic fallback schema
         // rather than the Codex-specific `payload.response_id` branch.
@@ -1390,8 +1450,6 @@ pub fn import_harness_llm_cost(
     result.backlog = result.backlog || sql_backlog;
     Ok(result)
 }
-
-
 
 /// `headless-claude-json` source (task T05n056tm, spec Sk2wwjwpa): one ledger
 /// record per `claude -p --output-format json` result file dropped under the
@@ -1486,7 +1544,9 @@ fn parse_headless_claude_result(path: &Path) -> Result<HeadlessClaudeRecord, Str
         .next()
         .ok_or_else(|| "empty file name".to_string())?
         .to_string();
-    let usage = v.get("usage").ok_or_else(|| "missing usage block".to_string())?;
+    let usage = v
+        .get("usage")
+        .ok_or_else(|| "missing usage block".to_string())?;
     let tok = |k: &str| usage.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
     let model = v
         .get("modelUsage")
@@ -1538,7 +1598,10 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
     if !dir.exists() {
         // A configured-but-absent source dir mirrors the Codex "no local
         // sources discovered" no-op: nothing has run yet, not a failure.
-        println!("usage collect: headless-claude-json: no source dir at {}", dir.display());
+        println!(
+            "usage collect: headless-claude-json: no source dir at {}",
+            dir.display()
+        );
         health("headless-claude-json", "ok", "no_source accepted=0".into());
         return 0;
     }
@@ -1549,7 +1612,10 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
             .collect(),
         Err(e) => {
-            eprintln!("usage collect: headless-claude-json: cannot read {}: {e}", dir.display());
+            eprintln!(
+                "usage collect: headless-claude-json: cannot read {}: {e}",
+                dir.display()
+            );
             return 1;
         }
     };
@@ -1574,7 +1640,11 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
         Ok(k) => k,
         Err(e) => {
             eprintln!("usage collect: headless-claude-json: ledger read failed: {e:?}");
-            health("headless-claude-json", "error", format!("kind=headless-claude-json ledger_read_failed={e:?}"));
+            health(
+                "headless-claude-json",
+                "error",
+                format!("kind=headless-claude-json ledger_read_failed={e:?}"),
+            );
             return 1;
         }
     };
@@ -1591,7 +1661,10 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
         // wrote anything (the run's own telemetry row already carries that
         // failure). There is no usage to record, so it is a counted skip,
         // not a collection error that would re-fire every 5 minutes forever.
-        if std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(false) {
+        if std::fs::metadata(&path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(false)
+        {
             empty += 1;
             continue;
         }
@@ -1641,7 +1714,10 @@ fn collect_headless_claude_json(dir: PathBuf, ledger: PathBuf, max_records: usiz
         health(
             "headless-claude-json",
             "error",
-            format!("kind=headless-claude-json accepted={accepted} issues={}", issues.len()),
+            format!(
+                "kind=headless-claude-json accepted={accepted} issues={}",
+                issues.len()
+            ),
         );
         1
     }
@@ -1682,6 +1758,7 @@ mod tests {
     /// top-level `requestId`/`type`/`sessionId`/`timestamp`, and
     /// `message.model`/`message.usage.{input_tokens,cache_creation_input_tokens,
     /// cache_read_input_tokens,output_tokens}`.
+    #[allow(clippy::too_many_arguments)]
     fn claude_turn(
         request_id: &str,
         session_id: &str,
@@ -1724,7 +1801,14 @@ mod tests {
         write_jsonl(
             &claude_root.join("-proj/").join(format!("{session}.jsonl")),
             &[claude_turn(
-                "req-1", session, 10, "claude-sonnet-4-6", 100, 7_000, 18_000, 55,
+                "req-1",
+                session,
+                10,
+                "claude-sonnet-4-6",
+                100,
+                7_000,
+                18_000,
+                55,
             )],
         );
         // Nested subagent transcript for the SAME session (req-2). Subagent
@@ -1737,14 +1821,28 @@ mod tests {
                 .join("subagents")
                 .join("agent-abc.jsonl"),
             &[claude_turn(
-                "req-2", session, 5, "claude-haiku-4-5", 20, 100, 200, 10,
+                "req-2",
+                session,
+                5,
+                "claude-haiku-4-5",
+                20,
+                100,
+                200,
+                10,
             )],
         );
         // req-1 repeated in a different file — must dedupe to one row.
         write_jsonl(
             &claude_root.join("-proj/other.jsonl"),
             &[claude_turn(
-                "req-1", session, 10, "claude-sonnet-4-6", 100, 7_000, 18_000, 55,
+                "req-1",
+                session,
+                10,
+                "claude-sonnet-4-6",
+                100,
+                7_000,
+                18_000,
+                55,
             )],
         );
 
@@ -1757,7 +1855,10 @@ mod tests {
         );
 
         let rows = ledger.rows(100, 0).unwrap();
-        let claude_rows: Vec<_> = rows.iter().filter(|r| r.provider == "claude-code").collect();
+        let claude_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.provider == "claude-code")
+            .collect();
         assert_eq!(
             claude_rows.len(),
             2,
@@ -1795,7 +1896,10 @@ mod tests {
         );
         let rows_after = ledger.rows(100, 0).unwrap();
         assert_eq!(
-            rows_after.iter().filter(|r| r.provider == "claude-code").count(),
+            rows_after
+                .iter()
+                .filter(|r| r.provider == "claude-code")
+                .count(),
             2,
             "re-import must not duplicate canonical claude-code rows"
         );
@@ -2028,13 +2132,23 @@ mod tests {
         let result =
             collect_boi_phase_runs(&db_path, &recipes_dir, &staging_path, &mut ledger, 1_000)
                 .expect("collect_boi_phase_runs should succeed against fixture-only paths");
-        assert_eq!(result.accepted, 1, "the one eligible row must be accepted: {result:?}");
+        assert_eq!(
+            result.accepted, 1,
+            "the one eligible row must be accepted: {result:?}"
+        );
 
         let rows = ledger.rows(10, 0).unwrap();
-        assert_eq!(rows.len(), 1, "ledger must contain exactly the imported row: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "ledger must contain exactly the imported row: {rows:?}"
+        );
         let row = &rows[0];
         assert_eq!(row.provider, "claude_code");
-        assert_eq!(row.account_scope, "boi", "account_scope must always be \"boi\"");
+        assert_eq!(
+            row.account_scope, "boi",
+            "account_scope must always be \"boi\""
+        );
         assert_eq!(row.response_id, "run1");
         assert_eq!(row.root_task_family.as_deref(), Some("specA"));
         assert_eq!(row.event_at.as_deref(), Some("2026-09-14T10:00:00Z"));
@@ -2049,8 +2163,15 @@ mod tests {
         let result2 =
             collect_boi_phase_runs(&db_path, &recipes_dir, &staging_path, &mut ledger, 1_000)
                 .expect("re-collection should succeed");
-        assert_eq!(result2.accepted, 0, "re-collection over unchanged data must not re-accept: {result2:?}");
-        assert_eq!(ledger.rows(10, 0).unwrap().len(), 1, "row count must stay 1 after a no-op re-collection");
+        assert_eq!(
+            result2.accepted, 0,
+            "re-collection over unchanged data must not re-accept: {result2:?}"
+        );
+        assert_eq!(
+            ledger.rows(10, 0).unwrap().len(),
+            1,
+            "row count must stay 1 after a no-op re-collection"
+        );
 
         // Growth (a new eligible phase_run appears) must be picked up
         // incrementally, without disturbing the already-imported row.
@@ -2065,7 +2186,10 @@ mod tests {
         let result3 =
             collect_boi_phase_runs(&db_path, &recipes_dir, &staging_path, &mut ledger, 1_000)
                 .expect("collection after growth should succeed");
-        assert_eq!(result3.accepted, 1, "the newly-eligible row must be accepted: {result3:?}");
+        assert_eq!(
+            result3.accepted, 1,
+            "the newly-eligible row must be accepted: {result3:?}"
+        );
         let rows3 = ledger.rows(10, 0).unwrap();
         assert_eq!(rows3.len(), 2, "ledger must now hold both rows: {rows3:?}");
         assert!(
@@ -2073,7 +2197,9 @@ mod tests {
             "the original row must still be present: {rows3:?}"
         );
         assert!(
-            rows3.iter().any(|r| r.response_id == "run4" && r.provider == "codex"),
+            rows3
+                .iter()
+                .any(|r| r.response_id == "run4" && r.provider == "codex"),
             "the newly-collected row must be present: {rows3:?}"
         );
     }
@@ -2124,7 +2250,10 @@ mod tests {
         let read = ledger
             .frozen_read([
                 HalfOpenUtcWindow { start, end },
-                HalfOpenUtcWindow { start: start - Duration::days(1), end: start },
+                HalfOpenUtcWindow {
+                    start: start - Duration::days(1),
+                    end: start,
+                },
             ])
             .unwrap();
         let groups = read.summary_groups(FrozenWindow::First).unwrap();
@@ -2140,8 +2269,18 @@ mod tests {
                 .map(|c| c.measured.input + c.measured.output)
                 .unwrap_or(0)
         };
-        assert_eq!(tokens_for("boi"), 1200 + 340, "boi rows must count: {:?}", r.by_source);
-        assert_eq!(tokens_for("harness"), 500 + 50, "llm-cost rows must count: {:?}", r.by_source);
+        assert_eq!(
+            tokens_for("boi"),
+            1200 + 340,
+            "boi rows must count: {:?}",
+            r.by_source
+        );
+        assert_eq!(
+            tokens_for("harness"),
+            500 + 50,
+            "llm-cost rows must count: {:?}",
+            r.by_source
+        );
     }
 
     /// The headless budget must be spent on NEW files only, and a run that
@@ -2157,20 +2296,42 @@ mod tests {
             let body = format!(
                 r#"{{"session_id":"s{i}","usage":{{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}},"modelUsage":{{"claude-haiku-4-5":{{}}}},"num_turns":1,"total_cost_usd":0.0}}"#
             );
-            std::fs::write(src.join(format!("proposer-2026-09-1{i}T033000Z.json")), body).unwrap();
+            std::fs::write(
+                src.join(format!("proposer-2026-09-1{i}T033000Z.json")),
+                body,
+            )
+            .unwrap();
         }
         let ledger = dir.path().join("usage.db");
         // Budget of 1: first call lands s0 and reports truncation.
-        assert_eq!(collect_headless_claude_json(src.clone(), ledger.clone(), 1), 0);
+        assert_eq!(
+            collect_headless_claude_json(src.clone(), ledger.clone(), 1),
+            0
+        );
         let l = UsageLedger::open(&ledger).unwrap();
         assert_eq!(l.rows(10, 0).unwrap().len(), 1);
         drop(l);
         // Second and third calls must land s1 then s2, not re-select s0.
-        assert_eq!(collect_headless_claude_json(src.clone(), ledger.clone(), 1), 0);
-        assert_eq!(collect_headless_claude_json(src.clone(), ledger.clone(), 1), 0);
+        assert_eq!(
+            collect_headless_claude_json(src.clone(), ledger.clone(), 1),
+            0
+        );
+        assert_eq!(
+            collect_headless_claude_json(src.clone(), ledger.clone(), 1),
+            0
+        );
         let l = UsageLedger::open(&ledger).unwrap();
-        let ids: Vec<String> = l.rows(10, 0).unwrap().into_iter().map(|r| r.response_id).collect();
-        assert_eq!(ids.len(), 3, "each budgeted call must reach a new file: {ids:?}");
+        let ids: Vec<String> = l
+            .rows(10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.response_id)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "each budgeted call must reach a new file: {ids:?}"
+        );
     }
 
     fn write_events_fixture(path: &Path, rows: &[(i64, &str, &str, &str, &str)]) {
@@ -2249,7 +2410,10 @@ mod tests {
         let mut ledger = UsageLedger::open(&ledger_path).unwrap();
 
         let first = import_harness_llm_cost(&events_db, &mut ledger, 1_000).unwrap();
-        assert_eq!(first.accepted, 2, "only the two llm-cost rows are canonical");
+        assert_eq!(
+            first.accepted, 2,
+            "only the two llm-cost rows are canonical"
+        );
 
         let rows = ledger.rows(10, 0).unwrap();
         assert_eq!(rows.len(), 2, "the other-source row must not be imported");
@@ -2299,9 +2463,15 @@ mod tests {
         // and the ledger content itself is unchanged row-for-row.
         let second = import_harness_llm_cost(&events_db, &mut ledger, 1_000).unwrap();
         assert_eq!(second.accepted, 0, "second import must add nothing new");
-        assert_eq!(second.conflicts, 0, "re-import must never conflict-delete a canonical row");
+        assert_eq!(
+            second.conflicts, 0,
+            "re-import must never conflict-delete a canonical row"
+        );
         let rows_after = ledger.rows(10, 0).unwrap();
-        assert_eq!(rows_after, rows, "ledger content must be unchanged by re-import");
+        assert_eq!(
+            rows_after, rows,
+            "ledger content must be unchanged by re-import"
+        );
 
         // The high-water mark plus stable staging file must make a re-collect
         // a TRUE no-op: nothing new appended to the staging file means
@@ -2355,8 +2525,14 @@ mod tests {
         // max_records=2 is smaller than the 3-row fixture: the first call can
         // only ever see the lowest 2 ids.
         let first = import_harness_llm_cost(&events_db, &mut ledger, 2).unwrap();
-        assert_eq!(first.accepted, 2, "first call is capped at max_records rows");
-        assert!(first.backlog, "hitting the max_records cap must report backlog=true");
+        assert_eq!(
+            first.accepted, 2,
+            "first call is capped at max_records rows"
+        );
+        assert!(
+            first.backlog,
+            "hitting the max_records cap must report backlog=true"
+        );
         let rows_after_first = ledger.rows(10, 0).unwrap();
         assert_eq!(rows_after_first.len(), 2);
         assert!(!rows_after_first.iter().any(|r| r.response_id == "3"));
@@ -2365,10 +2541,17 @@ mod tests {
         // first call couldn't — not restart at id=1 and see the same two
         // rows again (the original bug: LIMIT from the lowest id forever).
         let second = import_harness_llm_cost(&events_db, &mut ledger, 2).unwrap();
-        assert_eq!(second.accepted, 1, "second call must reach the remaining row (id=3)");
+        assert_eq!(
+            second.accepted, 1,
+            "second call must reach the remaining row (id=3)"
+        );
         assert!(!second.backlog, "no rows remain beyond this call");
         let rows_after_second = ledger.rows(10, 0).unwrap();
-        assert_eq!(rows_after_second.len(), 3, "all three rows must be reachable across calls");
+        assert_eq!(
+            rows_after_second.len(),
+            3,
+            "all three rows must be reachable across calls"
+        );
         assert!(rows_after_second.iter().any(|r| r.response_id == "3"));
     }
 
@@ -2475,7 +2658,10 @@ mod tests {
         let bad_json_path = tmp.path().join("proposer-bad.json");
         std::fs::write(&bad_json_path, "{not valid json").unwrap();
         let err = parse_headless_claude_result(&bad_json_path).unwrap_err();
-        assert!(err.contains("json"), "reason should name the JSON problem, got: {err}");
+        assert!(
+            err.contains("json"),
+            "reason should name the JSON problem, got: {err}"
+        );
 
         let no_session_path = tmp.path().join("proposer-no-session.json");
         std::fs::write(&no_session_path, json!({"usage": {}}).to_string()).unwrap();
@@ -2535,10 +2721,17 @@ mod tests {
 
         // Re-import must not duplicate the row.
         let code = collect_headless_claude_json(dir, ledger_path.clone(), 1_000);
-        assert_eq!(code, 0, "re-collect must stay a success (duplicates are not failures)");
+        assert_eq!(
+            code, 0,
+            "re-collect must stay a success (duplicates are not failures)"
+        );
         let ledger = UsageLedger::open(&ledger_path).unwrap();
         let rows = ledger.rows(100, 0).unwrap();
-        assert_eq!(rows.len(), 1, "re-import must be idempotent, not a duplicate row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "re-import must be idempotent, not a duplicate row"
+        );
     }
 
     /// A missing source dir is a no-op, not a failure (S6: distinguishes "no
@@ -2588,7 +2781,10 @@ mod tests {
         let ledger_path = tmp.path().join("usage.db");
 
         let code = collect_headless_claude_json(dir, ledger_path.clone(), 1_000);
-        assert_eq!(code, 1, "an unparseable file must make the run's exit non-zero");
+        assert_eq!(
+            code, 1,
+            "an unparseable file must make the run's exit non-zero"
+        );
 
         let ledger = UsageLedger::open(&ledger_path).unwrap();
         let rows = ledger.rows(100, 0).unwrap();

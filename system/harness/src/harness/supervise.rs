@@ -245,7 +245,10 @@ fn path_env(hex_dir: &Path) -> String {
     if !base.split(':').any(|p| p == "/opt/homebrew/bin") {
         parts.push("/opt/homebrew/bin");
     }
-    parts.extend(base.split(':').filter(|p| !p.is_empty() && *p != hex_bin_dir.as_ref()));
+    parts.extend(
+        base.split(':')
+            .filter(|p| !p.is_empty() && *p != hex_bin_dir.as_ref()),
+    );
     parts.join(":")
 }
 
@@ -634,7 +637,10 @@ mod tests {
             1,
             "hex bin dir must not be duplicated: {rendered}"
         );
-        for spec in [build_harness_spec(temp.path()), build_watchdog_spec(temp.path())] {
+        for spec in [
+            build_harness_spec(temp.path()),
+            build_watchdog_spec(temp.path()),
+        ] {
             let path = spec.env.get("PATH").expect("PATH env on rendered service");
             assert!(path.starts_with(&hex_bin), "{}: {path}", spec.label);
         }

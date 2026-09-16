@@ -382,7 +382,7 @@ fn apply_managed_file_protected(
     if !file.destination.exists() || files_differ(file.source, &file.destination) {
         let bytes = fs::read(file.source)?;
         copy_file_with_perms(file.source, &file.destination, &bytes)?;
-        if let Some(paths) = owned.as_deref_mut() {
+        if let Some(paths) = owned.as_mut() {
             paths.insert(file.destination.clone(), Some(bytes));
         }
         return Ok(1);
@@ -1063,7 +1063,10 @@ fn personal_overlay_dirs(hex_dot_dir: &Path) -> Vec<PathBuf> {
 /// installed binary's mtime. A missing or non-directory entry in
 /// `overlay_dirs` is simply skipped (no overlay there yet), matching
 /// `detect_personal_overlay`'s own presence-based keying.
-fn personal_overlay_newer_than(overlay_dirs: &[PathBuf], binary_mtime: SystemTime) -> Option<PathBuf> {
+fn personal_overlay_newer_than(
+    overlay_dirs: &[PathBuf],
+    binary_mtime: SystemTime,
+) -> Option<PathBuf> {
     for dir in overlay_dirs {
         if !dir.is_dir() {
             continue;
@@ -1091,7 +1094,9 @@ fn personal_overlay_newer_than(overlay_dirs: &[PathBuf], binary_mtime: SystemTim
 /// side changed.
 fn personal_overlay_stale(hex_dot_dir: &Path) -> Option<PathBuf> {
     let installed_bin = hex_dot_dir.join("bin/hex");
-    let binary_mtime = fs::metadata(&installed_bin).and_then(|m| m.modified()).ok()?;
+    let binary_mtime = fs::metadata(&installed_bin)
+        .and_then(|m| m.modified())
+        .ok()?;
     personal_overlay_newer_than(&personal_overlay_dirs(hex_dot_dir), binary_mtime)
 }
 
@@ -3622,7 +3627,10 @@ mod tests {
         write_file(&newer_file, "// probe");
 
         let binary_mtime = SystemTime::now();
-        set_mtime(&modules.join("old.worker.rs"), binary_mtime - Duration::from_secs(60));
+        set_mtime(
+            &modules.join("old.worker.rs"),
+            binary_mtime - Duration::from_secs(60),
+        );
         set_mtime(&newer_file, binary_mtime + Duration::from_secs(60));
 
         assert_eq!(
@@ -3639,7 +3647,8 @@ mod tests {
             return;
         }
         let _env = crate::test_env::isolate_hex_dir();
-        test_child::stage("upgrade:preflight-overlay-stale-body").expect("test-child stage must flush");
+        test_child::stage("upgrade:preflight-overlay-stale-body")
+            .expect("test-child stage must flush");
         let (_tmp, source, instance) = binary_preflight_fixture();
         // Fixture's installed binary is written, then its overlay file below
         // is written strictly after — filesystem mtime order proves the

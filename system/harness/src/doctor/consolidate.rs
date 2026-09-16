@@ -348,7 +348,11 @@ mod tests {
         let proj = td.path().join("projects").join("beta");
         fs::create_dir_all(&proj).unwrap();
         let issues = orphan_project_issues(td.path());
-        assert_eq!(issues.len(), 1, "expected exactly one ORPHAN issue: {issues:?}");
+        assert_eq!(
+            issues.len(),
+            1,
+            "expected exactly one ORPHAN issue: {issues:?}"
+        );
         assert!(
             issues[0].contains("context.md"),
             "message must name context.md: {issues:?}"

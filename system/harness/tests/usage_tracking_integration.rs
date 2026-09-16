@@ -145,9 +145,18 @@ fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
     assert!(!text.contains("\"r1\""));
     assert!(text.contains("\"credits_micro\":\"81\""));
     assert_eq!(body["schema"], "hex.usage-report.v2");
-    assert_eq!(body["windows"]["current"]["start"], "2026-09-10T00:00:00+00:00");
-    assert_eq!(body["windows"]["current"]["end"], "2026-09-11T00:00:00+00:00");
-    assert_eq!(body["windows"]["preceding"]["end"], "2026-09-10T00:00:00+00:00");
+    assert_eq!(
+        body["windows"]["current"]["start"],
+        "2026-09-10T00:00:00+00:00"
+    );
+    assert_eq!(
+        body["windows"]["current"]["end"],
+        "2026-09-11T00:00:00+00:00"
+    );
+    assert_eq!(
+        body["windows"]["preceding"]["end"],
+        "2026-09-10T00:00:00+00:00"
+    );
     assert!(body["windows"]["current"]["measured"]["cache_write_input_tokens"].is_null());
     assert!(body["windows"]["current"]["measured"]["reasoning_output_tokens"].is_null());
     assert!(body["windows"]["current"]["measured"]["provider_total_tokens"].is_null());
@@ -191,8 +200,12 @@ fn collect_and_report_are_local_disposable_and_worker_is_harness_only() {
         .status()
         .unwrap();
     assert!(status.success());
-    let detail: serde_json::Value = serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
-    assert_eq!(detail["contributor_detail"]["response_ids"], serde_json::json!(["r1"]));
+    let detail: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    assert_eq!(
+        detail["contributor_detail"]["response_ids"],
+        serde_json::json!(["r1"])
+    );
     assert_eq!(detail["contributor_detail"]["total_matches"], 1);
     let paths = hex::workers::hex_modules::module_paths();
     assert!(paths
@@ -213,14 +226,44 @@ fn report_streams_more_than_the_old_cap_and_keeps_half_open_boundaries() {
     for id in 0..100_001 {
         writeln!(file, "{{\"type\":\"token_usage_record\",\"provider\":\"codex\",\"response_id\":\"current-{id}\",\"event_at\":\"2026-09-10T12:00:00Z\",\"model\":\"gpt-5.6-luna\",\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}").unwrap();
     }
-    for (id, event_at) in [("preceding", "2026-09-09T00:00:00Z"), ("end", "2026-09-11T00:00:00Z")] {
+    for (id, event_at) in [
+        ("preceding", "2026-09-09T00:00:00Z"),
+        ("end", "2026-09-11T00:00:00Z"),
+    ] {
         writeln!(file, "{{\"type\":\"token_usage_record\",\"provider\":\"codex\",\"response_id\":\"{id}\",\"event_at\":\"{event_at}\",\"model\":\"gpt-5.6-luna\",\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}").unwrap();
     }
-    let collect = Command::new(bin()).env("HEX_DIR", root.path()).args(["usage", "collect", "--source", source.to_str().unwrap(), "--ledger", ledger.to_str().unwrap(), "--max-records", "100010"]).status().unwrap();
+    let collect = Command::new(bin())
+        .env("HEX_DIR", root.path())
+        .args([
+            "usage",
+            "collect",
+            "--source",
+            source.to_str().unwrap(),
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--max-records",
+            "100010",
+        ])
+        .status()
+        .unwrap();
     assert!(collect.success());
-    let report = Command::new(bin()).env("HEX_DIR", root.path()).args(["usage", "report", "--ledger", ledger.to_str().unwrap(), "--output", output.to_str().unwrap(), "--cutoff", "2026-09-11T16:30:00Z"]).status().unwrap();
+    let report = Command::new(bin())
+        .env("HEX_DIR", root.path())
+        .args([
+            "usage",
+            "report",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--cutoff",
+            "2026-09-11T16:30:00Z",
+        ])
+        .status()
+        .unwrap();
     assert!(report.success());
-    let body: serde_json::Value = serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
     assert_eq!(body["windows"]["current"]["measured"]["responses"], 100_001);
     assert_eq!(body["windows"]["preceding"]["measured"]["responses"], 1);
     assert_eq!(body["windows"]["change_tokens"], "200000");
