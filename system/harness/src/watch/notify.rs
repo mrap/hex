@@ -139,16 +139,28 @@ pub fn notify(
 /// Clears the inbox unless `peek`.
 pub fn drain(hex_dir: &Path, session: &str, peek: bool) -> Result<Option<String>, String> {
     let p = inbox_path(hex_dir, session);
-    let body = match std::fs::read_to_string(&p) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("read {}: {e}", p.display())),
+    let body = if peek {
+        match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("read {}: {e}", p.display())),
+        }
+    } else {
+        // Claim by rename first, so two hooks draining at once (SessionStart
+        // racing the first prompt) cannot both read the same lines.
+        let claimed = p.with_extension(format!("md.{}.draining", std::process::id()));
+        match std::fs::rename(&p, &claimed) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("claim {}: {e}", p.display())),
+        }
+        let s = std::fs::read_to_string(&claimed)
+            .map_err(|e| format!("read {}: {e}", claimed.display()))?;
+        std::fs::remove_file(&claimed).map_err(|e| format!("remove {}: {e}", claimed.display()))?;
+        s
     };
     if body.trim().is_empty() {
         return Ok(None);
-    }
-    if !peek {
-        std::fs::write(&p, "").map_err(|e| format!("clear {}: {e}", p.display()))?;
     }
     Ok(Some(format!(
         "\n*** hex events for session \"{session}\" (act on these; they are consumed now) ***\n{}*** End hex events ***\n",

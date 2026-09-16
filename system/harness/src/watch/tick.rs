@@ -224,7 +224,16 @@ fn poll(env: &Env, w: &Watch) -> Result<Vec<Hit>, String> {
                     tail(&out.stderr, 300)
                 ));
             }
-            sources::parse_gmail_output(&out.stdout, &account)
+            let hits = sources::parse_gmail_output(&out.stdout, &account)?;
+            if let Some(h) = hits.iter().find(|h| h.at_ms <= 0) {
+                // Gmail always has internalDate; a missing one is a broken
+                // adapter, and trusting it would defeat the since guard.
+                return Err(format!(
+                    "gmail hit {} has no internal_ms; refusing to trust it",
+                    h.key
+                ));
+            }
+            Ok(hits)
         }
         "event" => {
             let name = sources::event_name(&w.r#match)?;
@@ -293,7 +302,33 @@ fn tail(s: &str, n: usize) -> String {
 /// One pass. Returns the report; `Err` only when the store itself is broken
 /// (unreadable items or state), which the worker turns into an error row.
 pub fn run(env: &Env, now: DateTime<Utc>) -> Result<TickReport, String> {
+    use fs2::FileExt;
     let hex_dir = env.hex_dir.as_path();
+    // One tick at a time per HEX_DIR: a hand-run `hex watch tick` racing the
+    // cron worker would otherwise both claim and fire the same watch
+    // (adversarial review 2026-09-16, finding 1). The lock lives for the
+    // whole pass; a second caller fails loudly instead of waiting.
+    std::fs::create_dir_all(store::watch_dir(hex_dir))
+        .map_err(|e| format!("watch: mkdir {}: {e}", store::watch_dir(hex_dir).display()))?;
+    let lock_path = store::watch_dir(hex_dir).join("tick.lock");
+    let lock = std::fs::File::create(&lock_path)
+        .map_err(|e| format!("watch: open {}: {e}", lock_path.display()))?;
+    // Short grace: a forked child of another thread can hold a dup of the
+    // lock fd for a few ms before it execs (CLOEXEC then drops it).
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+            Err(e) => {
+                return Err(format!(
+                    "another tick is already running for this HEX_DIR (tick.lock held: {e}); not racing it"
+                ))
+            }
+        }
+    }
     let imported = store::import_v1(hex_dir, now)?;
     if imported > 0 {
         (env.log)(&format!(
@@ -524,22 +559,31 @@ impl Shell for ShShell {
             .map_err(|e| format!("create {}: {e}", out_p.display()))?;
         let err_f = std::fs::File::create(&err_p)
             .map_err(|e| format!("create {}: {e}", err_p.display()))?;
-        let mut child = Command::new("/bin/sh")
+        #[allow(unused_imports)]
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(cmd)
+            // own process group, so a timeout kills grandchildren too
+            // (an action that shells out to `gws` must not leave it running)
+            .process_group(0)
             .env_clear()
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .stdout(Stdio::from(out_f))
-            .stderr(Stdio::from(err_f))
-            .spawn()
-            .map_err(|e| format!("spawn sh: {e}"))?;
+            .stderr(Stdio::from(err_f));
+        let mut child = command.spawn().map_err(|e| format!("spawn sh: {e}"))?;
         let start = std::time::Instant::now();
         let code = loop {
             match child.try_wait() {
                 Ok(Some(st)) => break st.code().unwrap_or(128 + 9),
                 Ok(None) => {
                     if start.elapsed() >= timeout {
+                        // SAFETY: plain libc call on a pgid we created above.
+                        unsafe {
+                            libc::kill(-(child.id() as i32), libc::SIGKILL);
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         let mut o = ShellOutput {
@@ -663,6 +707,7 @@ pub(crate) mod fakes {
                     "fail" => (1, String::new(), "boom".to_string()),
                     "hit" => (0, format!("{{\"account\":\"me@example.com\",\"id\":\"m1\",\"internal_ms\":{now_ms},\"date\":\"D\",\"from\":\"a@b\",\"subject\":\"Subj\"}}\n"), String::new()),
                     "old" => (0, "{\"account\":\"me@example.com\",\"id\":\"m0\",\"internal_ms\":1000000000000,\"date\":\"D\",\"from\":\"a@b\",\"subject\":\"Old\"}\n".to_string(), String::new()),
+                    "nots" => (0, "{\"account\":\"me@example.com\",\"id\":\"m9\",\"date\":\"D\",\"from\":\"a@b\",\"subject\":\"NoTs\"}\n".to_string(), String::new()),
                     _ => (0, String::new(), String::new()),
                 };
                 return Ok(ShellOutput {
@@ -1066,6 +1111,71 @@ mod tests {
         assert!(rep.would_fire[0].starts_with(&w.id));
         assert!(!marker.exists());
         assert_eq!(r.get(&w.id).status, Status::Pending);
+    }
+
+    #[test]
+    fn a_second_tick_cannot_run_while_the_lock_is_held() {
+        use fs2::FileExt;
+        let r = Rig::new("hit");
+        r.add("true");
+        std::fs::create_dir_all(store::watch_dir(r.hex())).unwrap();
+        let held = std::fs::File::create(store::watch_dir(r.hex()).join("tick.lock")).unwrap();
+        held.lock_exclusive().unwrap();
+        let log = |_m: &str| {};
+        let env = Env {
+            hex_dir: r.hex().to_path_buf(),
+            config: Config::default(),
+            substrate: &r.sub,
+            shell: &r.shell,
+            alerter: &r.al,
+            parent_env: r.parent.clone(),
+            dry_run: false,
+            log: &log,
+        };
+        let err = run(&env, Utc::now()).unwrap_err();
+        assert!(err.contains("another tick is already running"), "{err}");
+        assert!(
+            r.shell.gmail_calls.borrow().is_empty(),
+            "locked-out tick must not poll"
+        );
+        held.unlock().unwrap();
+        assert!(run(&env, Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn gmail_hit_without_internal_ms_is_a_poll_error_not_a_fire() {
+        let r = Rig::new("nots");
+        let w = r.add("true");
+        let rep = r.tick();
+        assert_eq!(rep.poll_failures, 1);
+        assert_eq!(r.get(&w.id).status, Status::Pending);
+        assert!(r.logs_contain("has no internal_ms"));
+    }
+
+    #[test]
+    fn action_timeout_kills_the_whole_process_group() {
+        let r = Rig::new("hit");
+        let marker = r.dir.path().join("grandchild");
+        // background grandchild in the same group; must die with the group
+        let w = r.add(&format!("(sleep 2; touch {}) & sleep 30", marker.display()));
+        let log = |_m: &str| {};
+        let mut config = Config::default();
+        config.sources.gmail.command = "GMAILSTUB {query} {account}".into();
+        config.action_timeout_secs = 1;
+        let env = Env {
+            hex_dir: r.hex().to_path_buf(),
+            config,
+            substrate: &r.sub,
+            shell: &r.shell,
+            alerter: &r.al,
+            parent_env: r.parent.clone(),
+            dry_run: false,
+            log: &log,
+        };
+        run(&env, Utc::now()).unwrap();
+        assert_eq!(r.get(&w.id).status, Status::Failed);
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!marker.exists(), "grandchild survived the timeout kill");
     }
 
     #[test]

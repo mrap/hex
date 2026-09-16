@@ -3009,14 +3009,15 @@ fn run_watch(command: WatchCommands) -> i32 {
         let Some(t) = t else { return "-".to_string() };
         let d = (t - now).num_seconds();
         let s = d.unsigned_abs();
+        // nearest unit, so a fresh 14d watch reads "in 14d", not "in 13d"
         let txt = if s < 60 {
             format!("{s}s")
         } else if s < 3600 {
-            format!("{}m", s / 60)
+            format!("{}m", (s + 30) / 60)
         } else if s < 86_400 {
-            format!("{}h", s / 3600)
+            format!("{}h", (s + 1800) / 3600)
         } else {
-            format!("{}d", s / 86_400)
+            format!("{}d", (s + 43_200) / 86_400)
         };
         if d > 0 {
             format!("in {txt}")

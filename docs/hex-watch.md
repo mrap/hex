@@ -52,7 +52,7 @@ Adapter contract, for new sources: a `poll` in `watch/sources.rs` plus a `tick::
 
 ### Action contract
 
-- Runs once through `/bin/sh -c`, exit 0 = `done`, anything else = `failed`, killed after `action_timeout_secs` (exit 124).
+- Runs once through `/bin/sh -c` in its own process group, exit 0 = `done`, anything else = `failed`. After `action_timeout_secs` the whole group is killed (grandchildren too) and the watch fails with exit 124.
 - Env is allowlisted, never the daemon's full environment: `PATH`, `HOME`, `USER`, `LANG`, `TMPDIR`, `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` (default `file`), `HEX_DIR`, anything in `[action] env_passthrough`, plus `WATCH_ID`, `WATCH_SOURCE`, `WATCH_KEY`, `WATCH_AT` (epoch ms), `WATCH_NOTE`, and `WATCH_<FIELD>` for every hit field (upper-cased, non-alphanumerics to `_`). Gmail adds `MAIL_MSG_ID`, `MAIL_SUBJECT`, `MAIL_FROM`, `MAIL_DATE`, `MAIL_INTERNAL_MS`, `MAIL_ACCOUNT`. Event adds `WATCH_EVENT`, `WATCH_PRODUCER`, `WATCH_TS`, `WATCH_DATA` (JSON), `WATCH_DATA_<KEY>` per top-level data key.
 - `--notify SESSION` with no `--action` sets the action to `"$HEX_DIR/.hex/bin/hex" watch notify SESSION "watch $WATCH_ID fired ($WATCH_SOURCE $WATCH_KEY): $WATCH_NOTE"`. `--nudge` appends `--now`.
 
@@ -96,7 +96,8 @@ Missing file = defaults. Malformed or unknown key = loud error, every command ex
 | Guarantee | How |
 |---|---|
 | At most once | The record is saved as `firing` before the action runs. A crash or restart mid-action leaves it `firing`; it is never re-run, `list` flags it, `retry` is the human path back. |
-| Never before `since` | `since` is stamped at add time (or `--since`). The adapter narrows at the source; the loop then rejects any hit with `at_ms < since`. A hit with unknown time (`at_ms = 0`) is trusted and logged. |
+| Never before `since` | `since` is stamped at add time (or `--since`). The adapter narrows at the source; the loop then rejects any hit with `at_ms < since`. An `event` hit with an unparseable `ts` is trusted and logged; a `gmail` hit without `internal_ms` is a poll error (Gmail always has one; a missing one is a broken adapter). |
+| One tick at a time | `tick` holds an exclusive lock on `.hex/watch/tick.lock` for the whole pass. A hand-run `hex watch tick` while the worker is ticking waits up to 3 s, then fails loudly instead of racing (double fire). |
 | Never forever | `expires` = add time + duration (default 14d; `--since` does not shorten it). On lapse: status `expired`, alert, `hex hitl` item (project `hex-ops`, P2), `hex.watch.expired` emitted. Exactly once, and never polled. |
 | Always visible | Nothing runs that `list` cannot show. `status` is the dashboard line. `hex module list` shows the worker; telemetry rows show every tick. |
 | Loud failures (S6) | Poll errors log every tick and make the worker fire `status=error`; 3 failing ticks in a row alert once (`alert::notify`, key `watch-poll-streak`), a clean tick resets and clears the stamp. Config errors (unknown source, missing match) fail that watch once with an alert and stay out of the poll streak. Action failure: `failed`, stderr tail stored, alert. Emit or hitl failure: logged, never blocks the watch. A malformed item file or config is a loud error, never a skipped row. |

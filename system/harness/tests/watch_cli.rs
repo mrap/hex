@@ -114,7 +114,7 @@ fn add_list_status_and_the_record_shape() {
     assert!(
         out.contains(&id)
             && out.contains("pending")
-            && out.contains("in 13d")
+            && out.contains("in 14d")
             && out.contains("demo"),
         "{out}"
     );
