@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""hex-hooks-merge: merge system/hooks/required-hooks.json into .claude/settings.json.
+
+Idempotent. Used by install.sh (fresh install) and by /hex-upgrade (existing instance),
+so a hook added to the manifest reaches every instance, not only new ones.
+Usage: hex-hooks-merge <manifest.json> <settings.json>
+Prints one line per hook added; exits non-zero on unreadable manifest.
+"""
+import json, os, sys
+
+def merge(manifest_path, settings_path):
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    settings = {}
+    if os.path.exists(settings_path):
+        with open(settings_path) as f:
+            try:
+                settings = json.load(f)
+            except json.JSONDecodeError:
+                settings = {}
+    hooks_section = settings.setdefault('hooks', {})
+    added = []
+    for event_type, hook_defs in manifest.items():
+        event_hooks = hooks_section.setdefault(event_type, [])
+        for hook_def in hook_defs:
+            matcher = hook_def.get('matcher', '')
+            if 'command' in hook_def:
+                hook_command = hook_def['command']
+                is_present = any(any(h.get('command', '') == hook_command for h in e.get('hooks', [])) for e in event_hooks)
+            else:
+                script_rel = hook_def['script']
+                script_name = os.path.basename(script_rel)
+                hook_command = f'bash "$CLAUDE_PROJECT_DIR/{script_rel}"'
+                is_present = any(any(script_name in h.get('command', '') for h in e.get('hooks', [])) for e in event_hooks)
+            if not is_present:
+                event_hooks.append({'matcher': matcher, 'hooks': [{'type': 'command', 'command': hook_command}]})
+                added.append(f"{event_type}: {hook_command}")
+    tmp = settings_path + '.tmp'
+    os.makedirs(os.path.dirname(os.path.abspath(tmp)), exist_ok=True)
+    with open(tmp, 'w') as f:
+        json.dump(settings, f, indent=2); f.write("\n")
+    os.replace(tmp, settings_path)
+    return added
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3:
+        sys.exit("usage: hex-hooks-merge <manifest.json> <settings.json>")
+    for line in merge(sys.argv[1], sys.argv[2]):
+        print("hook added:", line)
