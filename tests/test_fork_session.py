@@ -7,7 +7,7 @@ the launch line to `eval` (so both a real launch command like `hex-new <name>` a
 `FAKE-LAUNCH <name>` run for real and can invoke the SessionStart hook). This exercises the round trip
 stage -> launch -> inject -> archive -> kickoff -> register end to end.
 """
-import os, shutil, subprocess, sys, tempfile, unittest
+import os, re, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -314,6 +314,68 @@ class ForkTests(Base):
         self.env["FAKE_RC_AFTER_ENTER"] = "1"; self.env["FAKE_NO_SUBMIT"] = "1"
         r = self.run_fork("tau", "body\n")
         self.assertEqual(r.returncode, 5, r.stderr)
+
+
+class DocContractTests(unittest.TestCase):
+    """Doc-content assertions for review findings #6/#7/#14/#20/#21 (R17, R18, R20): the command
+    doc must carry a full exit-code table in foundation terms with every instance path qualified,
+    the test matrix must name the new test files, and the two hex-upgrade docs must describe the
+    hooks merge identically."""
+
+    DOC = REPO / "system/commands/hex-fork-session.md"
+    TESTING_DOC = REPO / "docs/testing.md"
+    HEX_OPS_DOC = REPO / "docs/hex-ops.md"
+    UPGRADE_CMD = REPO / "system/commands/hex-upgrade.md"
+    UPGRADE_SKILL = REPO / "system/skills/hex-upgrade/SKILL.md"
+
+    def test_command_doc_has_exit_code_table_rows(self):
+        text = self.DOC.read_text()
+        for code in (0, 2, 3, 4, 5, 6, 7):
+            with self.subTest(code=code):
+                self.assertRegex(text, rf"(?m)^\|\s*{code}\s*\|", f"missing exit-code table row for {code}")
+
+    def test_command_doc_qualifies_instance_paths_with_hex_dir(self):
+        text = self.DOC.read_text()
+        prefix = "$HEX_DIR/"
+        for needle in (".hex/run/handoffs", "projects/hex-ops"):
+            start = 0
+            found = False
+            while True:
+                idx = text.find(needle, start)
+                if idx == -1:
+                    break
+                found = True
+                got = text[max(0, idx - len(prefix)):idx]
+                self.assertEqual(got, prefix,
+                                  f"{needle!r} at offset {idx} not qualified with $HEX_DIR/ (got {got!r})")
+                start = idx + 1
+            self.assertTrue(found, f"expected at least one occurrence of {needle!r} in the doc")
+
+    def test_command_doc_uses_foundation_terms_only(self):
+        text = self.DOC.read_text()
+        for banned in ("--fresh", "hex-new-session", "SO 3b", "fleet table"):
+            self.assertNotIn(banned, text, f"foundation doc must not contain {banned!r}")
+
+    def test_testing_doc_names_both_new_tests(self):
+        text = self.TESTING_DOC.read_text()
+        self.assertIn("test_fork_session.py", text)
+        self.assertIn("test_hooks_merge.py", text)
+
+    def test_hex_ops_doc_has_kickoff_and_no_fresh_default(self):
+        text = self.HEX_OPS_DOC.read_text()
+        self.assertIn("--kickoff", text)
+        self.assertNotIn("hex-new @name@ --fresh", text)
+
+    def _step_2b_section(self, path):
+        text = path.read_text()
+        m = re.search(r"(?ms)^## Step 2b.*?(?=^## |\Z)", text)
+        self.assertIsNotNone(m, f"no ## Step 2b section found in {path}")
+        return m.group(0)
+
+    def test_step_2b_identical_across_upgrade_docs(self):
+        cmd_section = self._step_2b_section(self.UPGRADE_CMD)
+        skill_section = self._step_2b_section(self.UPGRADE_SKILL)
+        self.assertEqual(cmd_section, skill_section)
 
 
 if __name__ == "__main__":
