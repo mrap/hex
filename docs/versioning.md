@@ -76,14 +76,26 @@ nothing.
    or none), verify each ref, then create the GitHub release if the repo profile
    enables it
 
-**If a push is rejected:** nothing is on origin. When `origin/develop` moved again
-between the reconcile and the push, the ceremony reconciles once more and retries
-once; a second rejection aborts with `Nothing was pushed` and numbered by-hand
-commands (merge `origin/develop`, merge `main`, one atomic push, delete the
-release branch). If origin accepted the push but verification disagrees, the
-ceremony prints a `PUBLISH STATE` block naming each ref as on origin or not, runs
-the GitHub release only when the tag is on origin, and exits non-zero with the
-push command for whatever is missing.
+**If origin rejects the push:** nothing is on origin. When `origin/develop` moved
+again between the reconcile and the push, the ceremony reconciles once more and
+retries once; a second rejection aborts with `Nothing was pushed` and numbered
+by-hand commands (merge `origin/develop`, merge `main`, one atomic push, delete
+the release branch; plus an unwind that resets `main` and `develop` to their
+pre-cut commits).
+
+**If git fails without a rejection from origin** (connection lost after send,
+git killed, a client-side hook): the outcome is unknown, so the ceremony asks
+origin. If every ref is exactly where it was before the push, that is a verified
+`Nothing was pushed` with the same by-hand commands. If all three refs are at
+the expected commits, the release completes normally. Anything else is the
+publish-state path below.
+
+**If verification disagrees with the push:** the ceremony prints a `PUBLISH
+STATE` block with one line per ref: `on origin at <sha>`, `on origin at <sha>
+(expected <sha>)`, `not on origin`, or `could not verify (<error>)`. It creates
+the GitHub release only when the tag is on origin at the expected commit, runs
+cleanup, and exits non-zero with a push command for refs origin confirmed absent
+and an `ls-remote` command for refs it could not confirm.
 
 If `develop` does not exist yet, the command refuses and prints the bootstrap
 one-liner: `git branch develop main && git push origin develop`.
