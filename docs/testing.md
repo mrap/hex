@@ -8,7 +8,7 @@ Rules for writing and reviewing tests: [testing-standard.md](testing-standard.md
 
 | Category | Files | Needs API key |
 |----------|-------|:-------------:|
-| Static / unit | `test_skill_frontmatter.sh`, `test_skill_refs.sh`, `test_doctor.bats`, `test_claude_runs_migration.bats`, `test_worktree_guard.sh` | No |
+| Static / unit | `test_skill_frontmatter.sh`, `test_skill_refs.sh`, `test_doctor.bats`, `test_claude_runs_migration.bats`, `test_worktree_guard.sh`, `test_fork_session.py`, `test_hooks_merge.py` | No |
 | Core E2E (containerized) | `tests/core-e2e/run-all.sh` | BOI suites only |
 | Live eval — Claude Code | `test_skill_discovery.sh`, `test_e2e.sh`, `test_fullstack.sh` | Yes |
 | Live eval — Codex | `test_skill_discovery_codex.sh`, `test_codex_onboarding.sh` | Yes |
@@ -130,6 +130,8 @@ bash tests/test_skill_frontmatter.sh
 bash tests/test_skill_refs.sh
 bash tests/test_worktree_guard.sh
 bats tests/test_doctor.bats tests/test_claude_runs_migration.bats
+python3 -I -B tests/test_fork_session.py
+python3 -I -B tests/test_hooks_merge.py
 ```
 
 ### Full Docker eval suite
