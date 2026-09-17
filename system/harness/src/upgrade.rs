@@ -1847,6 +1847,128 @@ fn configure_hooks_path(workspace: &Path) {
     }
 }
 
+/// R1a/KTD1: preflight check for `hex upgrade`'s up-to-date gate and dry-run
+/// report. Runs `<merger> --check <manifest> <settings>` and translates its
+/// exit code into the set of missing "event: command" lines, per
+/// `hex-hooks-merge`'s own `--check` contract: 0 = none missing, 3 = the
+/// listed lines (on stdout) are missing, 2 = `settings` exists but is not
+/// valid JSON. An unparseable settings.json is folded into `Ok` with a
+/// synthetic line rather than `Err`, so the gate treats it as work to do
+/// (never "up to date") instead of aborting the whole preflight over it.
+/// `merger` is deliberately the SOURCE tree's copy (this runs before Step 5
+/// has synced anything into the instance); a missing merger there is a real
+/// preflight failure, not "nothing missing" — python3 itself exits 2 for a
+/// missing script file, which would otherwise collide with the JSON-error
+/// code, so that case is checked explicitly first. A missing manifest means
+/// nothing is required at all (mirrors `merge_required_hooks`'s warn-and-skip),
+/// checked before the merger so a source tree that ships no hooks manifest
+/// never trips over a merger requirement it has no use for.
+fn required_hooks_missing(
+    merger: &Path,
+    manifest: &Path,
+    settings: &Path,
+) -> Result<Vec<String>, String> {
+    if !manifest.exists() {
+        return Ok(Vec::new());
+    }
+    if !merger.exists() {
+        return Err(format!(
+            "required hooks merger not found at {}",
+            merger.display()
+        ));
+    }
+    let output = Command::new("python3")
+        .arg(merger)
+        .arg("--check")
+        .arg(manifest)
+        .arg(settings)
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", merger.display()))?;
+    match output.status.code() {
+        Some(0) => Ok(Vec::new()),
+        Some(3) => Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(2) => Ok(vec![format!(
+            "settings.json is not valid JSON: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )]),
+        _ => Err(format!(
+            "{} --check failed: {}",
+            merger.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// R1/R1b/KTD1: merges `<hex_dot_dir>/hooks/required-hooks.json` into
+/// `<workspace>/.claude/settings.json` via the one `hex-hooks-merge`
+/// implementation shared with `install.sh`, so a hook added to the manifest
+/// reaches every instance on its next `hex upgrade`, not only fresh installs.
+/// `Ok` carries the merger's stdout lines (one per hook added; empty when
+/// everything was already wired). An absent manifest is a `[WARN]` skip, not
+/// a failure — install may run this before `hooks/` has synced. A missing
+/// merger script, or a non-zero merger exit (e.g. a malformed
+/// `settings.json`, which the merger refuses to overwrite), is `Err`.
+fn merge_required_hooks(hex_dot_dir: &Path, workspace: &Path) -> Result<Vec<String>, String> {
+    let manifest = hex_dot_dir.join("hooks/required-hooks.json");
+    let merger = hex_dot_dir.join("scripts/hex-hooks-merge");
+    let settings = workspace.join(".claude/settings.json");
+
+    if !manifest.exists() {
+        println!(
+            "  [WARN] no required-hooks manifest at {}",
+            manifest.display()
+        );
+        return Ok(Vec::new());
+    }
+    if !merger.exists() {
+        return Err(format!("hooks merger not found at {}", merger.display()));
+    }
+
+    let output = Command::new("python3")
+        .arg(&merger)
+        .arg(&manifest)
+        .arg(&settings)
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", merger.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "hex-hooks-merge failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// R1a/KTD1: pure predicate behind the "Everything is up to date" gate,
+/// factored out so a missing required hook (`missing_hooks_empty == false`)
+/// can be exercised without a whole-upgrade fixture. Mirrors the previous
+/// inline `&&`-chain exactly, plus the new hooks term.
+fn upgrade_is_up_to_date(
+    total_changed: usize,
+    total_new: usize,
+    version_changed: bool,
+    binary_stale: bool,
+    versions_pin_stale: bool,
+    companion_needs_work: bool,
+    missing_hooks_empty: bool,
+) -> bool {
+    total_changed == 0
+        && total_new == 0
+        && !version_changed
+        && !binary_stale
+        && !versions_pin_stale
+        && !companion_needs_work
+        && missing_hooks_empty
+}
+
 /// Paths already dirty when the upgrade started are never eligible for the
 /// upgrade bookkeeping commit. This snapshot is intentionally small: it
 /// records only porcelain paths under `.hex`, including untracked operator
@@ -2426,13 +2548,30 @@ pub fn run(args: &[String]) -> i32 {
         println!("  → Code-intel needs a separate app, command path or service update.");
     }
 
-    if total_changed == 0
-        && total_new == 0
-        && !version_changed
-        && !binary_stale
-        && !versions_pin_stale
-        && !companion_plan.needs_work()
-    {
+    // R1a/KTD1: a missing required hook is work to do. Checked against the
+    // SOURCE tree's merger + manifest so this works even before Step 5 has
+    // synced `.hex/hooks` and `.hex/scripts` on this instance.
+    let missing_hooks = match required_hooks_missing(
+        &source_dir.join("system/scripts/hex-hooks-merge"),
+        &source_dir.join("system/hooks/required-hooks.json"),
+        &hex_dir.join(".claude/settings.json"),
+    ) {
+        Ok(missing) => missing,
+        Err(e) => {
+            eprintln!("  [FAIL] Could not check required hooks during preflight: {e}");
+            return 1;
+        }
+    };
+
+    if upgrade_is_up_to_date(
+        total_changed,
+        total_new,
+        version_changed,
+        binary_stale,
+        versions_pin_stale,
+        companion_plan.needs_work(),
+        missing_hooks.is_empty(),
+    ) {
         println!("  [OK] Everything is up to date. Nothing to do.");
         return 0;
     }
@@ -2454,6 +2593,10 @@ pub fn run(args: &[String]) -> i32 {
                 "  → launchd jobs to reload after a binary swap: {}",
                 labels.join(", ")
             );
+        }
+        println!("  → required hooks to merge: {}", missing_hooks.len());
+        for line in &missing_hooks {
+            println!("     {line}");
         }
         println!("\n4. Dry Run Complete");
         println!("  → Run without --dry-run to apply changes.");
@@ -2536,6 +2679,26 @@ pub fn run(args: &[String]) -> i32 {
                     failures.push(message);
                 }
             }
+        }
+    }
+
+    // R1/R1b/KTD1: wire required hooks now that scripts (the merger) and
+    // hooks (the manifest) are both on disk. A merge failure is a [FAIL]
+    // that makes the upgrade exit non-zero (R1b); the existing settings.json
+    // is left untouched (the merger never writes on a non-zero exit).
+    match merge_required_hooks(&hex_dot_dir, &hex_dir) {
+        Ok(lines) if lines.is_empty() => {
+            println!("  [OK] Required hooks already wired.");
+        }
+        Ok(lines) => {
+            for line in &lines {
+                println!("  [OK] {line}");
+            }
+        }
+        Err(e) => {
+            let message = format!("required hooks merge failed: {e}");
+            eprintln!("  [FAIL] {message}");
+            failures.push(message);
         }
     }
 
