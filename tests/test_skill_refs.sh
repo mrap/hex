@@ -46,7 +46,8 @@ OPTIONAL_PREFIXES = (
 )
 OPTIONAL_PATHS = {
     ".hex/", ".hex/llm-preference", ".hex/memory.db", ".hex/migrate-from",
-    ".hex/settings.local.json", ".hex/upgrade.json", "evolution/", "me/",
+    ".hex/settings.local.json", ".hex/upgrade.json", ".claude/settings.json",
+    "evolution/", "me/",
 }
 
 # install.sh builds this binary from the harness crate and copies it into the

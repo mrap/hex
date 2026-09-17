@@ -1244,13 +1244,18 @@ fn gate_codex_parity(repo_root: &Path, skip: SkipFlags) -> GateResult {
     }
 }
 
-/// The `FAIL` lines of a codex-parity run (at most 8) followed by the output
-/// tail, so a blocked release says which tests failed, not just the exit code.
+/// The failed-test lines of a codex-parity run (at most 8) followed by the
+/// output tail, so a blocked release says which tests failed, not just the
+/// exit code. `tests/codex-parity/run-all.sh` prints its per-test summary as
+/// `[FAIL] name (exit N)`; the individual parity scripts print per-assertion
+/// detail as `FAIL: <name>`. Both prefixes are load-bearing — anchoring on
+/// them (rather than a loose `contains("FAIL")`) keeps lines like
+/// `PASS: no FAILures` from being reported as failures.
 fn parity_failure_detail(combined: &str) -> String {
     let fails: Vec<&str> = combined
         .lines()
         .map(str::trim)
-        .filter(|l| l.contains("FAIL"))
+        .filter(|l| l.starts_with("[FAIL]") || l.starts_with("FAIL:"))
         .take(8)
         .collect();
     if fails.is_empty() {
@@ -3512,7 +3517,7 @@ mod tests {
         std::fs::create_dir_all(&suite).unwrap();
         std::fs::write(
             suite.join("run-all.sh"),
-            "echo 'PASS: something fine'\necho 'FAIL: widget missing'\necho '[FAIL] test-widget'\nexit 1\n",
+            "echo 'PASS: something fine'\necho 'PASS: no FAILures here'\necho 'FAIL: widget missing'\necho '[FAIL] test-widget'\nexit 1\n",
         )
         .unwrap();
         match gate_codex_parity(root, SkipFlags::default()) {
@@ -3520,6 +3525,11 @@ mod tests {
                 assert!(msg.contains("exit 1"), "got: {msg}");
                 assert!(msg.contains("FAIL: widget missing"), "got: {msg}");
                 assert!(msg.contains("[FAIL] test-widget"), "got: {msg}");
+                // The reported FAIL-line list (everything before the raw
+                // "; tail:" context dump) must not pick up a PASS line just
+                // because it contains the substring "FAIL".
+                let fail_lines = msg.split("; tail:").next().unwrap();
+                assert!(!fail_lines.contains("no FAILures"), "got: {msg}");
             }
             other => panic!("expected Fail, got {other:?}"),
         }
@@ -3527,6 +3537,20 @@ mod tests {
             parity_failure_detail("no markers here\nlast line"),
             "no markers here | last line"
         );
+    }
+
+    /// R16/KTD8: `parity_failure_detail` caps at 8 `[FAIL]`/`FAIL:` lines even
+    /// when the run produces more, so the gate reason stays readable.
+    #[test]
+    fn parity_failure_detail_caps_at_eight_fail_lines() {
+        let combined = (0..10)
+            .map(|i| format!("[FAIL] t{i} (exit 1)"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = parity_failure_detail(&combined);
+        let (fail_lines, tail) = detail.split_once("; tail:").expect("got: {detail}");
+        assert_eq!(fail_lines.split(" | ").count(), 8, "got: {detail}");
+        assert!(!tail.is_empty(), "got: {detail}");
     }
 
     // -- profiles --------------------------------------------------------------
