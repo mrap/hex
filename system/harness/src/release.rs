@@ -80,10 +80,16 @@
 //! [`cut`] (`hex release cut`) is the single release verb: exclusive lock →
 //! preconditions → gate battery (`--dry-run` stops here) → version → the
 //! `release/X.Y.Z` (or `hotfix/X.Y.Z`) branch → version bump with
-//! build-failure revert → notes → `--no-ff` merge to main + tag → `--no-ff`
-//! back-merge to develop → race guard → hardened pushes (every push carries
-//! `HEX_RELEASE_PIPELINE=1`) → optional GitHub release → cleanup → summary.
-//! Fully non-interactive; exit 0 only on full success.
+//! build-failure revert → notes → `--no-ff` merge to main + tag → race guard
+//! (fresh cut: local develop unmoved) → fetch + reconcile `origin/develop`
+//! into local develop (fast-forward when behind, `--no-ff` merge when
+//! diverged, abort before any push on conflict) → `--no-ff` back-merge to
+//! develop → consistency check → ONE atomic push of main, the tag, and
+//! develop (`git push --atomic`, carrying `HEX_RELEASE_PIPELINE=1`; origin
+//! holds all three or none; a develop non-fast-forward rejection gets one
+//! reconcile-and-retry) → independent post-push verify (a mismatch prints a
+//! `PUBLISH STATE` block naming what origin holds) → optional GitHub release
+//! → cleanup → summary. Fully non-interactive; exit 0 only on full success.
 //!
 //! ### Finish mode (`--finish release/X.Y.Z` | `--finish hotfix/X.Y.Z`)
 //!

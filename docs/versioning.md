@@ -68,9 +68,22 @@ nothing.
 3. Compute the next semver (refusing anything not greater than the latest tag)
 4. Branch `release/X.Y.Z`, bump `system/harness/Cargo.toml` + `system/version.txt`,
    rebuild so `Cargo.lock` updates, commit `bump: vX.Y.Z`
-5. Merge `--no-ff` to `main`, tag `vX.Y.Z`, back-merge to `develop`
-6. Push `main`, `develop`, and the tag (with post-push verification), then create
-   the GitHub release if the repo profile enables it
+5. Merge `--no-ff` to `main` and tag `vX.Y.Z`
+6. Reconcile `develop` with `origin/develop` (fast-forward when behind, a real
+   merge when diverged; a conflict aborts before any push), then back-merge
+   `main` to `develop`
+7. Push `main`, the tag, and `develop` in ONE atomic push (origin holds all three
+   or none), verify each ref, then create the GitHub release if the repo profile
+   enables it
+
+**If a push is rejected:** nothing is on origin. When `origin/develop` moved again
+between the reconcile and the push, the ceremony reconciles once more and retries
+once; a second rejection aborts with `Nothing was pushed` and numbered by-hand
+commands (merge `origin/develop`, merge `main`, one atomic push, delete the
+release branch). If origin accepted the push but verification disagrees, the
+ceremony prints a `PUBLISH STATE` block naming each ref as on origin or not, runs
+the GitHub release only when the tag is on origin, and exits non-zero with the
+push command for whatever is missing.
 
 If `develop` does not exist yet, the command refuses and prints the bootstrap
 one-liner: `git branch develop main && git push origin develop`.
