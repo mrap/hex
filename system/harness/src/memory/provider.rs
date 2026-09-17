@@ -148,10 +148,7 @@ pub fn generate_for(use_case: &str, prompt: &str) -> Result<String, ProviderErro
 /// content-presence check because a `length` cutoff can leave content empty
 /// too (all budget spent on hidden reasoning tokens before any content token
 /// was emitted).
-pub(crate) fn parse_chat_response(
-    use_case: &str,
-    json: &serde_json::Value,
-) -> Result<String, ProviderError> {
+fn parse_chat_response(use_case: &str, json: &serde_json::Value) -> Result<String, ProviderError> {
     let content = json["choices"][0]["message"]["content"].as_str();
     let finish_reason = json["choices"][0]["finish_reason"].as_str();
     if finish_reason == Some("length") {

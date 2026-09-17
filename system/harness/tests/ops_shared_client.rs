@@ -4,8 +4,8 @@
 //! call. See `docs/plans/2026-09-17-1412-fix-known-open-harness-failures-plan.md`,
 //! unit U6.
 //!
-//! Own integration binary, not `tests/fd_limits.rs`: `ops`'s eventual shared
-//! client is a process-wide `OnceLock`, so once one test installs a client,
+//! Own integration binary, not `tests/fd_limits.rs`: `ops`'s shared client is
+//! a process-wide `OnceLock`, so once one test installs a client,
 //! every later test in that SAME PROCESS sees a client already installed.
 //! Sharing a binary with `fd_limits.rs`'s per-call-path tests would make one
 //! file's outcome depend on the other file's run order.
@@ -18,14 +18,15 @@
 //! is not silently order-dependent under a plain `cargo test` run, where all
 //! tests in a binary share one process and one `OnceLock`: there, only the
 //! first call across the binary actually wins the slot, and every test here
-//! is written to tolerate that (tests 1 and 2 assert the per-call path's fd,
-//! telemetry, and per-call-client footprint — not "calls are routed through
-//! THIS test's specific url" — so whichever client wins the slot does not
+//! is written to tolerate that (tests 1 and 2 assert that calls made while
+//! A client is installed add no surviving fds and emit no `iii::shutdown`
+//! row — not "calls are routed through THIS test's specific url" — and each
+//! test's `III_URL`-only port is a freshly bound refused port distinct from
+//! any installed client's, so whichever client wins the slot does not
 //! change their verdict).
 #![cfg(unix)]
 
 use std::net::TcpListener;
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use hex::ops::{
@@ -34,61 +35,9 @@ use hex::ops::{
 };
 use hex::worker::runtime::connect_engine_client;
 
-/// Serializes every test in this binary: they touch the process-wide shared
-/// client slot, `III_URL`, `HEX_DIR`, and the telemetry store it points at.
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Open-fd count of this process (`/dev/fd` on macOS and Linux). Copied from
-/// `tests/fd_limits.rs` (not shared — see module doc for why).
-fn open_fd_count() -> usize {
-    std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
-}
-
-/// Set an env var for the guard's lifetime, restoring the previous value on
-/// drop. Copied from `tests/fd_limits.rs`.
-struct EnvVar {
-    name: &'static str,
-    prev: Option<String>,
-}
-
-impl EnvVar {
-    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let prev = std::env::var(name).ok();
-        std::env::set_var(name, value);
-        EnvVar { name, prev }
-    }
-}
-
-impl Drop for EnvVar {
-    fn drop(&mut self) {
-        match self.prev.take() {
-            Some(v) => std::env::set_var(self.name, v),
-            None => std::env::remove_var(self.name),
-        }
-    }
-}
-
-/// Engine address plus an isolated telemetry store for one test. Copied from
-/// `tests/fd_limits.rs`: telemetry-asserting tests must isolate `HEX_DIR`
-/// into a tempdir because other tests (in other binaries, same lane run)
-/// share the sandboxed `HEX_DIR` the workspace `.cargo/config.toml` sets.
-fn engine_env(url: String) -> (EnvVar, EnvVar, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let hex_dir = EnvVar::set("HEX_DIR", tmp.path());
-    let iii_url = EnvVar::set("III_URL", url);
-    (hex_dir, iii_url, tmp)
-}
-
-/// A loopback port with nothing listening: connects are refused at once.
-/// Copied from `tests/fd_limits.rs`.
-fn refused_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr").port()
-}
+#[path = "support/mod.rs"]
+mod support;
+use support::*;
 
 /// Install a client on `url` into the process-wide shared slot (see module
 /// doc: only the first caller across the whole binary actually wins it).
@@ -144,16 +93,16 @@ fn stall_forever(listener: TcpListener) {
 /// installed shared client, not open its own client from `III_URL`.
 ///
 /// The discriminator is the error message, not timing: `call_builtin_with_
-/// timeout_and_budget` formats `"{function_id} failed (url={url}): {e}"`
-/// where `url` is read straight from `III_URL` on every per-call-path
-/// invocation. So today the error names the `III_URL` port unconditionally;
-/// once the shared path is wired in (this unit's remaining task), `III_URL`
-/// is never read on that path and the error must not name it. `iii::shutdown`
-/// only fires from `record_shutdown_failure` — a per-call shutdown that
-/// OVERRAN its budget, not merely "a per-call shutdown ran" — and fd count
-/// are kept as envelope guards, not the primary signal (a refused-port
-/// shutdown already completes well inside its budget today, so neither one
-/// discriminates before/after on its own here).
+/// timeout_and_budget` formats `"{function_id} failed (url={url}): {e}"`,
+/// and on the shared-client path `url` comes from `shared.address()`, never
+/// from `III_URL`. So the error names the shared client's port; it must
+/// never name the second, `III_URL`-only port, which would mean the call
+/// resolved its own client instead of reusing the installed one.
+/// `iii::shutdown` only fires from `record_shutdown_failure` — a per-call
+/// shutdown that OVERRAN its budget, not merely "a per-call shutdown ran" —
+/// and fd count are kept as envelope guards, not the primary signal (a
+/// refused-port shutdown already completes well inside its budget today, so
+/// neither one discriminates on its own here).
 #[test]
 fn shared_client_refused_port_calls_add_no_fds() {
     let _g = serial();
@@ -208,10 +157,9 @@ fn shared_client_refused_port_calls_add_no_fds() {
 /// installed against a listener that accepts TCP and never answers the
 /// WebSocket handshake, `call_builtin` calls must still fail loud within the
 /// trigger timeout, must not leak fds, and must not run a per-call
-/// `shutdown()`. Fails today for both reasons: the per-call client's
-/// `shutdown_within` blocks for its full budget against a stalled handshake
-/// (recording an `iii::shutdown` row each time) and its socket is never
-/// released within the test.
+/// `shutdown()` — the shared-client path never constructs or tears down its
+/// own client, so `shutdown_within` (and its `iii::shutdown` telemetry row)
+/// never runs on this path at all.
 #[test]
 fn shared_client_stalled_handshake_calls_add_no_fds() {
     let _g = serial();
@@ -244,12 +192,11 @@ fn shared_client_stalled_handshake_calls_add_no_fds() {
         assert!(r.is_err(), "stalled engine must fail loud, got {r:?}");
     }
 
-    // Checked before the fd poll (which can run up to 10s) so both pieces of
-    // red evidence show up even though the fd assertion is very likely to
-    // fail first: each per-call `shutdown_within` blocks for its full budget
-    // against a handshake that never completes, and `record_shutdown_failure`
-    // fires — a per-call shutdown that OVERRAN its budget, not merely "a
-    // per-call shutdown ran" — once per call.
+    // Checked before the fd poll (which can run up to 10s): the shared-client
+    // path never constructs or tears down its own client, so no `iii::shutdown`
+    // row should appear here — a row would mean a per-call `shutdown_within`
+    // ran and overran its budget against the stalled handshake, not merely
+    // "a per-call shutdown ran".
     let rows = hex::telemetry::recent(50).expect("telemetry recent");
     assert!(
         !rows.iter().any(|r| r.event == "iii::shutdown"),
@@ -268,9 +215,9 @@ fn shared_client_stalled_handshake_calls_add_no_fds() {
     );
 }
 
-/// Pins the install contract itself: the seam `serve` will call
+/// Pins the install contract itself: the seam `serve` calls
 /// (`connect_engine_client`) must be the one that installs the shared
-/// client. Fails today: the stub registers a client but does not install it.
+/// client.
 #[test]
 fn connect_engine_client_installs_the_shared_client() {
     let _g = serial();
@@ -284,12 +231,10 @@ fn connect_engine_client_installs_the_shared_client() {
 }
 
 /// A second install must not panic, and the flag must stay true (the first
-/// installed client wins; see module doc). Fails today: the stub's
-/// `shared_client_installed` is hard-coded `false`, regardless of any
-/// install call. The stub install cannot yet print the production WARN line
-/// either (there is nothing to compare a second install against); this test
-/// only pins the panic-free / flag-stays-true contract, which a test process
-/// can observe.
+/// installed client wins; see module doc, and the WARN line
+/// `install_shared_client` prints to stderr on this path). This test pins
+/// the panic-free / flag-stays-true contract, which a test process can
+/// observe; the stderr WARN itself is not asserted here.
 #[test]
 fn second_install_is_a_loud_no_op() {
     let _g = serial();

@@ -369,21 +369,34 @@ mod tests {
     const F3_RAW_COMMAND: &str = "hex hook worktree-guard";
     const F3_HASH: &str = "sha256:96b28df6d719740da58b88bb770bdb9edabfafa79a3091253911eb425814a5a9";
 
-    /// Build the normalized handlers JSON for Fixture 3 the same way
-    /// `trusted_hash_matches_codex_written_entry_live` normalizes a raw
-    /// hooks.json handler, given the raw (un-normalized) `timeout` and
-    /// `additionalContextLimit` that were present in the source (both
-    /// absent for this fixture).
-    fn f3_normalized_handlers_json(raw_timeout: Option<u64>, raw_limit: Option<u64>) -> String {
+    /// Builds the normalized command-handler JSON array `hook_hash` expects,
+    /// applying the same normalization the trusted-hash flow applies to a raw
+    /// Codex hooks.json handler: type "command", the given `command`, the
+    /// defaulted `timeout` (via `normalize_timeout`), the given `async`, an
+    /// optional `statusMessage`, and an optional `additionalContextLimit`
+    /// (only for context-limit events, and only when it differs from the
+    /// 2500 default). Shared by the Fixture 3 tests below and by
+    /// `trusted_hash_matches_codex_written_entry_live`.
+    fn normalized_command_handler_json(
+        event_label: &str,
+        command: &str,
+        raw_timeout: Option<u64>,
+        runs_async: bool,
+        status_message: Option<&str>,
+        raw_limit: Option<u64>,
+    ) -> String {
         let mut norm = serde_json::Map::new();
         norm.insert("type".into(), serde_json::json!("command"));
-        norm.insert("command".into(), serde_json::json!(F3_RAW_COMMAND));
+        norm.insert("command".into(), serde_json::json!(command));
         norm.insert(
             "timeout".into(),
-            serde_json::json!(normalize_timeout(F3_EVENT_LABEL, raw_timeout)),
+            serde_json::json!(normalize_timeout(event_label, raw_timeout)),
         );
-        norm.insert("async".into(), serde_json::json!(false));
-        if context_limit_event(F3_EVENT_LABEL) {
+        norm.insert("async".into(), serde_json::json!(runs_async));
+        if let Some(sm) = status_message {
+            norm.insert("statusMessage".into(), serde_json::json!(sm));
+        }
+        if context_limit_event(event_label) {
             if let Some(limit) = raw_limit {
                 if limit != 2500 {
                     norm.insert("additionalContextLimit".into(), serde_json::json!(limit));
@@ -391,6 +404,22 @@ mod tests {
             }
         }
         serde_json::to_string(&JsonValue::Array(vec![JsonValue::Object(norm)])).unwrap()
+    }
+
+    /// Build the normalized handlers JSON for Fixture 3 the same way
+    /// `trusted_hash_matches_codex_written_entry_live` normalizes a raw
+    /// hooks.json handler, given the raw (un-normalized) `timeout` and
+    /// `additionalContextLimit` that were present in the source (both
+    /// absent for this fixture).
+    fn f3_normalized_handlers_json(raw_timeout: Option<u64>, raw_limit: Option<u64>) -> String {
+        normalized_command_handler_json(
+            F3_EVENT_LABEL,
+            F3_RAW_COMMAND,
+            raw_timeout,
+            false,
+            None,
+            raw_limit,
+        )
     }
 
     #[test]
@@ -524,31 +553,16 @@ mod tests {
                     .unwrap_or_else(|| panic!("async for state key {key} is not a bool: {v}")),
             };
 
-            let mut norm = serde_json::Map::new();
-            norm.insert("type".into(), serde_json::json!("command"));
-            norm.insert("command".into(), serde_json::json!(command));
-            norm.insert(
-                "timeout".into(),
-                serde_json::json!(normalize_timeout(event_label, raw_timeout)),
-            );
-            norm.insert("async".into(), serde_json::json!(runs_async));
-            if let Some(sm) = handler.get("statusMessage").and_then(|v| v.as_str()) {
-                norm.insert("statusMessage".into(), serde_json::json!(sm));
-            }
-            if context_limit_event(event_label) {
-                if let Some(limit) = handler
+            let handlers_json = normalized_command_handler_json(
+                event_label,
+                command,
+                raw_timeout,
+                runs_async,
+                handler.get("statusMessage").and_then(|v| v.as_str()),
+                handler
                     .get("additionalContextLimit")
-                    .and_then(|v| v.as_u64())
-                {
-                    if limit != 2500 {
-                        norm.insert("additionalContextLimit".into(), serde_json::json!(limit));
-                    }
-                }
-            }
-
-            let handlers_json =
-                serde_json::to_string(&serde_json::Value::Array(vec![JsonValue::Object(norm)]))
-                    .unwrap();
+                    .and_then(|v| v.as_u64()),
+            );
             let matcher = matcher_pattern_for_event(event_label, raw_matcher);
             let recomputed = hook_hash(event_label, matcher, &handlers_json).unwrap();
             assert_eq!(

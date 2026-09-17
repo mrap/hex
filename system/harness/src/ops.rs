@@ -169,7 +169,6 @@ pub fn call_builtin_with_timeout_and_budget(
     shutdown_budget: Duration,
 ) -> Result<Value, String> {
     if let Some(shared) = SHARED_CLIENT.get() {
-        let url = shared.address().to_string();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -180,7 +179,7 @@ pub fn call_builtin_with_timeout_and_budget(
             action: None,
             timeout_ms,
         }));
-        return result.map_err(|e| format!("{function_id} failed (url={url}): {e}"));
+        return result.map_err(|e| format!("{function_id} failed (url={}): {e}", shared.address()));
     }
 
     let rt = tokio::runtime::Runtime::new()

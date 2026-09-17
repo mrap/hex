@@ -210,12 +210,6 @@ pub fn run_on_file(
                     );
                     return Ok(report);
                 }
-                // Decision (U4/KTD6): Truncated is handled exactly like
-                // Upstream. A truncated extract is a slice-too-large-for-the-
-                // budget failure, not a config problem — it belongs in the
-                // same strike/halving/poison-slice escape hatch as any other
-                // upstream failure, so a repeatedly-truncated slice still gets
-                // skipped after STRIKE_LIMIT instead of retrying forever.
                 ProviderError::Upstream(_) | ProviderError::Truncated(_) => {
                     let new_strikes = strikes + 1;
                     if new_strikes == STRIKE_LIMIT - 1 {

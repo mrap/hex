@@ -998,7 +998,7 @@ const BAIL_ESCALATE_AT: u32 = 4;
 /// `index_file` completed without the predicate firing, or at least one embed
 /// batch stored." A file whose FTS5 rows were committed but whose first batch
 /// never stored contributes to neither field — see
-/// [`file_contributes_progress`].
+/// [`contributes_progress`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct RunProgress {
     /// Count of files whose `index_file` call finished without the
@@ -1015,22 +1015,24 @@ struct RunProgress {
 }
 
 impl RunProgress {
-    /// Same OR rule as [`file_contributes_progress`], applied to the run's
+    /// Same OR rule as [`contributes_progress`], applied to the run's
     /// aggregate counts instead of one file's: at least one completed file,
     /// or at least one stored batch, somewhere in the run.
     fn any(&self) -> bool {
-        file_contributes_progress(self.files_completed > 0, self.vectors_stored)
+        contributes_progress(self.files_completed > 0, self.vectors_stored)
     }
 }
 
-/// KTD5: does one file's indexing attempt count as progress? FTS5 chunk rows
-/// alone (written unconditionally by `index_file` before the embed pass) do
-/// NOT count — only a file that finished (the budget predicate never fired
-/// mid-file) or a file that stored at least one embed batch before bailing
-/// does. A file whose FTS5 rows landed but whose first batch never stored is
-/// the stuck signature (the run could not embed even one batch in budget) and
-/// must not be mistaken for progress.
-fn file_contributes_progress(file_completed: bool, vectors_stored_this_file: usize) -> bool {
+/// KTD5's shared "is this progress?" OR rule: `completed || stored > 0`.
+/// Applied per file directly in tests, and to the run's aggregate counts in
+/// [`RunProgress::any`]. FTS5 chunk rows alone (written unconditionally by
+/// `index_file` before the embed pass) do NOT count — only a file that
+/// finished (the budget predicate never fired mid-file) or a file that
+/// stored at least one embed batch before bailing does. A file whose FTS5
+/// rows landed but whose first batch never stored is the stuck signature
+/// (the run could not embed even one batch in budget) and must not be
+/// mistaken for progress.
+fn contributes_progress(file_completed: bool, vectors_stored_this_file: usize) -> bool {
     file_completed || vectors_stored_this_file > 0
 }
 
@@ -1488,6 +1490,41 @@ fn run_index_body(
         // waits for the next tick (fixed 2026-09-11).
         let mtime = file_mtime(filepath);
 
+        // Shared by both branches below: records one `index_file` outcome
+        // against the run's counters. Declared fresh each iteration (not
+        // hoisted above the `for`) so its captures never outlive this file's
+        // handling — in particular, its mutable borrow of `bailed` is gone by
+        // the time the loop's `if bailed { break; }` runs below.
+        let mut handle_index_result = |result: rusqlite::Result<IndexFileOutcome>| match result {
+            Ok(outcome) => {
+                let n = outcome.chunks_written;
+                if n > 0 {
+                    indexed += 1;
+                    total_chunks += n;
+                    let tag = if strategy != "full" {
+                        format!(" [{strategy}]")
+                    } else {
+                        String::new()
+                    };
+                    println!("  Indexed: {rel_path} ({n} chunks{tag})");
+                } else if strategy == "summary" {
+                    println!("  Indexed: {rel_path} (0 chunks, no summaries found [summary])");
+                }
+                progress.vectors_stored += outcome.vectors_stored;
+                if outcome.completed {
+                    progress.files_completed += 1;
+                } else {
+                    // KTD5: the within-file budget predicate fired mid-embed
+                    // — this run bails after this file, same as the
+                    // between-files gate above.
+                    bailed = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("  ERROR indexing {rel_path}: {e}");
+            }
+        };
+
         if !full {
             let prev = existing.get(&rel_path);
 
@@ -1526,7 +1563,7 @@ fn run_index_body(
             }
 
             // Actually re-index
-            match index_file(
+            handle_index_result(index_file(
                 &conn,
                 filepath,
                 hex_root,
@@ -1535,35 +1572,7 @@ fn run_index_body(
                 strategy,
                 &embedder,
                 &over_budget,
-            ) {
-                Ok(outcome) => {
-                    let n = outcome.chunks_written;
-                    if n > 0 {
-                        indexed += 1;
-                        total_chunks += n;
-                        let tag = if strategy != "full" {
-                            format!(" [{strategy}]")
-                        } else {
-                            String::new()
-                        };
-                        println!("  Indexed: {rel_path} ({n} chunks{tag})");
-                    } else if strategy == "summary" {
-                        println!("  Indexed: {rel_path} (0 chunks, no summaries found [summary])");
-                    }
-                    progress.vectors_stored += outcome.vectors_stored;
-                    if outcome.completed {
-                        progress.files_completed += 1;
-                    } else {
-                        // KTD5: the within-file budget predicate fired mid-embed
-                        // — this run bails after this file, same as the
-                        // between-files gate above.
-                        bailed = true;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  ERROR indexing {rel_path}: {e}");
-                }
-            }
+            ));
         } else {
             // Full mode: read unconditionally
             let content = match std::fs::read_to_string(filepath) {
@@ -1576,7 +1585,7 @@ fn run_index_body(
             if content.trim().is_empty() {
                 continue;
             }
-            match index_file(
+            handle_index_result(index_file(
                 &conn,
                 filepath,
                 hex_root,
@@ -1585,35 +1594,7 @@ fn run_index_body(
                 strategy,
                 &embedder,
                 &over_budget,
-            ) {
-                Ok(outcome) => {
-                    let n = outcome.chunks_written;
-                    if n > 0 {
-                        indexed += 1;
-                        total_chunks += n;
-                        let tag = if strategy != "full" {
-                            format!(" [{strategy}]")
-                        } else {
-                            String::new()
-                        };
-                        println!("  Indexed: {rel_path} ({n} chunks{tag})");
-                    } else if strategy == "summary" {
-                        println!("  Indexed: {rel_path} (0 chunks, no summaries found [summary])");
-                    }
-                    progress.vectors_stored += outcome.vectors_stored;
-                    if outcome.completed {
-                        progress.files_completed += 1;
-                    } else {
-                        // KTD5: the within-file budget predicate fired mid-embed
-                        // — this run bails after this file, same as the
-                        // between-files gate above.
-                        bailed = true;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  ERROR indexing {rel_path}: {e}");
-                }
-            }
+            ));
         }
 
         if bailed {
@@ -2581,10 +2562,8 @@ mod tests {
     // ── U3: within-file index budget and progress-aware bail reporting ──────
     // KTD4 (the over_budget predicate seam on embed_and_store /
     // backfill_missing_vectors_with) and KTD5 (the pure exit-code/counter
-    // contract in bail_outcome + its impure wrapper record_index_bail) are not
-    // wired into run_index_body yet — that lands in the U3 fix commit. These
-    // tests are RED against the current stub bodies (embed_and_store ignores
-    // `over_budget`; `bail_outcome` is `todo!()`), by design.
+    // contract in run_outcome + its impure wrapper record_index_bail) are wired
+    // into run_index_body: these tests exercise that wiring end to end.
 
     #[test]
     fn embed_and_store_stops_between_batches_once_over_budget() {
@@ -2812,15 +2791,15 @@ mod tests {
         // file whose first batch never stored. A completed file, or a file
         // that stored at least one batch before its own bail, IS progress.
         assert!(
-            !file_contributes_progress(false, 0),
+            !contributes_progress(false, 0),
             "FTS5 rows with zero stored batches must not count as progress"
         );
         assert!(
-            file_contributes_progress(false, 1),
+            contributes_progress(false, 1),
             "a stored batch before a mid-file bail is progress"
         );
         assert!(
-            file_contributes_progress(true, 0),
+            contributes_progress(true, 0),
             "a completed file is progress even with nothing left to embed"
         );
     }
@@ -2830,7 +2809,7 @@ mod tests {
         // The distinctive KTD5 claim end to end: a file whose FTS5 rows landed
         // but whose first batch never stored, with no other progress this
         // run, must error out (not warn) on the bail.
-        assert!(!file_contributes_progress(false, 0));
+        assert!(!contributes_progress(false, 0));
         let progress = RunProgress {
             files_completed: 0,
             vectors_stored: 0,
@@ -3215,9 +3194,8 @@ mod tests {
 
     // Codifies the e2e bail contract verified manually against the built binary
     // (budget=3s on a 25-file --full reindex bailed after 2 files with exit 1).
-    // Model-dependent (run_index loads ONNX) → #[ignore]; run with --ignored.
     #[test]
-    #[ignore]
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn run_index_over_budget_exits_nonzero() {
         use std::io::Write;
         let tmp = TempDir::new().unwrap();
@@ -3245,7 +3223,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // model-dependent — run with --ignored
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn test_index_file_writes_vectors() {
         let tmp = TempDir::new().unwrap();
         let hex_root = tmp.path();
@@ -3315,7 +3293,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // run_index now builds an embedder and loads the model
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn test_incremental_index_skips_unchanged() {
         let tmp = TempDir::new().unwrap();
         let hex_root = tmp.path();
@@ -3359,7 +3337,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // now requires the embedding model
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn test_index_file_inserts_chunks_and_meta() {
         let tmp = TempDir::new().unwrap();
         let hex_root = tmp.path();
