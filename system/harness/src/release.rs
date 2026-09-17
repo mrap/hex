@@ -1773,6 +1773,71 @@ fn verify_pushed(repo_root: &Path, branch: &str, expected_sha: &str) -> Result<(
     }
 }
 
+/// One atomic push of `refspecs` (KTD3) — origin accepts all of `main`, the
+/// tag, and `develop`, or none. Same env contract as [`push_ref`] (every
+/// push carries `RELEASE_PIPELINE_ENV`, including the tag). Unlike
+/// `push_ref`, a rejection is NOT an error here — the caller (the only one
+/// who knows about the KTD4 retry and the KTD6 publish-state report)
+/// classifies the exit code and stderr; only a spawn failure is a hard
+/// `Err`.
+fn push_atomic(repo_root: &Path, refspecs: &[String]) -> Result<RunResult> {
+    println!("  Pushing (atomic): {}...", refspecs.join(", "));
+    let mut cmd = Command::new("git");
+    cmd.arg("push").arg("--atomic").arg("origin");
+    cmd.args(refspecs);
+    cmd.current_dir(repo_root).env(RELEASE_PIPELINE_ENV, "1");
+    run_checked("git push --atomic origin ...", &mut cmd).map_err(|msg| anyhow::anyhow!(msg))
+}
+
+/// Refspecs for [`push_atomic`] (KTD3): `main`, then the tag (unless
+/// `action` is [`TagPushAction::SkipAlreadyOnOrigin`] — it is already on
+/// origin at the same commit, so re-sending it would be pure overhead),
+/// then `develop`. [`TagPushAction::RefuseDivergent`] never reaches this
+/// function — the caller bails before assembling refspecs.
+fn atomic_refspecs(
+    main: &str,
+    develop: &str,
+    tag_ref: &str,
+    action: &TagPushAction,
+) -> Vec<String> {
+    let mut refspecs = vec![main.to_string()];
+    if !matches!(action, TagPushAction::SkipAlreadyOnOrigin) {
+        refspecs.push(tag_ref.to_string());
+    }
+    refspecs.push(develop.to_string());
+    refspecs
+}
+
+/// True iff `stderr` from a rejected [`push_atomic`] names `develop`
+/// specifically as the ref that failed — the only case KTD4 retries. Two
+/// shapes of git output both name the true culprit ref, and BOTH must be
+/// checked because which one appears depends on timing, not on the
+/// underlying cause:
+///
+/// - Client-side preflight (the remote's advertised state already showed
+///   the conflict before any pack was sent): `! [rejected]        develop
+///   -> develop (fetch first)` — develop's own line carries the real
+///   reason; sibling refs get `(atomic push failed)`.
+/// - Server-side atomic-transaction failure (the race landed on origin
+///   AFTER negotiation but before the ref update — exactly the window a
+///   pre-push hook can race into): every ref in the batch gets an
+///   identical, uninformative `! [remote rejected] <ref> -> <ref> (atomic
+///   transaction failed)` line, so the real culprit is only named in git's
+///   `remote: error: cannot lock ref '<full ref>': ...` line.
+///
+/// A rejection for `main` or the tag, or a transport-level refusal such as
+/// "the receiving end does not support --atomic" (which never names a
+/// ref), matches neither shape and falls through to the immediate KTD5
+/// abort instead of retrying.
+fn develop_push_rejected(stderr: &str, develop: &str) -> bool {
+    let bracket_marker = format!("{develop} -> {develop}");
+    let lock_marker = format!("cannot lock ref 'refs/heads/{develop}'");
+    stderr.lines().any(|line| {
+        (line.contains("[rejected]") && line.contains(&bracket_marker))
+            || line.contains(&lock_marker)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Base-branch sync (oss-releaser develop-sync) — the only push path outside
 // the cut ceremony. Strictly-ahead fast-forwards ONLY; divergence is an
@@ -2029,6 +2094,42 @@ fn reconcile_develop_with_origin(
             bail!("origin/{develop} vanished between the ls-remote check and the fetch")
         }
     }
+}
+
+/// The RECONCILE CONFLICT recovery block (KTD5), shared by the pre-back-merge
+/// reconcile call and its post-atomic-push-rejection retry (U2 KTD4): both
+/// abort with `git merge --abort` already run, leaving `develop` at
+/// whatever it already was before THIS attempt (which may itself carry an
+/// earlier successful reconcile and/or the back-merge) — hence one shared
+/// "is unchanged (merge aborted)" state line for both call sites.
+fn reconcile_conflict_message(
+    main: &str,
+    develop: &str,
+    tag: &str,
+    rel_branch: &str,
+    main_before: &str,
+    why: &str,
+) -> String {
+    format!(
+        "RECONCILE CONFLICT — nothing was pushed.\n\
+         reconcile: merge of origin/{develop} into {develop} failed ({why}).\n\
+         State: local {main} has the release merge and tag {tag}; {develop} is \
+         unchanged (merge aborted); {rel_branch} still exists. Nothing was pushed.\n\
+         Recover:\n  \
+         1. git checkout {develop} && git merge --no-ff origin/{develop}   \
+         # resolve, commit\n  \
+         2. git merge --no-ff {main}\n  \
+         3. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} \
+         {tag}\n  \
+         4. git branch -d {rel_branch}\n\
+         Or unwind a fresh cut:\n  \
+         git tag -d {tag}\n  \
+         git branch -f {main} {main_before}\n  \
+         git branch -D {rel_branch}\n  \
+         then re-run hex release cut\n\
+         The releaser's develop-sync will push {develop} on its next tick if it \
+         is strictly ahead of origin, and alert if diverged."
+    )
 }
 
 /// One-line phase text for a [`DevelopReconcile`] outcome (R5).
@@ -2623,26 +2724,14 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
         Err(e) => {
             if let Some(ReconcileMergeConflict(why)) = e.downcast_ref::<ReconcileMergeConflict>() {
                 red("RECONCILE CONFLICT — nothing was pushed.");
-                bail!(
-                    "RECONCILE CONFLICT — nothing was pushed.\n\
-                     reconcile: merge of origin/{develop} into {develop} failed ({why}).\n\
-                     State: local {main} has the release merge and tag {tag}; {develop} is \
-                     unchanged (merge aborted); {rel_branch} still exists. Nothing was pushed.\n\
-                     Recover:\n  \
-                     1. git checkout {develop} && git merge --no-ff origin/{develop}   \
-                     # resolve, commit\n  \
-                     2. git merge --no-ff {main}\n  \
-                     3. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} \
-                     {tag}\n  \
-                     4. git branch -d {rel_branch}\n\
-                     Or unwind a fresh cut:\n  \
-                     git tag -d {tag}\n  \
-                     git branch -f {main} {main_before}\n  \
-                     git branch -D {rel_branch}\n  \
-                     then re-run hex release cut\n\
-                     The releaser's develop-sync will push {develop} on its next tick if it \
-                     is strictly ahead of origin, and alert if diverged."
-                );
+                bail!(reconcile_conflict_message(
+                    main,
+                    develop,
+                    &tag,
+                    &rel_branch,
+                    &main_before,
+                    why
+                ));
             }
             return Err(e).context("reconciling develop with origin before the back-merge");
         }
@@ -2697,7 +2786,7 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
              3. git branch -d {rel_branch}{fresh_cut_unwind}"
         );
     }
-    let develop_sha = rev_parse(repo_root, "HEAD")?;
+    let mut develop_sha = rev_parse(repo_root, "HEAD")?;
     phases.push((
         "back-merge",
         format!("{main} → {develop} @ {}", short_sha(&develop_sha)),
@@ -2725,56 +2814,229 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
         format!("ok — {main}, {develop}, and {tag} mutually consistent"),
     ));
 
-    // (k) Hardened pushes — every push carries HEX_RELEASE_PIPELINE=1;
-    // independent post-push ls-remote verify for both branches.
-    bold("Pushing...");
-    push_ref(repo_root, main)?;
-    verify_pushed(repo_root, main, &main_sha)?;
-    push_ref(repo_root, develop)?;
-    verify_pushed(repo_root, develop, &develop_sha)?;
+    // (k) Atomic push (KTD3): main, the tag, and develop land together or
+    // not at all — the two partial states the old sequential order allowed
+    // (main without tag; main+tag without develop) cannot occur. A
+    // rejection naming develop specifically (origin moved again between
+    // the reconcile above and this push) gets ONE retry: reconcile once
+    // more, then push once more (KTD4). Any other rejection, or a second
+    // one, aborts with nothing on origin (R8).
+    bold("Pushing (atomic)...");
     let tag_ref = format!("refs/tags/{tag}");
-    let tag_phase = match tag_push_action(&tag_sha, ls_remote_sha(repo_root, &tag_ref)?.as_deref())
-    {
-        TagPushAction::Push => {
-            push_ref(repo_root, &tag_ref)?;
-            // Independent verify for the tag too — same S6 doctrine.
-            match ls_remote_sha(repo_root, &tag_ref)?.as_deref() {
-                Some(sha) if sha == tag_sha => {}
-                other => bail!(
-                    "SHA MISMATCH after tag push: origin {tag} is {} but expected {tag_sha}",
-                    other.unwrap_or("<absent>")
-                ),
-            }
-            format!("{tag} pushed")
+    let mut retried = false;
+    let tag_action = loop {
+        let tag_action = tag_push_action(&tag_sha, ls_remote_sha(repo_root, &tag_ref)?.as_deref());
+        if let TagPushAction::RefuseDivergent { remote_sha } = &tag_action {
+            bail!(
+                "tag {tag} on origin points to {}, not {} — refusing to overwrite a \
+                 divergent remote tag",
+                short_sha(remote_sha),
+                short_sha(&tag_sha)
+            );
         }
-        TagPushAction::SkipAlreadyOnOrigin => {
-            green(&format!(
-                "  Tag {tag} already on origin at the same commit ✓ (idempotent skip)"
+        let refspecs = atomic_refspecs(main, develop, &tag_ref, &tag_action);
+        let result = push_atomic(repo_root, &refspecs)?;
+        if result.code == 0 {
+            break tag_action;
+        }
+
+        if !retried && develop_push_rejected(&result.stderr, develop) {
+            red(&format!(
+                "PUSH REJECTED — origin/{develop} moved again; reconciling once more \
+                 and retrying the atomic push..."
             ));
-            format!("{tag} already on origin")
+            match reconcile_develop_with_origin(repo_root, develop, &tag) {
+                Ok(r) => {
+                    let detail = describe_reconcile(&r);
+                    green(&format!("  develop-reconcile (retry): {detail}"));
+                    phases.push(("develop-reconcile-retry", detail));
+                    develop_sha = rev_parse(repo_root, &format!("refs/heads/{develop}"))?;
+                    retried = true;
+                    continue;
+                }
+                Err(e) => {
+                    if let Some(ReconcileMergeConflict(why)) =
+                        e.downcast_ref::<ReconcileMergeConflict>()
+                    {
+                        red("RECONCILE CONFLICT — nothing was pushed.");
+                        bail!(reconcile_conflict_message(
+                            main,
+                            develop,
+                            &tag,
+                            &rel_branch,
+                            &main_before,
+                            why
+                        ));
+                    }
+                    return Err(e)
+                        .context("reconciling develop with origin before the atomic push retry");
+                }
+            }
         }
-        TagPushAction::RefuseDivergent { remote_sha } => bail!(
-            "tag {tag} on origin points to {}, not {} — refusing to overwrite a \
-             divergent remote tag",
-            short_sha(&remote_sha),
-            short_sha(&tag_sha)
-        ),
+
+        bail!(
+            "PUSH REJECTED — nothing was pushed (atomic).\n{}\n\
+             State: local {main} has the release merge and tag {tag}; {develop} unpushed; \
+             {rel_branch} still exists. Nothing was pushed.\n\
+             Recover:\n  \
+             1. git checkout {develop} && git merge --no-ff origin/{develop}   \
+             # resolve, commit\n  \
+             2. git merge --no-ff {main}\n  \
+             3. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} {tag}\n  \
+             4. git branch -d {rel_branch}\n\
+             Or unwind a fresh cut:\n  \
+             git tag -d {tag}\n  \
+             git branch -f {main} {main_before}\n  \
+             git branch -D {rel_branch}\n  \
+             then re-run hex release cut\n\
+             The releaser's develop-sync will push {develop} on its next tick if it is \
+             strictly ahead of origin, and alert if diverged.",
+            result.stderr.trim()
+        );
     };
-    green(&format!("  Pushed {main} + {develop} — SHAs verified ✓"));
-    phases.push(("push", format!("{main} + {develop} verified; {tag_phase}")));
+
+    // Independent post-push verify (S6: a 0 exit from `git push` is not
+    // proof on its own) — main and develop by expected sha, the tag by
+    // ls-remote (mirrors the tag verify the sequential code used to do
+    // inline).
+    let mut mismatches = Vec::new();
+    if let Err(e) = verify_pushed(repo_root, main, &main_sha) {
+        mismatches.push(format!("{e:#}"));
+    }
+    if let Err(e) = verify_pushed(repo_root, develop, &develop_sha) {
+        mismatches.push(format!("{e:#}"));
+    }
+    match ls_remote_sha(repo_root, &tag_ref) {
+        Ok(Some(sha)) if sha == tag_sha => {}
+        Ok(other) => mismatches.push(format!(
+            "SHA MISMATCH after tag push: origin {tag} is {} but expected {tag_sha}",
+            other.unwrap_or_else(|| "<absent>".to_string())
+        )),
+        Err(e) => mismatches.push(format!("{e:#}")),
+    }
+
+    if !mismatches.is_empty() {
+        // KTD6: the push was accepted but verification failed (or errored)
+        // — the only genuinely uncertain outcome. Re-query origin for all
+        // three refs, run the GitHub release step only if the tag made it,
+        // run cleanup, print the summary, THEN bail — none of that is
+        // optional just because the ceremony is about to fail (S6).
+        red("PUSH VERIFY FAILED — publish state uncertain.");
+        let main_origin = ls_remote_sha(repo_root, &format!("refs/heads/{main}"))
+            .ok()
+            .flatten();
+        let tag_origin = ls_remote_sha(repo_root, &tag_ref).ok().flatten();
+        let develop_origin = ls_remote_sha(repo_root, &format!("refs/heads/{develop}"))
+            .ok()
+            .flatten();
+        let state_line = |name: &str, sha: &Option<String>| match sha {
+            Some(s) => format!("{name}: on origin at {s}"),
+            None => format!("{name}: not on origin"),
+        };
+        let publish_state = format!(
+            "PUBLISH STATE:\n  {}\n  {}\n  {}",
+            state_line(main, &main_origin),
+            state_line(&tag, &tag_origin),
+            state_line(develop, &develop_origin),
+        );
+        phases.push((
+            "push",
+            "VERIFY FAILED — see PUBLISH STATE below".to_string(),
+        ));
+        let gh_phase = run_gh_release(profile, repo_root, &tag, &notes_path, tag_origin.is_some());
+        phases.push(("gh-release", gh_phase));
+        let cleanup = run_cleanup(repo_root, &rel_branch);
+        phases.push(("cleanup", cleanup.join("; ")));
+        bold(&format!("═══ Release UNCERTAIN: {tag} ═══"));
+        print_phase_summary(&phases);
+        let missing: Vec<&str> = [
+            main_origin.is_none().then_some(main),
+            tag_origin.is_none().then_some(tag.as_str()),
+            develop_origin.is_none().then_some(develop),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let hint = if missing.is_empty() {
+            format!(
+                "all refs on origin; only verification failed: {}",
+                mismatches.join("; ")
+            )
+        } else {
+            format!(
+                "{RELEASE_PIPELINE_ENV}=1 git push origin {}",
+                missing.join(" ")
+            )
+        };
+        bail!("{publish_state}\n{hint}");
+    }
+
+    let retry_note = if retried {
+        format!(" (atomic, 1 retry after origin/{develop} moved)")
+    } else {
+        " (atomic)".to_string()
+    };
+    let tag_note = match &tag_action {
+        TagPushAction::Push => format!("{tag} pushed"),
+        TagPushAction::SkipAlreadyOnOrigin => format!("{tag} already on origin"),
+        TagPushAction::RefuseDivergent { .. } => {
+            unreachable!("RefuseDivergent bails before any push")
+        }
+    };
+    green(&format!(
+        "  Pushed {main} + {develop} + {tag} — SHAs verified ✓{retry_note}"
+    ));
+    phases.push((
+        "push",
+        format!("{main}, {tag}, {develop} verified{retry_note}; {tag_note}"),
+    ));
 
     // (l) GitHub release — recoverable: every failure is a loud WARN naming
     // the backfill command; the pushes already succeeded.
-    let gh_phase = if profile.gh_release {
-        gh_release_step(repo_root, &tag, &notes_path)
-    } else {
-        "disabled by profile".to_string()
-    };
+    let gh_phase = run_gh_release(profile, repo_root, &tag, &notes_path, true);
     phases.push(("gh-release", gh_phase));
 
     // (m) Branch cleanup — best-effort, loud on failure.
+    let cleanup = run_cleanup(repo_root, &rel_branch);
+    phases.push(("cleanup", cleanup.join("; ")));
+
+    // Final summary — every phase outcome.
+    bold(&format!(
+        "═══ Release complete: {tag} ({}) ═══",
+        short_sha(&main_sha)
+    ));
+    print_phase_summary(&phases);
+    Ok(format!("{tag} released"))
+}
+
+/// Step (l), shared by the success path and the KTD6 publish-state-uncertain
+/// path: run [`gh_release_step`] only when the tag actually made it to
+/// origin — creating a GitHub release from a tag name alone would mint the
+/// tag on the default branch instead (KTD6's explicit "never call `gh
+/// release create` when the tag is not on origin").
+fn run_gh_release(
+    profile: &ReleaseProfile,
+    repo_root: &Path,
+    tag: &str,
+    notes_path: &Path,
+    tag_on_origin: bool,
+) -> String {
+    if !tag_on_origin {
+        return "GitHub release SKIPPED: tag not on origin".to_string();
+    }
+    if profile.gh_release {
+        gh_release_step(repo_root, tag, notes_path)
+    } else {
+        "disabled by profile".to_string()
+    }
+}
+
+/// Step (m), shared by the success path and the KTD6 publish-state-uncertain
+/// path: best-effort local + origin cleanup of the spent release branch,
+/// loud on failure, never fatal.
+fn run_cleanup(repo_root: &Path, rel_branch: &str) -> Vec<String> {
     let mut cleanup = Vec::new();
-    match git_stdout(repo_root, &["branch", "-d", &rel_branch]) {
+    match git_stdout(repo_root, &["branch", "-d", rel_branch]) {
         Ok(_) => cleanup.push(format!("{rel_branch} deleted locally")),
         Err(e) => {
             red(&format!(
@@ -2798,15 +3060,7 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
             "WARN: could not check origin for {rel_branch}: {e:#}"
         )),
     }
-    phases.push(("cleanup", cleanup.join("; ")));
-
-    // Final summary — every phase outcome.
-    bold(&format!(
-        "═══ Release complete: {tag} ({}) ═══",
-        short_sha(&main_sha)
-    ));
-    print_phase_summary(&phases);
-    Ok(format!("{tag} released"))
+    cleanup
 }
 
 /// Step (f): write the new version into every profile version file, run the
