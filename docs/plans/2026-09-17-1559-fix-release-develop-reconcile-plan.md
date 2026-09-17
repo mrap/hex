@@ -170,7 +170,7 @@ U1 (reconcile) then U2 (atomic publish, retry, publish state) then U3 (docs), ea
 - **Execution note:** red first. The R14 race test uses a pre-push hook that, on its first run, pushes a foreign commit from the second clone (then removes its own marker file) and exits 0; against the old sequential code the develop push is rejected after `main` and the tag went out. The rejection test's hook exits 1 for every push; against the old code the tag is missing on origin while `main` is present.
 - **Patterns to follow:** `push_ref` and `verify_pushed` for env and verify shape; `gh_release_step` backfill wording; `gitflow_fixture` hook-dir setup (use a fresh test-owned hooks dir).
 - **Test scenarios:**
-  - Happy path: phase summary `push` line reads `main, <tag>, develop verified (atomic)`; all three refs on origin at the expected SHAs.
+  - Success path: phase summary `push` line reads `main, <tag>, develop verified (atomic)`; all three refs on origin at the expected SHAs.
   - Second race (R14): hook pushes a foreign commit on first attempt; ceremony `Ok`; phase line mentions `1 retry`; `origin/develop` contains both foreign commits and the back-merge.
   - Every push rejected (R15): `Err`; `main`, tag, and `develop` absent or unchanged on origin; message contains `Nothing was pushed` and the KTD5 commands.
   - Persistent non-fast-forward (hook pushes a foreign commit on every attempt): `Err` after exactly two pushes; nothing on origin; message names the second rejection.

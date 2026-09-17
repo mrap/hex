@@ -5624,7 +5624,7 @@ match_dir = "boi"
     }
 
     #[test]
-    fn atomic_happy_path_is_one_push_carrying_all_three_refs() {
+    fn atomic_success_path_is_one_push_carrying_all_three_refs() {
         let (_hex, _guard) = crate::telemetry::test_support::isolate();
         let td = tempfile::tempdir().unwrap();
         let repo = gitflow_fixture(td.path());
@@ -5633,7 +5633,7 @@ match_dir = "boi"
         install_pre_push_hook(
             &repo,
             td.path(),
-            "hooks-happy",
+            "hooks-ok",
             &format!(
                 "#!/bin/sh\n{{ echo ---; cat; }} >> {}\nexit 0\n",
                 log.display()
