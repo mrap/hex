@@ -636,9 +636,14 @@ pub fn index_file(
         rel_path,
         contents.len()
     ));
-    let stored = embed_and_store(conn, &rel_path, &chunk_rowids, &contents, |batch| {
-        embedder.embed_documents(batch)
-    });
+    let stored = embed_and_store(
+        conn,
+        &rel_path,
+        &chunk_rowids,
+        &contents,
+        |batch| embedder.embed_documents(batch),
+        &|| false,
+    );
     super::embed::log_rss(&format!(
         "post-embed {} ({}/{} vectors)",
         rel_path,
@@ -669,16 +674,27 @@ pub fn index_file(
 /// Failures are loud but non-fatal (S6): an embed error stops the loop (the
 /// remaining chunks stay FTS5-only, repaired later); a per-batch count mismatch
 /// is logged and skips only that batch.
+///
+/// `over_budget` (KTD4, U3) is checked between batches, after the first — a
+/// slow file's later batches must not carry a run past `run_budget()`. It is
+/// currently threaded through but not yet enforced in the loop below; callers
+/// pass `&|| false` until the fix commit wires the between-batch check
+/// (tracked by `embed_and_store_stops_between_batches_once_over_budget`,
+/// which is red until then).
 fn embed_and_store<F>(
     conn: &Connection,
     rel_path: &str,
     chunk_rowids: &[i64],
     contents: &[String],
     mut embed_batch: F,
+    over_budget: &dyn Fn() -> bool,
 ) -> usize
 where
     F: FnMut(&[String]) -> anyhow::Result<Vec<Vec<f32>>>,
 {
+    // Not yet consulted (see doc comment above) — silences the unused-binding
+    // lint without changing behavior ahead of the fix commit.
+    let _ = &over_budget;
     const EMBED_BATCH: usize = 8;
     let mut stored = 0usize;
     for (rowid_batch, content_batch) in chunk_rowids
@@ -923,6 +939,130 @@ fn get_metadata(conn: &Connection, key: &str) -> Option<String> {
         |r| r.get(0),
     )
     .ok()
+}
+
+/// `metadata` key backing the KTD5 consecutive-budget-bail counter.
+const BAIL_COUNT_KEY: &str = "consecutive_budget_bails";
+
+/// Consecutive bails at or above this count escalate a bail-with-progress from
+/// warn to error (KTD5: "the fourth consecutive bail exits 1" — one hour of
+/// 15-minute ticks).
+const BAIL_ESCALATE_AT: u32 = 4;
+
+/// What a run accomplished before a within-file budget bail (or a clean
+/// finish), per KTD5's progress definition: "at least one file whose
+/// `index_file` completed without the predicate firing, or at least one embed
+/// batch stored." A file whose FTS5 rows were committed but whose first batch
+/// never stored contributes to neither field — see
+/// [`file_contributes_progress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RunProgress {
+    files_completed: usize,
+    batches_stored: usize,
+}
+
+impl RunProgress {
+    fn any(&self) -> bool {
+        self.files_completed > 0 || self.batches_stored > 0
+    }
+}
+
+/// KTD5: does one file's indexing attempt count as progress? FTS5 chunk rows
+/// alone (written unconditionally by `index_file` before the embed pass) do
+/// NOT count — only a file that finished (the budget predicate never fired
+/// mid-file) or a file that stored at least one embed batch before bailing
+/// does. A file whose FTS5 rows landed but whose first batch never stored is
+/// the stuck signature (the run could not embed even one batch in budget) and
+/// must not be mistaken for progress.
+fn file_contributes_progress(file_completed: bool, batches_stored_this_file: usize) -> bool {
+    let _ = (file_completed, batches_stored_this_file);
+    todo!("KTD5 per-file progress rule — lands in the U3 fix commit")
+}
+
+/// KTD5 exit-code and counter contract for how a run of `run_index_body` ends:
+/// a within-file budget bail (`bailed = true`) or a clean finish under budget
+/// (`bailed = false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    /// Finished under budget: counter resets to 0 regardless of prior value.
+    CleanFinish { new_bail_count: u32 },
+    /// A bail with progress and the consecutive-bail counter still under
+    /// `BAIL_ESCALATE_AT`: warn, exit 0, counter increments. Visible in `hex
+    /// telemetry recent` without paging (`hex failures` only alerts on
+    /// error/panic/failed).
+    Warn { new_bail_count: u32 },
+    /// A bail with no progress, or the counter has reached
+    /// `BAIL_ESCALATE_AT`: error, exit 1, counter still increments.
+    Error { new_bail_count: u32 },
+}
+
+/// Pure KTD5 decision: given whether this run bailed, what it accomplished,
+/// and how many consecutive bails preceded it, what the next counter value
+/// and severity are. No I/O — [`record_index_bail`] and [`reset_bail_count`]
+/// are the impure wrappers that read/write `metadata` and emit telemetry.
+fn run_outcome(bailed: bool, progress: RunProgress, prior_bails: u32) -> RunOutcome {
+    let _ = (bailed, progress, prior_bails, BAIL_ESCALATE_AT);
+    todo!("KTD5 run-outcome contract — lands in the U3 fix commit")
+}
+
+/// Impure wrapper around [`run_outcome`] for the bail path: reads the prior
+/// consecutive-bail count from `metadata`, writes the new count back, emits a
+/// `warn` telemetry row when the outcome is a warn (KTD5 — never for an error
+/// outcome, since `hex failures` already treats a non-zero exit as loud), and
+/// returns the process exit code `run_index_body` should return for this
+/// bail.
+fn record_index_bail(conn: &Connection, progress: RunProgress) -> i32 {
+    let prior_bails = get_bail_count(conn);
+    match run_outcome(true, progress, prior_bails) {
+        RunOutcome::Warn { new_bail_count } => {
+            set_metadata(conn, BAIL_COUNT_KEY, &new_bail_count.to_string());
+            crate::telemetry::record_loud(&crate::telemetry::TelemetryEvent {
+                source: "memory".into(),
+                event: "index::budget-bail".into(),
+                status: "warn".into(),
+                duration_ms: None,
+                exit_code: Some(0),
+                detail: Some(format!(
+                    "files_completed={} batches_stored={} consecutive_bails={new_bail_count}",
+                    progress.files_completed, progress.batches_stored
+                )),
+            });
+            0
+        }
+        RunOutcome::Error { new_bail_count } => {
+            set_metadata(conn, BAIL_COUNT_KEY, &new_bail_count.to_string());
+            eprintln!(
+                "hex memory index: budget bail with no resumable progress or the \
+                 consecutive-bail escalation threshold reached \
+                 (consecutive_bails={new_bail_count}) — exiting non-zero"
+            );
+            1
+        }
+        RunOutcome::CleanFinish { .. } => {
+            unreachable!("a within-file budget bail can never resolve to a clean finish")
+        }
+    }
+}
+
+/// Current consecutive-budget-bail count (0 if never set).
+fn get_bail_count(conn: &Connection) -> u32 {
+    get_metadata(conn, BAIL_COUNT_KEY)
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Impure wrapper around [`run_outcome`] for the clean-finish path: resets the
+/// consecutive-bail counter after a run that finishes under budget (KTD5).
+/// Not yet called from `run_index_body`'s clean-finish path — that wiring
+/// lands in the U3 fix commit.
+fn reset_bail_count(conn: &Connection) {
+    let prior_bails = get_bail_count(conn);
+    match run_outcome(false, RunProgress::default(), prior_bails) {
+        RunOutcome::CleanFinish { new_bail_count } => {
+            set_metadata(conn, BAIL_COUNT_KEY, &new_bail_count.to_string());
+        }
+        _ => unreachable!("a clean finish (bailed = false) can never resolve to a bail outcome"),
+    }
 }
 
 /// Per-run wall-clock budget for [`run_index`]. Default 600s (10 min). Caps the
@@ -1454,6 +1594,20 @@ fn backfill_missing_vectors(
     embedder: &super::embed::Embedder,
     cap: usize,
 ) -> rusqlite::Result<usize> {
+    backfill_missing_vectors_with(conn, cap, |batch| embedder.embed_documents(batch))
+}
+
+/// Closure-injected body of [`backfill_missing_vectors`] (same seam pattern as
+/// `embed_and_store`) so the FTS5-then-backfill contract (R5, U3) is testable
+/// without the ONNX model.
+fn backfill_missing_vectors_with<F>(
+    conn: &Connection,
+    cap: usize,
+    mut embed_batch: F,
+) -> rusqlite::Result<usize>
+where
+    F: FnMut(&[String]) -> anyhow::Result<Vec<Vec<f32>>>,
+{
     let mut stmt = conn.prepare(
         "SELECT c.rowid, c.content FROM chunks c
          WHERE c.rowid NOT IN (SELECT rowid FROM vec_chunks)
@@ -1466,7 +1620,7 @@ fn backfill_missing_vectors(
     let mut done = 0;
     for batch in rows.chunks(8) {
         let texts: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
-        match embedder.embed_documents(&texts) {
+        match embed_batch(&texts) {
             Ok(vecs) if vecs.len() == batch.len() => {
                 for ((rowid, _), vec) in batch.iter().zip(vecs) {
                     super::vector::insert_vec(conn, *rowid, &vec)?;
@@ -2137,16 +2291,23 @@ mod tests {
         let rowids: Vec<i64> = (1..=20).collect();
         let contents: Vec<String> = (0..20).map(|i| format!("chunk {i}")).collect();
         let mut calls = 0;
-        let stored = embed_and_store(&conn, "test.md", &rowids, &contents, |batch| {
-            calls += 1;
-            if calls == 2 {
-                anyhow::bail!("simulated interruption on batch 2");
-            }
-            Ok(batch
-                .iter()
-                .map(|_| vec![0.1f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                calls += 1;
+                if calls == 2 {
+                    anyhow::bail!("simulated interruption on batch 2");
+                }
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.1f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
 
         // Batch 1 (8 chunks) committed before batch 2 failed. The pre-fix code
         // stored 0 here (insert ran only after the whole file embedded).
@@ -2166,12 +2327,19 @@ mod tests {
 
         let rowids: Vec<i64> = (1..=20).collect();
         let contents: Vec<String> = (0..20).map(|i| format!("chunk {i}")).collect();
-        let stored = embed_and_store(&conn, "test.md", &rowids, &contents, |batch| {
-            Ok(batch
-                .iter()
-                .map(|_| vec![0.2f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.2f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
 
         assert_eq!(stored, 20);
         assert_eq!(vec_count(&conn), 20);
@@ -2188,17 +2356,24 @@ mod tests {
         let rowids: Vec<i64> = (1..=20).collect();
         let contents: Vec<String> = (0..20).map(|i| format!("chunk {i}")).collect();
         let mut calls = 0;
-        let stored = embed_and_store(&conn, "test.md", &rowids, &contents, |batch| {
-            calls += 1;
-            let n = if calls == 2 {
-                batch.len() - 1
-            } else {
-                batch.len()
-            };
-            Ok((0..n)
-                .map(|_| vec![0.3f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                calls += 1;
+                let n = if calls == 2 {
+                    batch.len() - 1
+                } else {
+                    batch.len()
+                };
+                Ok((0..n)
+                    .map(|_| vec![0.3f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
 
         // Batches 1 (8) and 3 (4) stored; batch 2 skipped loudly → 12 total.
         assert_eq!(
@@ -2218,11 +2393,18 @@ mod tests {
 
         let rowids: Vec<i64> = (1..=8).collect();
         let contents: Vec<String> = (0..8).map(|i| format!("chunk {i}")).collect();
-        let stored = embed_and_store(&conn, "test.md", &rowids, &contents, |batch| {
-            Ok((0..batch.len() + 1) // one too many
-                .map(|_| vec![0.4f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok((0..batch.len() + 1) // one too many
+                    .map(|_| vec![0.4f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
 
         assert_eq!(stored, 0, "over-count batch must be skipped, not truncated");
         assert_eq!(vec_count(&conn), 0);
@@ -2235,25 +2417,342 @@ mod tests {
         init_db(&conn).unwrap();
 
         // 0 chunks → no work, no panic (empty slices → zip yields nothing).
-        let s0 = embed_and_store(&conn, "empty.md", &[], &[], |batch| {
-            Ok(batch
-                .iter()
-                .map(|_| vec![0.5f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let s0 = embed_and_store(
+            &conn,
+            "empty.md",
+            &[],
+            &[],
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.5f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
         assert_eq!(s0, 0);
 
         // Exact multiple of 8 (16 → two full batches, no trailing partial).
         let rowids: Vec<i64> = (1..=16).collect();
         let contents: Vec<String> = (0..16).map(|i| format!("c{i}")).collect();
-        let s16 = embed_and_store(&conn, "sixteen.md", &rowids, &contents, |batch| {
-            Ok(batch
-                .iter()
-                .map(|_| vec![0.5f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let s16 = embed_and_store(
+            &conn,
+            "sixteen.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.5f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
         assert_eq!(s16, 16);
         assert_eq!(vec_count(&conn), 16);
+    }
+
+    // ── U3: within-file index budget and progress-aware bail reporting ──────
+    // KTD4 (the over_budget predicate seam on embed_and_store /
+    // backfill_missing_vectors_with) and KTD5 (the pure exit-code/counter
+    // contract in bail_outcome + its impure wrapper record_index_bail) are not
+    // wired into run_index_body yet — that lands in the U3 fix commit. These
+    // tests are RED against the current stub bodies (embed_and_store ignores
+    // `over_budget`; `bail_outcome` is `todo!()`), by design.
+
+    #[test]
+    fn embed_and_store_stops_between_batches_once_over_budget() {
+        // 24 chunks → batches of 8, 8, 8. The predicate is checked between
+        // batches (never before the first), so an always-true predicate must
+        // still let batch 1 store before the loop stops.
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        let rowids: Vec<i64> = (1..=24).collect();
+        let contents: Vec<String> = (0..24).map(|i| format!("chunk {i}")).collect();
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.6f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| true,
+        );
+
+        assert_eq!(
+            stored, 8,
+            "the over-budget predicate fires after batch 1; batches 2 and 3 must not run"
+        );
+        assert_eq!(vec_count(&conn), 8);
+    }
+
+    #[test]
+    fn embed_and_store_bail_leaves_fts5_searchable_until_backfill_reembeds() {
+        // R5: after a within-file budget bail, un-vectorized chunks stay
+        // FTS5-searchable, and backfill_missing_vectors re-embeds them later.
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO files (path, mtime, content_hash, indexed_at, chunk_count) \
+             VALUES ('budget.md', 0.0, 'h', '', 16)",
+            [],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+            .unwrap();
+
+        // Content avoids hyphens: FTS5's default query syntax treats a
+        // leading `-` as a NOT-term operator, so a bareword like
+        // "needle-marker-15" is not a safe MATCH token.
+        let mut rowids = Vec::new();
+        let mut contents = Vec::new();
+        for i in 0..16 {
+            let content = format!("needlemarker{i} unique searchable text");
+            conn.execute(
+                "INSERT INTO chunks (file_id, source_path, heading, chunk_index, content, private) \
+                 VALUES (?, 'budget.md', '', ?, ?, 0)",
+                params![file_id.to_string(), i.to_string(), content],
+            )
+            .unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chunk_meta (chunk_rowid, source_weight) VALUES (?, 1.0)",
+                params![rowid],
+            )
+            .unwrap();
+            rowids.push(rowid);
+            contents.push(content);
+        }
+
+        // The chunk-insert phase alone (mirroring `index_file`, which always
+        // writes FTS5 rows before the embed pass) already makes every chunk
+        // searchable — proven here, ahead of and independent of the
+        // over-budget bail below, so a MATCH syntax regression shows up on
+        // its own rather than hiding behind the `stored == 8` failure.
+        let unvectored_rowid = rowids[15];
+        let hit: String = conn
+            .query_row(
+                "SELECT source_path FROM chunks WHERE chunks MATCH ?",
+                params!["needlemarker15"],
+                |r| r.get(0),
+            )
+            .expect("FTS5 must find the not-yet-embedded chunk's text");
+        assert_eq!(hit, "budget.md");
+
+        // Bail after the first batch — chunks 8..16 stay FTS5-only.
+        let stored = embed_and_store(
+            &conn,
+            "budget.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.1f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| true,
+        );
+        assert_eq!(stored, 8, "only the first batch stores before the bail");
+
+        let has_vec_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks WHERE rowid = ?",
+                params![unvectored_rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_vec_before, 0, "the bailed chunk has no vector yet");
+
+        let backfilled = backfill_missing_vectors_with(&conn, 500, |batch| {
+            Ok(batch
+                .iter()
+                .map(|_| vec![0.2f32; super::super::vector::EMBED_DIM])
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(backfilled, 8, "the 8 bailed chunks get backfilled");
+
+        let has_vec_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks WHERE rowid = ?",
+                params![unvectored_rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_vec_after, 1,
+            "backfill_missing_vectors stores its vector"
+        );
+    }
+
+    #[test]
+    fn run_outcome_with_progress_and_no_prior_bails_warns_and_increments() {
+        assert_eq!(
+            run_outcome(
+                true,
+                RunProgress {
+                    files_completed: 1,
+                    batches_stored: 0,
+                },
+                0
+            ),
+            RunOutcome::Warn { new_bail_count: 1 }
+        );
+    }
+
+    #[test]
+    fn record_index_bail_with_progress_writes_one_warn_row_and_no_error_row() {
+        let (_hex_tmp, _guard) = crate::telemetry::test_support::isolate();
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        let code = record_index_bail(
+            &conn,
+            RunProgress {
+                files_completed: 1,
+                batches_stored: 3,
+            },
+        );
+
+        assert_eq!(code, 0, "a bail with progress and counter 0 exits 0");
+        assert_eq!(get_bail_count(&conn), 1);
+
+        let rows = crate::telemetry::recent(10).unwrap();
+        let bail_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event == "index::budget-bail")
+            .collect();
+        assert_eq!(
+            bail_rows.len(),
+            1,
+            "exactly one telemetry row for this bail"
+        );
+        let row = bail_rows[0];
+        assert_eq!(row.source, "memory");
+        assert_eq!(row.status, "warn");
+        let detail = row.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("files_completed=1"), "got: {detail}");
+        assert!(detail.contains("batches_stored=3"), "got: {detail}");
+        assert!(detail.contains("consecutive_bails=1"), "got: {detail}");
+        assert!(
+            !rows.iter().any(|r| r.status == "error"),
+            "no error row for a warn outcome"
+        );
+    }
+
+    #[test]
+    fn run_outcome_with_zero_progress_errors() {
+        assert_eq!(
+            run_outcome(true, RunProgress::default(), 0),
+            RunOutcome::Error { new_bail_count: 1 }
+        );
+    }
+
+    #[test]
+    fn record_index_bail_with_zero_progress_exits_1_with_no_warn_row() {
+        let (_hex_tmp, _guard) = crate::telemetry::test_support::isolate();
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        let code = record_index_bail(&conn, RunProgress::default());
+
+        assert_eq!(code, 1, "zero progress must exit non-zero");
+        assert_eq!(get_bail_count(&conn), 1, "the counter still increments");
+        let rows = crate::telemetry::recent(10).unwrap();
+        assert!(
+            !rows.iter().any(|r| r.event == "index::budget-bail"),
+            "an error outcome records no telemetry row (S6 loud path is eprintln + exit 1)"
+        );
+    }
+
+    #[test]
+    fn file_progress_rule_excludes_fts5_only_files_but_includes_completed_or_stored() {
+        // KTD5: FTS5 chunk rows alone (an `index_file` chunk-insert that ran
+        // before the embed pass) are NOT progress — the stuck signature is a
+        // file whose first batch never stored. A completed file, or a file
+        // that stored at least one batch before its own bail, IS progress.
+        assert!(
+            !file_contributes_progress(false, 0),
+            "FTS5 rows with zero stored batches must not count as progress"
+        );
+        assert!(
+            file_contributes_progress(false, 1),
+            "a stored batch before a mid-file bail is progress"
+        );
+        assert!(
+            file_contributes_progress(true, 0),
+            "a completed file is progress even with nothing left to embed"
+        );
+    }
+
+    #[test]
+    fn committed_fts5_rows_without_a_stored_batch_yield_a_non_progress_bail() {
+        // The distinctive KTD5 claim end to end: a file whose FTS5 rows landed
+        // but whose first batch never stored, with no other progress this
+        // run, must error out (not warn) on the bail.
+        assert!(!file_contributes_progress(false, 0));
+        let progress = RunProgress {
+            files_completed: 0,
+            batches_stored: 0,
+        };
+        assert_eq!(
+            run_outcome(true, progress, 0),
+            RunOutcome::Error { new_bail_count: 1 }
+        );
+    }
+
+    #[test]
+    fn run_outcome_with_progress_but_counter_at_threshold_errors() {
+        assert_eq!(
+            run_outcome(
+                true,
+                RunProgress {
+                    files_completed: 2,
+                    batches_stored: 5,
+                },
+                3
+            ),
+            RunOutcome::Error { new_bail_count: 4 }
+        );
+    }
+
+    #[test]
+    fn run_outcome_under_budget_after_bails_resets_counter_to_zero() {
+        assert_eq!(
+            run_outcome(false, RunProgress::default(), 2),
+            RunOutcome::CleanFinish { new_bail_count: 0 }
+        );
+    }
+
+    #[test]
+    fn reset_bail_count_zeroes_the_counter_after_two_bails() {
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+        set_metadata(&conn, BAIL_COUNT_KEY, "2");
+        assert_eq!(get_bail_count(&conn), 2);
+
+        reset_bail_count(&conn);
+
+        assert_eq!(
+            get_bail_count(&conn),
+            0,
+            "a run that finishes under budget resets the counter"
+        );
     }
 
     #[test]
