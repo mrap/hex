@@ -9,6 +9,13 @@
 use hex::telemetry::{self, TelemetryEvent};
 use std::sync::Mutex;
 
+// This binary only needs `EnvVar`; the module's other helpers (`serial`,
+// `open_fd_count`, `engine_env`, `refused_port`) are for fd_limits.rs /
+// ops_shared_client.rs's own private copy of this file and are dead code here.
+#[allow(dead_code)]
+#[path = "support/mod.rs"]
+mod support;
+
 // HEX_DIR is process-global; these tests run as parallel threads in one binary,
 // so serialize every HEX_DIR mutation on a single lock or they stomp each other
 // (one test's tempdir gets swapped out → wrong db opened → lost rows / I/O error).
@@ -17,7 +24,11 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 fn with_hex_dir<F: FnOnce()>(f: F) {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("HEX_DIR", tmp.path());
+    // RAII guard restores whatever HEX_DIR held before this test (the sandbox
+    // value set by `.cargo/config.toml`, or a real value outside cargo) on
+    // scope exit — a bare `set_var` here leaked the tempdir's path to every
+    // test that ran afterward in this process.
+    let _hex_dir = support::EnvVar::set("HEX_DIR", tmp.path());
     f();
 }
 
@@ -110,6 +121,10 @@ const SANDBOX_HEX_DIR: &str = "/tmp/hex-test-hex-dir";
 
 #[test]
 fn cargo_launched_test_sees_sandbox_hex_dir() {
+    // Take ENV_LOCK: without it this read can race `with_hex_dir` tests that
+    // mutate HEX_DIR concurrently in other threads of this binary and see a
+    // tempdir path instead of the sandbox value.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let hex_dir = std::env::var("HEX_DIR").unwrap_or_default();
     assert_eq!(
         hex_dir, SANDBOX_HEX_DIR,

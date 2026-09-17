@@ -164,10 +164,8 @@ mod tests {
         clear_stale_locks(Path::new("/tmp/does-not-exist-hex-fastembed"));
     }
 
-    // Model-dependent: requires the nomic ONNX weights. Run explicitly with
-    // `cargo test -- --ignored`. CI / the nightly eval also exercise this path.
     #[test]
-    #[ignore]
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn embeds_at_768_dimensions() {
         let e = Embedder::new(Path::new(".")).unwrap();
         let q = e
