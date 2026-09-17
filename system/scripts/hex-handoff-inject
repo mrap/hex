@@ -14,7 +14,7 @@
 # a session name that is not kebab-case, so a name derived from something unexpected cannot walk
 # the path outside the handoffs directory.
 #
-# Session name: $HEX_SESSION_NAME (exported by the launcher) or the tmux session name.
+# Session name: $HEX_SESSION_NAME (set on the tmux session by the launcher) or the tmux session name.
 # Staging: $HEX_DIR/.hex/run/handoffs/<name>.md  ->  archive $HEX_DIR/projects/hex-ops/handoffs/
 set -uo pipefail
 HEX_DIR="${HEX_DIR:-$HOME/hex}"

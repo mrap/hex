@@ -1847,6 +1847,25 @@ fn configure_hooks_path(workspace: &Path) {
     }
 }
 
+/// Runs the python merger with `args`; `Err` only when the process could not
+/// be spawned. Callers interpret the exit code (the merger's contract differs
+/// between plain merge and `--check`).
+fn run_hooks_merger(merger: &Path, args: &[&Path]) -> Result<std::process::Output, String> {
+    Command::new("python3")
+        .arg(merger)
+        .args(args)
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", merger.display()))
+}
+
+fn nonempty_lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// R1a/KTD1: preflight check for `hex upgrade`'s up-to-date gate and dry-run
 /// report. Runs `<merger> --check <manifest> <settings>` and translates its
 /// exit code into the set of missing "event: command" lines, per
@@ -1877,20 +1896,10 @@ fn required_hooks_missing(
             merger.display()
         ));
     }
-    let output = Command::new("python3")
-        .arg(merger)
-        .arg("--check")
-        .arg(manifest)
-        .arg(settings)
-        .output()
-        .map_err(|e| format!("could not run {}: {e}", merger.display()))?;
+    let output = run_hooks_merger(merger, &[Path::new("--check"), manifest, settings])?;
     match output.status.code() {
         Some(0) => Ok(Vec::new()),
-        Some(3) => Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect()),
+        Some(3) => Ok(nonempty_lines(&output.stdout)),
         Some(2) => Ok(vec![format!(
             "settings.json is not valid JSON: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -1928,29 +1937,19 @@ fn merge_required_hooks(hex_dot_dir: &Path, workspace: &Path) -> Result<Vec<Stri
         return Err(format!("hooks merger not found at {}", merger.display()));
     }
 
-    let output = Command::new("python3")
-        .arg(&merger)
-        .arg(&manifest)
-        .arg(&settings)
-        .output()
-        .map_err(|e| format!("could not run {}: {e}", merger.display()))?;
+    let output = run_hooks_merger(&merger, &[&manifest, &settings])?;
     if !output.status.success() {
         return Err(format!(
             "hex-hooks-merge failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect())
+    Ok(nonempty_lines(&output.stdout))
 }
 
 /// R1a/KTD1: pure predicate behind the "Everything is up to date" gate,
 /// factored out so a missing required hook (`missing_hooks_empty == false`)
-/// can be exercised without a whole-upgrade fixture. Mirrors the previous
-/// inline `&&`-chain exactly, plus the new hooks term.
+/// can be exercised without a whole-upgrade fixture.
 fn upgrade_is_up_to_date(
     total_changed: usize,
     total_new: usize,
@@ -2686,6 +2685,9 @@ pub fn run(args: &[String]) -> i32 {
     // hooks (the manifest) are both on disk. A merge failure is a [FAIL]
     // that makes the upgrade exit non-zero (R1b); the existing settings.json
     // is left untouched (the merger never writes on a non-zero exit).
+    // Always run the (idempotent) merger here rather than trusting the
+    // preflight result: settings.json can change between preflight and
+    // Step 5, and a skipped merge would leave a hook silently unwired.
     match merge_required_hooks(&hex_dot_dir, &hex_dir) {
         Ok(lines) if lines.is_empty() => {
             println!("  [OK] Required hooks already wired.");

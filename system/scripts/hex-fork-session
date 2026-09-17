@@ -43,24 +43,31 @@ tmux has-session -t "=$name" 2>/dev/null && { echo "ERR: tmux session '$name' al
 
 stage="$HEX_DIR/.hex/run/handoffs"; mkdir -p "$stage"
 archive_dir="${HEX_HANDOFF_ARCHIVE:-$HEX_DIR/projects/hex-ops/handoffs}"
-[[ -f "$stage/$name.md" ]] && { echo "ERR: a handoff for '$name' is already staged at $stage/$name.md; remove or consume it first" >&2; exit 7; }
-cat > "$stage/$name.md"
+# noclobber makes the redirect itself the collision check, so two same-name launches cannot both
+# pass a separate -f test and then overwrite each other's handoff.
+if ! { set -o noclobber; cat > "$stage/$name.md"; } 2>/dev/null; then
+  echo "ERR: a handoff for '$name' is already staged at $stage/$name.md; remove or consume it first" >&2; exit 7
+fi
+set +o noclobber
 [[ -s "$stage/$name.md" ]] || { rm -f "$stage/$name.md"; echo "ERR: empty handoff" >&2; exit 2; }
 
 # Kill the session this run created and archive the still-staged handoff (never delete it: a
 # heredoc'd handoff has no other copy). Safe because R6's exact-match guarantees this run created
 # the session (it was absent), so there is no other owner to disturb.
+# Prints the archived path, or nothing when the hook had already claimed the file (then the
+# session is briefed and is NOT killed: the caller decides what that means for its exit code).
 kill_and_archive() {
-  tmux kill-session -t "=$name" 2>/dev/null || true
   local stamp archived
-  stamp="$(date +%Y%m%d-%H%M%S)"
+  [[ -f "$stage/$name.md" ]] || return 0
+  tmux kill-session -t "=$name" 2>/dev/null || true
+  stamp="$(date +%Y%m%d-%H%M%S)-$$"
   archived="$archive_dir/$name-unconsumed-$stamp.md"
   mkdir -p "$archive_dir" || { echo "ERR: cannot create $archive_dir; staged handoff left at $stage/$name.md" >&2; return 1; }
-  [[ -f "$stage/$name.md" ]] && mv "$stage/$name.md" "$archived"
+  mv "$stage/$name.md" "$archived" || { echo "ERR: cannot archive to $archived; staged handoff left at $stage/$name.md" >&2; return 1; }
   printf '%s\n' "$archived"
 }
 
-tmux new-session -d -s "$name" -c "$HEX_DIR"
+tmux new-session -d -s "$name" -c "$HEX_DIR" -e "HEX_SESSION_NAME=$name"
 tmux send-keys -t "$name" "${launch//@name@/$name} ${flags[*]:-}" Enter
 
 # Verify the runtime banner (S6: loud, show the pane on failure)
@@ -74,7 +81,11 @@ if (( ! banner_seen )); then
   echo "ERR: Claude Code banner not seen in ${timeout}s. Pane:" >&2
   tmux capture-pane -t "$name" -p >&2
   archived="$(kill_and_archive)" || exit 4
-  echo "ERR: staged handoff archived at $archived" >&2
+  if [[ -n "$archived" ]]; then
+    echo "ERR: staged handoff archived at $archived" >&2
+  else
+    echo "ERR: the SessionStart hook already consumed the handoff, so the session is briefed and left running; attach to inspect: tmux attach -t $name" >&2
+  fi
   exit 4
 fi
 
@@ -84,11 +95,16 @@ fi
 inject_timeout="${HEX_FORK_INJECT_TIMEOUT:-20}"
 for ((i=1; i<=inject_timeout; i++)); do [[ -f "$stage/$name.md" ]] || break; sleep 1; done
 if [[ -f "$stage/$name.md" ]]; then
-  echo "ERR: handoff not consumed within ${inject_timeout}s. Pane:" >&2
-  tmux capture-pane -t "$name" -p >&2
+  pane="$(tmux capture-pane -t "$name" -p 2>/dev/null || true)"
   archived="$(kill_and_archive)" || exit 6
-  echo "ERR: handoff not consumed; the SessionStart hook is not wired (run hex upgrade), then re-fork: hex-fork-session $name < $archived" >&2
-  exit 6
+  # An empty path means the hook claimed the file between the wait and the kill: the session is
+  # briefed after all, so fall through to the kickoff.
+  if [[ -n "$archived" ]]; then
+    echo "ERR: handoff not consumed within ${inject_timeout}s. Pane:" >&2
+    printf '%s\n' "$pane" >&2
+    echo "ERR: handoff not consumed; the SessionStart hook is not wired (run hex upgrade), then re-fork: hex-fork-session $name < $archived" >&2
+    exit 6
+  fi
 fi
 
 sleep "${HEX_FORK_KICKOFF_DELAY:-2}"
@@ -119,7 +135,7 @@ for attempt in 1 2; do
 done
 
 if (( ! submitted )); then
-  echo "ERR: session '$name' is up and briefed but the kickoff prompt was typed and NOT submitted after 2 Enter attempts. Attach and press Enter: tmux attach -t $name. Pane:" >&2
+  echo "ERR: session '$name' is up and briefed but the kickoff prompt was typed and NOT submitted after 2 Enter attempts. Run: tmux send-keys -t $name Enter, then re-check the pane. Pane:" >&2
   tmux capture-pane -t "$name" -p >&2
   exit 5
 fi

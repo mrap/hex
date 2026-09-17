@@ -26,6 +26,8 @@ def command_present(existing_commands, hook_command):
     existing command after splitting that command on ';', '&&', '||', and newlines.
     A mention inside a longer command (e.g. an echo string) is not presence."""
     for cmd in existing_commands:
+        if cmd.strip() == hook_command:
+            return True
         for segment in re.split(r';|&&|\|\||\n', cmd):
             if segment.strip() == hook_command:
                 return True
@@ -47,13 +49,16 @@ def load_settings(settings_path):
         ) from e
 
 
+def existing_commands_for(event_hooks):
+    return [h.get('command', '') for e in event_hooks for h in e.get('hooks', [])]
+
+
 def missing_hooks(manifest, settings):
     """Return 'event: command' lines for manifest hooks absent from settings. Never writes."""
     hooks_section = settings.get('hooks', {})
     result = []
     for event_type, hook_defs in manifest.items():
-        event_hooks = hooks_section.get(event_type, [])
-        existing_commands = [h.get('command', '') for e in event_hooks for h in e.get('hooks', [])]
+        existing_commands = existing_commands_for(hooks_section.get(event_type, []))
         for hook_def in hook_defs:
             hook_command = hook_def['command']
             if not command_present(existing_commands, hook_command):
@@ -69,12 +74,13 @@ def merge(manifest_path, settings_path):
     added = []
     for event_type, hook_defs in manifest.items():
         event_hooks = hooks_section.setdefault(event_type, [])
+        existing_commands = existing_commands_for(event_hooks)
         for hook_def in hook_defs:
             matcher = hook_def.get('matcher', '')
             hook_command = hook_def['command']
-            existing_commands = [h.get('command', '') for e in event_hooks for h in e.get('hooks', [])]
             if not command_present(existing_commands, hook_command):
                 event_hooks.append({'matcher': matcher, 'hooks': [{'type': 'command', 'command': hook_command}]})
+                existing_commands.append(hook_command)
                 added.append(f"{event_type}: {hook_command}")
     tmp = settings_path + '.tmp'
     os.makedirs(os.path.dirname(os.path.abspath(tmp)), exist_ok=True)
