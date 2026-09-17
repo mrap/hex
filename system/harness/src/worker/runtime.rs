@@ -48,12 +48,7 @@ pub fn serve(workers: Vec<Worker>) -> i32 {
     // socket per in-process SDK client sits near that ceiling even when
     // nothing leaks (2026-09-17 EMFILE storm). Raise soft → hard up front and
     // say what we got; a refusal is loud but not fatal.
-    match raise_nofile_soft_limit() {
-        Ok((soft, hard)) => {
-            eprintln!("hex harness serve: RLIMIT_NOFILE soft={soft} hard={hard}")
-        }
-        Err(e) => eprintln!("hex harness serve: WARN could not raise RLIMIT_NOFILE: {e}"),
-    }
+    report_nofile_limit(raise_nofile_soft_limit());
 
     // Multi-thread runtime: the engine + SDK both want a full reactor, and
     // handlers run on blocking threads (see the spawn_blocking below).
@@ -66,6 +61,36 @@ pub fn serve(workers: Vec<Worker>) -> i32 {
     };
     rt.block_on(run(workers))
 }
+
+/// Log the outcome of the startup `RLIMIT_NOFILE` raise. A failure is loud
+/// on both channels S6 names: stderr AND a telemetry error row
+/// (`harness` / `rlimit::nofile`), so `hex failures` surfaces it instead of
+/// it living only in the launchd log. Not fatal: the daemon keeps serving
+/// under the old limit. Split from `serve()` so the Err arm is unit-testable.
+fn report_nofile_limit(result: Result<(u64, u64), String>) {
+    match result {
+        Ok((soft, hard)) => {
+            eprintln!("hex harness serve: RLIMIT_NOFILE soft={soft} hard={hard}")
+        }
+        Err(e) => {
+            eprintln!("hex harness serve: WARN could not raise RLIMIT_NOFILE: {e}");
+            crate::telemetry::record_loud(&crate::telemetry::TelemetryEvent {
+                source: "harness".into(),
+                event: "rlimit::nofile".into(),
+                status: "error".into(),
+                duration_ms: None,
+                exit_code: None,
+                detail: Some(e),
+            });
+        }
+    }
+}
+
+/// macOS reports the `RLIMIT_NOFILE` hard limit as `RLIM_INFINITY` but
+/// refuses a soft limit above `OPEN_MAX` (10240, `<sys/syslimits.h>`) with
+/// EINVAL, so the raise clamps to this value there. `pub` so the `fd_limits`
+/// integration binary asserts against the same constant.
+pub const NOFILE_CLAMP_MACOS: libc::rlim_t = 10240;
 
 /// Raise this process's `RLIMIT_NOFILE` soft limit to its hard limit and
 /// return the resulting `(soft, hard)`. On macOS the hard limit is reported
@@ -84,10 +109,7 @@ pub fn raise_nofile_soft_limit() -> Result<(u64, u64), String> {
     }
     let hard = lim.rlim_max;
     #[cfg(target_os = "macos")]
-    let target = {
-        const OPEN_MAX: libc::rlim_t = 10240;
-        std::cmp::min(hard, OPEN_MAX)
-    };
+    let target = std::cmp::min(hard, NOFILE_CLAMP_MACOS);
     #[cfg(not(target_os = "macos"))]
     let target = hard;
     if lim.rlim_cur < target {
@@ -698,23 +720,33 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    /// 2026-09-17 EMFILE storm: the harness ran under launchd's 256-fd soft
-    /// limit. After `raise_nofile_soft_limit` the soft limit must be well
-    /// above that (macOS clamps at OPEN_MAX=10240; Linux at the hard limit),
-    /// never below the hard limit's clamp, and a second call is a no-op.
+    /// A failed RLIMIT_NOFILE raise must reach telemetry, not only stderr
+    /// (S6; review finding #4 on the v0.53.2 fix): `hex failures` reads the
+    /// events store, never the launchd log.
     #[test]
-    fn raise_nofile_soft_limit_lifts_soft_limit_above_launchd_default() {
-        let (soft, hard) = raise_nofile_soft_limit().expect("raise rlimit");
-        assert!(soft > 256, "soft limit still at launchd default: {soft}");
-        assert!(soft <= hard, "soft {soft} exceeds hard {hard}");
-        let again = raise_nofile_soft_limit().expect("second call");
-        assert_eq!(again, (soft, hard), "must be idempotent");
-        // Proof by running code, not by reading the struct back: open more
-        // than 256 fds at once.
-        let files: Vec<_> = (0..300)
-            .map(|_| std::fs::File::open("/dev/null").expect("open /dev/null"))
-            .collect();
-        assert_eq!(files.len(), 300);
+    fn report_nofile_limit_records_telemetry_error_row_on_failure() {
+        let _t = crate::telemetry::test_support::isolate();
+        report_nofile_limit(Err("setrlimit(soft=10240, hard=10240): EPERM".into()));
+        let rows = crate::telemetry::recent(10).expect("recent");
+        let row = rows
+            .iter()
+            .find(|r| r.event == "rlimit::nofile")
+            .expect("rlimit::nofile row recorded");
+        assert_eq!(row.source, "harness");
+        assert_eq!(row.status, "error");
+        assert!(
+            row.detail.as_deref().unwrap_or("").contains("EPERM"),
+            "{row:?}"
+        );
+    }
+
+    /// A successful raise records nothing: it is the normal boot path.
+    #[test]
+    fn report_nofile_limit_records_nothing_on_success() {
+        let _t = crate::telemetry::test_support::isolate();
+        report_nofile_limit(Ok((10240, u64::MAX)));
+        let rows = crate::telemetry::recent(10).expect("recent");
+        assert!(rows.iter().all(|r| r.event != "rlimit::nofile"), "{rows:?}");
     }
 
     /// Every listener worker in the default engine config gets its bind host
