@@ -137,21 +137,31 @@ pub fn generate_for(use_case: &str, prompt: &str) -> Result<String, ProviderErro
 /// Extract the assistant's message content from an OpenRouter-shape chat
 /// completion response JSON.
 ///
-/// PHASE A STUB (KTD6 / U4, not yet wired into `generate_inner`): mirrors
-/// today's `generate_inner` behavior exactly — it ignores `finish_reason` and
-/// `use_case` — so the truncation-handling tests below are red against
-/// today's behavior rather than red against an unimplemented body. The next
-/// phase makes this the real body of the `choices[0].message.content`
-/// extraction in `generate_inner` and adds the `finish_reason == "length"` ->
-/// `ProviderError::Truncated` branch (incident: 3 `distill::judge-error` rows
-/// on 2026-09-16, `finish_reason: length`, truncated JSON that failed to
-/// parse).
+/// `finish_reason == "length"` means the provider's own output cap cut the
+/// response off — on a JSON-emitting use case (e.g. `memory_judge`) this
+/// yields a truncated document that fails to parse, which without this check
+/// surfaced as an opaque `json: EOF while parsing a string` error indistinguishable
+/// from a genuinely malformed response (incident: 3 `distill::judge-error`
+/// rows on 2026-09-16, `finish_reason: length`, JSON cut mid-string at the
+/// 256-token cap). Reported as `Truncated` instead, named by use case, so the
+/// operator sees the real cause immediately. Checked ahead of the
+/// content-presence check because a `length` cutoff can leave content empty
+/// too (all budget spent on hidden reasoning tokens before any content token
+/// was emitted).
 pub(crate) fn parse_chat_response(
-    _use_case: &str,
+    use_case: &str,
     json: &serde_json::Value,
 ) -> Result<String, ProviderError> {
-    json["choices"][0]["message"]["content"]
-        .as_str()
+    let content = json["choices"][0]["message"]["content"].as_str();
+    let finish_reason = json["choices"][0]["finish_reason"].as_str();
+    if finish_reason == Some("length") {
+        let content_len = content.map(str::len).unwrap_or(0);
+        return Err(ProviderError::Truncated(format!(
+            "{use_case}: response truncated by the output token cap (finish_reason: length, \
+             content_len={content_len})"
+        )));
+    }
+    content
         .map(str::to_string)
         .ok_or_else(|| ProviderError::Upstream(format!("no content in response: {json}")))
 }
@@ -230,10 +240,7 @@ fn generate_inner(
         crate::llm_cost::record_llm_cost("openrouter", use_case, 0, 0, 0.0, Some(model));
     }
 
-    json["choices"][0]["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| ProviderError::Upstream(format!("no content in response: {json}")))
+    parse_chat_response(use_case, &json)
 }
 
 pub fn health_check() -> Result<String, ProviderError> {
@@ -351,10 +358,9 @@ api_key_env = "MY_CUSTOM_LLM_KEY"
         );
     }
 
-    // Red tests for U4 / KTD6 (2026-09-16 distill::judge-error incident:
+    // Tests for U4 / KTD6 (2026-09-16 distill::judge-error incident:
     // finish_reason "length" truncated the judge's JSON before it could be
-    // parsed). `parse_chat_response` is still a Phase A stub that ignores
-    // `finish_reason`, so the first two fail against today's behavior.
+    // parsed).
 
     #[test]
     fn parse_chat_response_truncated_with_partial_content_is_err_truncated() {

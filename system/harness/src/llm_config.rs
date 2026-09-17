@@ -89,9 +89,21 @@ fn builtin(use_case: &str) -> Option<BuiltIn> {
             // larger gets sliced by `memory::distill::cap::cap_span`.
             max_input_tokens: Some(48_000),
         }),
+        // memory_judge emits one small JSON decision object ({"action",
+        // "target_id","reason"}), but at the previous 256-token cap hidden
+        // reasoning tokens on anthropic/claude-sonnet-5 via OpenRouter ate the
+        // whole budget before content was written, or cut content off
+        // mid-string — 3 `distill::judge-error` rows on 2026-09-16,
+        // `finish_reason: length`, JSON truncated ("json: EOF while parsing a
+        // string"). Raise to 4096: the JSON body itself needs only a few dozen
+        // tokens, so the cap only needs headroom for reasoning, not more
+        // output — a cap is not a spend, and 4096 keeps a runaway reasoning
+        // turn bounded on a per-candidate call (see `ProviderError::Truncated`
+        // in memory/provider.rs, which now names a `length` cutoff instead of
+        // surfacing as an opaque parse error).
         "memory_judge" => Some(BuiltIn {
             model: "anthropic/claude-sonnet-5",
-            max_tokens: 256,
+            max_tokens: 4096,
             max_input_tokens: None,
         }),
         // consolidate_audit runs on anthropic/claude-sonnet-5 via OpenRouter,
@@ -396,10 +408,10 @@ max_tokens = 999
         assert_eq!(r.max_tokens, 999);
 
         // memory_judge has no use_cases entry → inherits [defaults] model,
-        // but max_tokens falls back to the built-in (256).
+        // but max_tokens falls back to the built-in (4096).
         let r = resolve("memory_judge").expect("resolve ok");
         assert_eq!(r.model, "defaults/model");
-        assert_eq!(r.max_tokens, 256);
+        assert_eq!(r.max_tokens, 4096);
     }
 
     #[test]

@@ -179,10 +179,16 @@ pub fn run_on_file(
             // the corpus on a box that simply has not been handed a key yet,
             // which is the exact fleet-wide data-loss bug this task fixes. So
             // Deferred waits for ops: no strike, no watermark move, retry next
-            // tick. Only `Upstream` (network/API error) follows the
-            // strike/halving/poison-slice escape hatch. Match both variants
-            // explicitly so a future third variant is a compile error forcing a
-            // deliberate decision, not a silent fall-through into the strike path.
+            // tick. `Upstream` (network/API error) AND `Truncated` (the
+            // provider's own output cap cut the extraction response off,
+            // U4/KTD6) both follow the strike/halving/poison-slice escape
+            // hatch: a truncated extract response is content the model could
+            // not finish inside its output budget, the same "this slice
+            // defeated the model" shape as a genuine upstream failure, not a
+            // config problem — it belongs in the same escape hatch, not a
+            // third path. Match every variant explicitly so a future new
+            // variant is a compile error forcing a deliberate decision, not a
+            // silent fall-through into the strike path.
             let reason = e.to_string();
             match e {
                 ProviderError::Deferred(_) => {
@@ -204,13 +210,12 @@ pub fn run_on_file(
                     );
                     return Ok(report);
                 }
-                // Truncated is treated like Upstream here for now (compile-only
-                // addition for U4/KTD6 phase A: the variant is not yet produced
-                // by any real call path — parse_chat_response isn't wired into
-                // generate_inner yet). Whether a truncated extract response
-                // should get its own strike/poison-slice treatment is a
-                // decision for whichever unit wires Truncated into the extract
-                // path; not decided here.
+                // Decision (U4/KTD6): Truncated is handled exactly like
+                // Upstream. A truncated extract is a slice-too-large-for-the-
+                // budget failure, not a config problem — it belongs in the
+                // same strike/halving/poison-slice escape hatch as any other
+                // upstream failure, so a repeatedly-truncated slice still gets
+                // skipped after STRIKE_LIMIT instead of retrying forever.
                 ProviderError::Upstream(_) | ProviderError::Truncated(_) => {
                     let new_strikes = strikes + 1;
                     if new_strikes == STRIKE_LIMIT - 1 {
