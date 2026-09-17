@@ -314,66 +314,6 @@ mod tests {
         }
     }
 
-    /// Open-fd count of this process (`/dev/fd` on macOS and Linux).
-    fn open_fd_count() -> usize {
-        std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
-    }
-
-    /// Regression for the 2026-09-17 EMFILE storm: `call_builtin` used to
-    /// leak the SDK's `iii-connection` thread (plus its kqueue and the
-    /// loopback socket) on every call because nothing ever called
-    /// `III::shutdown()`. Inside `hex harness serve` that reached the 256-fd
-    /// soft limit in ~100 min and broke every worker that spawns `hex`.
-    ///
-    /// Drives the unreachable-engine path (a port with no listener) with a
-    /// short invocation timeout: each call must fail LOUD and must not hold
-    /// on to file descriptors once it returns.
-    #[test]
-    fn call_builtin_releases_fds_after_each_call_when_engine_unreachable() {
-        let _guard = crate::telemetry::test_support::lock_env();
-
-        // Reserve a loopback port, then drop the listener so connects are refused.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
-        let prev = std::env::var("III_URL").ok();
-        std::env::set_var("III_URL", format!("ws://127.0.0.1:{port}"));
-
-        let before = open_fd_count();
-        const CALLS: usize = 3;
-        for _ in 0..CALLS {
-            let r = call_builtin_with_timeout(
-                "state::get",
-                state_payload("events", "nope", None),
-                Some(200),
-            );
-            assert!(r.is_err(), "unreachable engine must fail loud, got {r:?}");
-        }
-
-        // The connection thread exits within ~2s of shutdown() even while
-        // connects keep failing; poll for the fds to come back.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut after = open_fd_count();
-        while after > before + 2 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            after = open_fd_count();
-        }
-
-        match prev {
-            Some(v) => std::env::set_var("III_URL", v),
-            None => std::env::remove_var("III_URL"),
-        }
-
-        // A leak is >= 5 fds per call (socket, kqueue, runtime wakers);
-        // allow a small tolerance for unrelated test threads.
-        assert!(
-            after <= before + 2,
-            "fd leak: {before} open before, {after} after {CALLS} calls (>= {} would be a per-call leak)",
-            before + CALLS * 5
-        );
-    }
-
     /// Live round-trip against a running engine. Run: `cargo test -p hex-harness
     /// -- --ignored state_roundtrip_live`.
     #[test]

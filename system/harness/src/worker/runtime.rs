@@ -67,6 +67,12 @@ pub fn serve(workers: Vec<Worker>) -> i32 {
     rt.block_on(run(workers))
 }
 
+/// macOS reports the `RLIMIT_NOFILE` hard limit as `RLIM_INFINITY` but
+/// refuses a soft limit above `OPEN_MAX` (10240, `<sys/syslimits.h>`) with
+/// EINVAL, so the raise clamps to this value there. `pub` so the `fd_limits`
+/// integration binary asserts against the same constant.
+pub const NOFILE_CLAMP_MACOS: libc::rlim_t = 10240;
+
 /// Raise this process's `RLIMIT_NOFILE` soft limit to its hard limit and
 /// return the resulting `(soft, hard)`. On macOS the hard limit is reported
 /// as `RLIM_INFINITY` while the kernel caps it at `kern.maxfilesperproc`, so
@@ -84,10 +90,7 @@ pub fn raise_nofile_soft_limit() -> Result<(u64, u64), String> {
     }
     let hard = lim.rlim_max;
     #[cfg(target_os = "macos")]
-    let target = {
-        const OPEN_MAX: libc::rlim_t = 10240;
-        std::cmp::min(hard, OPEN_MAX)
-    };
+    let target = std::cmp::min(hard, NOFILE_CLAMP_MACOS);
     #[cfg(not(target_os = "macos"))]
     let target = hard;
     if lim.rlim_cur < target {
@@ -697,25 +700,6 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use tempfile::tempdir;
-
-    /// 2026-09-17 EMFILE storm: the harness ran under launchd's 256-fd soft
-    /// limit. After `raise_nofile_soft_limit` the soft limit must be well
-    /// above that (macOS clamps at OPEN_MAX=10240; Linux at the hard limit),
-    /// never below the hard limit's clamp, and a second call is a no-op.
-    #[test]
-    fn raise_nofile_soft_limit_lifts_soft_limit_above_launchd_default() {
-        let (soft, hard) = raise_nofile_soft_limit().expect("raise rlimit");
-        assert!(soft > 256, "soft limit still at launchd default: {soft}");
-        assert!(soft <= hard, "soft {soft} exceeds hard {hard}");
-        let again = raise_nofile_soft_limit().expect("second call");
-        assert_eq!(again, (soft, hard), "must be idempotent");
-        // Proof by running code, not by reading the struct back: open more
-        // than 256 fds at once.
-        let files: Vec<_> = (0..300)
-            .map(|_| std::fs::File::open("/dev/null").expect("open /dev/null"))
-            .collect();
-        assert_eq!(files.len(), 300);
-    }
 
     /// Every listener worker in the default engine config gets its bind host
     /// pinned to loopback (mrap/hex#8 — upstream defaults are 0.0.0.0).
