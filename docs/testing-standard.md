@@ -112,6 +112,7 @@ Rust
 - Profile: `debug = "line-tables-only"`, `split-debuginfo = "packed"` for dev and test. Same posture on the host `~/.cargo/config.toml` and in the image. Full debuginfo caused an OOM link in the container and 139k `.rcgu.o` files on the host.
 - Add `.config/nextest.toml`: `retries = 1`, `slow-timeout = { period = "60s", terminate-after = 3 }`, `--no-tests=fail` default. Quarantine overrides live here.
 - Spawn the binary with `env!("CARGO_BIN_EXE_hex")` and a temp `HEX_DIR`. Never touch the real `~/.hex`, `~/.boi`, or keychain.
+- `HEX_DIR` is sandboxed for every process cargo or nextest launches: `.cargo/config.toml` forces it to `/tmp/hex-test-hex-dir`, so a test that forgets to isolate cannot reach a live store (`tests/telemetry_store.rs` proves the sandbox is active). To point a cargo-built binary at a live instance, run `target/debug/hex` directly with `HEX_DIR` set.
 - What the lane gives you: shared target at `/target`, 0 crates compiled on a no-change rerun (27 s), a receipt JSON line, and freedom from Gatekeeper walks.
 
 Python

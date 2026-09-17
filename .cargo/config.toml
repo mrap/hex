@@ -1,0 +1,11 @@
+# Sandbox HEX_DIR for every process cargo or nextest launches from this
+# workspace (unit tests, integration test binaries, `cargo run`). hex sessions
+# export a live HEX_DIR, and a test that forgets to isolate it would write
+# telemetry into the live instance store (it happened 2026-09-17). `force`
+# overrides the exported value on purpose. To run a cargo-built binary against
+# a live instance, invoke target/debug/hex directly with HEX_DIR set; cargo's
+# [env] only reaches processes cargo starts. The path is absolute rather than
+# repo-relative so the container test lane (root, bind mount) leaves no
+# root-owned files in the working tree.
+[env]
+HEX_DIR = { value = "/tmp/hex-test-hex-dir", force = true }
