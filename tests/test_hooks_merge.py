@@ -56,6 +56,19 @@ class T(unittest.TestCase):
             chained_entry = next(e for e in cfg["hooks"]["SessionStart"] for h in e["hooks"] if h["command"] == chained)
             self.assertEqual(len(chained_entry["hooks"]), 1, "entry count for the chained command must be unchanged")
 
+    def test_manifest_command_containing_separator_is_idempotent(self):
+        """Review 20260916 round 2 #2: a manifest command that itself contains ';' must match the
+        whole existing command, not only its split segments; otherwise every merge re-adds it."""
+        with tempfile.TemporaryDirectory() as d:
+            manifest = Path(d) / "manifest.json"
+            manifest.write_text(json.dumps({"SessionStart": [{"matcher": "", "command": "bash -c 'a; b'"}]}))
+            s = Path(d) / "settings.json"
+            self.assertEqual(0, self.run_merge_raw(manifest, s).returncode)
+            self.assertEqual(0, self.run_merge_raw(manifest, s).returncode)
+            hooks = json.loads(s.read_text())["hooks"]["SessionStart"]
+            self.assertEqual(1, len(hooks), hooks)
+            self.assertEqual(0, self.run_check(manifest, s).returncode)
+
     def test_mention_inside_echo_string_is_not_presence(self):
         """R3/KTD7: a mention of the hook command inside a longer echo string is not presence;
         the real hook is still added."""

@@ -17,6 +17,13 @@ FORK = REPO / "system/scripts/hex-fork-session"
 TMUX_FAKE = '''#!/bin/bash
 echo "$*" >> "__CALLS__"
 case "$1" in
+  new-session)
+    # Record `-e VAR=value` pairs the way tmux would seed the session environment, so the launch
+    # line runs with exactly what production gets (the hook must not need anything else).
+    args=("$@"); sess=""
+    for ((i=0; i<${#args[@]}; i++)); do [[ "${args[$i]}" == -s ]] && sess="${args[$((i+1))]}"; done
+    : > "__TMP__/env-$sess"
+    for ((i=0; i<${#args[@]}; i++)); do [[ "${args[$i]}" == -e ]] && echo "export ${args[$((i+1))]}" >> "__TMP__/env-$sess"; done ;;
   has-session)
     t="$3"
     if [[ "$t" == "="* ]]; then
@@ -26,6 +33,12 @@ case "$1" in
       [[ -n "$FAKE_EXISTING" && "$FAKE_EXISTING" == "$t"* ]] && exit 0 || exit 1
     fi ;;
   capture-pane)
+    # FAKE_LATE_INJECT: the hook claims the handoff while the launcher is capturing the pane for
+    # its exit-6 report, i.e. after the consume-wait gave up but before kill_and_archive runs.
+    if [[ -n "$FAKE_LATE_INJECT" && -f "__TMP__/banner-$3" && -f "__HEX__/.hex/run/handoffs/$3.md" ]]; then
+      export HEX_DIR="__HEX__"; [[ -f "__TMP__/env-$3" ]] && source "__TMP__/env-$3"
+      "__INJECT__" > "__TMP__/injected-$3.txt"
+    fi
     # Build the whole pane in one string and print it with a single write. grep -q exits the
     # instant it sees a match, and if this producer is still mid multi-echo when that happens the
     # pipe closes under it (SIGPIPE); with `pipefail` that non-zero producer exit -- not grep's
@@ -44,7 +57,7 @@ case "$1" in
     case "$4" in
       Enter) [[ -f "__TMP__/typed-$3" ]] && touch "__TMP__/submitted-$3" ;;
       -l) touch "__TMP__/typed-$3" ;;
-      *) export HEX_SESSION_NAME="$3" HEX_DIR="__HEX__"; eval "$4" ;;
+      *) export HEX_DIR="__HEX__"; [[ -f "__TMP__/env-$3" ]] && source "__TMP__/env-$3"; eval "$4" ;;
     esac ;;
 esac
 exit 0
@@ -85,7 +98,7 @@ class Base(unittest.TestCase):
         self.env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", HEX_DIR=str(self.hex),
                         HEX_FORK_LAUNCH="FAKE-LAUNCH @name@", HEX_FORK_TIMEOUT="3", HEX_FORK_INJECT_TIMEOUT="1",
                         HEX_FORK_KICKOFF_DELAY="0", HEX_FORK_ENTER_DELAY="0", HEX_FORK_SUBMIT_TIMEOUT="1",
-                        FAKE_EXISTING="", FAKE_NO_SUBMIT="", FAKE_NO_BANNER="", FAKE_NO_INJECT="",
+                        FAKE_EXISTING="", FAKE_NO_SUBMIT="", FAKE_LATE_INJECT="", FAKE_NO_BANNER="", FAKE_NO_INJECT="",
                         FAKE_RC_AFTER_ENTER="")
         self.env.pop("HEX_SESSION_NAME", None); self.env.pop("TMUX", None)
 
@@ -204,7 +217,7 @@ class ForkTests(Base):
         r = self.run_fork("theta", "body\n")
         self.assertEqual(r.returncode, 5, r.stderr)
         self.assertEqual(self.calls.read_text().splitlines().count("send-keys -t theta Enter"), 2)
-        self.assertIn("NOT submitted", r.stderr); self.assertIn("tmux attach -t theta", r.stderr)
+        self.assertIn("NOT submitted", r.stderr); self.assertIn("tmux send-keys -t theta Enter", r.stderr)
 
     def test_no_registry_is_fine(self):
         r = self.run_fork("zeta", "body\n")
@@ -280,6 +293,17 @@ class ForkTests(Base):
         self.assertEqual(r.returncode, 4, r.stderr)
         self.assertIn("cannot create", r.stderr)
 
+    def test_hook_claiming_during_exit6_report_falls_through_to_success(self):
+        """Review 20260916 round 2 #1: if the hook claims the handoff between the consume-wait and
+        kill_and_archive, the session is briefed; the launcher must not kill it or fabricate an
+        archive path, and the run proceeds to the kickoff."""
+        self.env["FAKE_NO_INJECT"] = "1"; self.env["FAKE_LATE_INJECT"] = "1"
+        r = self.run_fork("late", "# Handoff: late\n## Work queue\n1. LATE-1\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("kill-session", self.calls.read_text())
+        self.assertIn("LATE-1", (self.tmp / "injected-late.txt").read_text())
+        self.assertFalse(list((self.hex / "projects/hex-ops/handoffs").glob("late-unconsumed-*")))
+
     def test_unsubmitted_kickoff_writes_no_registry_row(self):
         # R10: the registry row is written only after submission is proven.
         reg = self.hex / "projects/hex-ops/sessions.md"
@@ -328,11 +352,27 @@ class DocContractTests(unittest.TestCase):
     UPGRADE_CMD = REPO / "system/commands/hex-upgrade.md"
     UPGRADE_SKILL = REPO / "system/skills/hex-upgrade/SKILL.md"
 
+    def script_exit_codes(self):
+        """Exit codes the launcher can actually produce: every literal `exit N` plus 0."""
+        codes = {0} | {int(m) for m in re.findall(r"\bexit (\d+)", FORK.read_text())}
+        self.assertTrue(codes >= {2, 3, 4, 5, 6, 7}, codes)
+        return codes
+
     def test_command_doc_has_exit_code_table_rows(self):
+        """Review 20260916 round 2 #3: derive the set from the script, never a hardcoded tuple."""
         text = self.DOC.read_text()
-        for code in (0, 2, 3, 4, 5, 6, 7):
+        for code in sorted(self.script_exit_codes()):
             with self.subTest(code=code):
                 self.assertRegex(text, rf"(?m)^\|\s*{code}\s*\|", f"missing exit-code table row for {code}")
+        # And no row for a code the script cannot produce.
+        for row in re.findall(r"(?m)^\|\s*(\d+)\s*\|", text):
+            self.assertIn(int(row), self.script_exit_codes(), f"doc row for exit {row} that the script never emits")
+
+    def test_hex_ops_summary_names_every_exit_code(self):
+        text = self.HEX_OPS_DOC.read_text()
+        for code in sorted(self.script_exit_codes()):
+            with self.subTest(code=code):
+                self.assertRegex(text, rf"(?<![\d.])\b{code} ", f"docs/hex-ops.md exit-code summary lacks {code}")
 
     def test_command_doc_qualifies_instance_paths_with_hex_dir(self):
         text = self.DOC.read_text()
