@@ -677,7 +677,8 @@ before the hook was wired) before it can ship in a release.
 
 "Hex owns the handoff." When the operator asks to fork the current thread into its own session, the new session must boot already briefed. Mechanism:
 
-- `system/scripts/hex-fork-session <name> [--purpose TEXT] < handoff.md` stages the handoff at `$HEX_DIR/.hex/run/handoffs/<name>.md`, starts a detached tmux session, launches the runtime (`HEX_FORK_LAUNCH`, default `hex-new @name@ --fresh`), verifies the Claude Code banner, sends the kickoff prompt, and appends a row to `$HEX_DIR/projects/hex-ops/sessions.md` if that registry exists.
+- `system/scripts/hex-fork-session <name> [--purpose TEXT] [--kickoff TEXT] [--launch CMD] < handoff.md` stages the handoff at `$HEX_DIR/.hex/run/handoffs/<name>.md`, starts a detached tmux session, launches the runtime (`HEX_FORK_LAUNCH`, default `hex-new @name@`), verifies the Claude Code banner, sends the kickoff prompt, and appends a row to `$HEX_DIR/projects/hex-ops/sessions.md` if that registry exists.
 - `system/scripts/hex-handoff-inject` runs on `SessionStart` (declared in `system/hooks/required-hooks.json`). If a handoff is staged for this session name (`HEX_SESSION_NAME`, else tmux `#S`), it prints the handoff into context and moves it to `$HEX_DIR/projects/hex-ops/handoffs/<name>-<stamp>.md`. Consumed once; a restart does not re-inject.
+- Exit codes: 0 ok; 2 usage error or empty handoff; 3 name already exists; 4 no banner seen, session killed, handoff archived; 5 kickoff typed but not submitted, session left up; 6 handoff not consumed, session killed, handoff archived; 7 a handoff is already staged for that name. Full recovery steps: `system/commands/hex-fork-session.md`.
 - Operator-facing procedure and handoff template: `system/commands/hex-fork-session.md`.
 - Tests: `tests/test_fork_session.py` (headless, fake tmux).

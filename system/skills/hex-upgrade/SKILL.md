@@ -47,6 +47,10 @@ If the upgrade script reports that the AGENTS.md template has changed:
 
 5. Show the user a summary of what changed in AGENTS.md and ask for confirmation before writing.
 
+## Step 2b: Required hooks
+
+`hex upgrade` merges `.hex/hooks/required-hooks.json` into `.claude/settings.json` itself and prints `[OK] hook added: <event>: <command>` per addition (or `[OK] Required hooks already wired.`). A merge failure is a `[FAIL]` and the upgrade exits non-zero. Nothing to run by hand; report any additions in Step 4.
+
 ## Step 3: Rebuild memory index
 
 After upgrade, rebuild the memory index to pick up any changes:

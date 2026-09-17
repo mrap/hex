@@ -3,37 +3,84 @@
 
 Idempotent. Used by install.sh (fresh install) and by /hex-upgrade (existing instance),
 so a hook added to the manifest reaches every instance, not only new ones.
-Usage: hex-hooks-merge <manifest.json> <settings.json>
+
+Manifest schema: {event: [{matcher, command}]}.
+
+Usage: hex-hooks-merge [--check] <manifest.json> <settings.json>
 Prints one line per hook added; exits non-zero on unreadable manifest.
+With --check, writes nothing: exits 0 when every manifest command is present,
+3 when any is missing (printing the missing "event: command" lines to stdout),
+or 2 with the JSON error on stderr when settings.json exists but is malformed.
+A settings.json that exists but is not valid JSON is never overwritten: the
+merge and the check both refuse and exit non-zero rather than treating it as {}.
 """
-import json, os, sys
+import json, os, re, sys
+
+
+class SettingsInvalid(Exception):
+    """Raised when an existing settings.json fails to parse as JSON."""
+
+
+def command_present(existing_commands, hook_command):
+    """R3/KTD7: hook_command is present when it equals one trimmed segment of an
+    existing command after splitting that command on ';', '&&', '||', and newlines.
+    A mention inside a longer command (e.g. an echo string) is not presence."""
+    for cmd in existing_commands:
+        if cmd.strip() == hook_command:
+            return True
+        for segment in re.split(r';|&&|\|\||\n', cmd):
+            if segment.strip() == hook_command:
+                return True
+    return False
+
+
+def load_settings(settings_path):
+    """Missing file starts from {}. An existing-but-malformed file raises
+    SettingsInvalid rather than being silently treated as {}."""
+    if not os.path.exists(settings_path):
+        return {}
+    with open(settings_path) as f:
+        text = f.read()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SettingsInvalid(
+            f"{settings_path} is not valid JSON ({e}); refusing to overwrite"
+        ) from e
+
+
+def existing_commands_for(event_hooks):
+    return [h.get('command', '') for e in event_hooks for h in e.get('hooks', [])]
+
+
+def missing_hooks(manifest, settings):
+    """Return 'event: command' lines for manifest hooks absent from settings. Never writes."""
+    hooks_section = settings.get('hooks', {})
+    result = []
+    for event_type, hook_defs in manifest.items():
+        existing_commands = existing_commands_for(hooks_section.get(event_type, []))
+        for hook_def in hook_defs:
+            hook_command = hook_def['command']
+            if not command_present(existing_commands, hook_command):
+                result.append(f"{event_type}: {hook_command}")
+    return result
+
 
 def merge(manifest_path, settings_path):
     with open(manifest_path) as f:
         manifest = json.load(f)
-    settings = {}
-    if os.path.exists(settings_path):
-        with open(settings_path) as f:
-            try:
-                settings = json.load(f)
-            except json.JSONDecodeError:
-                settings = {}
+    settings = load_settings(settings_path)
     hooks_section = settings.setdefault('hooks', {})
     added = []
     for event_type, hook_defs in manifest.items():
         event_hooks = hooks_section.setdefault(event_type, [])
+        existing_commands = existing_commands_for(event_hooks)
         for hook_def in hook_defs:
             matcher = hook_def.get('matcher', '')
-            if 'command' in hook_def:
-                hook_command = hook_def['command']
-                is_present = any(any(h.get('command', '') == hook_command for h in e.get('hooks', [])) for e in event_hooks)
-            else:
-                script_rel = hook_def['script']
-                script_name = os.path.basename(script_rel)
-                hook_command = f'bash "$CLAUDE_PROJECT_DIR/{script_rel}"'
-                is_present = any(any(script_name in h.get('command', '') for h in e.get('hooks', [])) for e in event_hooks)
-            if not is_present:
+            hook_command = hook_def['command']
+            if not command_present(existing_commands, hook_command):
                 event_hooks.append({'matcher': matcher, 'hooks': [{'type': 'command', 'command': hook_command}]})
+                existing_commands.append(hook_command)
                 added.append(f"{event_type}: {hook_command}")
     tmp = settings_path + '.tmp'
     os.makedirs(os.path.dirname(os.path.abspath(tmp)), exist_ok=True)
@@ -42,8 +89,42 @@ def merge(manifest_path, settings_path):
     os.replace(tmp, settings_path)
     return added
 
+
+def check(manifest_path, settings_path):
+    """--check: read-only. Returns the missing 'event: command' lines; raises
+    SettingsInvalid if settings.json exists but is malformed."""
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    settings = load_settings(settings_path)
+    return missing_hooks(manifest, settings)
+
+
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        sys.exit("usage: hex-hooks-merge <manifest.json> <settings.json>")
-    for line in merge(sys.argv[1], sys.argv[2]):
+    args = sys.argv[1:]
+    check_mode = False
+    if args and args[0] == '--check':
+        check_mode = True
+        args = args[1:]
+    if len(args) != 2:
+        sys.exit("usage: hex-hooks-merge [--check] <manifest.json> <settings.json>")
+    manifest_path, settings_path = args
+
+    if check_mode:
+        try:
+            missing = check(manifest_path, settings_path)
+        except SettingsInvalid as e:
+            print(f"hex-hooks-merge: {e}", file=sys.stderr)
+            sys.exit(2)
+        if missing:
+            for line in missing:
+                print(line)
+            sys.exit(3)
+        sys.exit(0)
+
+    try:
+        added = merge(manifest_path, settings_path)
+    except SettingsInvalid as e:
+        print(f"hex-hooks-merge: {e}", file=sys.stderr)
+        sys.exit(1)
+    for line in added:
         print("hook added:", line)

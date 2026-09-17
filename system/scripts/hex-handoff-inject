@@ -1,20 +1,36 @@
 #!/usr/bin/env bash
 # hex-handoff-inject: SessionStart hook helper for forked sessions.
-# If a fork handoff is pending for this session name, print it into the new session's
-# context and archive it (consumed exactly once). Wire in settings.json SessionStart:
+# If a fork handoff is pending for this session name, claim it (move it to the archive) BEFORE
+# printing anything, then print it into the new session's context. Claim-before-print means a
+# read failure after the claim (archive unreadable) still fails loudly instead of
+# printing a half handoff, and a second run for the same name is silent because there is nothing
+# left to claim -- consumed exactly once. Wire in settings.json SessionStart:
 #   "$HEX_DIR"/.hex/scripts/hex-handoff-inject
-# Session name: $HEX_SESSION_NAME (exported by the launcher) or the tmux session name.
+#
+# Trust model (R15): a staged handoff at $HEX_DIR/.hex/run/handoffs/<name>.md is operator-written
+# input on a single-operator machine. The only writer of that directory is the launcher
+# (hex-fork-session), itself run by the operator's own agent -- never a remote or multi-tenant
+# actor. This hook does not authenticate the staged content; its one defense is refusing to act on
+# a session name that is not kebab-case, so a name derived from something unexpected cannot walk
+# the path outside the handoffs directory.
+#
+# Session name: $HEX_SESSION_NAME (set on the tmux session by the launcher) or the tmux session name.
 # Staging: $HEX_DIR/.hex/run/handoffs/<name>.md  ->  archive $HEX_DIR/projects/hex-ops/handoffs/
 set -uo pipefail
 HEX_DIR="${HEX_DIR:-$HOME/hex}"
 name="${HEX_SESSION_NAME:-}"
 [[ -z "$name" && -n "${TMUX:-}" ]] && name="$(tmux display-message -p '#S' 2>/dev/null)"
 [[ -z "$name" ]] && exit 0
+[[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || exit 0
 pending="$HEX_DIR/.hex/run/handoffs/$name.md"
 [[ -f "$pending" ]] || exit 0
-archive_dir="${HEX_HANDOFF_ARCHIVE:-$HEX_DIR/projects/hex-ops/handoffs}"; mkdir -p "$archive_dir"
+archive_dir="${HEX_HANDOFF_ARCHIVE:-$HEX_DIR/projects/hex-ops/handoffs}"
 archive="$archive_dir/$name-$(date +%F-%H%M).md"
+mkdir -p "$archive_dir" || { echo "ERROR: cannot create $archive_dir" >&2; exit 1; }
+if ! mv "$pending" "$archive" 2>/dev/null; then
+  [[ -e "$pending" ]] && { echo "ERROR: could not claim handoff $pending -> $archive" >&2; exit 1; }
+  exit 0
+fi
 printf '\n*** Fork handoff for session "%s" (archived at %s) ***\n\n' "$name" "${archive#$HEX_DIR/}"
-cat "$pending"
+cat "$archive" || { echo "ERROR: handoff claimed but unreadable at $archive" >&2; exit 1; }
 printf '\n*** End handoff. You already have the context above; do not re-ask for it. On the first user turn, start the first item in the work queue. ***\n'
-mv "$pending" "$archive" || { echo "ERROR: could not archive handoff $pending" >&2; exit 1; }
