@@ -341,6 +341,107 @@ mod tests {
         )
     }
 
+    // -------------------------------------------------------------------------
+    // Fixture 3 - a real Codex-written trusted_hash, captured 2026-09-17 from
+    // Codex CLI 0.154.0 on the instance (state key
+    // `<HEX_DIR>/.codex/hooks.json:pre_tool_use:0:0`). This retires the
+    // toml-version divergence risk on every run, not only when the `#[ignore]`d
+    // live test below happens to execute on a host with a trusted JSON hook.
+    //
+    // Source entry, verbatim as Codex wrote it to hooks.json (no personal
+    // path in these constants): event_name "pre_tool_use", matcher
+    // "Write|Edit|MultiEdit|NotebookEdit", one command handler
+    // `hex hook worktree-guard` with no timeout/async/statusMessage/
+    // additionalContextLimit present. The test below applies EXACTLY the
+    // same normalization the live test applies (`normalize_timeout`,
+    // `matcher_pattern_for_event`, `context_limit_event`, all defined just
+    // above) before calling `hook_hash`, rather than hardcoding the already-
+    // normalized handler JSON — that is what makes this a parity proof of
+    // the normalization rules, not just of `hook_hash` on pre-cooked input.
+    //
+    // Expected canonical JSON (matcher kept: pre_tool_use is not in the
+    // None-matcher event list; timeout defaulted to 600; async defaulted to
+    // false; no additionalContextLimit, since none was present):
+    //   {"event_name":"pre_tool_use","hooks":[{"async":false,"command":"hex hook worktree-guard","timeout":600,"type":"command"}],"matcher":"Write|Edit|MultiEdit|NotebookEdit"}
+    // -------------------------------------------------------------------------
+    const F3_EVENT_LABEL: &str = "pre_tool_use";
+    const F3_RAW_MATCHER: &str = "Write|Edit|MultiEdit|NotebookEdit";
+    const F3_RAW_COMMAND: &str = "hex hook worktree-guard";
+    const F3_HASH: &str = "sha256:96b28df6d719740da58b88bb770bdb9edabfafa79a3091253911eb425814a5a9";
+
+    /// Build the normalized handlers JSON for Fixture 3 the same way
+    /// `trusted_hash_matches_codex_written_entry` normalizes a raw
+    /// hooks.json handler, given the raw (un-normalized) `timeout` and
+    /// `additionalContextLimit` that were present in the source (both
+    /// absent for this fixture).
+    fn f3_normalized_handlers_json(raw_timeout: Option<u64>, raw_limit: Option<u64>) -> String {
+        let mut norm = serde_json::Map::new();
+        norm.insert("type".into(), serde_json::json!("command"));
+        norm.insert("command".into(), serde_json::json!(F3_RAW_COMMAND));
+        norm.insert(
+            "timeout".into(),
+            serde_json::json!(normalize_timeout(F3_EVENT_LABEL, raw_timeout)),
+        );
+        norm.insert("async".into(), serde_json::json!(false));
+        if context_limit_event(F3_EVENT_LABEL) {
+            if let Some(limit) = raw_limit {
+                if limit != 2500 {
+                    norm.insert("additionalContextLimit".into(), serde_json::json!(limit));
+                }
+            }
+        }
+        serde_json::to_string(&JsonValue::Array(vec![JsonValue::Object(norm)])).unwrap()
+    }
+
+    #[test]
+    fn worktree_guard_pre_tool_use_hash_matches_codex_written_entry() {
+        // Source has no timeout and no additionalContextLimit: both None.
+        let handlers_json = f3_normalized_handlers_json(None, None);
+        let matcher = matcher_pattern_for_event(F3_EVENT_LABEL, Some(F3_RAW_MATCHER));
+        assert_eq!(
+            matcher,
+            Some(F3_RAW_MATCHER),
+            "pre_tool_use keeps its matcher"
+        );
+
+        let hash = hook_hash(F3_EVENT_LABEL, matcher, &handlers_json).unwrap();
+        assert_eq!(hash, F3_HASH);
+        // CamelCase event name must resolve to the same label and hash.
+        assert_eq!(
+            hook_hash(
+                camel_for_label(F3_EVENT_LABEL).unwrap(),
+                matcher,
+                &handlers_json
+            )
+            .unwrap(),
+            F3_HASH
+        );
+
+        // The normalization is load-bearing: feeding the RAW (un-normalized)
+        // source handler straight to `hook_hash`, without deriving the
+        // defaulted timeout first, must NOT reproduce the captured hash.
+        let raw_handlers_json = format!(r#"[{{"type":"command","command":"{F3_RAW_COMMAND}"}}]"#);
+        let raw_hash = hook_hash(F3_EVENT_LABEL, Some(F3_RAW_MATCHER), &raw_handlers_json).unwrap();
+        assert_ne!(
+            raw_hash, F3_HASH,
+            "the un-normalized source handler (no timeout key) must hash \
+             differently from the normalized one (timeout: 600), proving the \
+             normalization step this fixture exercises is load-bearing"
+        );
+    }
+
+    #[test]
+    fn worktree_guard_hash_changes_without_the_matcher() {
+        let handlers_json = f3_normalized_handlers_json(None, None);
+        let with_matcher = hook_hash(F3_EVENT_LABEL, Some(F3_RAW_MATCHER), &handlers_json).unwrap();
+        let without_matcher = hook_hash(F3_EVENT_LABEL, None, &handlers_json).unwrap();
+        assert_ne!(
+            with_matcher, without_matcher,
+            "removing the matcher must change the hash"
+        );
+        assert_eq!(with_matcher, F3_HASH);
+    }
+
     #[test]
     #[ignore]
     fn trusted_hash_matches_codex_written_entry() {
