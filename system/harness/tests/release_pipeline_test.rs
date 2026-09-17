@@ -420,14 +420,17 @@ fn cut_refuses_tag_that_already_exists_on_origin() {
 }
 
 #[test]
-fn tag_already_on_origin_at_same_commit_is_idempotent_success() {
-    // Legacy test 2-ish, remote-aware: origin grows the tag at the SAME
-    // commit mid-release (post-receive on the main push) → green-check skip.
+fn origin_side_tag_created_during_the_atomic_push_cannot_race_it() {
+    // Under the atomic push (main, tag, develop land in one transaction) a
+    // post-receive hook that tags main only fires AFTER our tag is already on
+    // origin, so its `git tag` no-ops. The ceremony succeeds and origin holds
+    // the ceremony's tag at the release merge. (Before atomic pushes this
+    // fixture exercised the "tag already on origin" idempotent skip, which is
+    // structurally unreachable now.)
     let f = fixture();
     install_origin_tagger(&f.origin, "v0.2.0", "$new");
     let out = run_cut(&f, &["--version", "0.2.0"]);
     assert!(out.status.success(), "stderr: {}", text(&out.stderr));
-    assert!(text(&out.stdout).contains("already on origin"));
     let main_sha = git_out(&f.repo, &["rev-parse", "refs/heads/main"]);
     assert_eq!(
         git_out(&f.origin, &["rev-parse", "v0.2.0^{commit}"]),
@@ -437,20 +440,28 @@ fn tag_already_on_origin_at_same_commit_is_idempotent_success() {
 
 #[test]
 fn divergent_remote_tag_is_refused_never_overwritten() {
-    // Legacy test 3: origin's tag points elsewhere → loud error, exit 1, and
-    // the remote tag is NOT silently overwritten.
+    // Legacy test 3, atomic-era shape: the tag already exists on origin at a
+    // different commit BEFORE the cut (the only way a divergent remote tag can
+    // exist once pushes are atomic). The precondition check sees it, refuses
+    // loudly before the battery and before any push, and origin's tag still
+    // points where it did.
     let f = fixture();
-    install_origin_tagger(&f.origin, "v0.2.0", "$old");
     let divergent_sha = git_out(&f.origin, &["rev-parse", "refs/heads/main"]);
+    git(&f.origin, &["tag", "v0.2.0", &divergent_sha]);
+    let origin_main_before = divergent_sha.clone();
     let out = run_cut(&f, &["--version", "0.2.0"]);
     assert!(!out.status.success());
     let err = text(&out.stderr);
-    assert!(err.contains("divergent"), "{err}");
-    assert!(err.contains("refusing to overwrite"), "{err}");
-    // The remote tag still points where it did.
+    assert!(err.contains("already exists on origin"), "{err}");
+    assert!(err.contains("refusing to reuse"), "{err}");
+    // The remote tag still points where it did, and main did not move.
     assert_eq!(
         git_out(&f.origin, &["rev-parse", "v0.2.0^{commit}"]),
         divergent_sha
+    );
+    assert_eq!(
+        git_out(&f.origin, &["rev-parse", "refs/heads/main"]),
+        origin_main_before
     );
 }
 
