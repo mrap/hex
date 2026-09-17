@@ -80,6 +80,27 @@ fn call_builtin(function_id: &str, payload: Value) -> Result<Value, String> {
 /// WebSocket handshake, where the SDK's `connect_async` has no timeout.
 const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(5);
 
+/// Install the process-wide shared client that `serve` owns (KTD8: `serve`
+/// already creates one long-lived `iii_sdk::III` client at startup via
+/// `worker::runtime::connect_engine_client`; this seam lets
+/// `call_builtin_with_timeout_and_budget` reuse it instead of opening a new
+/// client per call, which is the per-call-client residual this unit closes).
+///
+/// STUB (Phase A of this unit): does not retain `iii` anywhere yet. The real
+/// `OnceLock<iii_sdk::III>` storage, the loud-no-op behavior on a second
+/// install, and the `call_builtin_with_timeout_and_budget` branch that
+/// consults it all land in the follow-up task for this unit. Until then this
+/// function is inert and every caller still takes the per-call path.
+pub fn install_shared_client(iii: iii_sdk::III) {
+    let _ = iii;
+}
+
+/// True once [`install_shared_client`] has installed the process-wide shared
+/// client. STUB (Phase A): always `false` — see `install_shared_client`.
+pub fn shared_client_installed() -> bool {
+    false
+}
+
 /// `call_builtin` with an explicit invocation timeout (`None` = SDK default,
 /// 30s). `pub` so the `fd_limits` integration binary can drive the
 /// unreachable-engine path quickly; production callers use `state_*`/`emit`.

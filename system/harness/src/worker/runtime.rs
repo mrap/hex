@@ -32,6 +32,20 @@ const DEFAULT_ENGINE_URL: &str = "ws://127.0.0.1:49134";
 /// forcing exit.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Connect to the iii engine at `url` and install the resulting client as the
+/// process-wide shared client `ops::call_builtin_with_timeout_and_budget`
+/// will reuse (KTD8). This is the seam `serve` calls instead of its bare
+/// `iii_sdk::register_worker(&url, ...)` line, so the install happens as
+/// part of the same connect `serve` already makes, before registering any
+/// handlers.
+///
+/// STUB (Phase A of this unit): registers the client but does not yet call
+/// `ops::install_shared_client`, and `serve` does not call this seam yet
+/// either — both land in the follow-up task for this unit.
+pub fn connect_engine_client(url: &str) -> iii_sdk::III {
+    iii_sdk::register_worker(url, iii_sdk::InitOptions::default())
+}
+
 /// Long-running serve entry — hidden behind `hex harness serve` so launchd can
 /// invoke it. One tokio runtime hosts BOTH the in-process iii engine and the
 /// worker runtime that connects to it as an SDK client:
