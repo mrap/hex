@@ -122,7 +122,10 @@ fn sandbox_hex_dir_is_a_working_telemetry_store() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // Do not touch HEX_DIR here: the point is that the ambient sandbox value
     // is a real, writable store, not a dead path.
-    assert_eq!(std::env::var("HEX_DIR").unwrap_or_default(), SANDBOX_HEX_DIR);
+    assert_eq!(
+        std::env::var("HEX_DIR").unwrap_or_default(),
+        SANDBOX_HEX_DIR
+    );
     telemetry::record(&TelemetryEvent {
         source: "test".to_string(),
         event: "hex::sandbox::probe".to_string(),
@@ -133,7 +136,9 @@ fn sandbox_hex_dir_is_a_working_telemetry_store() {
     })
     .expect("record into the sandbox store");
     assert!(
-        std::path::Path::new(SANDBOX_HEX_DIR).join(".hex/telemetry/events.db").exists(),
+        std::path::Path::new(SANDBOX_HEX_DIR)
+            .join(".hex/telemetry/events.db")
+            .exists(),
         "sandbox events.db was not created"
     );
 }
@@ -144,7 +149,14 @@ fn built_binary_outside_cargo_honors_explicit_hex_dir() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_hex"))
         .env("HEX_DIR", live.path())
         .args([
-            "telemetry", "record", "--source", "test", "--event", "hex::sandbox::binary", "--status", "ok",
+            "telemetry",
+            "record",
+            "--source",
+            "test",
+            "--event",
+            "hex::sandbox::binary",
+            "--status",
+            "ok",
         ])
         .output()
         .expect("spawn hex binary");
