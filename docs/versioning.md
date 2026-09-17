@@ -68,9 +68,34 @@ nothing.
 3. Compute the next semver (refusing anything not greater than the latest tag)
 4. Branch `release/X.Y.Z`, bump `system/harness/Cargo.toml` + `system/version.txt`,
    rebuild so `Cargo.lock` updates, commit `bump: vX.Y.Z`
-5. Merge `--no-ff` to `main`, tag `vX.Y.Z`, back-merge to `develop`
-6. Push `main`, `develop`, and the tag (with post-push verification), then create
-   the GitHub release if the repo profile enables it
+5. Merge `--no-ff` to `main` and tag `vX.Y.Z`
+6. Reconcile `develop` with `origin/develop` (fast-forward when behind, a real
+   merge when diverged; a conflict aborts before any push), then back-merge
+   `main` to `develop`
+7. Push `main`, the tag, and `develop` in ONE atomic push (origin holds all three
+   or none), verify each ref, then create the GitHub release if the repo profile
+   enables it
+
+**If origin rejects the push:** nothing is on origin. When `origin/develop` moved
+again between the reconcile and the push, the ceremony reconciles once more and
+retries once; a second rejection aborts with `Nothing was pushed` and numbered
+by-hand commands (merge `origin/develop`, merge `main`, one atomic push, delete
+the release branch; plus an unwind that resets `main` and `develop` to their
+pre-cut commits).
+
+**If git fails without a rejection from origin** (connection lost after send,
+git killed, a client-side hook): the outcome is unknown, so the ceremony asks
+origin. If every ref is exactly where it was before the push, that is a verified
+`Nothing was pushed` with the same by-hand commands. If all three refs are at
+the expected commits, the release completes normally. Anything else is the
+publish-state path below.
+
+**If verification disagrees with the push:** the ceremony prints a `PUBLISH
+STATE` block with one line per ref: `on origin at <sha>`, `on origin at <sha>
+(expected <sha>)`, `not on origin`, or `could not verify (<error>)`. It creates
+the GitHub release only when the tag is on origin at the expected commit, runs
+cleanup, and exits non-zero with a push command for refs origin confirmed absent
+and an `ls-remote` command for refs it could not confirm.
 
 If `develop` does not exist yet, the command refuses and prints the bootstrap
 one-liner: `git branch develop main && git push origin develop`.
