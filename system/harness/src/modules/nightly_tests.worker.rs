@@ -165,12 +165,43 @@ mod tests {
         let argv = lane_argv(&repo);
         let joined = argv.join(" ");
         assert!(joined.contains("test-lane.sh"), "argv: {joined}");
-        assert!(joined.contains("--run-ignored"), "argv: {joined}");
-        assert!(joined.contains("all"), "argv: {joined}");
+        assert!(
+            joined.contains("-- --profile nightly --no-fail-fast --run-ignored all"),
+            "argv must pass --profile nightly, --no-fail-fast, and --run-ignored all \
+             (in that order) after --: {joined}"
+        );
         assert_eq!(
             argv.last().map(String::as_str),
             Some("/some/repo"),
             "the repo path must be the last argv entry (bash's $1): {argv:?}"
+        );
+    }
+
+    #[test]
+    fn nextest_profile_nightly_excludes_live_tests() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let nextest_toml_path = workspace_root.join(".config/nextest.toml");
+        let raw = std::fs::read_to_string(&nextest_toml_path).unwrap_or_else(|e| {
+            panic!(
+                "read {} failed: {e} (expected the nightly profile config at the workspace root)",
+                nextest_toml_path.display()
+            )
+        });
+        let value: toml::Value = toml::from_str(&raw).unwrap_or_else(|e| {
+            panic!(
+                "{} does not parse as TOML: {e}",
+                nextest_toml_path.display()
+            )
+        });
+        let default_filter = value
+            .get("profile")
+            .and_then(|p| p.get("nightly"))
+            .and_then(|n| n.get("default-filter"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            default_filter,
+            Some("not test(/_live$/)"),
+            "profile.nightly.default-filter must exclude _live tests, got: {raw}"
         );
     }
 
