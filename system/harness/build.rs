@@ -85,8 +85,9 @@ fn main() {
                 "hex build (--features personal): personal overlay root resolved to \
                  {root:?}, but neither {modules_dir:?} nor {harness_personal_dir:?} \
                  exists — this build would silently drop every personal worker. \
-                 Set HEX_OVERLAY_DIR (checked first), HEX_DIR, or HOME (fallback: \
-                 $HOME/hex) to the real instance directory, not a sandbox path."
+                 Set HEX_OVERLAY_DIR (checked first) or HEX_DIR to the real instance \
+                 directory, not a sandbox path; the last fallback is the hex \
+                 directory under HOME."
             );
         }
         Some(root)
