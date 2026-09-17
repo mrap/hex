@@ -69,20 +69,40 @@ pub fn state_payload(scope: &str, key: &str, value: Option<&Value>) -> Value {
 /// Returns the engine's result Value. LOUD on failure (S6). The ONE place
 /// state/* builtins (and emit) cross into `iii_sdk`.
 fn call_builtin(function_id: &str, payload: Value) -> Result<Value, String> {
+    call_builtin_with_timeout(function_id, payload, None)
+}
+
+/// `call_builtin` with an explicit invocation timeout (`None` = SDK default,
+/// 30s). Split out so tests can drive the unreachable-engine path quickly.
+///
+/// The client is torn down on EVERY return path. `iii_sdk::register_worker`
+/// spawns a dedicated OS thread (`iii-connection`) with its own tokio runtime
+/// and a reconnect loop, and `III` has no `Drop` — dropping the handle (or
+/// the caller's runtime) leaves that thread, its kqueue, and both ends of
+/// the loopback socket alive. Inside the long-lived `hex harness serve`
+/// process that was a leak of ~6 fds per call (2026-09-17: hex-watch polls
+/// two event watches per tick → 256-fd soft limit in ~100 min → EMFILE
+/// storm across every worker; incident `failures-storm-...Too-many-open-
+/// files`). `shutdown()` flips `running=false` and joins the thread; the
+/// reconnect loop honors that within ~2s even when connect keeps failing.
+fn call_builtin_with_timeout(
+    function_id: &str,
+    payload: Value,
+    timeout_ms: Option<u64>,
+) -> Result<Value, String> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("ops::call_builtin: failed to start tokio runtime: {e}"))?;
-    rt.block_on(async move {
-        let url = std::env::var("III_URL").unwrap_or_else(|_| "ws://127.0.0.1:49134".to_string());
-        let iii = iii_sdk::register_worker(&url, iii_sdk::InitOptions::default());
-        iii.trigger(iii_sdk::protocol::TriggerRequest {
-            function_id: function_id.to_string(),
-            payload,
-            action: None,
-            timeout_ms: None,
-        })
-        .await
-        .map_err(|e| format!("{function_id} failed (url={url}): {e}"))
-    })
+    let url = std::env::var("III_URL").unwrap_or_else(|_| "ws://127.0.0.1:49134".to_string());
+    let iii = iii_sdk::register_worker(&url, iii_sdk::InitOptions::default());
+    let result = rt.block_on(iii.trigger(iii_sdk::protocol::TriggerRequest {
+        function_id: function_id.to_string(),
+        payload,
+        action: None,
+        timeout_ms,
+    }));
+    // Release the connection thread + sockets before returning, success or not.
+    iii.shutdown();
+    result.map_err(|e| format!("{function_id} failed (url={url}): {e}"))
 }
 
 /// Write a value into iii state. LOUD on failure (S6).
@@ -227,6 +247,66 @@ mod tests {
 
     /// Live round-trip against a running engine. Run: `cargo test -p hex-harness
     /// -- --ignored state_roundtrip_live`.
+    /// Open-fd count of this process (`/dev/fd` on macOS and Linux).
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
+    }
+
+    /// Regression for the 2026-09-17 EMFILE storm: `call_builtin` used to
+    /// leak the SDK's `iii-connection` thread (plus its kqueue and the
+    /// loopback socket) on every call because nothing ever called
+    /// `III::shutdown()`. Inside `hex harness serve` that reached the 256-fd
+    /// soft limit in ~100 min and broke every worker that spawns `hex`.
+    ///
+    /// Drives the unreachable-engine path (a port with no listener) with a
+    /// short invocation timeout: each call must fail LOUD and must not hold
+    /// on to file descriptors once it returns.
+    #[test]
+    fn call_builtin_releases_fds_after_each_call_when_engine_unreachable() {
+        let _guard = crate::telemetry::test_support::lock_env();
+
+        // Reserve a loopback port, then drop the listener so connects are refused.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let prev = std::env::var("III_URL").ok();
+        std::env::set_var("III_URL", format!("ws://127.0.0.1:{port}"));
+
+        let before = open_fd_count();
+        const CALLS: usize = 3;
+        for _ in 0..CALLS {
+            let r = call_builtin_with_timeout(
+                "state::get",
+                state_payload("events", "nope", None),
+                Some(200),
+            );
+            assert!(r.is_err(), "unreachable engine must fail loud, got {r:?}");
+        }
+
+        // The connection thread exits within ~2s of shutdown() even while
+        // connects keep failing; poll for the fds to come back.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut after = open_fd_count();
+        while after > before + 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            after = open_fd_count();
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("III_URL", v),
+            None => std::env::remove_var("III_URL"),
+        }
+
+        // A leak is >= 5 fds per call (socket, kqueue, runtime wakers);
+        // allow a small tolerance for unrelated test threads.
+        assert!(
+            after <= before + 2,
+            "fd leak: {before} open before, {after} after {CALLS} calls (>= {} would be a per-call leak)",
+            before + CALLS * 5
+        );
+    }
+
     #[test]
     #[ignore]
     fn state_roundtrip_live() {
