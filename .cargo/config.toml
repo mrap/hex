@@ -7,5 +7,14 @@
 # [env] only reaches processes cargo starts. The path is absolute rather than
 # repo-relative so the container test lane (root, bind mount) leaves no
 # root-owned files in the working tree.
+#
+# This `force` also reaches build scripts, not just tests: any `cargo build`
+# run from a checkout of this repo (including the one `hex upgrade` shells out
+# to) gets this sandboxed HEX_DIR, not whatever HEX_DIR its parent process set.
+# `hex upgrade` passes HEX_OVERLAY_DIR alongside HEX_DIR precisely because this
+# entry is not forced, so system/harness/build.rs resolves the personal
+# overlay from HEX_OVERLAY_DIR instead. A manual
+# `cargo build --features personal` from this checkout must set
+# HEX_OVERLAY_DIR itself — setting only HEX_DIR here is silently overridden.
 [env]
 HEX_DIR = { value = "/tmp/hex-test-hex-dir", force = true }

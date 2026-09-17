@@ -111,9 +111,9 @@ Rust
 
 - Runner: `cargo nextest` in the lane image (`tests/lane/Dockerfile`, `rust:1.96`, cargo-chef, nextest). Doctests do not run under nextest, so no behavior lives in doctests.
 - Profile: `debug = "line-tables-only"`, `split-debuginfo = "packed"` for dev and test. Same posture on the host `~/.cargo/config.toml` and in the image. Full debuginfo caused an OOM link in the container and 139k `.rcgu.o` files on the host.
-- Add `.config/nextest.toml`: `retries = 1`, `slow-timeout = { period = "60s", terminate-after = 3 }`, `--no-tests=fail` default. Quarantine overrides live here.
+- `.config/nextest.toml` exists; today it holds the `nightly` profile (`default-filter` excluding `_live` tests, backing the nightly full-suite worker). `retries`, `slow-timeout`, and quarantine overrides go here when needed.
 - Spawn the binary with `env!("CARGO_BIN_EXE_hex")` and a temp `HEX_DIR`. Never touch the real `~/.hex`, `~/.boi`, or keychain.
-- `HEX_DIR` is sandboxed for every process cargo or nextest launches: `.cargo/config.toml` forces it to `/tmp/hex-test-hex-dir`, so a test that forgets to isolate cannot reach a live store (`tests/telemetry_store.rs` proves the sandbox is active). To point a cargo-built binary at a live instance, run `target/debug/hex` directly with `HEX_DIR` set.
+- `HEX_DIR` is sandboxed for every process cargo or nextest launches: `.cargo/config.toml` forces it to `/tmp/hex-test-hex-dir`, so a test that forgets to isolate cannot reach a live store (`tests/telemetry_store.rs` proves the sandbox is active). To point a cargo-built binary at a live instance, run `target/debug/hex` directly with `HEX_DIR` set. That same force reaches build scripts: `hex upgrade` passes `HEX_OVERLAY_DIR` (unforced) alongside `HEX_DIR` so `system/harness/build.rs` can still resolve the personal overlay when building from a checkout, and a manual `cargo build --features personal` from this repo must set `HEX_OVERLAY_DIR` itself.
 - What the lane gives you: shared target at `/target`, 0 crates compiled on a no-change rerun (27 s), a receipt JSON line, and freedom from Gatekeeper walks.
 
 Python
