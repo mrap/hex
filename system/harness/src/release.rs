@@ -5343,6 +5343,339 @@ match_dir = "boi"
         );
     }
 
+    // -- U2: atomic publish, one retry, publish-state reporting ---------------------
+    //
+    // Black-box on `cut_v`/`cut_with_profile` plus repo/origin/hook-log state,
+    // same discipline as the U1 section above — red is a real runtime
+    // failure against the sequential push code, never a missing symbol.
+
+    /// A fresh, test-owned pre-push hook directory (never the fixtures'
+    /// shared `nohooks` dir — KTD7) with `body` installed as `pre-push` and
+    /// made executable, wired onto `repo` via `core.hooksPath`.
+    fn install_pre_push_hook(repo: &Path, td: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = td.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hook = dir.join("pre-push");
+        std::fs::write(&hook, body).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(repo, &["config", "core.hooksPath", dir.to_str().unwrap()]);
+        dir
+    }
+
+    #[test]
+    fn atomic_happy_path_is_one_push_carrying_all_three_refs() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let log = td.path().join("hook.log");
+        install_pre_push_hook(
+            &repo,
+            td.path(),
+            "hooks-happy",
+            &format!(
+                "#!/bin/sh\n{{ echo ---; cat; }} >> {}\nexit 0\n",
+                log.display()
+            ),
+        );
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        // One atomic invocation, carrying all three refs (R7/KTD3) — not
+        // three separate pushes.
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            1,
+            "expected exactly one push invocation, got log:\n{log_text}"
+        );
+        assert!(log_text.contains("refs/heads/main"), "got: {log_text}");
+        assert!(log_text.contains("refs/heads/develop"), "got: {log_text}");
+        assert!(log_text.contains("refs/tags/v0.2.0"), "got: {log_text}");
+
+        let main_sha = git_stdout(&repo, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            main_sha
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap()
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "v0.2.0^{commit}"]).unwrap(),
+            main_sha
+        );
+    }
+
+    #[test]
+    fn atomic_retries_once_after_a_second_race_on_develop() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "foreign.txt", "feat: foreign");
+
+        let log = td.path().join("hook.log");
+        let marker = td.path().join("hook.marker");
+        let hook_body = format!(
+            "#!/bin/sh\n{{ echo ---; cat; }} >> {log}\n\
+             if [ ! -f {marker} ]; then\n  touch {marker}\n  \
+             git -C {other} push -q origin develop\nfi\nexit 0\n",
+            log = log.display(),
+            marker = marker.display(),
+            other = other.display(),
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-race", &hook_body);
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            2,
+            "expected two push attempts (one retry), got log:\n{log_text}"
+        );
+
+        // origin/develop carries BOTH the foreign commit and the back-merge.
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: foreign"),
+            "got: {origin_dev_log}"
+        );
+        let origin_main = rev_parse(&origin, "refs/heads/main").unwrap();
+        let origin_dev = rev_parse(&origin, "refs/heads/develop").unwrap();
+        assert!(is_ancestor(&repo, &origin_main, &origin_dev).unwrap());
+        assert_eq!(rev_parse(&origin, "v0.2.0^{commit}").unwrap(), origin_main);
+    }
+
+    #[test]
+    fn atomic_every_push_rejected_leaves_nothing_on_origin() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+        let origin_dev_before = git_stdout(&origin, &["rev-parse", "refs/heads/develop"]).unwrap();
+
+        let log = td.path().join("hook.log");
+        let hook_body = format!(
+            "#!/bin/sh\n{{ echo ---; cat; }} >> {}\necho blocked by test hook >&2\nexit 1\n",
+            log.display()
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-reject", &hook_body);
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(
+            err.to_lowercase().contains("nothing was pushed"),
+            "got: {err}"
+        );
+        assert!(err.contains("git push --atomic origin"), "got: {err}");
+
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            origin_dev_before
+        );
+        assert!(ls_remote_sha(&repo, "refs/tags/v0.2.0").unwrap().is_none());
+
+        // Every rejection is a generic hook failure, not a develop-specific
+        // one — no retry, exactly one attempt.
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            1,
+            "expected exactly one push attempt, got log:\n{log_text}"
+        );
+    }
+
+    #[test]
+    fn atomic_persistent_non_fast_forward_fails_after_two_attempts() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+        let log = td.path().join("hook.log");
+        let counter = td.path().join("hook.counter");
+        let hook_body = format!(
+            "#!/bin/sh\n{{ echo ---; cat; }} >> {log}\n\
+             N=$(( $(cat {counter} 2>/dev/null || echo 0) + 1 ))\n\
+             echo \"$N\" > {counter}\n\
+             echo content-$N > {other}/foreign-$N.txt\n\
+             git -C {other} add -A\n\
+             git -C {other} -c user.email=test@example.com -c user.name=Test \
+             commit -q -m \"feat: foreign $N\"\n\
+             git -C {other} push -q origin develop\nexit 0\n",
+            log = log.display(),
+            counter = counter.display(),
+            other = other.display(),
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-persistent", &hook_body);
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(
+            err.to_lowercase().contains("nothing was pushed"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert!(ls_remote_sha(&repo, "refs/tags/v0.2.0").unwrap().is_none());
+
+        // One initial attempt plus exactly one retry, both rejected.
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            2,
+            "expected exactly two push attempts, got log:\n{log_text}"
+        );
+    }
+
+    #[test]
+    fn atomic_tag_already_on_origin_omits_tag_from_refspecs() {
+        // Full-ceremony reproduction is structurally unreachable: within one
+        // `cut_v` run, `refuse_existing_tag` bails long before the tag is
+        // created if it already exists anywhere, the tag object that would
+        // need to pre-exist on origin does not exist until THIS run creates
+        // it, and `--atomic` guarantees a rejected attempt lands nothing —
+        // so no actor, including a retried attempt of this same run, can
+        // put the tag on origin ahead of the push that is supposed to send
+        // it. This exercises the refspec builder directly instead (KTD3's
+        // "left out of the push list" contract), the same unit the
+        // ceremony calls.
+        let tag_ref = "refs/tags/v0.2.0".to_string();
+        assert_eq!(
+            atomic_refspecs("main", "develop", &tag_ref, &TagPushAction::Push),
+            vec!["main".to_string(), tag_ref.clone(), "develop".to_string()]
+        );
+        assert_eq!(
+            atomic_refspecs(
+                "main",
+                "develop",
+                &tag_ref,
+                &TagPushAction::SkipAlreadyOnOrigin
+            ),
+            vec!["main".to_string(), "develop".to_string()]
+        );
+    }
+
+    #[test]
+    fn atomic_verify_uncertain_reports_publish_state_runs_gh_and_cleanup() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "scratch.txt", "chore: scratch for post-update hook");
+        // The commit object lands in origin's odb on a side ref that is
+        // never `develop` itself, so the real push below is a normal,
+        // uncontested fast-forward — the hook alone creates the mismatch.
+        git(
+            &other,
+            &[
+                "push",
+                "-q",
+                "origin",
+                "develop:refs/heads/scratch-mismatch",
+            ],
+        );
+
+        use std::os::unix::fs::PermissionsExt;
+        let hook = origin.join("hooks").join("post-update");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nfor r in \"$@\"; do\n  \
+             if [ \"$r\" = \"refs/heads/develop\" ]; then\n    \
+             git update-ref refs/heads/develop refs/heads/scratch-mismatch\n  fi\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(err.contains("PUBLISH STATE"), "got: {err}");
+        assert!(err.contains("main: on origin at"), "got: {err}");
+        assert!(err.contains("v0.2.0: on origin at"), "got: {err}");
+        assert!(err.contains("develop: on origin at"), "got: {err}");
+        // develop is PRESENT on origin (the hook moved it, not deleted it),
+        // so nothing is "missing" — the hint names the verify failure
+        // instead of a push command for an absent ref.
+        assert!(
+            err.contains("all refs on origin; only verification failed"),
+            "got: {err}"
+        );
+        assert!(err.contains("SHA MISMATCH"), "got: {err}");
+
+        // Cleanup still ran best-effort despite the uncertain outcome.
+        assert!(!ref_exists(&repo, "refs/heads/release/0.2.0"));
+    }
+
+    // -- pure classifiers: atomic push rejection / refspecs -------------------------
+
+    #[test]
+    fn atomic_develop_rejection_classifier_matches_only_develop() {
+        // Client-side preflight shape (remote's advertised state already
+        // showed the conflict before any pack was sent) — captured from a
+        // real `git push --atomic` against a local bare origin.
+        let client_side = " ! [rejected]        develop -> develop (fetch first)\n\
+             ! [rejected]        main -> main (atomic push failed)\n\
+             ! [rejected]        v9.9.9 -> v9.9.9 (atomic push failed)\n\
+             error: failed to push some refs to 'origin'\n";
+        assert!(develop_push_rejected(client_side, "develop"));
+
+        // Server-side atomic-transaction shape (the race lands AFTER
+        // negotiation, e.g. from inside a pre-push hook) — every ref gets
+        // an identical, uninformative bracket line; only the "cannot lock
+        // ref" line names the true culprit. Captured verbatim from the
+        // `atomic_retries_once_after_a_second_race_on_develop` red run.
+        let server_side = "remote: error: cannot lock ref 'refs/heads/develop': is at \
+             57540adb942e637d0814a87af9056a890c9999c7 but expected \
+             83e716b54503b5d73327cce208c59cadf2587944\n\
+             ! [remote rejected] develop -> develop (atomic transaction failed)\n\
+             ! [remote rejected] main -> main (atomic transaction failed)\n\
+             ! [remote rejected] v0.2.0 -> v0.2.0 (atomic transaction failed)\n\
+             error: failed to push some refs to 'origin'\n";
+        assert!(develop_push_rejected(server_side, "develop"));
+
+        let main_rejected = " ! [rejected]        main -> main (fetch first)\n\
+             error: failed to push some refs to 'origin'\n";
+        assert!(!develop_push_rejected(main_rejected, "develop"));
+
+        let server_side_main_culprit = "remote: error: cannot lock ref 'refs/heads/main': \
+             is at aaa but expected bbb\n\
+             ! [remote rejected] develop -> develop (atomic transaction failed)\n\
+             ! [remote rejected] main -> main (atomic transaction failed)\n";
+        assert!(!develop_push_rejected(server_side_main_culprit, "develop"));
+
+        let atomic_unsupported = "error: the receiving end does not support --atomic push\n";
+        assert!(!develop_push_rejected(atomic_unsupported, "develop"));
+
+        let hook_blocked = "blocked by test hook\nerror: failed to push some refs to 'origin'\n";
+        assert!(!develop_push_rejected(hook_blocked, "develop"));
+    }
+
     // -- develop sync --------------------------------------------------------------
 
     /// A second working clone of the fixture origin — the "someone else
