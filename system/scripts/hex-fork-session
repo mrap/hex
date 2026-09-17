@@ -6,45 +6,100 @@
 # Claude Code came up, sends the kickoff prompt, and registers the session if a registry exists.
 # Principle: the new session boots already briefed; the operator never re-explains.
 #
-# Exit codes: 2 usage, 3 name collision, 4 no Claude Code banner, 5 kickoff typed but not submitted.
-# Env: HEX_DIR (default ~/hex); HEX_FORK_LAUNCH (default "hex-new @name@ --fresh", @name@ substituted);
-#      HEX_SESSION_REGISTRY (default $HEX_DIR/projects/hex-ops/sessions.md; skipped if absent).
+# Staged handoffs are trusted operator input (R15): the only writer of the staging directory below
+# is this launcher, run by the operator's own agent on a single-operator machine.
+#
+# Exit codes:
+#   0  ok, session up, briefed, and registered (if a registry exists)
+#   2  usage error or empty handoff on stdin
+#   3  a tmux session with this exact name already exists (tmux `=name` match)
+#   4  Claude Code banner not seen within the timeout -- the session this run created is killed
+#      and the staged handoff is archived (never deleted); the path is printed
+#   5  the kickoff was typed but never submitted after two Enter attempts -- the session is left
+#      up and briefed, nothing is written to the registry
+#   6  the staged handoff was never consumed by the SessionStart hook -- the session is killed,
+#      the handoff is archived, and no kickoff is sent
+#   7  a handoff is already staged for this name; consume or remove it first
+#
+# Env: HEX_DIR (default ~/hex); HEX_FORK_LAUNCH (default "hex-new @name@", @name@ substituted --
+#      no --fresh, so this works on any foundation instance); HEX_FORK_TIMEOUT (banner wait,
+#      default 20s); HEX_FORK_INJECT_TIMEOUT (consume wait, default 20s); HEX_HANDOFF_ARCHIVE
+#      (default $HEX_DIR/projects/hex-ops/handoffs); HEX_SESSION_REGISTRY (default
+#      $HEX_DIR/projects/hex-ops/sessions.md; skipped if absent).
 set -euo pipefail
 HEX_DIR="${HEX_DIR:-$HOME/hex}"
 name="${1:?usage: hex-fork-session <name> [--purpose TEXT] [--launch CMD] [flags...] < handoff.md}"; shift
 [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "ERR: name must be kebab-case (tmux forbids ':' and '.')" >&2; exit 2; }
 kickoff="Start on the first item in the handoff work queue."
-purpose="forked session"; launch="${HEX_FORK_LAUNCH:-hex-new @name@ --fresh}"; flags=()
+purpose="forked session"; launch="${HEX_FORK_LAUNCH:-hex-new @name@}"; flags=()
 while (($#)); do case "$1" in
   --purpose) purpose="$2"; shift 2;;
   --launch) launch="$2"; shift 2;;
   --kickoff) kickoff="$2"; shift 2;;
   *) flags+=("$1"); shift;;
 esac; done
-tmux has-session -t "$name" 2>/dev/null && { echo "ERR: tmux session '$name' already exists; not clobbering" >&2; exit 3; }
+tmux has-session -t "=$name" 2>/dev/null && { echo "ERR: tmux session '$name' already exists; not clobbering" >&2; exit 3; }
 [ -t 0 ] && { echo "ERR: pipe the handoff markdown on stdin" >&2; exit 2; }
 
 stage="$HEX_DIR/.hex/run/handoffs"; mkdir -p "$stage"
+archive_dir="${HEX_HANDOFF_ARCHIVE:-$HEX_DIR/projects/hex-ops/handoffs}"
+[[ -f "$stage/$name.md" ]] && { echo "ERR: a handoff for '$name' is already staged at $stage/$name.md; remove or consume it first" >&2; exit 7; }
 cat > "$stage/$name.md"
 [[ -s "$stage/$name.md" ]] || { rm -f "$stage/$name.md"; echo "ERR: empty handoff" >&2; exit 2; }
+
+# Kill the session this run created and archive the still-staged handoff (never delete it: a
+# heredoc'd handoff has no other copy). Safe because R6's exact-match guarantees this run created
+# the session (it was absent), so there is no other owner to disturb.
+kill_and_archive() {
+  tmux kill-session -t "=$name" 2>/dev/null || true
+  local stamp archived
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  archived="$archive_dir/$name-unconsumed-$stamp.md"
+  mkdir -p "$archive_dir" || { echo "ERR: cannot create $archive_dir; staged handoff left at $stage/$name.md" >&2; return 1; }
+  [[ -f "$stage/$name.md" ]] && mv "$stage/$name.md" "$archived"
+  printf '%s\n' "$archived"
+}
 
 tmux new-session -d -s "$name" -c "$HEX_DIR"
 tmux send-keys -t "$name" "${launch//@name@/$name} ${flags[*]:-}" Enter
 
 # Verify the runtime banner (S6: loud, show the pane on failure)
 timeout="${HEX_FORK_TIMEOUT:-20}"
+banner_seen=0
 for ((i=1; i<=timeout; i++)); do
   sleep 1
-  tmux capture-pane -t "$name" -p 2>/dev/null | grep -q "Claude Code" && break
-  if (( i == timeout )); then echo "ERR: Claude Code banner not seen in ${timeout}s. Pane:" >&2; tmux capture-pane -t "$name" -p >&2; exit 4; fi
+  tmux capture-pane -t "$name" -p 2>/dev/null | grep -q "Claude Code" && { banner_seen=1; break; }
 done
-for ((i=1; i<=10; i++)); do [[ -f "$stage/$name.md" ]] || break; sleep 1; done
-[[ -f "$stage/$name.md" ]] && echo "WARN: handoff still staged after launch; the SessionStart hook did not consume it (is hex-handoff-inject wired?)" >&2
+if (( ! banner_seen )); then
+  echo "ERR: Claude Code banner not seen in ${timeout}s. Pane:" >&2
+  tmux capture-pane -t "$name" -p >&2
+  archived="$(kill_and_archive)" || exit 4
+  echo "ERR: staged handoff archived at $archived" >&2
+  exit 4
+fi
+
+# Wait for the SessionStart hook to consume the staged handoff before sending any kickoff (R7,
+# KTD6): sending a kickoff into an unbriefed session would report success while the session
+# doesn't have the context it was forked to have.
+inject_timeout="${HEX_FORK_INJECT_TIMEOUT:-20}"
+for ((i=1; i<=inject_timeout; i++)); do [[ -f "$stage/$name.md" ]] || break; sleep 1; done
+if [[ -f "$stage/$name.md" ]]; then
+  echo "ERR: handoff not consumed within ${inject_timeout}s. Pane:" >&2
+  tmux capture-pane -t "$name" -p >&2
+  archived="$(kill_and_archive)" || exit 6
+  echo "ERR: handoff not consumed; the SessionStart hook is not wired (run hex upgrade), then re-fork: hex-fork-session $name < $archived" >&2
+  exit 6
+fi
+
 sleep "${HEX_FORK_KICKOFF_DELAY:-2}"
 # Kickoff: text and Enter go as SEPARATE sends with a pause between. Claude Code bundles a burst of
 # keystrokes as a paste and swallows an Enter inside the burst, so "text Enter" in one send-keys left
-# the prompt typed but unsent (2026-09-16 fork-test on v0.52.10). Then verify the prompt was
-# submitted (activity marker in the pane); one retry of Enter, then fail loudly (S6).
+# the prompt typed but unsent (2026-09-16 fork-test on v0.52.10). Submission is proven by new pane
+# activity relative to a snapshot taken once before the first Enter -- never by glyphs already
+# present in the pane or in the handoff itself, and never by a `Remote Control` line, since that
+# link emits its own connect/disconnect notices asynchronously (R12/KTD3). One retry of Enter, then
+# fail loudly (S6).
+before="$(tmux capture-pane -t "$name" -p 2>/dev/null)"
 tmux send-keys -t "$name" -l "$kickoff"
 submitted=0
 for attempt in 1 2; do
@@ -52,10 +107,25 @@ for attempt in 1 2; do
   tmux send-keys -t "$name" Enter
   for ((i=1; i<=${HEX_FORK_SUBMIT_TIMEOUT:-10}; i++)); do
     sleep 1
-    tmux capture-pane -t "$name" -p 2>/dev/null | grep -qE '⏺|esc to interrupt|✻' && { submitted=1; break 2; }
+    after="$(tmux capture-pane -t "$name" -p 2>/dev/null)"
+    # LC_ALL=C on both sort and comm: comm requires its inputs sorted in the SAME collation it
+    # uses to compare them, and a locale mismatch on multi-byte glyphs (⏺, ✻) makes comm warn
+    # "not in sorted order" and produce unreliable output. Byte order keeps sort and comm in
+    # agreement; grep still matches the UTF-8 byte sequences literally under LC_ALL=C.
+    if LC_ALL=C comm -13 <(LC_ALL=C sort <<<"$before") <(LC_ALL=C sort <<<"$after") | grep -v 'Remote Control' | grep -qE '⏺|esc to interrupt|✻'; then
+      submitted=1; break 2
+    fi
   done
 done
 
+if (( ! submitted )); then
+  echo "ERR: session '$name' is up and briefed but the kickoff prompt was typed and NOT submitted after 2 Enter attempts. Attach and press Enter: tmux attach -t $name. Pane:" >&2
+  tmux capture-pane -t "$name" -p >&2
+  exit 5
+fi
+
+# The registry row is written only after submission is proven (R10): an exit-5 run leaves no
+# healthy row implying a session that isn't actually running its kickoff.
 reg="${HEX_SESSION_REGISTRY:-$HEX_DIR/projects/hex-ops/sessions.md}"
 if [[ -f "$reg" ]]; then
   stamp="$(date '+%Y-%m-%d %H:%M')"
@@ -64,16 +134,13 @@ if [[ -f "$reg" ]]; then
 import re, sys
 p, row, name, stamp = sys.argv[1:]
 s = open(p).read()
-m = re.search(r"^\| `[^`]+` \|.*\n(?=(?:\| `|\n|$))", s, re.M)  # first fleet-table row
 rows = list(re.finditer(r"^\| `[^`]+` \|.*$", s, re.M))
 if rows:
     last = rows[-1].end(); s = s[:last] + "\n" + row + s[last:]
+else:
+    print(f"WARN: no fleet-table row found in {p}; row not appended", file=sys.stderr)
 s = s.rstrip("\n") + f"\n- {stamp} — Created `{name}` via hex-fork-session (handoff injected at SessionStart).\n"
 open(p, "w").write(s)
 PY
-fi
-if (( ! submitted )); then
-  echo "ERR: session '$name' is up and briefed but the kickoff prompt was typed and NOT submitted after 2 Enter attempts. Attach and press Enter: tmux attach -t $name. Pane:" >&2
-  tmux capture-pane -t "$name" -p >&2; exit 5
 fi
 echo "OK: session '$name' up with handoff. Attach: tmux attach -t $name"
