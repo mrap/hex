@@ -1,12 +1,19 @@
 //! `hex-nightly-tests`, nightly run of the full test suite including the
 //! `#[ignore]`d model tests.
 //!
-//! Why this exists: twelve `#[ignore]` model tests exist across the
-//! workspace, and nothing ever ran them on a schedule. This is the testing
-//! standard's nightly layer: a check that costs more than a normal
-//! `cargo test` run belongs on cron, not on every developer's machine. This
-//! worker closes that gap: every night it runs the container test lane with
-//! `--run-ignored all`.
+//! Why this exists: 8 `#[ignore]` tests exist in `system/harness/src` today
+//! (5 need the embedding model, 1 the live iii engine, 1 the live Codex
+//! config, 1 a git checkout), and nothing ever ran them on a schedule. This
+//! is the testing standard's nightly layer: a check that costs more than a
+//! normal `cargo test` run belongs on cron, not on every developer's
+//! machine. This worker closes that gap: every night it runs the container
+//! test lane with the `nightly` nextest profile (`.config/nextest.toml`)
+//! and `--run-ignored all`, for a full tally with `--no-fail-fast`.
+//!
+//! The `_live` rule: a test whose name ends in `_live` needs a host-only
+//! resource the container does not have (a running engine, a live user
+//! config file). The `nightly` nextest profile's `default-filter` excludes
+//! those by name; they run on the host instead, under their own name.
 //!
 //! Cron `0 0 10 * * * *` is 10:00 UTC, 03:00 PT, clear of the 03:00 UTC full
 //! memory consolidation and the 04:00 UTC backup.
@@ -103,12 +110,15 @@ fn expand_tilde(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-/// Build the argv that runs the lane with every `#[ignore]` test included.
+/// Build the argv that runs the lane with every `#[ignore]` test included,
+/// the `nightly` nextest profile (excludes `_live` tests, KTD1), and
+/// `--no-fail-fast` so one red test does not cut off the rest of the tally
+/// (KTD2).
 pub fn lane_argv(repo: &Path) -> Vec<String> {
     vec![
         "bash".to_string(),
         "-c".to_string(),
-        "cd \"$1\" && bash system/scripts/test-lane.sh -- --run-ignored all".to_string(),
+        "cd \"$1\" && bash system/scripts/test-lane.sh -- --profile nightly --no-fail-fast --run-ignored all".to_string(),
         "_".to_string(),
         repo.display().to_string(),
     ]
@@ -119,7 +129,7 @@ pub fn lane_argv(repo: &Path) -> Vec<String> {
 pub fn run_nightly_at(hex_dir: &Path, ctx: &Ctx) -> Result<()> {
     let repo = repo_path(hex_dir)?;
     eprintln!(
-        "[hex-nightly-tests] running lane against {} (--run-ignored all)",
+        "[hex-nightly-tests] running lane against {} (--profile nightly --no-fail-fast --run-ignored all)",
         repo.display()
     );
     ctx.run(&lane_argv(&repo)).map(|_| ())

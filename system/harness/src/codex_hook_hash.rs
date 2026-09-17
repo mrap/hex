@@ -370,7 +370,7 @@ mod tests {
     const F3_HASH: &str = "sha256:96b28df6d719740da58b88bb770bdb9edabfafa79a3091253911eb425814a5a9";
 
     /// Build the normalized handlers JSON for Fixture 3 the same way
-    /// `trusted_hash_matches_codex_written_entry` normalizes a raw
+    /// `trusted_hash_matches_codex_written_entry_live` normalizes a raw
     /// hooks.json handler, given the raw (un-normalized) `timeout` and
     /// `additionalContextLimit` that were present in the source (both
     /// absent for this fixture).
@@ -443,8 +443,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn trusted_hash_matches_codex_written_entry() {
+    #[ignore = "needs a live ~/.codex/config.toml [hooks.state] table with at \
+                least one trusted JSON hook; host-only, run explicitly"]
+    fn trusted_hash_matches_codex_written_entry_live() {
         let home = std::env::var("HOME").expect("HOME must be set");
         let config_path = std::path::Path::new(&home).join(".codex/config.toml");
         let text = std::fs::read_to_string(&config_path)

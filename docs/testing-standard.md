@@ -63,6 +63,7 @@ Bug reports (TDD)
 Flakiness
 
 - Never `#[ignore]` a flaky test. `#[ignore]` is reserved for tests that need a model, the network, or a live keychain, and each carries a reason string.
+- A test that needs a host-only live resource (a running engine, a live user config file) ends its name in `_live`. The nightly lane's `nightly` nextest profile (`.config/nextest.toml`) excludes `_live` tests by name; they run on the host instead, under their own name.
 - A test that fails then passes is a flaky pass. Record it in the PR or spec verdict as `test.flaky <name>`. Three in 7 days moves it to a quarantine override in `.config/nextest.toml` (`retries = 3`) by a spec Mike approves. Quarantined tests still run and still report.
 - No `sleep` without a bounded poll. No assertion on wall-clock time.
 

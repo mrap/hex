@@ -317,7 +317,8 @@ mod tests {
     /// Live round-trip against a running engine. Run: `cargo test -p hex-harness
     /// -- --ignored state_roundtrip_live`.
     #[test]
-    #[ignore]
+    #[ignore = "needs a live iii engine reachable for state_set/state_get/state_delete; \
+                host-only, run explicitly"]
     fn state_roundtrip_live() {
         let scope = "hex-test";
         let key = "ops-roundtrip";
