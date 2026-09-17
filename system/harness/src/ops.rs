@@ -6,6 +6,7 @@
 //! swappable: the seam is small, named, and grep-able.
 
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Pure description of the state write a given event maps to.
@@ -80,6 +81,41 @@ fn call_builtin(function_id: &str, payload: Value) -> Result<Value, String> {
 /// WebSocket handshake, where the SDK's `connect_async` has no timeout.
 const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(5);
 
+/// Process-wide shared client `serve` owns, installed once by
+/// [`install_shared_client`]. Not a tuple with a separately-tracked url:
+/// `III::address()` already returns the exact url the client connects to,
+/// so reading it back from the client at call time can never drift out of
+/// sync with what actually answers.
+static SHARED_CLIENT: OnceLock<iii_sdk::III> = OnceLock::new();
+
+/// Install the process-wide shared client that `serve` owns (KTD8: `serve`
+/// already creates one long-lived `iii_sdk::III` client at startup via
+/// `worker::runtime::connect_engine_client`; this seam lets
+/// `call_builtin_with_timeout_and_budget` reuse it instead of opening a new
+/// client per call, which is the per-call-client residual this unit closes).
+///
+/// A second install is a loud no-op (S6): the first client installed keeps
+/// serving every call, and the caller of a second install is told on stderr
+/// instead of silently losing its client.
+pub fn install_shared_client(iii: iii_sdk::III) {
+    if SHARED_CLIENT.set(iii).is_err() {
+        eprintln!(
+            "ops::install_shared_client: WARN a shared client is already installed (url={}); \
+             keeping the first one and ignoring this install",
+            SHARED_CLIENT
+                .get()
+                .map(|c| c.address())
+                .unwrap_or("<unknown>")
+        );
+    }
+}
+
+/// True once [`install_shared_client`] has installed the process-wide shared
+/// client.
+pub fn shared_client_installed() -> bool {
+    SHARED_CLIENT.get().is_some()
+}
+
 /// `call_builtin` with an explicit invocation timeout (`None` = SDK default,
 /// 30s). `pub` so the `fd_limits` integration binary can drive the
 /// unreachable-engine path quickly; production callers use `state_*`/`emit`.
@@ -92,25 +128,60 @@ pub fn call_builtin_with_timeout(
 }
 
 /// `call_builtin_with_timeout` with an explicit shutdown-join budget. `pub`
-/// only so the `fd_limits` integration binary can prove the bound with a
-/// sub-second budget; production always uses [`SHUTDOWN_JOIN_BUDGET`].
+/// only so the `fd_limits` and `ops_shared_client` integration binaries can
+/// prove the bound with a sub-second budget; production always uses
+/// [`SHUTDOWN_JOIN_BUDGET`].
 ///
-/// The client is torn down on EVERY return path. `iii_sdk::register_worker`
-/// spawns a dedicated OS thread (`iii-connection`) with its own tokio runtime
-/// and a reconnect loop, and `III` has no `Drop` — dropping the handle (or
-/// the caller's runtime) leaves that thread, its kqueue, and both ends of
-/// the loopback socket alive. Inside the long-lived `hex harness serve`
-/// process that was a leak of ~6 fds per call (2026-09-17: hex-watch polls
-/// two event watches per tick → 256-fd soft limit in ~100 min → EMFILE
-/// storm across every worker; incident `failures-storm-...Too-many-open-
-/// files`). `shutdown()` flips `running=false` and joins the thread; the
-/// reconnect loop honors that within ~2s even when connect keeps failing.
+/// Two paths (KTD8):
+///
+/// - **Inside `hex harness serve`.** `worker::runtime::connect_engine_client`
+///   already installed `serve`'s own long-lived `iii_sdk::III` client via
+///   [`install_shared_client`] before any handler could run. When
+///   [`SHARED_CLIENT`] is set, this function reuses it: a fresh
+///   `Builder::new_current_thread().enable_all()` runtime (the SDK's
+///   `trigger` awaits `tokio::time::timeout`, which needs a runtime with the
+///   timer driver — any runtime works, not only the client's own
+///   connection-thread runtime) just `block_on`s `shared.trigger(...)` and
+///   returns. No `register_worker`, no `shutdown()`: the shared client and
+///   its connection thread outlive this call, same as they outlive every
+///   other call `serve` makes. `shutdown_budget` is unused on this path —
+///   there is nothing to shut down per call.
+/// - **Every other caller** (a `hex` CLI subprocess, or a test that never
+///   installs a shared client) takes the ORIGINAL per-call path: the client
+///   is torn down on EVERY return path. `iii_sdk::register_worker` spawns a
+///   dedicated OS thread (`iii-connection`) with its own tokio runtime and a
+///   reconnect loop, and `III` has no `Drop` — dropping the handle (or the
+///   caller's runtime) leaves that thread, its kqueue, and both ends of the
+///   loopback socket alive. Inside the long-lived `hex harness serve`
+///   process that was a leak of ~6 fds per call (2026-09-17: hex-watch polls
+///   two event watches per tick → 256-fd soft limit in ~100 min → EMFILE
+///   storm across every worker; incident `failures-storm-...Too-many-open-
+///   files`) — closed for the serve path by the shared-client branch above;
+///   a CLI subprocess still opens one client per call, but it relies on
+///   process exit rather than a long-lived loop, so the residual there is
+///   wasted setup cost, not a leak. `shutdown()` flips `running=false` and
+///   joins the thread; the reconnect loop honors that within ~2s even when
+///   connect keeps failing.
 pub fn call_builtin_with_timeout_and_budget(
     function_id: &str,
     payload: Value,
     timeout_ms: Option<u64>,
     shutdown_budget: Duration,
 ) -> Result<Value, String> {
+    if let Some(shared) = SHARED_CLIENT.get() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("ops::call_builtin: failed to start tokio runtime: {e}"))?;
+        let result = rt.block_on(shared.trigger(iii_sdk::protocol::TriggerRequest {
+            function_id: function_id.to_string(),
+            payload,
+            action: None,
+            timeout_ms,
+        }));
+        return result.map_err(|e| format!("{function_id} failed (url={}): {e}", shared.address()));
+    }
+
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("ops::call_builtin: failed to start tokio runtime: {e}"))?;
     let url = std::env::var("III_URL").unwrap_or_else(|_| "ws://127.0.0.1:49134".to_string());
@@ -317,7 +388,8 @@ mod tests {
     /// Live round-trip against a running engine. Run: `cargo test -p hex-harness
     /// -- --ignored state_roundtrip_live`.
     #[test]
-    #[ignore]
+    #[ignore = "needs a live iii engine reachable for state_set/state_get/state_delete; \
+                host-only, run explicitly"]
     fn state_roundtrip_live() {
         let scope = "hex-test";
         let key = "ops-roundtrip";

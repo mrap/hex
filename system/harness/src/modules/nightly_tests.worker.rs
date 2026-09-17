@@ -1,12 +1,19 @@
 //! `hex-nightly-tests`, nightly run of the full test suite including the
 //! `#[ignore]`d model tests.
 //!
-//! Why this exists: twelve `#[ignore]` model tests exist across the
-//! workspace, and nothing ever ran them on a schedule. This is the testing
-//! standard's nightly layer: a check that costs more than a normal
-//! `cargo test` run belongs on cron, not on every developer's machine. This
-//! worker closes that gap: every night it runs the container test lane with
-//! `--run-ignored all`.
+//! Why this exists: 8 `#[ignore]` tests exist in `system/harness/src` today
+//! (5 need the embedding model, 1 the live iii engine, 1 the live Codex
+//! config, 1 a git checkout), and nothing ever ran them on a schedule. This
+//! is the testing standard's nightly layer: a check that costs more than a
+//! normal `cargo test` run belongs on cron, not on every developer's
+//! machine. This worker closes that gap: every night it runs the container
+//! test lane with the `nightly` nextest profile (`.config/nextest.toml`)
+//! and `--run-ignored all`, for a full tally with `--no-fail-fast`.
+//!
+//! The `_live` rule: a test whose name ends in `_live` needs a host-only
+//! resource the container does not have (a running engine, a live user
+//! config file). The `nightly` nextest profile's `default-filter` excludes
+//! those by name; they run on the host instead, under their own name.
 //!
 //! Cron `0 0 10 * * * *` is 10:00 UTC, 03:00 PT, clear of the 03:00 UTC full
 //! memory consolidation and the 04:00 UTC backup.
@@ -103,12 +110,15 @@ fn expand_tilde(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-/// Build the argv that runs the lane with every `#[ignore]` test included.
+/// Build the argv that runs the lane with every `#[ignore]` test included,
+/// the `nightly` nextest profile (excludes `_live` tests, KTD1), and
+/// `--no-fail-fast` so one red test does not cut off the rest of the tally
+/// (KTD2).
 pub fn lane_argv(repo: &Path) -> Vec<String> {
     vec![
         "bash".to_string(),
         "-c".to_string(),
-        "cd \"$1\" && bash system/scripts/test-lane.sh -- --run-ignored all".to_string(),
+        "cd \"$1\" && bash system/scripts/test-lane.sh -- --profile nightly --no-fail-fast --run-ignored all".to_string(),
         "_".to_string(),
         repo.display().to_string(),
     ]
@@ -119,7 +129,7 @@ pub fn lane_argv(repo: &Path) -> Vec<String> {
 pub fn run_nightly_at(hex_dir: &Path, ctx: &Ctx) -> Result<()> {
     let repo = repo_path(hex_dir)?;
     eprintln!(
-        "[hex-nightly-tests] running lane against {} (--run-ignored all)",
+        "[hex-nightly-tests] running lane against {} (--profile nightly --no-fail-fast --run-ignored all)",
         repo.display()
     );
     ctx.run(&lane_argv(&repo)).map(|_| ())
@@ -165,12 +175,43 @@ mod tests {
         let argv = lane_argv(&repo);
         let joined = argv.join(" ");
         assert!(joined.contains("test-lane.sh"), "argv: {joined}");
-        assert!(joined.contains("--run-ignored"), "argv: {joined}");
-        assert!(joined.contains("all"), "argv: {joined}");
+        assert!(
+            joined.contains("-- --profile nightly --no-fail-fast --run-ignored all"),
+            "argv must pass --profile nightly, --no-fail-fast, and --run-ignored all \
+             (in that order) after --: {joined}"
+        );
         assert_eq!(
             argv.last().map(String::as_str),
             Some("/some/repo"),
             "the repo path must be the last argv entry (bash's $1): {argv:?}"
+        );
+    }
+
+    #[test]
+    fn nextest_profile_nightly_excludes_live_tests() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let nextest_toml_path = workspace_root.join(".config/nextest.toml");
+        let raw = std::fs::read_to_string(&nextest_toml_path).unwrap_or_else(|e| {
+            panic!(
+                "read {} failed: {e} (expected the nightly profile config at the workspace root)",
+                nextest_toml_path.display()
+            )
+        });
+        let value: toml::Value = toml::from_str(&raw).unwrap_or_else(|e| {
+            panic!(
+                "{} does not parse as TOML: {e}",
+                nextest_toml_path.display()
+            )
+        });
+        let default_filter = value
+            .get("profile")
+            .and_then(|p| p.get("nightly"))
+            .and_then(|n| n.get("default-filter"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            default_filter,
+            Some("not test(/_live$/)"),
+            "profile.nightly.default-filter must exclude _live tests, got: {raw}"
         );
     }
 

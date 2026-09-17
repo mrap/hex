@@ -48,7 +48,7 @@ fn llm_config_resolution_layers() {
 
     let r = llm_config::resolve("memory_judge").expect("built-in default");
     assert_eq!(r.model, "anthropic/claude-sonnet-5");
-    assert_eq!(r.max_tokens, 256);
+    assert_eq!(r.max_tokens, 4096);
 
     let r = llm_config::resolve("consolidate_audit").expect("built-in default");
     assert_eq!(r.model, "anthropic/claude-sonnet-5");
@@ -82,7 +82,7 @@ max_tokens = 9999
     // still falls back to the built-in for that use case.
     let r = llm_config::resolve("memory_judge").expect("defaults fallback");
     assert_eq!(r.model, "openrouter/default-model");
-    assert_eq!(r.max_tokens, 256);
+    assert_eq!(r.max_tokens, 4096);
 
     // ---- 3. Env var beats file --------------------------------------------
     std::env::set_var("HEX_LLM_MODEL_MEMORY_EXTRACT", "anthropic/from-env-extract");

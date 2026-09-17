@@ -531,7 +531,25 @@ fn delete_chunks_for_file(conn: &Connection, file_id: i64) -> rusqlite::Result<(
 
 // ── Index file ────────────────────────────────────────────────────────────────
 
-/// Index a single file. Returns the number of chunks written.
+/// Outcome of indexing one file. Feeds [`RunProgress`] accumulation in
+/// `run_index_body` (KTD5, U3): a bail is only "progress" if some file
+/// completed or some vectors were stored somewhere in the run.
+pub struct IndexFileOutcome {
+    /// Chunks written to FTS5 (`chunks.len()`) — the same count the pre-U3
+    /// `usize` return represented on its own.
+    pub chunks_written: usize,
+    /// Whether the embed pass finished without the within-file budget
+    /// predicate (`over_budget`) firing mid-file. A file with nothing to
+    /// embed (e.g. a "summary" strategy with no summaries found) is trivially
+    /// `true` — the predicate never got a chance to fire.
+    pub completed: bool,
+    /// Vectors actually stored before the embed pass finished or bailed.
+    pub vectors_stored: usize,
+}
+
+/// Index a single file. Returns [`IndexFileOutcome`] (chunk count, whether the
+/// within-file budget predicate fired, and vectors stored).
+#[allow(clippy::too_many_arguments)]
 pub fn index_file(
     conn: &Connection,
     filepath: &Path,
@@ -540,7 +558,8 @@ pub fn index_file(
     mtime: f64,
     strategy: &str,
     embedder: &super::embed::Embedder,
-) -> rusqlite::Result<usize> {
+    over_budget: &dyn Fn() -> bool,
+) -> rusqlite::Result<IndexFileOutcome> {
     let rel_path = filepath
         .strip_prefix(hex_root)
         .map(|p| p.to_string_lossy().to_string())
@@ -570,7 +589,11 @@ pub fn index_file(
                 "INSERT INTO files (path, mtime, content_hash, indexed_at, chunk_count) VALUES (?, ?, ?, ?, 0)",
                 params![rel_path, mtime, chash, Local::now().to_rfc3339()],
             )?;
-            return Ok(0);
+            return Ok(IndexFileOutcome {
+                chunks_written: 0,
+                completed: true,
+                vectors_stored: 0,
+            });
         }
         s
     } else {
@@ -636,9 +659,26 @@ pub fn index_file(
         rel_path,
         contents.len()
     ));
-    let stored = embed_and_store(conn, &rel_path, &chunk_rowids, &contents, |batch| {
-        embedder.embed_documents(batch)
-    });
+    // KTD4: wrap the run-level `over_budget` predicate to also record whether
+    // it ever fired for THIS file — `embed_and_store`'s return is just a
+    // vector count, so this is how `index_file` learns "did the predicate
+    // stop me" versus "did I just run out of chunks."
+    let predicate_fired = std::cell::Cell::new(false);
+    let tracked_over_budget = || {
+        let hit = over_budget();
+        if hit {
+            predicate_fired.set(true);
+        }
+        hit
+    };
+    let stored = embed_and_store(
+        conn,
+        &rel_path,
+        &chunk_rowids,
+        &contents,
+        |batch| embedder.embed_documents(batch),
+        &tracked_over_budget,
+    );
     super::embed::log_rss(&format!(
         "post-embed {} ({}/{} vectors)",
         rel_path,
@@ -646,7 +686,11 @@ pub fn index_file(
         chunk_rowids.len()
     ));
 
-    Ok(chunks.len())
+    Ok(IndexFileOutcome {
+        chunks_written: chunks.len(),
+        completed: !predicate_fired.get(),
+        vectors_stored: stored,
+    })
 }
 
 /// Embed `contents` (aligned 1:1 with `chunk_rowids`, same order) in
@@ -669,22 +713,38 @@ pub fn index_file(
 /// Failures are loud but non-fatal (S6): an embed error stops the loop (the
 /// remaining chunks stay FTS5-only, repaired later); a per-batch count mismatch
 /// is logged and skips only that batch.
+///
+/// `over_budget` (KTD4, U3) is checked between batches, after the first — a
+/// slow file's later batches must not carry a run past `run_budget()`. The
+/// first batch always runs regardless (starving a file that hasn't stored
+/// even one batch yet would be worse than the between-files gate letting it
+/// start); a bail here stops the loop and returns however many vectors
+/// stored so far, leaving the rest FTS5-only for `backfill_missing_vectors`.
 fn embed_and_store<F>(
     conn: &Connection,
     rel_path: &str,
     chunk_rowids: &[i64],
     contents: &[String],
     mut embed_batch: F,
+    over_budget: &dyn Fn() -> bool,
 ) -> usize
 where
     F: FnMut(&[String]) -> anyhow::Result<Vec<Vec<f32>>>,
 {
     const EMBED_BATCH: usize = 8;
     let mut stored = 0usize;
-    for (rowid_batch, content_batch) in chunk_rowids
+    for (batch_index, (rowid_batch, content_batch)) in chunk_rowids
         .chunks(EMBED_BATCH)
         .zip(contents.chunks(EMBED_BATCH))
+        .enumerate()
     {
+        if batch_index > 0 && over_budget() {
+            eprintln!(
+                "  hex memory index: over budget mid-file — stopping {rel_path} after {stored} \
+                 vector(s) (remaining chunks stay FTS5-only, backfilled later)"
+            );
+            break;
+        }
         match embed_batch(content_batch) {
             Ok(vecs) if vecs.len() == rowid_batch.len() => {
                 for (rowid, vec) in rowid_batch.iter().zip(vecs.iter()) {
@@ -925,14 +985,170 @@ fn get_metadata(conn: &Connection, key: &str) -> Option<String> {
     .ok()
 }
 
+/// `metadata` key backing the KTD5 consecutive-budget-bail counter.
+const BAIL_COUNT_KEY: &str = "consecutive_budget_bails";
+
+/// Consecutive bails at or above this count escalate a bail-with-progress from
+/// warn to error (KTD5: "the fourth consecutive bail exits 1" — one hour of
+/// 15-minute ticks).
+const BAIL_ESCALATE_AT: u32 = 4;
+
+/// What a run accomplished before a within-file budget bail (or a clean
+/// finish), per KTD5's progress definition: "at least one file whose
+/// `index_file` completed without the predicate firing, or at least one embed
+/// batch stored." A file whose FTS5 rows were committed but whose first batch
+/// never stored contributes to neither field — see
+/// [`contributes_progress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RunProgress {
+    /// Count of files whose `index_file` call finished without the
+    /// within-file budget predicate firing.
+    files_completed: usize,
+    /// Vectors stored across the run (not a literal batch count — an
+    /// `embed_and_store` batch is atomic in the common case, but a per-vector
+    /// insert failure can make a "batch" partial). What matters for [`any`]
+    /// and for the telemetry detail is `> 0`: at least one embed batch stored
+    /// somewhere before this run finished or bailed.
+    ///
+    /// [`any`]: RunProgress::any
+    vectors_stored: usize,
+}
+
+impl RunProgress {
+    /// Same OR rule as [`contributes_progress`], applied to the run's
+    /// aggregate counts instead of one file's: at least one completed file,
+    /// or at least one stored batch, somewhere in the run.
+    fn any(&self) -> bool {
+        contributes_progress(self.files_completed > 0, self.vectors_stored)
+    }
+}
+
+/// KTD5's shared "is this progress?" OR rule: `completed || stored > 0`.
+/// Applied per file directly in tests, and to the run's aggregate counts in
+/// [`RunProgress::any`]. FTS5 chunk rows alone (written unconditionally by
+/// `index_file` before the embed pass) do NOT count — only a file that
+/// finished (the budget predicate never fired mid-file) or a file that
+/// stored at least one embed batch before bailing does. A file whose FTS5
+/// rows landed but whose first batch never stored is the stuck signature
+/// (the run could not embed even one batch in budget) and must not be
+/// mistaken for progress.
+fn contributes_progress(file_completed: bool, vectors_stored_this_file: usize) -> bool {
+    file_completed || vectors_stored_this_file > 0
+}
+
+/// KTD5 exit-code and counter contract for how a run of `run_index_body` ends:
+/// a within-file budget bail (`bailed = true`) or a clean finish under budget
+/// (`bailed = false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    /// Finished under budget: counter resets to 0 regardless of prior value.
+    CleanFinish { new_bail_count: u32 },
+    /// A bail with progress and the consecutive-bail counter still under
+    /// `BAIL_ESCALATE_AT`: warn, exit 0, counter increments. Visible in `hex
+    /// telemetry recent` without paging (`hex failures` only alerts on
+    /// error/panic/failed).
+    Warn { new_bail_count: u32 },
+    /// A bail with no progress, or the counter has reached
+    /// `BAIL_ESCALATE_AT`: error, exit 1, counter still increments.
+    Error { new_bail_count: u32 },
+}
+
+/// Pure KTD5 decision: given whether this run bailed, what it accomplished,
+/// and how many consecutive bails preceded it, what the next counter value
+/// and severity are. No I/O — [`record_index_bail`] and [`reset_bail_count`]
+/// are the impure wrappers that read/write `metadata` and emit telemetry.
+fn run_outcome(bailed: bool, progress: RunProgress, prior_bails: u32) -> RunOutcome {
+    if !bailed {
+        return RunOutcome::CleanFinish { new_bail_count: 0 };
+    }
+    let new_bail_count = prior_bails + 1;
+    if progress.any() && new_bail_count < BAIL_ESCALATE_AT {
+        RunOutcome::Warn { new_bail_count }
+    } else {
+        RunOutcome::Error { new_bail_count }
+    }
+}
+
+/// Impure wrapper around [`run_outcome`] for the bail path: reads the prior
+/// consecutive-bail count from `metadata`, writes the new count back, emits a
+/// `warn` telemetry row when the outcome is a warn (KTD5 — never for an error
+/// outcome, since `hex failures` already treats a non-zero exit as loud), and
+/// returns the process exit code `run_index_body` should return for this
+/// bail.
+fn record_index_bail(conn: &Connection, progress: RunProgress) -> i32 {
+    let prior_bails = get_bail_count(conn);
+    match run_outcome(true, progress, prior_bails) {
+        RunOutcome::Warn { new_bail_count } => {
+            set_metadata(conn, BAIL_COUNT_KEY, &new_bail_count.to_string());
+            crate::telemetry::record_loud(&crate::telemetry::TelemetryEvent {
+                source: "memory".into(),
+                event: "index::budget-bail".into(),
+                status: "warn".into(),
+                duration_ms: None,
+                exit_code: Some(0),
+                detail: Some(format!(
+                    "files_completed={} vectors_stored={} consecutive_bails={new_bail_count}",
+                    progress.files_completed, progress.vectors_stored
+                )),
+            });
+            0
+        }
+        RunOutcome::Error { new_bail_count } => {
+            set_metadata(conn, BAIL_COUNT_KEY, &new_bail_count.to_string());
+            eprintln!(
+                "hex memory index: budget bail with no resumable progress or the \
+                 consecutive-bail escalation threshold reached \
+                 (consecutive_bails={new_bail_count}) — exiting non-zero"
+            );
+            1
+        }
+        RunOutcome::CleanFinish { .. } => {
+            unreachable!("a within-file budget bail can never resolve to a clean finish")
+        }
+    }
+}
+
+/// Current consecutive-budget-bail count (0 if never set).
+fn get_bail_count(conn: &Connection) -> u32 {
+    get_metadata(conn, BAIL_COUNT_KEY)
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Impure wrapper around [`run_outcome`] for the clean-finish path: resets the
+/// consecutive-bail counter after a run that finishes under budget (KTD5).
+/// Called from `run_index_body`'s clean-finish tail.
+fn reset_bail_count(conn: &Connection) {
+    let prior_bails = get_bail_count(conn);
+    match run_outcome(false, RunProgress::default(), prior_bails) {
+        RunOutcome::CleanFinish { new_bail_count } => {
+            set_metadata(conn, BAIL_COUNT_KEY, &new_bail_count.to_string());
+        }
+        _ => unreachable!("a clean finish (bailed = false) can never resolve to a bail outcome"),
+    }
+}
+
 /// Per-run wall-clock budget for [`run_index`]. Default 600s (10 min). Caps the
 /// dominant 2026-06-12 wedge signature: a throttled crawl over a large multi-file
 /// worklist (e.g. ~945 files post-reboot) burning a core unbounded between the
-/// 15-minute cron ticks. This is a BETWEEN-files gate — it is checked at the top
-/// of each file, so a single in-flight `index_file` is not interrupted mid-embed
-/// (that case is bounded instead by H-09's per-batch commit + the throttle, and
-/// is unlikely to exceed the budget — ~240+ chunks in one file at the throttled
-/// rate; a within-file budget is the queued follow-up, FIX-016).
+/// 15-minute cron ticks.
+///
+/// Checked in two places against the same predicate (`run_index_body`'s
+/// `over_budget` closure over this budget and `t0`):
+///   * **Between files**, at the top of each file — the original gate.
+///   * **Between embed batches, within one file** (KTD4/U3, `embed_and_store`,
+///     via `index_file`) — a single slow file (e.g. 240+ chunks at the
+///     throttled rate) can no longer carry a run past budget on its own; the
+///     first batch always runs, later batches are gated.
+///
+/// Either gate firing bails the run (KTD5): the exit code and consecutive-bail
+/// counter (`metadata` key `consecutive_budget_bails`) come from
+/// [`run_outcome`] — a bail that made progress (a completed file, or at least
+/// one embed batch stored) is a WARN (exit 0, counter increments, self-healing
+/// on the next tick), while zero progress or a run of `BAIL_ESCALATE_AT`
+/// consecutive bails is an ERROR (exit 1). A clean finish under budget resets
+/// the counter to 0 ([`reset_bail_count`]).
+///
 /// `HEX_INDEX_BUDGET_SECS` tunes it; `0` disables the cap (returns `None`).
 /// Values below the ~2s cold model-load starve the run (bail at file 0) — keep
 /// it well above that; the default has ample headroom.
@@ -1236,7 +1452,12 @@ fn run_index_body(
     let mut skipped_hash = 0usize;
     let mut total_chunks = 0usize;
     let budget = run_budget();
-    let mut over_budget = false;
+    // Single predicate, checked both between files (below) and between embed
+    // batches within a file (threaded into `index_file` → `embed_and_store`,
+    // KTD4) — one definition of "over budget" for the whole run.
+    let over_budget = || budget.is_some_and(|b| t0.elapsed() > b);
+    let mut progress = RunProgress::default();
+    let mut bailed = false;
 
     for (i, (filepath, strategy)) in file_tuples.iter().enumerate() {
         // Defense-in-depth (S6): a pathological corpus change or slow file must
@@ -1245,7 +1466,7 @@ fn run_index_body(
         // starting another file; the files already indexed are committed
         // (autocommit) and the rest resume on the next tick.
         if let Some(b) = budget {
-            if t0.elapsed() > b {
+            if over_budget() {
                 eprintln!(
                     "hex memory index: EXCEEDED {}s wall-clock budget after {indexed} indexed \
                      ({} of {} files unprocessed) — bailing loudly; remaining resume next tick \
@@ -1254,7 +1475,7 @@ fn run_index_body(
                     file_tuples.len() - i,
                     file_tuples.len()
                 );
-                over_budget = true;
+                bailed = true;
                 break;
             }
         }
@@ -1268,6 +1489,41 @@ fn run_index_body(
         // against its current mtime, not a stale one, or the edit silently
         // waits for the next tick (fixed 2026-09-11).
         let mtime = file_mtime(filepath);
+
+        // Shared by both branches below: records one `index_file` outcome
+        // against the run's counters. Declared fresh each iteration (not
+        // hoisted above the `for`) so its captures never outlive this file's
+        // handling — in particular, its mutable borrow of `bailed` is gone by
+        // the time the loop's `if bailed { break; }` runs below.
+        let mut handle_index_result = |result: rusqlite::Result<IndexFileOutcome>| match result {
+            Ok(outcome) => {
+                let n = outcome.chunks_written;
+                if n > 0 {
+                    indexed += 1;
+                    total_chunks += n;
+                    let tag = if strategy != "full" {
+                        format!(" [{strategy}]")
+                    } else {
+                        String::new()
+                    };
+                    println!("  Indexed: {rel_path} ({n} chunks{tag})");
+                } else if strategy == "summary" {
+                    println!("  Indexed: {rel_path} (0 chunks, no summaries found [summary])");
+                }
+                progress.vectors_stored += outcome.vectors_stored;
+                if outcome.completed {
+                    progress.files_completed += 1;
+                } else {
+                    // KTD5: the within-file budget predicate fired mid-embed
+                    // — this run bails after this file, same as the
+                    // between-files gate above.
+                    bailed = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("  ERROR indexing {rel_path}: {e}");
+            }
+        };
 
         if !full {
             let prev = existing.get(&rel_path);
@@ -1307,27 +1563,16 @@ fn run_index_body(
             }
 
             // Actually re-index
-            match index_file(
-                &conn, filepath, hex_root, &content, mtime, strategy, &embedder,
-            ) {
-                Ok(n) => {
-                    if n > 0 {
-                        indexed += 1;
-                        total_chunks += n;
-                        let tag = if strategy != "full" {
-                            format!(" [{strategy}]")
-                        } else {
-                            String::new()
-                        };
-                        println!("  Indexed: {rel_path} ({n} chunks{tag})");
-                    } else if strategy == "summary" {
-                        println!("  Indexed: {rel_path} (0 chunks, no summaries found [summary])");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  ERROR indexing {rel_path}: {e}");
-                }
-            }
+            handle_index_result(index_file(
+                &conn,
+                filepath,
+                hex_root,
+                &content,
+                mtime,
+                strategy,
+                &embedder,
+                &over_budget,
+            ));
         } else {
             // Full mode: read unconditionally
             let content = match std::fs::read_to_string(filepath) {
@@ -1340,34 +1585,31 @@ fn run_index_body(
             if content.trim().is_empty() {
                 continue;
             }
-            match index_file(
-                &conn, filepath, hex_root, &content, mtime, strategy, &embedder,
-            ) {
-                Ok(n) => {
-                    if n > 0 {
-                        indexed += 1;
-                        total_chunks += n;
-                        let tag = if strategy != "full" {
-                            format!(" [{strategy}]")
-                        } else {
-                            String::new()
-                        };
-                        println!("  Indexed: {rel_path} ({n} chunks{tag})");
-                    } else if strategy == "summary" {
-                        println!("  Indexed: {rel_path} (0 chunks, no summaries found [summary])");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  ERROR indexing {rel_path}: {e}");
-                }
-            }
+            handle_index_result(index_file(
+                &conn,
+                filepath,
+                hex_root,
+                &content,
+                mtime,
+                strategy,
+                &embedder,
+                &over_budget,
+            ));
+        }
+
+        if bailed {
+            break;
         }
     }
 
-    // If we bailed on the wall-clock budget, skip the (potentially slow)
-    // backfill and the cleanup sweep and exit LOUDLY non-zero (S6) — the next
-    // tick resumes the remaining files. Files already indexed are committed.
-    if over_budget {
+    // If we bailed on the wall-clock budget (between files or within one, via
+    // `over_budget`), skip the (potentially slow) backfill and the cleanup
+    // sweep and exit LOUDLY (S6) — the next tick resumes the remaining files.
+    // Files already indexed, and any embed batches already committed, stay
+    // put. KTD5: a bail that made progress is a WARN (exit 0, self-healing);
+    // a bail with none, or one that hit the escalation threshold, is an ERROR
+    // (exit 1).
+    if bailed {
         set_metadata(&conn, "last_run", &Local::now().to_rfc3339());
         set_metadata(
             &conn,
@@ -1375,12 +1617,14 @@ fn run_index_body(
             if full { "full" } else { "incremental" },
         );
         let elapsed = t0.elapsed().as_secs_f64();
+        let code = record_index_bail(&conn, progress);
+        let severity = if code == 0 { "WARN" } else { "BAILED" };
         eprintln!(
-            "hex memory index: BAILED after {elapsed:.1}s over budget — {indexed} indexed, \
+            "hex memory index: {severity} after {elapsed:.1}s over budget — {indexed} indexed, \
              {skipped_mtime} unchanged (mtime), {skipped_hash} unchanged (hash), \
              {total_chunks} new chunks; cleanup + backfill skipped, resuming next tick"
         );
-        return 1;
+        return code;
     }
 
     // Cleanup: remove DB records for files no longer on disk
@@ -1433,6 +1677,9 @@ fn run_index_body(
         "last_run_mode",
         if full { "full" } else { "incremental" },
     );
+    // KTD5: a clean finish under budget clears the consecutive-bail counter —
+    // the run drained the backlog, so the next bail (if any) starts fresh.
+    reset_bail_count(&conn);
 
     let elapsed = t0.elapsed().as_secs_f64();
     println!(
@@ -1454,6 +1701,20 @@ fn backfill_missing_vectors(
     embedder: &super::embed::Embedder,
     cap: usize,
 ) -> rusqlite::Result<usize> {
+    backfill_missing_vectors_with(conn, cap, |batch| embedder.embed_documents(batch))
+}
+
+/// Closure-injected body of [`backfill_missing_vectors`] (same seam pattern as
+/// `embed_and_store`) so the FTS5-then-backfill contract (R5, U3) is testable
+/// without the ONNX model.
+fn backfill_missing_vectors_with<F>(
+    conn: &Connection,
+    cap: usize,
+    mut embed_batch: F,
+) -> rusqlite::Result<usize>
+where
+    F: FnMut(&[String]) -> anyhow::Result<Vec<Vec<f32>>>,
+{
     let mut stmt = conn.prepare(
         "SELECT c.rowid, c.content FROM chunks c
          WHERE c.rowid NOT IN (SELECT rowid FROM vec_chunks)
@@ -1466,7 +1727,7 @@ fn backfill_missing_vectors(
     let mut done = 0;
     for batch in rows.chunks(8) {
         let texts: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
-        match embedder.embed_documents(&texts) {
+        match embed_batch(&texts) {
             Ok(vecs) if vecs.len() == batch.len() => {
                 for ((rowid, _), vec) in batch.iter().zip(vecs) {
                     super::vector::insert_vec(conn, *rowid, &vec)?;
@@ -2137,16 +2398,23 @@ mod tests {
         let rowids: Vec<i64> = (1..=20).collect();
         let contents: Vec<String> = (0..20).map(|i| format!("chunk {i}")).collect();
         let mut calls = 0;
-        let stored = embed_and_store(&conn, "test.md", &rowids, &contents, |batch| {
-            calls += 1;
-            if calls == 2 {
-                anyhow::bail!("simulated interruption on batch 2");
-            }
-            Ok(batch
-                .iter()
-                .map(|_| vec![0.1f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                calls += 1;
+                if calls == 2 {
+                    anyhow::bail!("simulated interruption on batch 2");
+                }
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.1f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
 
         // Batch 1 (8 chunks) committed before batch 2 failed. The pre-fix code
         // stored 0 here (insert ran only after the whole file embedded).
@@ -2166,12 +2434,19 @@ mod tests {
 
         let rowids: Vec<i64> = (1..=20).collect();
         let contents: Vec<String> = (0..20).map(|i| format!("chunk {i}")).collect();
-        let stored = embed_and_store(&conn, "test.md", &rowids, &contents, |batch| {
-            Ok(batch
-                .iter()
-                .map(|_| vec![0.2f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.2f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
 
         assert_eq!(stored, 20);
         assert_eq!(vec_count(&conn), 20);
@@ -2188,17 +2463,24 @@ mod tests {
         let rowids: Vec<i64> = (1..=20).collect();
         let contents: Vec<String> = (0..20).map(|i| format!("chunk {i}")).collect();
         let mut calls = 0;
-        let stored = embed_and_store(&conn, "test.md", &rowids, &contents, |batch| {
-            calls += 1;
-            let n = if calls == 2 {
-                batch.len() - 1
-            } else {
-                batch.len()
-            };
-            Ok((0..n)
-                .map(|_| vec![0.3f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                calls += 1;
+                let n = if calls == 2 {
+                    batch.len() - 1
+                } else {
+                    batch.len()
+                };
+                Ok((0..n)
+                    .map(|_| vec![0.3f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
 
         // Batches 1 (8) and 3 (4) stored; batch 2 skipped loudly → 12 total.
         assert_eq!(
@@ -2218,11 +2500,18 @@ mod tests {
 
         let rowids: Vec<i64> = (1..=8).collect();
         let contents: Vec<String> = (0..8).map(|i| format!("chunk {i}")).collect();
-        let stored = embed_and_store(&conn, "test.md", &rowids, &contents, |batch| {
-            Ok((0..batch.len() + 1) // one too many
-                .map(|_| vec![0.4f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok((0..batch.len() + 1) // one too many
+                    .map(|_| vec![0.4f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
 
         assert_eq!(stored, 0, "over-count batch must be skipped, not truncated");
         assert_eq!(vec_count(&conn), 0);
@@ -2235,25 +2524,340 @@ mod tests {
         init_db(&conn).unwrap();
 
         // 0 chunks → no work, no panic (empty slices → zip yields nothing).
-        let s0 = embed_and_store(&conn, "empty.md", &[], &[], |batch| {
-            Ok(batch
-                .iter()
-                .map(|_| vec![0.5f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let s0 = embed_and_store(
+            &conn,
+            "empty.md",
+            &[],
+            &[],
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.5f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
         assert_eq!(s0, 0);
 
         // Exact multiple of 8 (16 → two full batches, no trailing partial).
         let rowids: Vec<i64> = (1..=16).collect();
         let contents: Vec<String> = (0..16).map(|i| format!("c{i}")).collect();
-        let s16 = embed_and_store(&conn, "sixteen.md", &rowids, &contents, |batch| {
-            Ok(batch
-                .iter()
-                .map(|_| vec![0.5f32; super::super::vector::EMBED_DIM])
-                .collect())
-        });
+        let s16 = embed_and_store(
+            &conn,
+            "sixteen.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.5f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| false,
+        );
         assert_eq!(s16, 16);
         assert_eq!(vec_count(&conn), 16);
+    }
+
+    // ── U3: within-file index budget and progress-aware bail reporting ──────
+    // KTD4 (the over_budget predicate seam on embed_and_store /
+    // backfill_missing_vectors_with) and KTD5 (the pure exit-code/counter
+    // contract in run_outcome + its impure wrapper record_index_bail) are wired
+    // into run_index_body: these tests exercise that wiring end to end.
+
+    #[test]
+    fn embed_and_store_stops_between_batches_once_over_budget() {
+        // 24 chunks → batches of 8, 8, 8. The predicate is checked between
+        // batches (never before the first), so an always-true predicate must
+        // still let batch 1 store before the loop stops.
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        let rowids: Vec<i64> = (1..=24).collect();
+        let contents: Vec<String> = (0..24).map(|i| format!("chunk {i}")).collect();
+        let stored = embed_and_store(
+            &conn,
+            "test.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.6f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| true,
+        );
+
+        assert_eq!(
+            stored, 8,
+            "the over-budget predicate fires after batch 1; batches 2 and 3 must not run"
+        );
+        assert_eq!(vec_count(&conn), 8);
+    }
+
+    #[test]
+    fn embed_and_store_bail_leaves_fts5_searchable_until_backfill_reembeds() {
+        // R5: after a within-file budget bail, un-vectorized chunks stay
+        // FTS5-searchable, and backfill_missing_vectors re-embeds them later.
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO files (path, mtime, content_hash, indexed_at, chunk_count) \
+             VALUES ('budget.md', 0.0, 'h', '', 16)",
+            [],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+            .unwrap();
+
+        // Content avoids hyphens: FTS5's default query syntax treats a
+        // leading `-` as a NOT-term operator, so a bareword like
+        // "needle-marker-15" is not a safe MATCH token.
+        let mut rowids = Vec::new();
+        let mut contents = Vec::new();
+        for i in 0..16 {
+            let content = format!("needlemarker{i} unique searchable text");
+            conn.execute(
+                "INSERT INTO chunks (file_id, source_path, heading, chunk_index, content, private) \
+                 VALUES (?, 'budget.md', '', ?, ?, 0)",
+                params![file_id.to_string(), i.to_string(), content],
+            )
+            .unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chunk_meta (chunk_rowid, source_weight) VALUES (?, 1.0)",
+                params![rowid],
+            )
+            .unwrap();
+            rowids.push(rowid);
+            contents.push(content);
+        }
+
+        // The chunk-insert phase alone (mirroring `index_file`, which always
+        // writes FTS5 rows before the embed pass) already makes every chunk
+        // searchable — proven here, ahead of and independent of the
+        // over-budget bail below, so a MATCH syntax regression shows up on
+        // its own rather than hiding behind the `stored == 8` failure.
+        let unvectored_rowid = rowids[15];
+        let hit: String = conn
+            .query_row(
+                "SELECT source_path FROM chunks WHERE chunks MATCH ?",
+                params!["needlemarker15"],
+                |r| r.get(0),
+            )
+            .expect("FTS5 must find the not-yet-embedded chunk's text");
+        assert_eq!(hit, "budget.md");
+
+        // Bail after the first batch — chunks 8..16 stay FTS5-only.
+        let stored = embed_and_store(
+            &conn,
+            "budget.md",
+            &rowids,
+            &contents,
+            |batch| {
+                Ok(batch
+                    .iter()
+                    .map(|_| vec![0.1f32; super::super::vector::EMBED_DIM])
+                    .collect())
+            },
+            &|| true,
+        );
+        assert_eq!(stored, 8, "only the first batch stores before the bail");
+
+        let has_vec_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks WHERE rowid = ?",
+                params![unvectored_rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_vec_before, 0, "the bailed chunk has no vector yet");
+
+        let backfilled = backfill_missing_vectors_with(&conn, 500, |batch| {
+            Ok(batch
+                .iter()
+                .map(|_| vec![0.2f32; super::super::vector::EMBED_DIM])
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(backfilled, 8, "the 8 bailed chunks get backfilled");
+
+        let has_vec_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks WHERE rowid = ?",
+                params![unvectored_rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_vec_after, 1,
+            "backfill_missing_vectors stores its vector"
+        );
+    }
+
+    #[test]
+    fn run_outcome_with_progress_and_no_prior_bails_warns_and_increments() {
+        assert_eq!(
+            run_outcome(
+                true,
+                RunProgress {
+                    files_completed: 1,
+                    vectors_stored: 0,
+                },
+                0
+            ),
+            RunOutcome::Warn { new_bail_count: 1 }
+        );
+    }
+
+    #[test]
+    fn record_index_bail_with_progress_writes_one_warn_row_and_no_error_row() {
+        let (_hex_tmp, _guard) = crate::telemetry::test_support::isolate();
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        let code = record_index_bail(
+            &conn,
+            RunProgress {
+                files_completed: 1,
+                vectors_stored: 3,
+            },
+        );
+
+        assert_eq!(code, 0, "a bail with progress and counter 0 exits 0");
+        assert_eq!(get_bail_count(&conn), 1);
+
+        let rows = crate::telemetry::recent(10).unwrap();
+        let bail_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event == "index::budget-bail")
+            .collect();
+        assert_eq!(
+            bail_rows.len(),
+            1,
+            "exactly one telemetry row for this bail"
+        );
+        let row = bail_rows[0];
+        assert_eq!(row.source, "memory");
+        assert_eq!(row.status, "warn");
+        let detail = row.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("files_completed=1"), "got: {detail}");
+        assert!(detail.contains("vectors_stored=3"), "got: {detail}");
+        assert!(detail.contains("consecutive_bails=1"), "got: {detail}");
+        assert!(
+            !rows.iter().any(|r| r.status == "error"),
+            "no error row for a warn outcome"
+        );
+    }
+
+    #[test]
+    fn run_outcome_with_zero_progress_errors() {
+        assert_eq!(
+            run_outcome(true, RunProgress::default(), 0),
+            RunOutcome::Error { new_bail_count: 1 }
+        );
+    }
+
+    #[test]
+    fn record_index_bail_with_zero_progress_exits_1_with_no_warn_row() {
+        let (_hex_tmp, _guard) = crate::telemetry::test_support::isolate();
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        let code = record_index_bail(&conn, RunProgress::default());
+
+        assert_eq!(code, 1, "zero progress must exit non-zero");
+        assert_eq!(get_bail_count(&conn), 1, "the counter still increments");
+        let rows = crate::telemetry::recent(10).unwrap();
+        assert!(
+            !rows.iter().any(|r| r.event == "index::budget-bail"),
+            "an error outcome records no telemetry row (S6 loud path is eprintln + exit 1)"
+        );
+    }
+
+    #[test]
+    fn file_progress_rule_excludes_fts5_only_files_but_includes_completed_or_stored() {
+        // KTD5: FTS5 chunk rows alone (an `index_file` chunk-insert that ran
+        // before the embed pass) are NOT progress — the stuck signature is a
+        // file whose first batch never stored. A completed file, or a file
+        // that stored at least one batch before its own bail, IS progress.
+        assert!(
+            !contributes_progress(false, 0),
+            "FTS5 rows with zero stored batches must not count as progress"
+        );
+        assert!(
+            contributes_progress(false, 1),
+            "a stored batch before a mid-file bail is progress"
+        );
+        assert!(
+            contributes_progress(true, 0),
+            "a completed file is progress even with nothing left to embed"
+        );
+    }
+
+    #[test]
+    fn committed_fts5_rows_without_a_stored_batch_yield_a_non_progress_bail() {
+        // The distinctive KTD5 claim end to end: a file whose FTS5 rows landed
+        // but whose first batch never stored, with no other progress this
+        // run, must error out (not warn) on the bail.
+        assert!(!contributes_progress(false, 0));
+        let progress = RunProgress {
+            files_completed: 0,
+            vectors_stored: 0,
+        };
+        assert_eq!(
+            run_outcome(true, progress, 0),
+            RunOutcome::Error { new_bail_count: 1 }
+        );
+    }
+
+    #[test]
+    fn run_outcome_with_progress_but_counter_at_threshold_errors() {
+        assert_eq!(
+            run_outcome(
+                true,
+                RunProgress {
+                    files_completed: 2,
+                    vectors_stored: 5,
+                },
+                3
+            ),
+            RunOutcome::Error { new_bail_count: 4 }
+        );
+    }
+
+    #[test]
+    fn run_outcome_under_budget_after_bails_resets_counter_to_zero() {
+        assert_eq!(
+            run_outcome(false, RunProgress::default(), 2),
+            RunOutcome::CleanFinish { new_bail_count: 0 }
+        );
+    }
+
+    #[test]
+    fn reset_bail_count_zeroes_the_counter_after_two_bails() {
+        let tmp = TempDir::new().unwrap();
+        let conn = super::super::open_db(&tmp.path().join("memory.db")).unwrap();
+        init_db(&conn).unwrap();
+        set_metadata(&conn, BAIL_COUNT_KEY, "2");
+        assert_eq!(get_bail_count(&conn), 2);
+
+        reset_bail_count(&conn);
+
+        assert_eq!(
+            get_bail_count(&conn),
+            0,
+            "a run that finishes under budget resets the counter"
+        );
     }
 
     #[test]
@@ -2590,9 +3194,8 @@ mod tests {
 
     // Codifies the e2e bail contract verified manually against the built binary
     // (budget=3s on a 25-file --full reindex bailed after 2 files with exit 1).
-    // Model-dependent (run_index loads ONNX) → #[ignore]; run with --ignored.
     #[test]
-    #[ignore]
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn run_index_over_budget_exits_nonzero() {
         use std::io::Write;
         let tmp = TempDir::new().unwrap();
@@ -2620,7 +3223,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // model-dependent — run with --ignored
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn test_index_file_writes_vectors() {
         let tmp = TempDir::new().unwrap();
         let hex_root = tmp.path();
@@ -2634,8 +3237,20 @@ mod tests {
         let content = "# Decision\nWe chose sqlite-vec for the vector store.";
         std::fs::write(&f, content).unwrap();
 
-        let n = index_file(&conn, &f, hex_root, content, 0.0, "full", &embedder).unwrap();
+        let outcome = index_file(
+            &conn,
+            &f,
+            hex_root,
+            content,
+            0.0,
+            "full",
+            &embedder,
+            &|| false,
+        )
+        .unwrap();
+        let n = outcome.chunks_written;
         assert!(n >= 1);
+        assert!(outcome.completed, "the predicate never fired");
         let vec_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap();
@@ -2678,7 +3293,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // run_index now builds an embedder and loads the model
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn test_incremental_index_skips_unchanged() {
         let tmp = TempDir::new().unwrap();
         let hex_root = tmp.path();
@@ -2722,7 +3337,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // now requires the embedding model
+    #[ignore = "requires the ONNX embedding model; run with --run-ignored all"]
     fn test_index_file_inserts_chunks_and_meta() {
         let tmp = TempDir::new().unwrap();
         let hex_root = tmp.path();
@@ -2738,7 +3353,18 @@ mod tests {
         std::fs::write(&test_file, content).unwrap();
 
         let embedder = super::super::embed::Embedder::new(hex_root).unwrap();
-        let n = index_file(&conn, &test_file, hex_root, content, 0.0, "full", &embedder).unwrap();
+        let outcome = index_file(
+            &conn,
+            &test_file,
+            hex_root,
+            content,
+            0.0,
+            "full",
+            &embedder,
+            &|| false,
+        )
+        .unwrap();
+        let n = outcome.chunks_written;
         assert!(n >= 2);
 
         let chunk_count: i64 = conn

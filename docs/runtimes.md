@@ -1011,7 +1011,7 @@ Unit tests derive the expected hash by hand (documented in the test) and pass:
 export PATH="/opt/homebrew/bin:$PATH" && cargo test --manifest-path system/harness/Cargo.toml codex_hook_hash
 ```
 
-The live cross-check `trusted_hash_matches_codex_written_entry` is `#[ignore]`d.
+The live cross-check `trusted_hash_matches_codex_written_entry_live` is `#[ignore]`d.
 It reads `~/.codex/config.toml`, and for each `[hooks.state.*]` entry whose key
 names an existing `hooks.json`, recomputes the hash and asserts equality. That
 run is PENDING: it needs Mike to trust at least one JSON hook on this machine

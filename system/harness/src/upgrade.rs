@@ -1100,6 +1100,27 @@ fn personal_overlay_stale(hex_dot_dir: &Path) -> Option<PathBuf> {
     personal_overlay_newer_than(&personal_overlay_dirs(hex_dot_dir), binary_mtime)
 }
 
+/// Environment applied to the `cargo build --release --features personal`
+/// child process that produces the upgraded hex binary. Extracted as a pure
+/// function so the exact env the build receives can be asserted in a unit
+/// test without shelling out to cargo.
+///
+/// Sets both `HEX_DIR` and `HEX_OVERLAY_DIR` to the same value. A checked-out
+/// `.cargo/config.toml` can carry a `[env]` table with `force = true` on
+/// `HEX_DIR`, which overrides whatever this process passes via
+/// `Command::envs` for every cargo-launched child, including this build
+/// script — so `build.rs` cannot trust `HEX_DIR` to resolve the personal
+/// overlay when built from a source checkout of this repo. `HEX_OVERLAY_DIR`
+/// is not forced by that config, so `build.rs` resolves the overlay root from
+/// `HEX_OVERLAY_DIR` first, falling back to `HEX_DIR` then `$HOME/hex` for
+/// callers (e.g. a manual `cargo build`) that never set it.
+fn harness_build_env(hex_dir: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("HEX_DIR", hex_dir.to_path_buf()),
+        ("HEX_OVERLAY_DIR", hex_dir.to_path_buf()),
+    ]
+}
+
 /// Sync VERSIONS and rebuild/swap the hex binary when stale. Returns `true`
 /// when the binary step is HEALTHY (rebuilt+swapped, or legitimately up to
 /// date / not applicable) and `false` when the installed binary may be stale
@@ -1266,11 +1287,12 @@ fn sync_versions_file_protected(
         // code-intel crate and bridge module are therefore staged together
         // without writing into the live instance before cargo succeeds.
 
-        // Detect a personal overlay and build with --features personal (and set
-        // HEX_DIR so build.rs can find it). Keyed on overlay PRESENCE — a
-        // `harness-personal/` dir (integration probes) or a `modules/` dir
-        // (personal workers) — NOT a specific file, so it survives files being
-        // added/removed/re-homed (e.g. release.rs leaving the binary).
+        // Detect a personal overlay and build with --features personal (and pass
+        // both HEX_DIR and HEX_OVERLAY_DIR via `harness_build_env` so build.rs
+        // can find it). Keyed on overlay PRESENCE — a `harness-personal/` dir
+        // (integration probes) or a `modules/` dir (personal workers) — NOT a
+        // specific file, so it survives files being added/removed/re-homed
+        // (e.g. release.rs leaving the binary).
         let use_personal = detect_personal_overlay(&hex_dot_dir);
         let mut build_args = vec!["build", "--release"];
         // Build output is private staging, so a failed build cannot mutate the
@@ -1282,10 +1304,17 @@ fn sync_versions_file_protected(
             build_args.extend_from_slice(&["--features", "personal"]);
             println!("  → Personal overlay detected — building with --features personal");
         }
+        // `harness_build_env` sets HEX_OVERLAY_DIR alongside HEX_DIR: when
+        // `source_dir` is a checkout of this repo, its `.cargo/config.toml`
+        // forces HEX_DIR to a sandbox value for every process cargo launches
+        // here, including this build script, which would otherwise beat the
+        // real `hex_dir` this Command tries to set. HEX_OVERLAY_DIR carries no
+        // such [env] force entry, so build.rs prefers it when resolving the
+        // personal overlay root.
         let build_status = Command::new("cargo")
             .args(&build_args)
             .current_dir(&harness_dst)
-            .env("HEX_DIR", hex_dir)
+            .envs(harness_build_env(hex_dir))
             .status();
         match build_status {
             Ok(s) if s.success() => {
@@ -3727,6 +3756,32 @@ mod tests {
 
     fn set_mtime(path: &Path, time: SystemTime) {
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(time)).unwrap();
+    }
+
+    // Finding #1 (P0): a checked-out `.cargo/config.toml` with `force = true`
+    // on `HEX_DIR` overrides whatever this crate's own build passes via
+    // `Command::env`/`.envs`, so `build.rs` (which resolves the personal
+    // overlay under `$HEX_DIR/.hex/harness-personal` and `$HEX_DIR/.hex/modules`)
+    // silently sees the sandboxed value instead of the real instance and emits
+    // an empty overlay — every personal worker vanishes from the upgraded
+    // binary. `harness_build_env` must also set `HEX_OVERLAY_DIR` (a variable
+    // the checked-in config.toml does not force) so build.rs has an unforced
+    // path to the real overlay root. This test is RED in phase A: the
+    // function only sets HEX_DIR today.
+    #[test]
+    fn harness_build_env_sets_overlay_dir_alongside_hex_dir() {
+        let hex_dir = Path::new("/example/hex-dir");
+        let env = harness_build_env(hex_dir);
+        assert!(
+            env.contains(&("HEX_DIR", hex_dir.to_path_buf())),
+            "expected HEX_DIR={hex_dir:?} in {env:?}"
+        );
+        assert!(
+            env.contains(&("HEX_OVERLAY_DIR", hex_dir.to_path_buf())),
+            "expected HEX_OVERLAY_DIR={hex_dir:?} in {env:?} — build.rs needs an \
+             unforced env var to find the personal overlay when \
+             .cargo/config.toml forces HEX_DIR to a sandbox value"
+        );
     }
 
     #[test]
