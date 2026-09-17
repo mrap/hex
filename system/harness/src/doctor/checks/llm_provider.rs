@@ -23,6 +23,12 @@ impl DoctorCheck for LlmProviderReachable {
             Err(ProviderError::Upstream(msg)) => {
                 CheckResult::warn(format!("LLM provider upstream error — {msg}"))
             }
+            // Compile-only arm for U4/KTD6 phase A: Truncated is not yet
+            // produced by any real call path (parse_chat_response isn't wired
+            // into generate_inner yet). Reported the same as Upstream for now.
+            Err(ProviderError::Truncated(msg)) => {
+                CheckResult::warn(format!("LLM provider truncated response — {msg}"))
+            }
         }
     }
 }

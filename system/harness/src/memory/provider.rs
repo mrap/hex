@@ -7,6 +7,11 @@ pub enum ProviderError {
     Deferred(String),
     /// Network or API error. Same handling — defer.
     Upstream(String),
+    /// The provider cut the response off (`finish_reason == "length"`) before
+    /// a complete answer was produced, distinct from a generic parse/upstream
+    /// failure so callers (e.g. distill::judge) can name the incident
+    /// precisely instead of reporting a JSON parse error on truncated JSON.
+    Truncated(String),
 }
 
 impl std::fmt::Display for ProviderError {
@@ -14,6 +19,7 @@ impl std::fmt::Display for ProviderError {
         match self {
             ProviderError::Deferred(msg) => write!(f, "provider DEFERRED: {msg}"),
             ProviderError::Upstream(msg) => write!(f, "provider upstream error: {msg}"),
+            ProviderError::Truncated(msg) => write!(f, "provider truncated: {msg}"),
         }
     }
 }
@@ -126,6 +132,28 @@ pub fn generate_for(use_case: &str, prompt: &str) -> Result<String, ProviderErro
         &cfg.base_url,
         &cfg.api_key_env,
     )
+}
+
+/// Extract the assistant's message content from an OpenRouter-shape chat
+/// completion response JSON.
+///
+/// PHASE A STUB (KTD6 / U4, not yet wired into `generate_inner`): mirrors
+/// today's `generate_inner` behavior exactly — it ignores `finish_reason` and
+/// `use_case` — so the truncation-handling tests below are red against
+/// today's behavior rather than red against an unimplemented body. The next
+/// phase makes this the real body of the `choices[0].message.content`
+/// extraction in `generate_inner` and adds the `finish_reason == "length"` ->
+/// `ProviderError::Truncated` branch (incident: 3 `distill::judge-error` rows
+/// on 2026-09-16, `finish_reason: length`, truncated JSON that failed to
+/// parse).
+pub(crate) fn parse_chat_response(
+    _use_case: &str,
+    json: &serde_json::Value,
+) -> Result<String, ProviderError> {
+    json["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| ProviderError::Upstream(format!("no content in response: {json}")))
 }
 
 fn generate_inner(
@@ -321,5 +349,67 @@ api_key_env = "MY_CUSTOM_LLM_KEY"
             body["provider"].is_null(),
             "provider field must NOT be present for non-anthropic models"
         );
+    }
+
+    // Red tests for U4 / KTD6 (2026-09-16 distill::judge-error incident:
+    // finish_reason "length" truncated the judge's JSON before it could be
+    // parsed). `parse_chat_response` is still a Phase A stub that ignores
+    // `finish_reason`, so the first two fail against today's behavior.
+
+    #[test]
+    fn parse_chat_response_truncated_with_partial_content_is_err_truncated() {
+        let json = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "{\"action\":\"ADD\""}
+            }]
+        });
+        match parse_chat_response("memory_judge", &json) {
+            Err(ProviderError::Truncated(msg)) => {
+                assert!(
+                    msg.contains("memory_judge"),
+                    "expected use case name `memory_judge` in message, got: {msg}"
+                );
+                assert!(
+                    msg.to_lowercase().contains("truncat"),
+                    "expected 'truncated' in message, got: {msg}"
+                );
+            }
+            other => panic!("expected Err(Truncated(_)), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_response_truncated_with_no_content_is_truncated_not_upstream() {
+        let json = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {}
+            }]
+        });
+        match parse_chat_response("memory_judge", &json) {
+            Err(ProviderError::Truncated(_)) => {}
+            other => panic!("expected Err(Truncated(_)), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chat_response_stop_with_content_returns_content() {
+        let json = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "hello"}
+            }]
+        });
+        assert_eq!(parse_chat_response("memory_judge", &json).unwrap(), "hello");
+    }
+
+    #[test]
+    fn parse_chat_response_no_choices_is_upstream() {
+        let json = serde_json::json!({});
+        match parse_chat_response("memory_judge", &json) {
+            Err(ProviderError::Upstream(_)) => {}
+            other => panic!("expected Err(Upstream(_)), got: {other:?}"),
+        }
     }
 }

@@ -204,7 +204,14 @@ pub fn run_on_file(
                     );
                     return Ok(report);
                 }
-                ProviderError::Upstream(_) => {
+                // Truncated is treated like Upstream here for now (compile-only
+                // addition for U4/KTD6 phase A: the variant is not yet produced
+                // by any real call path — parse_chat_response isn't wired into
+                // generate_inner yet). Whether a truncated extract response
+                // should get its own strike/poison-slice treatment is a
+                // decision for whichever unit wires Truncated into the extract
+                // path; not decided here.
+                ProviderError::Upstream(_) | ProviderError::Truncated(_) => {
                     let new_strikes = strikes + 1;
                     if new_strikes == STRIKE_LIMIT - 1 {
                         // One strike from a skip: page the alert path while an

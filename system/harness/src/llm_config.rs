@@ -360,7 +360,11 @@ mod tests {
 
         let r = resolve("memory_judge").expect("resolve ok");
         assert_eq!(r.model, "anthropic/claude-sonnet-5");
-        assert_eq!(r.max_tokens, 256);
+        // Red for U4/KTD6: 2026-09-16 distill::judge-error incident (3 rows,
+        // finish_reason: length) — hidden reasoning tokens ate the whole 256
+        // cap before the judge's JSON decision could be written. Raise to
+        // 4096, mirroring consolidate_audit's fix for the same failure mode.
+        assert_eq!(r.max_tokens, 4096);
 
         let r = resolve("consolidate_audit").expect("resolve ok");
         assert_eq!(r.model, "anthropic/claude-sonnet-5");
