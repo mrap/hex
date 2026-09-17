@@ -1766,17 +1766,48 @@ fn push_ref(repo_root: &Path, refspec: &str) -> Result<()> {
     }
 }
 
-/// Independent post-push verify: origin's branch SHA must equal the local
-/// one (a 0 exit from `git push` is not proof on its own).
-fn verify_pushed(repo_root: &Path, branch: &str, expected_sha: &str) -> Result<()> {
-    match ls_remote_sha(repo_root, &format!("refs/heads/{branch}"))?.as_deref() {
-        Some(sha) if sha == expected_sha => Ok(()),
-        other => bail!(
-            "SHA MISMATCH after push: origin/{branch} is {} but expected \
-             {expected_sha} — release ABORTED",
-            other.unwrap_or("<absent>")
-        ),
+/// Marker error for "the post-push verify found a SHA mismatch", carrying
+/// the observed origin SHA (`None` if the branch is absent on origin) so a
+/// caller that needs it for a later report — e.g. the KTD6 PUBLISH STATE
+/// block — can reuse it instead of re-querying origin. Downcast with
+/// [`anyhow::Error::downcast_ref`]; [`fmt::Display`] renders the exact same
+/// text `verify_pushed` used to `bail!` directly.
+#[derive(Debug)]
+struct PushMismatch {
+    branch: String,
+    expected: String,
+    observed: Option<String>,
+}
+
+impl fmt::Display for PushMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SHA MISMATCH after push: origin/{} is {} but expected {} — release ABORTED",
+            self.branch,
+            self.observed.as_deref().unwrap_or("<absent>"),
+            self.expected
+        )
     }
+}
+
+impl std::error::Error for PushMismatch {}
+
+/// Independent post-push verify: origin's branch SHA must equal the local
+/// one (a 0 exit from `git push` is not proof on its own). Returns the
+/// observed origin SHA on success (always `Some(expected_sha)`); on
+/// mismatch, `Err` wraps a [`PushMismatch`] carrying the observed SHA so
+/// the caller can reuse it.
+fn verify_pushed(repo_root: &Path, branch: &str, expected_sha: &str) -> Result<Option<String>> {
+    let observed = ls_remote_sha(repo_root, &format!("refs/heads/{branch}"))?;
+    if observed.as_deref() == Some(expected_sha) {
+        return Ok(observed);
+    }
+    Err(anyhow::Error::new(PushMismatch {
+        branch: branch.to_string(),
+        expected: expected_sha.to_string(),
+        observed,
+    }))
 }
 
 /// One atomic push of `refspecs` (KTD3) — origin accepts all of `main`, the
@@ -1883,6 +1914,27 @@ fn classify_develop_sync(
     }
 }
 
+/// [`classify_develop_sync`] for the common case: both SHAs already
+/// resolved (`origin` is known, i.e. never the `RemoteMissing` case), only
+/// the two ancestry checks remain. Runs the two `is_ancestor` calls against
+/// the repo and classifies the result — shared by [`sync_develop_to_origin`]
+/// and [`reconcile_develop_with_origin`], which each resolve `local` and
+/// `origin` their own way (base-branch watch vs. cut-ceremony reconcile).
+fn classify_against_origin(
+    repo_root: &Path,
+    local: &str,
+    origin: &str,
+) -> Result<DevelopSyncClass> {
+    let origin_anc = is_ancestor(repo_root, origin, local)?;
+    let local_anc = is_ancestor(repo_root, local, origin)?;
+    Ok(classify_develop_sync(
+        local,
+        Some(origin),
+        origin_anc,
+        local_anc,
+    ))
+}
+
 /// What one develop-sync pass did (or refused to do).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DevelopSyncOutcome {
@@ -1941,9 +1993,7 @@ pub fn sync_develop_to_origin(repo_root: &Path, develop: &str) -> Result<Develop
         }
     }
 
-    let origin_anc = is_ancestor(repo_root, &origin, &local)?;
-    let local_anc = is_ancestor(repo_root, &local, &origin)?;
-    match classify_develop_sync(&local, Some(&origin), origin_anc, local_anc) {
+    match classify_against_origin(repo_root, &local, &origin)? {
         DevelopSyncClass::Ahead => {
             push_ref(repo_root, develop)?;
             verify_pushed(repo_root, develop, &local)?;
@@ -2044,10 +2094,7 @@ fn reconcile_develop_with_origin(
         return Ok(DevelopReconcile::InSync);
     }
 
-    let origin_anc = is_ancestor(repo_root, &origin, &local)?;
-    let local_anc = is_ancestor(repo_root, &local, &origin)?;
-
-    match classify_develop_sync(&local, Some(&origin), origin_anc, local_anc) {
+    match classify_against_origin(repo_root, &local, &origin)? {
         DevelopSyncClass::InSync => Ok(DevelopReconcile::InSync),
         DevelopSyncClass::Ahead => {
             let n = git_stdout(
@@ -2102,6 +2149,37 @@ fn reconcile_develop_with_origin(
     }
 }
 
+/// The shared "Recover" + "Or unwind a fresh cut" + develop-sync-sentence
+/// tail, common to the RECONCILE CONFLICT message (KTD5) and the atomic-push
+/// "PUSH REJECTED — nothing was pushed (atomic)" bail: both leave the exact
+/// same local state (main has the merge and tag, develop untouched/unpushed,
+/// the release branch still exists) and recover the same way. Each call site
+/// keeps its own header and `State:` line.
+fn recovery_tail(
+    main: &str,
+    develop: &str,
+    tag: &str,
+    rel_branch: &str,
+    main_before: &str,
+) -> String {
+    format!(
+        "Recover:\n  \
+         1. git checkout {develop} && git merge --no-ff origin/{develop}   \
+         # resolve, commit\n  \
+         2. git merge --no-ff {main}\n  \
+         3. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} \
+         {tag}\n  \
+         4. git branch -d {rel_branch}\n\
+         Or unwind a fresh cut:\n  \
+         git tag -d {tag}\n  \
+         git branch -f {main} {main_before}\n  \
+         git branch -D {rel_branch}\n  \
+         then re-run hex release cut\n\
+         The releaser's develop-sync will push {develop} on its next tick if it \
+         is strictly ahead of origin, and alert if diverged."
+    )
+}
+
 /// The RECONCILE CONFLICT recovery block (KTD5), shared by the pre-back-merge
 /// reconcile call and its post-atomic-push-rejection retry (U2 KTD4): both
 /// abort with `git merge --abort` already run, leaving `develop` at
@@ -2121,21 +2199,43 @@ fn reconcile_conflict_message(
          reconcile: merge of origin/{develop} into {develop} failed ({why}).\n\
          State: local {main} has the release merge and tag {tag}; {develop} is \
          unchanged (merge aborted); {rel_branch} still exists. Nothing was pushed.\n\
-         Recover:\n  \
-         1. git checkout {develop} && git merge --no-ff origin/{develop}   \
-         # resolve, commit\n  \
-         2. git merge --no-ff {main}\n  \
-         3. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} \
-         {tag}\n  \
-         4. git branch -d {rel_branch}\n\
-         Or unwind a fresh cut:\n  \
-         git tag -d {tag}\n  \
-         git branch -f {main} {main_before}\n  \
-         git branch -D {rel_branch}\n  \
-         then re-run hex release cut\n\
-         The releaser's develop-sync will push {develop} on its next tick if it \
-         is strictly ahead of origin, and alert if diverged."
+         {}",
+        recovery_tail(main, develop, tag, rel_branch, main_before)
     )
+}
+
+/// Run a develop-reconcile `result` and turn its error, if any, into the
+/// right bail: a [`ReconcileMergeConflict`] becomes the KTD5 RECONCILE
+/// CONFLICT message (with the loud line printed first), anything else gets
+/// `context` attached. Shared by the pre-back-merge reconcile call and its
+/// post-atomic-push-rejection retry; each keeps its own phase labels, log
+/// lines, and `context` string around this call.
+fn reconcile_or_bail(
+    result: Result<DevelopReconcile>,
+    main: &str,
+    develop: &str,
+    tag: &str,
+    rel_branch: &str,
+    main_before: &str,
+    context: &str,
+) -> Result<DevelopReconcile> {
+    match result {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if let Some(ReconcileMergeConflict(why)) = e.downcast_ref::<ReconcileMergeConflict>() {
+                red("RECONCILE CONFLICT — nothing was pushed.");
+                bail!(reconcile_conflict_message(
+                    main,
+                    develop,
+                    tag,
+                    rel_branch,
+                    main_before,
+                    why
+                ));
+            }
+            Err(e).context(context.to_string())
+        }
+    }
 }
 
 /// One-line phase text for a [`DevelopReconcile`] outcome (R5).
@@ -2725,23 +2825,15 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
     // every other reconcile failure so the R3/KTD5 block below — which
     // needs `main`/`rel_branch`/`main_before` the pure reconcile fn does
     // not have — is built here, not inside it.
-    let reconcile = match reconcile_develop_with_origin(repo_root, develop, &tag) {
-        Ok(r) => r,
-        Err(e) => {
-            if let Some(ReconcileMergeConflict(why)) = e.downcast_ref::<ReconcileMergeConflict>() {
-                red("RECONCILE CONFLICT — nothing was pushed.");
-                bail!(reconcile_conflict_message(
-                    main,
-                    develop,
-                    &tag,
-                    &rel_branch,
-                    &main_before,
-                    why
-                ));
-            }
-            return Err(e).context("reconciling develop with origin before the back-merge");
-        }
-    };
+    let reconcile = reconcile_or_bail(
+        reconcile_develop_with_origin(repo_root, develop, &tag),
+        main,
+        develop,
+        &tag,
+        &rel_branch,
+        &main_before,
+        "reconciling develop with origin before the back-merge",
+    )?;
     let reconcile_detail = describe_reconcile(&reconcile);
     green(&format!("  develop-reconcile: {reconcile_detail}"));
     phases.push(("develop-reconcile", reconcile_detail));
@@ -2851,53 +2943,30 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
                 "PUSH REJECTED — origin/{develop} moved again; reconciling once more \
                  and retrying the atomic push..."
             ));
-            match reconcile_develop_with_origin(repo_root, develop, &tag) {
-                Ok(r) => {
-                    let detail = describe_reconcile(&r);
-                    green(&format!("  develop-reconcile (retry): {detail}"));
-                    phases.push(("develop-reconcile-retry", detail));
-                    develop_sha = rev_parse(repo_root, &format!("refs/heads/{develop}"))?;
-                    retried = true;
-                    continue;
-                }
-                Err(e) => {
-                    if let Some(ReconcileMergeConflict(why)) =
-                        e.downcast_ref::<ReconcileMergeConflict>()
-                    {
-                        red("RECONCILE CONFLICT — nothing was pushed.");
-                        bail!(reconcile_conflict_message(
-                            main,
-                            develop,
-                            &tag,
-                            &rel_branch,
-                            &main_before,
-                            why
-                        ));
-                    }
-                    return Err(e)
-                        .context("reconciling develop with origin before the atomic push retry");
-                }
-            }
+            let r = reconcile_or_bail(
+                reconcile_develop_with_origin(repo_root, develop, &tag),
+                main,
+                develop,
+                &tag,
+                &rel_branch,
+                &main_before,
+                "reconciling develop with origin before the atomic push retry",
+            )?;
+            let detail = describe_reconcile(&r);
+            green(&format!("  develop-reconcile (retry): {detail}"));
+            phases.push(("develop-reconcile-retry", detail));
+            develop_sha = rev_parse(repo_root, &format!("refs/heads/{develop}"))?;
+            retried = true;
+            continue;
         }
 
         bail!(
             "PUSH REJECTED — nothing was pushed (atomic).\n{}\n\
              State: local {main} has the release merge and tag {tag}; {develop} unpushed; \
              {rel_branch} still exists. Nothing was pushed.\n\
-             Recover:\n  \
-             1. git checkout {develop} && git merge --no-ff origin/{develop}   \
-             # resolve, commit\n  \
-             2. git merge --no-ff {main}\n  \
-             3. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} {tag}\n  \
-             4. git branch -d {rel_branch}\n\
-             Or unwind a fresh cut:\n  \
-             git tag -d {tag}\n  \
-             git branch -f {main} {main_before}\n  \
-             git branch -D {rel_branch}\n  \
-             then re-run hex release cut\n\
-             The releaser's develop-sync will push {develop} on its next tick if it is \
-             strictly ahead of origin, and alert if diverged.",
-            result.stderr.trim()
+             {}",
+            result.stderr.trim(),
+            recovery_tail(main, develop, &tag, &rel_branch, &main_before)
         );
     };
 
@@ -2906,35 +2975,49 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
     // ls-remote (mirrors the tag verify the sequential code used to do
     // inline).
     let mut mismatches = Vec::new();
-    if let Err(e) = verify_pushed(repo_root, main, &main_sha) {
-        mismatches.push(format!("{e:#}"));
-    }
-    if let Err(e) = verify_pushed(repo_root, develop, &develop_sha) {
-        mismatches.push(format!("{e:#}"));
-    }
-    match ls_remote_sha(repo_root, &tag_ref) {
-        Ok(Some(sha)) if sha == tag_sha => {}
-        Ok(other) => mismatches.push(format!(
-            "SHA MISMATCH after tag push: origin {tag} is {} but expected {tag_sha}",
-            other.unwrap_or_else(|| "<absent>".to_string())
-        )),
-        Err(e) => mismatches.push(format!("{e:#}")),
-    }
+    let main_origin = match verify_pushed(repo_root, main, &main_sha) {
+        Ok(sha) => sha,
+        Err(e) => {
+            let observed = e
+                .downcast_ref::<PushMismatch>()
+                .and_then(|m| m.observed.clone());
+            mismatches.push(format!("{e:#}"));
+            observed
+        }
+    };
+    let develop_origin = match verify_pushed(repo_root, develop, &develop_sha) {
+        Ok(sha) => sha,
+        Err(e) => {
+            let observed = e
+                .downcast_ref::<PushMismatch>()
+                .and_then(|m| m.observed.clone());
+            mismatches.push(format!("{e:#}"));
+            observed
+        }
+    };
+    let tag_origin = match ls_remote_sha(repo_root, &tag_ref) {
+        Ok(Some(sha)) if sha == tag_sha => Some(sha),
+        Ok(other) => {
+            mismatches.push(format!(
+                "SHA MISMATCH after tag push: origin {tag} is {} but expected {tag_sha}",
+                other.clone().unwrap_or_else(|| "<absent>".to_string())
+            ));
+            other
+        }
+        Err(e) => {
+            mismatches.push(format!("{e:#}"));
+            None
+        }
+    };
 
     if !mismatches.is_empty() {
         // KTD6: the push was accepted but verification failed (or errored)
-        // — the only genuinely uncertain outcome. Re-query origin for all
-        // three refs, run the GitHub release step only if the tag made it,
-        // run cleanup, print the summary, THEN bail — none of that is
+        // — the only genuinely uncertain outcome. Reuse the three SHAs
+        // already observed by the verification step above (no re-query),
+        // run the GitHub release step only if the tag made it, run
+        // cleanup, print the summary, THEN bail — none of that is
         // optional just because the ceremony is about to fail (S6).
         red("PUSH VERIFY FAILED — publish state uncertain.");
-        let main_origin = ls_remote_sha(repo_root, &format!("refs/heads/{main}"))
-            .ok()
-            .flatten();
-        let tag_origin = ls_remote_sha(repo_root, &tag_ref).ok().flatten();
-        let develop_origin = ls_remote_sha(repo_root, &format!("refs/heads/{develop}"))
-            .ok()
-            .flatten();
         let state_line = |name: &str, sha: &Option<String>| match sha {
             Some(s) => format!("{name}: on origin at {s}"),
             None => format!("{name}: not on origin"),
