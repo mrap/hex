@@ -5317,4 +5317,181 @@ CUSTOM_INSTANCE_PIN=abc123
             "bootout must be logged before bootstrap; calls:\n{calls}"
         );
     }
+
+    // --- R1/R1a/R1b/R19, KTD1: required-hooks preflight + merge (U2) ---
+
+    /// (tmp, source_merger, source_manifest, hex_dot_dir, workspace) with the
+    /// REAL hex-hooks-merge script copied in both as the "source tree" copy
+    /// (used by `required_hooks_missing`'s preflight) and already installed
+    /// under `hex_dot_dir/scripts` + `hex_dot_dir/hooks` (used by
+    /// `merge_required_hooks`, as if Step 5's sync already ran). A fresh
+    /// `.claude/settings.json` is `{}`, i.e. missing every manifest hook.
+    fn hooks_merge_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let source_merger = tmp.path().join("source/system/scripts/hex-hooks-merge");
+        let real_merger =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../system/scripts/hex-hooks-merge");
+        fs::create_dir_all(source_merger.parent().unwrap()).unwrap();
+        fs::copy(&real_merger, &source_merger)
+            .unwrap_or_else(|e| panic!("copy real merger from {}: {e}", real_merger.display()));
+        fs::set_permissions(&source_merger, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let source_manifest = tmp.path().join("source/system/hooks/required-hooks.json");
+        write_file(
+            &source_manifest,
+            r#"{"SessionStart": [{"matcher": "", "command": "hex memory recent"}]}"#,
+        );
+
+        let hex_dot_dir = tmp.path().join("workspace/.hex");
+        fs::create_dir_all(hex_dot_dir.join("scripts")).unwrap();
+        fs::create_dir_all(hex_dot_dir.join("hooks")).unwrap();
+        fs::copy(&source_merger, hex_dot_dir.join("scripts/hex-hooks-merge")).unwrap();
+        fs::set_permissions(
+            hex_dot_dir.join("scripts/hex-hooks-merge"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::copy(
+            &source_manifest,
+            hex_dot_dir.join("hooks/required-hooks.json"),
+        )
+        .unwrap();
+
+        let workspace = tmp.path().join("workspace");
+        write_file(&workspace.join(".claude/settings.json"), "{}");
+
+        (tmp, source_merger, source_manifest, hex_dot_dir, workspace)
+    }
+
+    #[test]
+    fn required_hooks_missing_reports_absent_hook() {
+        let (_tmp, merger, manifest, _hex_dot_dir, workspace) = hooks_merge_fixture();
+        let settings = workspace.join(".claude/settings.json");
+        let missing = required_hooks_missing(&merger, &manifest, &settings)
+            .expect("check must succeed against a fresh settings.json");
+        assert_eq!(missing, vec!["SessionStart: hex memory recent".to_string()]);
+    }
+
+    #[test]
+    fn required_hooks_missing_empty_after_merge() {
+        let (_tmp, merger, manifest, hex_dot_dir, workspace) = hooks_merge_fixture();
+        merge_required_hooks(&hex_dot_dir, &workspace).expect("merge must succeed");
+        let settings = workspace.join(".claude/settings.json");
+        let missing = required_hooks_missing(&merger, &manifest, &settings)
+            .expect("check must succeed after merge");
+        assert!(
+            missing.is_empty(),
+            "expected no missing hooks after merge: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn required_hooks_missing_malformed_settings_counts_as_missing() {
+        let (_tmp, merger, manifest, _hex_dot_dir, workspace) = hooks_merge_fixture();
+        let settings = workspace.join(".claude/settings.json");
+        fs::write(&settings, "{oops").unwrap();
+        let missing = required_hooks_missing(&merger, &manifest, &settings)
+            .expect("malformed settings must still return Ok (counts as missing)");
+        assert!(
+            !missing.is_empty(),
+            "malformed settings must count as missing hooks"
+        );
+        assert!(
+            missing[0].contains("not valid JSON"),
+            "expected a JSON-parse complaint, got {missing:?}"
+        );
+    }
+
+    #[test]
+    fn required_hooks_missing_errs_when_merger_absent() {
+        let (_tmp, merger, manifest, _hex_dot_dir, workspace) = hooks_merge_fixture();
+        let settings = workspace.join(".claude/settings.json");
+        fs::remove_file(&merger).unwrap();
+        let result = required_hooks_missing(&merger, &manifest, &settings);
+        assert!(result.is_err(), "missing merger must be a hard error");
+    }
+
+    #[test]
+    fn merge_required_hooks_adds_missing_hook() {
+        let (_tmp, _merger, _manifest, hex_dot_dir, workspace) = hooks_merge_fixture();
+        let added = merge_required_hooks(&hex_dot_dir, &workspace)
+            .expect("merge must succeed against a fresh settings.json");
+        assert_eq!(
+            added,
+            vec!["hook added: SessionStart: hex memory recent".to_string()]
+        );
+        let settings_text = fs::read_to_string(workspace.join(".claude/settings.json")).unwrap();
+        assert!(
+            settings_text.contains("hex memory recent"),
+            "settings.json must contain the merged command: {settings_text}"
+        );
+    }
+
+    #[test]
+    fn merge_required_hooks_second_run_is_noop() {
+        let (_tmp, _merger, _manifest, hex_dot_dir, workspace) = hooks_merge_fixture();
+        merge_required_hooks(&hex_dot_dir, &workspace).expect("first merge must succeed");
+        let second =
+            merge_required_hooks(&hex_dot_dir, &workspace).expect("second merge must succeed");
+        assert!(
+            second.is_empty(),
+            "second merge must be a no-op: {second:?}"
+        );
+    }
+
+    #[test]
+    fn merge_required_hooks_malformed_settings_errs_and_leaves_file_untouched() {
+        let (_tmp, _merger, _manifest, hex_dot_dir, workspace) = hooks_merge_fixture();
+        let settings = workspace.join(".claude/settings.json");
+        fs::write(&settings, "{oops").unwrap();
+        let before = fs::read(&settings).unwrap();
+        let result = merge_required_hooks(&hex_dot_dir, &workspace);
+        assert!(
+            result.is_err(),
+            "malformed settings.json must error, not merge"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains(&settings.display().to_string()),
+            "error must name the settings path: {err}"
+        );
+        let after = fs::read(&settings).unwrap();
+        assert_eq!(
+            before, after,
+            "malformed settings.json must be left byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn merge_required_hooks_errs_when_merger_script_absent() {
+        let (_tmp, _merger, _manifest, hex_dot_dir, workspace) = hooks_merge_fixture();
+        fs::remove_file(hex_dot_dir.join("scripts/hex-hooks-merge")).unwrap();
+        let result = merge_required_hooks(&hex_dot_dir, &workspace);
+        assert!(
+            result.is_err(),
+            "missing merger script must be a hard error"
+        );
+    }
+
+    #[test]
+    fn merge_required_hooks_manifest_absent_is_ok_empty() {
+        let (_tmp, _merger, _manifest, hex_dot_dir, workspace) = hooks_merge_fixture();
+        fs::remove_file(hex_dot_dir.join("hooks/required-hooks.json")).unwrap();
+        let result = merge_required_hooks(&hex_dot_dir, &workspace)
+            .expect("an absent manifest must be a warn-and-skip, not a failure");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn upgrade_up_to_date_gate_is_false_when_hooks_are_missing() {
+        assert!(
+            upgrade_is_up_to_date(0, 0, false, false, false, false, true),
+            "baseline with nothing missing must be up to date"
+        );
+        assert!(
+            !upgrade_is_up_to_date(0, 0, false, false, false, false, false),
+            "a missing required hook must block the up-to-date gate"
+        );
+    }
 }
