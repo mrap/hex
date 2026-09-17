@@ -109,7 +109,7 @@ pub fn call_builtin_with_timeout_and_budget(
     function_id: &str,
     payload: Value,
     timeout_ms: Option<u64>,
-    _shutdown_budget: Duration,
+    shutdown_budget: Duration,
 ) -> Result<Value, String> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("ops::call_builtin: failed to start tokio runtime: {e}"))?;
@@ -122,8 +122,56 @@ pub fn call_builtin_with_timeout_and_budget(
         timeout_ms,
     }));
     // Release the connection thread + sockets before returning, success or not.
-    iii.shutdown();
+    shutdown_within(&rt, &iii, shutdown_budget, &url);
     result.map_err(|e| format!("{function_id} failed (url={url}): {e}"))
+}
+
+/// Shut the SDK client down, waiting at most `budget` for its connection
+/// thread to be joined. `III::shutdown()` joins unconditionally, and the
+/// SDK's reconnect loop awaits `connect_async` with no handshake timeout, so
+/// against an engine that accepts TCP but never answers the upgrade the join
+/// would block the caller forever (review finding on the v0.53.2 fix). The
+/// join therefore runs on a helper thread; on overrun the caller logs LOUD
+/// (S6) and returns, and the helper finishes whenever the connect resolves.
+fn shutdown_within(rt: &tokio::runtime::Runtime, iii: &iii_sdk::III, budget: Duration, url: &str) {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let client = iii.clone();
+    let spawned = std::thread::Builder::new()
+        .name("iii-shutdown".into())
+        .spawn(move || {
+            client.shutdown();
+            let _ = tx.send(());
+        });
+    if let Err(e) = spawned {
+        // No helper thread means no bounded join is possible; signal the
+        // shutdown without joining (never blocks) so the caller still returns.
+        let detail = format!("could not spawn iii-shutdown thread ({e}); shutdown signalled without join (url={url})");
+        eprintln!("ops::call_builtin: WARN {detail}");
+        record_shutdown_failure(detail);
+        rt.block_on(iii.shutdown_async());
+        return;
+    }
+    if rx.recv_timeout(budget).is_err() {
+        let detail = format!(
+            "iii client shutdown exceeded {budget:?} (url={url}); connection thread detached (it exits when the engine's connect resolves)"
+        );
+        eprintln!("ops::call_builtin: WARN {detail}");
+        record_shutdown_failure(detail);
+    }
+}
+
+/// A teardown that could not be bounded is loud on both S6 channels: stderr
+/// (above) and a telemetry error row, so a stalling engine shows up in
+/// `hex failures` before it exhausts threads or fds again.
+fn record_shutdown_failure(detail: String) {
+    crate::telemetry::record_loud(&crate::telemetry::TelemetryEvent {
+        source: "harness".into(),
+        event: "iii::shutdown".into(),
+        status: "error".into(),
+        duration_ms: None,
+        exit_code: None,
+        detail: Some(detail),
+    });
 }
 
 /// Write a value into iii state. LOUD on failure (S6).
