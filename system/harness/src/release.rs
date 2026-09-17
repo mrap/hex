@@ -1244,13 +1244,18 @@ fn gate_codex_parity(repo_root: &Path, skip: SkipFlags) -> GateResult {
     }
 }
 
-/// The `FAIL` lines of a codex-parity run (at most 8) followed by the output
-/// tail, so a blocked release says which tests failed, not just the exit code.
+/// The failed-test lines of a codex-parity run (at most 8) followed by the
+/// output tail, so a blocked release says which tests failed, not just the
+/// exit code. `tests/codex-parity/run-all.sh` prints its per-test summary as
+/// `[FAIL] name (exit N)`; the individual parity scripts print per-assertion
+/// detail as `FAIL: <name>`. Both prefixes are load-bearing — anchoring on
+/// them (rather than a loose `contains("FAIL")`) keeps lines like
+/// `PASS: no FAILures` from being reported as failures.
 fn parity_failure_detail(combined: &str) -> String {
     let fails: Vec<&str> = combined
         .lines()
         .map(str::trim)
-        .filter(|l| l.contains("FAIL"))
+        .filter(|l| l.starts_with("[FAIL]") || l.starts_with("FAIL:"))
         .take(8)
         .collect();
     if fails.is_empty() {
