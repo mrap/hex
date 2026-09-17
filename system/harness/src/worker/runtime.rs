@@ -32,6 +32,20 @@ const DEFAULT_ENGINE_URL: &str = "ws://127.0.0.1:49134";
 /// forcing exit.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Connect to the iii engine at `url` and install the resulting client as the
+/// process-wide shared client `ops::call_builtin_with_timeout_and_budget`
+/// reuses (KTD8). This is the seam `serve` calls instead of a bare
+/// `iii_sdk::register_worker(&url, ...)`, so the install happens as part of
+/// the same connect `serve` already makes, before registering any handlers —
+/// every subsequent `call_builtin` from inside `serve` (including the ones
+/// handlers themselves trigger) reuses this one client instead of opening
+/// its own.
+pub fn connect_engine_client(url: &str) -> iii_sdk::III {
+    let iii = iii_sdk::register_worker(url, iii_sdk::InitOptions::default());
+    crate::ops::install_shared_client(iii.clone());
+    iii
+}
+
 /// Long-running serve entry — hidden behind `hex harness serve` so launchd can
 /// invoke it. One tokio runtime hosts BOTH the in-process iii engine and the
 /// worker runtime that connects to it as an SDK client:
@@ -192,8 +206,12 @@ async fn run(workers: Vec<Worker>) -> i32 {
     // 2. Connect the worker runtime to the in-process engine. The SDK opens the
     //    connection on a background task and auto-retries until the engine's WS
     //    port is up, so connecting immediately (before serve binds) is safe.
+    //    `connect_engine_client` also installs this client as the process-wide
+    //    shared client (KTD8), so every `ops::call_builtin` from here on
+    //    (including ones handlers themselves trigger) reuses it instead of
+    //    opening — and shutting down — a client of its own.
     let url = std::env::var("III_URL").unwrap_or_else(|_| DEFAULT_ENGINE_URL.to_string());
-    let iii = iii_sdk::register_worker(&url, iii_sdk::InitOptions::default());
+    let iii = connect_engine_client(&url);
 
     // 2a. REGISTER FIRST — every worker's functions + triggers — so any state
     //     changes replayed in 2b land on a live listener (init-order rule).

@@ -1,0 +1,14 @@
+# Nextest profiles for this workspace.
+#
+# The `nightly` profile backs the `hex-nightly-tests` harness worker
+# (system/harness/src/modules/nightly_tests.worker.rs), which runs the full
+# suite in the container lane every night with `--run-ignored all`. Tests
+# whose name ends in `_live` need a host-only resource (a running engine, a
+# live user config file, an interactive keychain) that the container does not
+# have, so this profile's `default-filter` excludes them by name. `_live`
+# tests still run, on the host, under their own name.
+#
+# The default profile is untouched: no `default-filter`, no `retries`, no
+# per-test timeouts.
+[profile.nightly]
+default-filter = 'not test(/_live$/)'

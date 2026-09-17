@@ -609,7 +609,7 @@ Decision or Follow-up.
 - Stay on `toml` 0.8 in the harness (spec says use existing deps; 0.8 and 0.9
   serialize these `Value` variants identically). The divergence risk is retired
   by the live test.
-- PENDING run: `trusted_hash_matches_codex_written_entry` is `#[ignore]`d and
+- PENDING run: `trusted_hash_matches_codex_written_entry_live` is `#[ignore]`d and
   needs Mike to trust at least one JSON hook on this machine, which writes a
   `[hooks.state."<key>"] trusted_hash` entry into `~/.codex/config.toml`. After
   that, run

@@ -62,20 +62,41 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     // Generate personal_mods.rs by DISCOVERING the personal overlay's probe modules
-    // (`$HEX_DIR/.hex/harness-personal/integration_*.rs`) — never by hardcoding the
-    // user's integration names in this (general) repo. Each probe file exposes
+    // (`<overlay_root>/.hex/harness-personal/integration_*.rs`) — never by hardcoding
+    // the user's integration names in this (general) repo. Each probe file exposes
     // `pub fn run_probe() -> i32`; the registry maps a probe name derived from the
     // filename (`integration_<foo>.rs` → `<foo>`, `_`→`-`) to it. Only globbed under
     // --features personal; an absent overlay dir → an empty registry (foundation
-    // builds clean with nothing personal present).
+    // builds clean with nothing personal present) — UNLESS both overlay dirs are
+    // absent, in which case `resolve_overlay_root`'s caller below fails loudly
+    // instead (S6): a resolved root with nothing under it usually means the wrong
+    // root was resolved (e.g. HEX_DIR pinned to a build sandbox), not that the
+    // instance genuinely has no personal overlay.
+    println!("cargo:rerun-if-env-changed=HEX_OVERLAY_DIR");
     println!("cargo:rerun-if-env-changed=HEX_DIR");
     println!("cargo:rerun-if-env-changed=HOME");
+    let personal_enabled = std::env::var("CARGO_FEATURE_PERSONAL").is_ok();
+    let overlay_root = if personal_enabled {
+        let root = resolve_overlay_root();
+        let modules_dir = std::path::Path::new(&root).join(".hex/modules");
+        let harness_personal_dir = std::path::Path::new(&root).join(".hex/harness-personal");
+        if !modules_dir.exists() && !harness_personal_dir.exists() {
+            panic!(
+                "hex build (--features personal): personal overlay root resolved to \
+                 {root:?}, but neither {modules_dir:?} nor {harness_personal_dir:?} \
+                 exists — this build would silently drop every personal worker. \
+                 Set HEX_OVERLAY_DIR (checked first) or HEX_DIR to the real instance \
+                 directory, not a sandbox path; the last fallback is the hex \
+                 directory under HOME."
+            );
+        }
+        Some(root)
+    } else {
+        None
+    };
     let mut probe_entries: Vec<(String, String, String)> = Vec::new(); // (mod_ident, probe_name, abs_path)
-    if std::env::var("CARGO_FEATURE_PERSONAL").is_ok() {
-        let personal_dir = std::env::var("HEX_DIR")
-            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/hex", h)))
-            .map(|d| format!("{}/.hex/harness-personal", d))
-            .expect("HEX_DIR or HOME must be set to locate .hex/harness-personal/");
+    if let Some(root) = &overlay_root {
+        let personal_dir = format!("{root}/.hex/harness-personal");
         println!("cargo:rerun-if-changed={personal_dir}");
         if let Ok(rd) = std::fs::read_dir(&personal_dir) {
             for entry in rd.flatten() {
@@ -115,11 +136,10 @@ fn main() {
     // ---- hex module discovery: recursive *.worker.rs glob → hex_modules.rs ----
     let mut roots: Vec<String> = vec![format!("{manifest_dir}/src/modules")];
     // Personal modules root (out-of-crate) only under --features personal.
-    if std::env::var("CARGO_FEATURE_PERSONAL").is_ok() {
-        let hex_dir = std::env::var("HEX_DIR")
-            .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/hex")))
-            .expect("HEX_DIR or HOME must be set to locate .hex/modules/");
-        roots.push(format!("{hex_dir}/.hex/modules"));
+    // Reuses the same `overlay_root` resolved (and existence-checked) above so
+    // both discovery passes agree on the root and share one loud failure.
+    if let Some(root) = &overlay_root {
+        roots.push(format!("{root}/.hex/modules"));
     }
 
     let mut entries: Vec<(String, String)> = Vec::new(); // (mod_ident, abs_path)
@@ -160,6 +180,28 @@ fn main() {
     }
     gen.push_str("]\n}\n");
     std::fs::write(format!("{out_dir}/hex_modules.rs"), gen).unwrap();
+}
+
+/// Resolve the personal overlay root directory for `--features personal`
+/// builds: `HEX_OVERLAY_DIR` first, then `HEX_DIR`, then `$HOME/hex`.
+///
+/// `HEX_OVERLAY_DIR` is checked first because a checked-out
+/// `.cargo/config.toml` can carry a `[env]` table with `force = true` on
+/// `HEX_DIR` (see that file), which overrides HEX_DIR for every process cargo
+/// launches from a checkout of this repo — including this build script — no
+/// matter what an ancestor process (e.g. `hex upgrade`) tries to set it to.
+/// `HEX_OVERLAY_DIR` carries no such forced entry, so it survives that
+/// override; `hex upgrade` sets it explicitly (see `harness_build_env` in
+/// `src/upgrade.rs`). `HEX_DIR` and `$HOME/hex` remain as fallbacks for a bare
+/// `cargo build --features personal` run outside that upgrade path.
+fn resolve_overlay_root() -> String {
+    std::env::var("HEX_OVERLAY_DIR")
+        .or_else(|_| std::env::var("HEX_DIR"))
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/hex")))
+        .expect(
+            "HEX_OVERLAY_DIR, HEX_DIR, or HOME must be set to locate the personal overlay \
+             (.hex/harness-personal, .hex/modules)",
+        )
 }
 
 /// Recursively collect `*.worker.rs` files under `dir`. `root` is the glob root
