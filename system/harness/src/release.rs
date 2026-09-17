@@ -1891,6 +1891,161 @@ pub fn sync_develop_to_origin(repo_root: &Path, develop: &str) -> Result<Develop
 }
 
 // ---------------------------------------------------------------------------
+// Cut-ceremony develop reconcile — runs unconditionally before the
+// back-merge (KTD1) so the develop push can never be rejected because
+// origin moved during the gate battery.
+// ---------------------------------------------------------------------------
+
+/// What [`reconcile_develop_with_origin`] did to local `develop` before the
+/// back-merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DevelopReconcile {
+    /// origin equals local — nothing to do.
+    InSync,
+    /// Local is strictly ahead of origin by `n` commits — nothing to
+    /// reconcile; those commits are carried by the ceremony's own push.
+    Ahead(usize),
+    /// Local was behind; fast-forwarded to origin's head. Carries the short
+    /// sha it was fast-forwarded to.
+    FastForwarded(String),
+    /// Local and origin had each diverged; merged with a no-ff commit.
+    /// Carries the short shas (oldest first) of the foreign commits that
+    /// came from origin.
+    Merged(Vec<String>),
+}
+
+/// Marker error for "the reconcile's own merge conflicted", kept distinct
+/// from every other reconcile failure (missing branch, network/fetch error)
+/// so the caller — which alone knows `main`, `rel_branch`, and
+/// `main_before` — can build the full R3/KTD5 recovery block. Downcast with
+/// [`anyhow::Error::downcast_ref`].
+#[derive(Debug)]
+struct ReconcileMergeConflict(String);
+
+impl fmt::Display for ReconcileMergeConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ReconcileMergeConflict {}
+
+/// Reconcile local `develop` with `origin/develop` before the back-merge
+/// (KTD1). Runs on every cut mode (fresh, hotfix, finish) — never a
+/// rebase, reset, or force.
+///
+/// Order (KTD2): `ls-remote` first — a missing `origin/develop` aborts here
+/// (R4) before anything is touched; the ceremony never creates a base
+/// branch on origin. Then `git fetch --quiet origin <develop>` (objects
+/// plus `refs/remotes/origin/<develop>` only, never a local branch write).
+/// Classification uses the local ref, the FETCHED remote-tracking ref
+/// (never a fresh `ls-remote` sha, whose objects may still be absent
+/// locally), and ancestry both ways. `Behind` fast-forwards `develop`
+/// in place; `Diverged` merges `origin/<develop>` into `develop` with
+/// `--no-ff`, aborting the merge on conflict and returning it as a
+/// [`ReconcileMergeConflict`] (never a rebase/reset/force).
+fn reconcile_develop_with_origin(
+    repo_root: &Path,
+    develop: &str,
+    tag: &str,
+) -> Result<DevelopReconcile> {
+    let branch_ref = format!("refs/heads/{develop}");
+    if ls_remote_sha(repo_root, &branch_ref)
+        .with_context(|| format!("checking origin for {develop} before the back-merge"))?
+        .is_none()
+    {
+        bail!(
+            "origin/{develop} does not exist (`git ls-remote origin {develop}` returned \
+             nothing) — the ceremony never creates a base branch on origin. Bootstrap it \
+             first, then re-run:\n  git push origin {develop}"
+        );
+    }
+
+    git_stdout(repo_root, &["fetch", "--quiet", "origin", develop])
+        .with_context(|| format!("fetching origin/{develop} for the reconcile"))?;
+
+    let local = rev_parse(repo_root, &branch_ref)?;
+    let origin_tracking_ref = format!("refs/remotes/origin/{develop}");
+    let origin = rev_parse(repo_root, &origin_tracking_ref)
+        .with_context(|| format!("resolving {origin_tracking_ref} after the fetch"))?;
+
+    if origin == local {
+        return Ok(DevelopReconcile::InSync);
+    }
+
+    let origin_anc = is_ancestor(repo_root, &origin, &local)?;
+    let local_anc = is_ancestor(repo_root, &local, &origin)?;
+
+    match classify_develop_sync(&local, Some(&origin), origin_anc, local_anc) {
+        DevelopSyncClass::InSync => Ok(DevelopReconcile::InSync),
+        DevelopSyncClass::Ahead => {
+            let n = git_stdout(
+                repo_root,
+                &["rev-list", "--count", &format!("{origin}..{local}")],
+            )?
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0);
+            Ok(DevelopReconcile::Ahead(n))
+        }
+        DevelopSyncClass::Behind => {
+            git_stdout(repo_root, &["checkout", "-q", develop])
+                .with_context(|| format!("checking out {develop} to fast-forward it"))?;
+            git_stdout(repo_root, &["merge", "--ff-only", &origin_tracking_ref])
+                .with_context(|| format!("fast-forwarding {develop} to {origin_tracking_ref}"))?;
+            Ok(DevelopReconcile::FastForwarded(
+                short_sha(&origin).to_string(),
+            ))
+        }
+        DevelopSyncClass::Diverged => {
+            // Collected BEFORE merging, per KTD2/plan step 2.
+            let foreign = git_stdout(
+                repo_root,
+                &[
+                    "rev-list",
+                    "--abbrev-commit",
+                    &format!("{develop}..{origin_tracking_ref}"),
+                ],
+            )?
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            git_stdout(repo_root, &["checkout", "-q", develop])
+                .with_context(|| format!("checking out {develop} to reconcile it"))?;
+            if let Err(why) = merge_no_ff(
+                repo_root,
+                &origin_tracking_ref,
+                &format!("reconcile: merge origin/{develop} into {develop} for {tag}"),
+            ) {
+                abort_merge(repo_root);
+                return Err(anyhow::Error::new(ReconcileMergeConflict(why)));
+            }
+            Ok(DevelopReconcile::Merged(foreign))
+        }
+        DevelopSyncClass::RemoteMissing => {
+            // Unreachable: `origin` above is a resolved sha (the ls-remote
+            // check at the top already ruled this out) — answered rather
+            // than panicked, consistent with `sync_develop_to_origin`.
+            bail!("origin/{develop} vanished between the ls-remote check and the fetch")
+        }
+    }
+}
+
+/// One-line phase text for a [`DevelopReconcile`] outcome (R5).
+fn describe_reconcile(reconcile: &DevelopReconcile) -> String {
+    match reconcile {
+        DevelopReconcile::InSync => "in sync".to_string(),
+        DevelopReconcile::Ahead(n) => format!("local ahead by {n} (carried by the push)"),
+        DevelopReconcile::FastForwarded(sha) => format!("fast-forwarded to {sha}"),
+        DevelopReconcile::Merged(shas) => format!(
+            "merged {} foreign commit(s): {}",
+            shas.len(),
+            shas.join(" ")
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pure ceremony decisions — version computation, race guard, tag-push action.
 // ---------------------------------------------------------------------------
 
@@ -2455,18 +2610,91 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
             );
         }
     }
+
+    // (i2) Reconcile local develop with origin/develop (KTD1) — runs on
+    // every cut mode, unconditionally, before the back-merge below can land
+    // `main` on a `develop` that is stale relative to origin. A reconcile
+    // merge conflict is distinguished (via ReconcileMergeConflict) from
+    // every other reconcile failure so the R3/KTD5 block below — which
+    // needs `main`/`rel_branch`/`main_before` the pure reconcile fn does
+    // not have — is built here, not inside it.
+    let reconcile = match reconcile_develop_with_origin(repo_root, develop, &tag) {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(ReconcileMergeConflict(why)) = e.downcast_ref::<ReconcileMergeConflict>() {
+                red("RECONCILE CONFLICT — nothing was pushed.");
+                bail!(
+                    "RECONCILE CONFLICT — nothing was pushed.\n\
+                     reconcile: merge of origin/{develop} into {develop} failed ({why}).\n\
+                     State: local {main} has the release merge and tag {tag}; {develop} is \
+                     unchanged (merge aborted); {rel_branch} still exists. Nothing was pushed.\n\
+                     Recover:\n  \
+                     1. git checkout {develop} && git merge --no-ff origin/{develop}   \
+                     # resolve, commit\n  \
+                     2. git merge --no-ff {main}\n  \
+                     3. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} \
+                     {tag}\n  \
+                     4. git branch -d {rel_branch}\n\
+                     Or unwind a fresh cut:\n  \
+                     git tag -d {tag}\n  \
+                     git branch -f {main} {main_before}\n  \
+                     git branch -D {rel_branch}\n  \
+                     then re-run hex release cut\n\
+                     The releaser's develop-sync will push {develop} on its next tick if it \
+                     is strictly ahead of origin, and alert if diverged."
+                );
+            }
+            return Err(e).context("reconciling develop with origin before the back-merge");
+        }
+    };
+    let reconcile_detail = describe_reconcile(&reconcile);
+    green(&format!("  develop-reconcile: {reconcile_detail}"));
+    phases.push(("develop-reconcile", reconcile_detail));
+
     git_stdout(repo_root, &["checkout", "-q", develop])?;
     if let Err(why) = merge_no_ff(repo_root, main, &format!("back-merge: {tag}")) {
         abort_merge(repo_root);
         red("BACK-MERGE CONFLICT — the release is NOT pushed.");
+        // R6a: report what the reconcile actually did to develop instead of
+        // the blanket "is unchanged" — a fast-forward or reconcile merge
+        // may now sit on local develop, unpushed.
+        let develop_state = match &reconcile {
+            DevelopReconcile::InSync | DevelopReconcile::Ahead(_) => {
+                format!("{develop} is unchanged (merge aborted)")
+            }
+            DevelopReconcile::FastForwarded(sha) => {
+                format!("{develop} at {sha}: fast-forwarded to origin (merge aborted)")
+            }
+            DevelopReconcile::Merged(foreign) => format!(
+                "{develop} merged {} foreign commit(s) from origin, unpushed (merge aborted)",
+                foreign.len()
+            ),
+        };
+        // Fresh-cut-only alternative: abandoning the cut entirely must also
+        // reset develop, since the reconcile above may have moved it ahead
+        // of origin (a fast-forward or an unpushed merge commit) — finish
+        // mode never re-cuts, so it never suggests this (R3's "never
+        // --finish while the tag exists" doctrine applies here too).
+        let fresh_cut_unwind = if finish.is_none() {
+            format!(
+                "\nOr unwind a fresh cut:\n  git tag -d {tag}\n  \
+                 git branch -f {main} {main_before}\n  \
+                 git branch -f {develop} origin/{develop}   \
+                 # drops an unpushed reconcile merge, if any\n  \
+                 git branch -D {rel_branch}\n  \
+                 then re-run hex release cut"
+            )
+        } else {
+            String::new()
+        };
         bail!(
             "back-merge of {main} into {develop} failed ({why}).\n\
-             State: local {main} has the release merge and tag {tag}; {develop} is \
-             unchanged (merge aborted); {rel_branch} still exists. Nothing was pushed.\n\
+             State: local {main} has the release merge and tag {tag}; {develop_state}; \
+             {rel_branch} still exists. Nothing was pushed.\n\
              Recover (v1 = operator resolves):\n  \
              1. git checkout {develop} && git merge --no-ff {main}   # resolve, commit\n  \
              2. {RELEASE_PIPELINE_ENV}=1 git push origin {main} {develop} {tag}\n  \
-             3. git branch -d {rel_branch}"
+             3. git branch -d {rel_branch}{fresh_cut_unwind}"
         );
     }
     let develop_sha = rev_parse(repo_root, "HEAD")?;
