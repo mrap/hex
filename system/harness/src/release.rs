@@ -4829,6 +4829,292 @@ match_dir = "boi"
         );
     }
 
+    // -- U1: reconcile origin/develop before the back-merge -------------------------
+    //
+    // Black-box on purpose: every assertion goes through `cut_v`/
+    // `cut_with_profile` plus repo/origin state, never the internal
+    // `reconcile_develop_with_origin`/`DevelopReconcile` names, so these
+    // tests compile and mean the same thing before and after the fix —
+    // red is a real runtime failure, not a missing symbol.
+
+    #[test]
+    fn reconcile_incident_fast_forwards_and_completes() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "foreign.txt", "feat: foreign");
+
+        // Local develop is still exactly at the pin; the gate pushes the
+        // foreign commit to origin/develop mid-battery (R11's incident).
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        cut_v(&repo, &profile, "0.2.0").unwrap();
+
+        // Fast-forward, not a merge: no reconcile merge commit anywhere.
+        let develop_log = git_stdout(&repo, &["log", "--oneline", "develop"]).unwrap();
+        assert!(
+            !develop_log.contains("reconcile: merge"),
+            "got: {develop_log}"
+        );
+        // origin/develop carries the foreign commit and the back-merge, and
+        // descends from origin/main; the tag is on origin.
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: foreign"),
+            "got: {origin_dev_log}"
+        );
+        let origin_main = rev_parse(&origin, "refs/heads/main").unwrap();
+        let origin_dev = rev_parse(&origin, "refs/heads/develop").unwrap();
+        assert!(is_ancestor(&repo, &origin_main, &origin_dev).unwrap());
+        assert_eq!(rev_parse(&origin, "v0.2.0^{commit}").unwrap(), origin_main);
+    }
+
+    #[test]
+    fn reconcile_diverged_creates_merge_commit_and_completes() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let other = second_clone(td.path(), "other");
+
+        // One unpushed local commit becomes part of the pin.
+        git(&repo, &["checkout", "-q", "develop"]);
+        add_commit(&repo, "ours.txt", "feat: ours");
+        git(&repo, &["checkout", "-q", "main"]);
+
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "foreign.txt", "feat: foreign");
+
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        cut_v(&repo, &profile, "0.2.0").unwrap();
+
+        let develop_log = git_stdout(&repo, &["log", "--oneline", "develop"]).unwrap();
+        assert!(
+            develop_log.contains("reconcile: merge origin/develop"),
+            "got: {develop_log}"
+        );
+        assert!(develop_log.contains("feat: ours"), "got: {develop_log}");
+        assert!(develop_log.contains("feat: foreign"), "got: {develop_log}");
+    }
+
+    #[test]
+    fn reconcile_in_sync_makes_no_merge_commit() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        let develop_log = git_stdout(&repo, &["log", "--oneline", "develop"]).unwrap();
+        assert!(
+            !develop_log.contains("reconcile: merge"),
+            "got: {develop_log}"
+        );
+    }
+
+    #[test]
+    fn reconcile_ahead_publishes_local_commit_unchanged() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        git(&repo, &["checkout", "-q", "develop"]);
+        add_commit(&repo, "ours.txt", "feat: ours");
+        git(&repo, &["checkout", "-q", "main"]);
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: ours"),
+            "got: {origin_dev_log}"
+        );
+        assert!(
+            !origin_dev_log.contains("reconcile: merge"),
+            "got: {origin_dev_log}"
+        );
+    }
+
+    #[test]
+    fn reconcile_conflict_aborts_before_any_push() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+
+        // Seed conflict.txt on develop from a shared base so both sides can
+        // edit the same line.
+        git(&repo, &["checkout", "-q", "develop"]);
+        std::fs::write(repo.join("conflict.txt"), "base\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        commit(&repo, "chore: seed conflict.txt");
+        git(&repo, &["push", "-q", "origin", "develop"]);
+
+        let other = second_clone(td.path(), "other");
+
+        // Local edits the line (unpushed) — part of the pin.
+        std::fs::write(repo.join("conflict.txt"), "ours\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        commit(&repo, "feat: ours edits the line");
+        let pre_cut_develop = git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap();
+        git(&repo, &["checkout", "-q", "main"]);
+
+        // Foreign clone edits the SAME line differently, pushed mid-battery.
+        git(&other, &["checkout", "-q", "develop"]);
+        std::fs::write(other.join("conflict.txt"), "theirs\n").unwrap();
+        git(&other, &["add", "-A"]);
+        commit(&other, "feat: theirs edits the line");
+
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        let err = format!("{:#}", cut_v(&repo, &profile, "0.2.0").unwrap_err());
+        assert!(err.contains("RECONCILE CONFLICT"), "got: {err}");
+        assert!(
+            err.contains("git merge --no-ff origin/develop"),
+            "got: {err}"
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert!(ls_remote_sha(&repo, "refs/tags/v0.2.0").unwrap().is_none());
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            pre_cut_develop
+        );
+    }
+
+    #[test]
+    fn reconcile_fast_forward_then_backmerge_conflict_reports_state() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+
+        // Foreign commit edits version.txt so the LATER back-merge (main's
+        // own version.txt bump into the now-fast-forwarded develop)
+        // conflicts on the same line.
+        git(&other, &["checkout", "-q", "develop"]);
+        std::fs::write(other.join("version.txt"), "9.9.9\n").unwrap();
+        git(&other, &["add", "-A"]);
+        commit(&other, "chore: bogus version bump on develop");
+
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        let err = format!("{:#}", cut_v(&repo, &profile, "0.2.0").unwrap_err());
+        assert!(err.contains("fast-forwarded to origin"), "got: {err}");
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert!(ls_remote_sha(&repo, "refs/tags/v0.2.0").unwrap().is_none());
+    }
+
+    #[test]
+    fn reconcile_remote_missing_develop_aborts_before_any_push() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["push", "-q", "origin", "--delete", "develop"]);
+
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+        let repo_develop_before = git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap();
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(err.contains("develop"), "got: {err}");
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            repo_develop_before
+        );
+    }
+
+    #[test]
+    fn reconcile_finish_mode_ahead_publishes_local_commit() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = finish_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        add_commit(&repo, "ours.txt", "feat: ours");
+
+        cut_with_profile(&repo, &ceremony_profile(), &finish_opts("release/0.2.0")).unwrap();
+
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: ours"),
+            "got: {origin_dev_log}"
+        );
+    }
+
+    #[test]
+    fn reconcile_runs_on_hotfix_cut_too() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "foreign.txt", "feat: foreign");
+
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        cut_with_profile(
+            &repo,
+            &profile,
+            &CutOptions {
+                version: Some("0.1.1".to_string()),
+                hotfix: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: foreign"),
+            "got: {origin_dev_log}"
+        );
+    }
+
     // -- develop sync --------------------------------------------------------------
 
     /// A second working clone of the fixture origin — the "someone else
