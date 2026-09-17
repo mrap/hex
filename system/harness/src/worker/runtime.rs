@@ -43,6 +43,18 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delivery is at-most-once; reliability comes from the graceful drain +
 /// shutdown-deferral outbox, not from redelivery (see hex-workers-as-rust-library).
 pub fn serve(workers: Vec<Worker>) -> i32 {
+    // launchd starts us with the macOS default soft limit of 256 open files.
+    // A long-lived daemon holding a ws listener, one kqueue per runtime, and a
+    // socket per in-process SDK client sits near that ceiling even when
+    // nothing leaks (2026-09-17 EMFILE storm). Raise soft → hard up front and
+    // say what we got; a refusal is loud but not fatal.
+    match raise_nofile_soft_limit() {
+        Ok((soft, hard)) => {
+            eprintln!("hex harness serve: RLIMIT_NOFILE soft={soft} hard={hard}")
+        }
+        Err(e) => eprintln!("hex harness serve: WARN could not raise RLIMIT_NOFILE: {e}"),
+    }
+
     // Multi-thread runtime: the engine + SDK both want a full reactor, and
     // handlers run on blocking threads (see the spawn_blocking below).
     let rt = match tokio::runtime::Runtime::new() {
@@ -53,6 +65,45 @@ pub fn serve(workers: Vec<Worker>) -> i32 {
         }
     };
     rt.block_on(run(workers))
+}
+
+/// Raise this process's `RLIMIT_NOFILE` soft limit to its hard limit and
+/// return the resulting `(soft, hard)`. On macOS the hard limit is reported
+/// as `RLIM_INFINITY` while the kernel caps it at `kern.maxfilesperproc`, so
+/// the request is clamped to `OPEN_MAX` (10240, `<sys/syslimits.h>`) there —
+/// asking for more fails with EINVAL. Idempotent: calling it when soft already equals the target is
+/// a no-op that still reports the limits.
+pub fn raise_nofile_soft_limit() -> Result<(u64, u64), String> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable rlimit struct for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(format!("getrlimit: {}", std::io::Error::last_os_error()));
+    }
+    let hard = lim.rlim_max;
+    #[cfg(target_os = "macos")]
+    let target = {
+        const OPEN_MAX: libc::rlim_t = 10240;
+        std::cmp::min(hard, OPEN_MAX)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let target = hard;
+    if lim.rlim_cur < target {
+        lim.rlim_cur = target;
+        // SAFETY: `lim` holds the values read above with only rlim_cur raised
+        // (never above rlim_max), which setrlimit permits for an unprivileged process.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+            return Err(format!(
+                "setrlimit(soft={target}, hard={hard}): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    // `rlim_t` is u64 on macOS/Linux-glibc but not on every libc target.
+    #[allow(clippy::unnecessary_cast)]
+    Ok((lim.rlim_cur as u64, hard as u64))
 }
 
 /// Resolve the durable outbox path: `$HEX_DIR/.hex/harness/outbox.jsonl`,
@@ -646,6 +697,25 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    /// 2026-09-17 EMFILE storm: the harness ran under launchd's 256-fd soft
+    /// limit. After `raise_nofile_soft_limit` the soft limit must be well
+    /// above that (macOS clamps at OPEN_MAX=10240; Linux at the hard limit),
+    /// never below the hard limit's clamp, and a second call is a no-op.
+    #[test]
+    fn raise_nofile_soft_limit_lifts_soft_limit_above_launchd_default() {
+        let (soft, hard) = raise_nofile_soft_limit().expect("raise rlimit");
+        assert!(soft > 256, "soft limit still at launchd default: {soft}");
+        assert!(soft <= hard, "soft {soft} exceeds hard {hard}");
+        let again = raise_nofile_soft_limit().expect("second call");
+        assert_eq!(again, (soft, hard), "must be idempotent");
+        // Proof by running code, not by reading the struct back: open more
+        // than 256 fds at once.
+        let files: Vec<_> = (0..300)
+            .map(|_| std::fs::File::open("/dev/null").expect("open /dev/null"))
+            .collect();
+        assert_eq!(files.len(), 300);
+    }
 
     /// Every listener worker in the default engine config gets its bind host
     /// pinned to loopback (mrap/hex#8 — upstream defaults are 0.0.0.0).
