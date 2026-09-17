@@ -74,7 +74,14 @@ fn report_nofile_limit(result: Result<(u64, u64), String>) {
         }
         Err(e) => {
             eprintln!("hex harness serve: WARN could not raise RLIMIT_NOFILE: {e}");
-            let _ = &e;
+            crate::telemetry::record_loud(&crate::telemetry::TelemetryEvent {
+                source: "harness".into(),
+                event: "rlimit::nofile".into(),
+                status: "error".into(),
+                duration_ms: None,
+                exit_code: None,
+                detail: Some(e),
+            });
         }
     }
 }
