@@ -80,10 +80,19 @@
 //! [`cut`] (`hex release cut`) is the single release verb: exclusive lock →
 //! preconditions → gate battery (`--dry-run` stops here) → version → the
 //! `release/X.Y.Z` (or `hotfix/X.Y.Z`) branch → version bump with
-//! build-failure revert → notes → `--no-ff` merge to main + tag → `--no-ff`
-//! back-merge to develop → race guard → hardened pushes (every push carries
-//! `HEX_RELEASE_PIPELINE=1`) → optional GitHub release → cleanup → summary.
-//! Fully non-interactive; exit 0 only on full success.
+//! build-failure revert → notes → `--no-ff` merge to main + tag → race guard
+//! (fresh cut: local develop unmoved) → fetch + reconcile `origin/develop`
+//! into local develop (fast-forward when behind, `--no-ff` merge when
+//! diverged, abort before any push on conflict) → `--no-ff` back-merge to
+//! develop → consistency check → ONE atomic push of main, the tag, and
+//! develop (`git push --atomic`, carrying `HEX_RELEASE_PIPELINE=1`; origin
+//! holds all three or none; a develop non-fast-forward rejection gets one
+//! reconcile-and-retry; a failure origin did not confirm is verified against
+//! origin, never assumed) → independent three-state post-push verify (a
+//! mismatch prints a `PUBLISH STATE` block naming what origin holds, or that
+//! it could not be asked) → optional GitHub release (only with the tag on
+//! origin at the expected commit) → cleanup → summary. Fully non-interactive;
+//! exit 0 only on full success.
 //!
 //! ### Finish mode (`--finish release/X.Y.Z` | `--finish hotfix/X.Y.Z`)
 //!
@@ -1760,8 +1769,10 @@ fn push_ref(repo_root: &Path, refspec: &str) -> Result<()> {
     }
 }
 
-/// Independent post-push verify: origin's branch SHA must equal the local
-/// one (a 0 exit from `git push` is not proof on its own).
+/// Independent post-push verify for the base-branch watcher: origin's
+/// branch SHA must equal the local one (a 0 exit from `git push` is not
+/// proof on its own). The cut ceremony uses [`ref_on_origin`] instead,
+/// because it must tell "absent" apart from "could not ask".
 fn verify_pushed(repo_root: &Path, branch: &str, expected_sha: &str) -> Result<()> {
     match ls_remote_sha(repo_root, &format!("refs/heads/{branch}"))?.as_deref() {
         Some(sha) if sha == expected_sha => Ok(()),
@@ -1770,6 +1781,205 @@ fn verify_pushed(repo_root: &Path, branch: &str, expected_sha: &str) -> Result<(
              {expected_sha} — release ABORTED",
             other.unwrap_or("<absent>")
         ),
+    }
+}
+
+/// What one `ls-remote` observed for a ref during the ceremony's post-push
+/// verification (KTD6). Three states, not two: a transport or auth error
+/// while asking is NOT evidence that the ref is absent (review #6) — the
+/// PUBLISH STATE block and its exit hint treat `Unknown` as "go look",
+/// never as "push it again".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RefOnOrigin {
+    /// origin holds the ref at this sha (which may or may not be the one
+    /// the ceremony expected — the caller compares).
+    At(String),
+    /// origin answered and does not have the ref.
+    Absent,
+    /// origin could not be asked; carries the error text.
+    Unknown(String),
+}
+
+impl RefOnOrigin {
+    fn is_at(&self, expected: &str) -> bool {
+        matches!(self, RefOnOrigin::At(sha) if sha == expected)
+    }
+}
+
+/// One `ls-remote` for `refname`, folded into a [`RefOnOrigin`].
+fn ref_on_origin(repo_root: &Path, refname: &str) -> RefOnOrigin {
+    match ls_remote_sha(repo_root, refname) {
+        Ok(Some(sha)) => RefOnOrigin::At(sha),
+        Ok(None) => RefOnOrigin::Absent,
+        Err(e) => RefOnOrigin::Unknown(format!("{e:#}")),
+    }
+}
+
+/// One line of the PUBLISH STATE block for `name`, given what origin holds
+/// and what the ceremony expected.
+fn publish_state_line(name: &str, state: &RefOnOrigin, expected: &str) -> String {
+    match state {
+        RefOnOrigin::At(sha) if sha == expected => format!("{name}: on origin at {sha}"),
+        RefOnOrigin::At(sha) => format!("{name}: on origin at {sha} (expected {expected})"),
+        RefOnOrigin::Absent => format!("{name}: not on origin"),
+        RefOnOrigin::Unknown(err) => format!("{name}: could not verify ({err})"),
+    }
+}
+
+/// The exit hint under a PUBLISH STATE block: a push for refs origin
+/// confirmed absent, an `ls-remote` for refs it could not confirm either
+/// way, and the plain verification text when everything is present but
+/// not where expected. `entries` are `(name, state, expected sha)`.
+fn publish_state_hint(entries: &[(&str, &RefOnOrigin, &str)]) -> String {
+    let missing: Vec<&str> = entries
+        .iter()
+        .filter(|(_, st, _)| matches!(st, RefOnOrigin::Absent))
+        .map(|(n, _, _)| *n)
+        .collect();
+    let unknown: Vec<&str> = entries
+        .iter()
+        .filter(|(_, st, _)| matches!(st, RefOnOrigin::Unknown(_)))
+        .map(|(n, _, _)| *n)
+        .collect();
+    let mut lines = Vec::new();
+    if !missing.is_empty() {
+        lines.push(format!(
+            "{RELEASE_PIPELINE_ENV}=1 git push origin {}",
+            missing.join(" ")
+        ));
+    }
+    if !unknown.is_empty() {
+        lines.push(format!(
+            "could not verify {}; check with: git ls-remote origin {}",
+            unknown.join(", "),
+            unknown.join(" ")
+        ));
+    }
+    if lines.is_empty() {
+        let divergent: Vec<String> = entries
+            .iter()
+            .filter(|(_, st, exp)| !st.is_at(exp))
+            .map(|(n, st, exp)| publish_state_line(n, st, exp))
+            .collect();
+        lines.push(format!(
+            "all refs on origin; only verification failed: {}",
+            divergent.join("; ")
+        ));
+    }
+    lines.join("\n")
+}
+
+/// One atomic push of `refspecs` (KTD3) — origin accepts all of `main`, the
+/// tag, and `develop`, or none. Same env contract as [`push_ref`] (every
+/// push carries `RELEASE_PIPELINE_ENV`, including the tag). Unlike
+/// `push_ref`, a rejection is NOT an error here — the caller (the only one
+/// who knows about the KTD4 retry and the KTD6 publish-state report)
+/// classifies the exit code and stderr; only a spawn failure is a hard
+/// `Err`.
+fn push_atomic(repo_root: &Path, refspecs: &[String]) -> Result<RunResult> {
+    println!("  Pushing (atomic): {}...", refspecs.join(", "));
+    let mut cmd = Command::new("git");
+    cmd.arg("push").arg("--atomic").arg("origin");
+    cmd.args(refspecs);
+    cmd.current_dir(repo_root).env(RELEASE_PIPELINE_ENV, "1");
+    run_checked("git push --atomic origin ...", &mut cmd).map_err(|msg| anyhow::anyhow!(msg))
+}
+
+/// Refspecs for [`push_atomic`] (KTD3): `main`, then the tag (unless
+/// `action` is [`TagPushAction::SkipAlreadyOnOrigin`] — it is already on
+/// origin at the same commit, so re-sending it would be pure overhead),
+/// then `develop`. [`TagPushAction::RefuseDivergent`] never reaches this
+/// function — the caller bails before assembling refspecs.
+fn atomic_refspecs(
+    main: &str,
+    develop: &str,
+    tag_ref: &str,
+    action: &TagPushAction,
+) -> Vec<String> {
+    let mut refspecs = vec![main.to_string()];
+    if !matches!(action, TagPushAction::SkipAlreadyOnOrigin) {
+        refspecs.push(tag_ref.to_string());
+    }
+    refspecs.push(develop.to_string());
+    refspecs
+}
+
+/// True iff `stderr` from a rejected [`push_atomic`] names `develop`
+/// specifically as the ref that failed — the only case KTD4 retries. Two
+/// shapes of git output both name the true culprit ref, and BOTH must be
+/// checked because which one appears depends on timing, not on the
+/// underlying cause:
+///
+/// - Client-side preflight (the remote's advertised state already showed
+///   the conflict before any pack was sent): `! [rejected]        develop
+///   -> develop (fetch first)` — develop's own line carries the real
+///   reason; sibling refs get `(atomic push failed)`.
+/// - Server-side atomic-transaction failure (the race landed on origin
+///   AFTER negotiation but before the ref update — exactly the window a
+///   pre-push hook can race into): every ref in the batch gets an
+///   identical, uninformative `! [remote rejected] <ref> -> <ref> (atomic
+///   transaction failed)` line, so the real culprit is only named in git's
+///   `remote: error: cannot lock ref '<full ref>': ...` line.
+///
+/// A rejection for `main` or the tag, or a transport-level refusal such as
+/// "the receiving end does not support --atomic" (which never names a
+/// ref), matches neither shape and falls through to the immediate KTD5
+/// abort instead of retrying.
+fn develop_push_rejected(stderr: &str, develop: &str) -> bool {
+    let bracket_marker = format!("{develop} -> {develop}");
+    let lock_marker = format!("cannot lock ref 'refs/heads/{develop}'");
+    stderr.lines().any(|line| {
+        (line.contains("[rejected]")
+            && line.contains(&bracket_marker)
+            // A sibling line: git prints one for EVERY ref in the batch
+            // when another ref is the culprit (review #5).
+            && !line.contains("(atomic push failed)"))
+            || line.contains(&lock_marker)
+    })
+}
+
+/// What one [`push_atomic`] attempt tells the ceremony (review #2).
+#[derive(Debug)]
+enum PushOutcome {
+    /// git exited 0. Origin's state is still verified independently.
+    Accepted,
+    /// origin refused the transaction and named `develop` as the culprit —
+    /// the only shape KTD4 retries.
+    DevelopRejected(String),
+    /// origin refused the transaction for another reason (main or the tag
+    /// moved, a hook, an `--atomic`-incapable server). Under `--atomic`
+    /// a refusal means nothing moved.
+    Rejected(String),
+    /// git failed without a refusal from origin: spawn error, signal,
+    /// connection lost after send, a client-side hook. Origin may or may
+    /// not hold the refs — the ceremony must ask, never assume.
+    Unknown(String),
+}
+
+/// Classify a [`push_atomic`] result. A refusal is only "confirmed" when
+/// origin's own rejection lines are present; everything else is
+/// [`PushOutcome::Unknown`] and gets verified against origin.
+fn classify_push_outcome(result: Result<RunResult>, develop: &str) -> PushOutcome {
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => return PushOutcome::Unknown(format!("{e:#}")),
+    };
+    if result.code == 0 {
+        return PushOutcome::Accepted;
+    }
+    let stderr = result.stderr.trim().to_string();
+    if develop_push_rejected(&stderr, develop) {
+        return PushOutcome::DevelopRejected(stderr);
+    }
+    let confirmed = stderr.lines().any(|line| {
+        line.contains("[rejected]")
+            || line.contains("[remote rejected]")
+            || line.contains("does not support --atomic")
+    });
+    if confirmed {
+        PushOutcome::Rejected(stderr)
+    } else {
+        PushOutcome::Unknown(stderr)
     }
 }
 
@@ -1810,6 +2020,27 @@ fn classify_develop_sync(
             (true, true) => DevelopSyncClass::Diverged,
         },
     }
+}
+
+/// [`classify_develop_sync`] for the common case: both SHAs already
+/// resolved (`origin` is known, i.e. never the `RemoteMissing` case), only
+/// the two ancestry checks remain. Runs the two `is_ancestor` calls against
+/// the repo and classifies the result — shared by [`sync_develop_to_origin`]
+/// and [`reconcile_develop_with_origin`], which each resolve `local` and
+/// `origin` their own way (base-branch watch vs. cut-ceremony reconcile).
+fn classify_against_origin(
+    repo_root: &Path,
+    local: &str,
+    origin: &str,
+) -> Result<DevelopSyncClass> {
+    let origin_anc = is_ancestor(repo_root, origin, local)?;
+    let local_anc = is_ancestor(repo_root, local, origin)?;
+    Ok(classify_develop_sync(
+        local,
+        Some(origin),
+        origin_anc,
+        local_anc,
+    ))
 }
 
 /// What one develop-sync pass did (or refused to do).
@@ -1870,9 +2101,7 @@ pub fn sync_develop_to_origin(repo_root: &Path, develop: &str) -> Result<Develop
         }
     }
 
-    let origin_anc = is_ancestor(repo_root, &origin, &local)?;
-    let local_anc = is_ancestor(repo_root, &local, &origin)?;
-    match classify_develop_sync(&local, Some(&origin), origin_anc, local_anc) {
+    match classify_against_origin(repo_root, &local, &origin)? {
         DevelopSyncClass::Ahead => {
             push_ref(repo_root, develop)?;
             verify_pushed(repo_root, develop, &local)?;
@@ -1887,6 +2116,257 @@ pub fn sync_develop_to_origin(repo_root: &Path, develop: &str) -> Result<Develop
         // consistently rather than panic if the impossible happens.
         DevelopSyncClass::InSync => Ok(DevelopSyncOutcome::InSync),
         DevelopSyncClass::RemoteMissing => Ok(DevelopSyncOutcome::RemoteMissing { local }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cut-ceremony develop reconcile — runs unconditionally before the
+// back-merge (KTD1) so the develop push can never be rejected because
+// origin moved during the gate battery.
+// ---------------------------------------------------------------------------
+
+/// What [`reconcile_develop_with_origin`] did to local `develop` before the
+/// back-merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DevelopReconcile {
+    /// origin equals local — nothing to do.
+    InSync,
+    /// Local is strictly ahead of origin by `n` commits — nothing to
+    /// reconcile; those commits are carried by the ceremony's own push.
+    Ahead(usize),
+    /// Local was behind; fast-forwarded to origin's head. Carries the short
+    /// sha it was fast-forwarded to.
+    FastForwarded(String),
+    /// Local and origin had each diverged; merged with a no-ff commit.
+    /// Carries the short shas (oldest first) of the foreign commits that
+    /// came from origin.
+    Merged(Vec<String>),
+}
+
+/// Marker error for "the reconcile's own merge conflicted", kept distinct
+/// from every other reconcile failure (missing branch, network/fetch error)
+/// so the caller — which alone knows `main`, `rel_branch`, and
+/// `main_before` — can build the full R3/KTD5 recovery block. Downcast with
+/// [`anyhow::Error::downcast_ref`].
+#[derive(Debug)]
+struct ReconcileMergeConflict(String);
+
+impl fmt::Display for ReconcileMergeConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ReconcileMergeConflict {}
+
+/// Reconcile local `develop` with `origin/develop` before the back-merge
+/// (KTD1). Runs on every cut mode (fresh, hotfix, finish) — never a
+/// rebase, reset, or force.
+///
+/// Order (KTD2): `ls-remote` first — a missing `origin/develop` aborts here
+/// (R4) before anything is touched; the ceremony never creates a base
+/// branch on origin. Then `git fetch --quiet origin <develop>` (objects
+/// plus `refs/remotes/origin/<develop>` only, never a local branch write).
+/// Classification uses the local ref, the FETCHED remote-tracking ref
+/// (never a fresh `ls-remote` sha, whose objects may still be absent
+/// locally), and ancestry both ways. `Behind` fast-forwards `develop`
+/// in place; `Diverged` merges `origin/<develop>` into `develop` with
+/// `--no-ff`, aborting the merge on conflict and returning it as a
+/// [`ReconcileMergeConflict`] (never a rebase/reset/force).
+fn reconcile_develop_with_origin(
+    repo_root: &Path,
+    develop: &str,
+    tag: &str,
+) -> Result<DevelopReconcile> {
+    let branch_ref = format!("refs/heads/{develop}");
+    if ls_remote_sha(repo_root, &branch_ref)
+        .with_context(|| format!("checking origin for {develop} before the back-merge"))?
+        .is_none()
+    {
+        bail!(
+            "origin/{develop} does not exist (`git ls-remote origin {develop}` returned \
+             nothing) — the ceremony never creates a base branch on origin. Bootstrap it \
+             first, then re-run:\n  git push origin {develop}"
+        );
+    }
+
+    git_stdout(repo_root, &["fetch", "--quiet", "origin", develop])
+        .with_context(|| format!("fetching origin/{develop} for the reconcile"))?;
+
+    let local = rev_parse(repo_root, &branch_ref)?;
+    let origin_tracking_ref = format!("refs/remotes/origin/{develop}");
+    let origin = rev_parse(repo_root, &origin_tracking_ref)
+        .with_context(|| format!("resolving {origin_tracking_ref} after the fetch"))?;
+
+    if origin == local {
+        return Ok(DevelopReconcile::InSync);
+    }
+
+    match classify_against_origin(repo_root, &local, &origin)? {
+        DevelopSyncClass::InSync => Ok(DevelopReconcile::InSync),
+        DevelopSyncClass::Ahead => {
+            let n = git_stdout(
+                repo_root,
+                &["rev-list", "--count", &format!("{origin}..{local}")],
+            )?
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("parsing `git rev-list --count {origin}..{local}`"))?;
+            Ok(DevelopReconcile::Ahead(n))
+        }
+        DevelopSyncClass::Behind => {
+            git_stdout(repo_root, &["checkout", "-q", develop])
+                .with_context(|| format!("checking out {develop} to fast-forward it"))?;
+            git_stdout(repo_root, &["merge", "--ff-only", &origin_tracking_ref])
+                .with_context(|| format!("fast-forwarding {develop} to {origin_tracking_ref}"))?;
+            Ok(DevelopReconcile::FastForwarded(
+                short_sha(&origin).to_string(),
+            ))
+        }
+        DevelopSyncClass::Diverged => {
+            // Collected BEFORE merging, per KTD2/plan step 2.
+            let foreign = git_stdout(
+                repo_root,
+                &[
+                    "rev-list",
+                    "--abbrev-commit",
+                    &format!("{develop}..{origin_tracking_ref}"),
+                ],
+            )?
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            git_stdout(repo_root, &["checkout", "-q", develop])
+                .with_context(|| format!("checking out {develop} to reconcile it"))?;
+            if let Err(why) = merge_no_ff(
+                repo_root,
+                &origin_tracking_ref,
+                &format!("reconcile: merge origin/{develop} into {develop} for {tag}"),
+            ) {
+                abort_merge(repo_root);
+                return Err(anyhow::Error::new(ReconcileMergeConflict(why)));
+            }
+            Ok(DevelopReconcile::Merged(foreign))
+        }
+        DevelopSyncClass::RemoteMissing => {
+            // Unreachable: `origin` above is a resolved sha (the ls-remote
+            // check at the top already ruled this out) — answered rather
+            // than panicked, consistent with `sync_develop_to_origin`.
+            bail!("origin/{develop} vanished between the ls-remote check and the fetch")
+        }
+    }
+}
+
+/// Everything the ceremony's abort messages need to describe local state
+/// and the by-hand recovery: the branch names, the tag, and the two
+/// pre-ceremony shas the fresh-cut unwind resets to.
+#[derive(Clone, Copy)]
+struct RecoveryContext<'a> {
+    main: &'a str,
+    develop: &'a str,
+    tag: &'a str,
+    rel_branch: &'a str,
+    main_before: &'a str,
+    develop_before: &'a str,
+}
+
+/// The shared "Recover" + "Or unwind a fresh cut" + develop-sync-sentence
+/// tail, common to the RECONCILE CONFLICT message (KTD5) and the atomic-push
+/// "nothing was pushed" bails: all leave main with the merge and tag,
+/// develop unpushed (untouched, reconciled, or carrying the back-merge —
+/// the caller's `State:` line says which), and the release branch in
+/// place, and recover the same way. The unwind resets develop to
+/// `develop_before` (its sha before the ceremony's reconcile), which drops
+/// the reconcile merge and the back-merge but keeps local-ahead commits
+/// (review #7).
+fn recovery_tail(ctx: &RecoveryContext<'_>) -> String {
+    let RecoveryContext {
+        main,
+        develop,
+        tag,
+        rel_branch,
+        main_before,
+        develop_before,
+    } = *ctx;
+    format!(
+        "Recover:\n  \
+         1. git checkout {develop} && git merge --no-ff origin/{develop}   \
+         # resolve, commit\n  \
+         2. git merge --no-ff {main}\n  \
+         3. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} \
+         {tag}\n  \
+         4. git branch -d {rel_branch}\n\
+         Or unwind a fresh cut:\n  \
+         git tag -d {tag}\n  \
+         git branch -f {main} {main_before}\n  \
+         git branch -f {develop} {develop_before}   \
+         # drops the reconcile/back-merge commits, keeps local-ahead ones\n  \
+         git branch -D {rel_branch}\n  \
+         then re-run hex release cut\n\
+         The releaser's develop-sync will push {develop} on its next tick if it \
+         is strictly ahead of origin, and alert if diverged."
+    )
+}
+
+/// The RECONCILE CONFLICT recovery block (KTD5), shared by the pre-back-merge
+/// reconcile call and its post-atomic-push-rejection retry (U2 KTD4): both
+/// abort with `git merge --abort` already run. `develop_state` is the
+/// caller's truthful description of local develop at that point — untouched
+/// before the back-merge, carrying the back-merge at the retry site
+/// (review #7).
+fn reconcile_conflict_message(ctx: &RecoveryContext<'_>, develop_state: &str, why: &str) -> String {
+    let RecoveryContext {
+        main,
+        develop,
+        tag,
+        rel_branch,
+        ..
+    } = *ctx;
+    format!(
+        "RECONCILE CONFLICT — nothing was pushed.\n\
+         reconcile: merge of origin/{develop} into {develop} failed ({why}).\n\
+         State: local {main} has the release merge and tag {tag}; {develop_state}; \
+         {rel_branch} still exists. Nothing was pushed.\n\
+         {}",
+        recovery_tail(ctx)
+    )
+}
+
+/// Run a develop-reconcile `result` and turn its error, if any, into the
+/// right bail: a [`ReconcileMergeConflict`] becomes the KTD5 RECONCILE
+/// CONFLICT message (with the loud line printed first), anything else gets
+/// `context` attached. Shared by the pre-back-merge reconcile call and its
+/// post-atomic-push-rejection retry; each keeps its own phase labels, log
+/// lines, and `context` string around this call.
+fn reconcile_or_bail(
+    result: Result<DevelopReconcile>,
+    ctx: &RecoveryContext<'_>,
+    develop_state: &str,
+    context: &str,
+) -> Result<DevelopReconcile> {
+    match result {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if let Some(ReconcileMergeConflict(why)) = e.downcast_ref::<ReconcileMergeConflict>() {
+                red("RECONCILE CONFLICT — nothing was pushed.");
+                bail!(reconcile_conflict_message(ctx, develop_state, why));
+            }
+            Err(e).context(context.to_string())
+        }
+    }
+}
+
+/// One-line phase text for a [`DevelopReconcile`] outcome (R5).
+fn describe_reconcile(reconcile: &DevelopReconcile) -> String {
+    match reconcile {
+        DevelopReconcile::InSync => "in sync".to_string(),
+        DevelopReconcile::Ahead(n) => format!("local ahead by {n} (carried by the push)"),
+        DevelopReconcile::FastForwarded(sha) => format!("fast-forwarded to {sha}"),
+        DevelopReconcile::Merged(shas) => format!(
+            "merged {} foreign commit(s): {}",
+            shas.len(),
+            shas.join(" ")
+        ),
     }
 }
 
@@ -2455,21 +2935,80 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
             );
         }
     }
+
+    // (i2) Reconcile local develop with origin/develop (KTD1) — runs on
+    // every cut mode, unconditionally, before the back-merge below can land
+    // `main` on a `develop` that is stale relative to origin. A reconcile
+    // merge conflict is distinguished (via ReconcileMergeConflict) from
+    // every other reconcile failure so the R3/KTD5 block below — which
+    // needs `main`/`rel_branch`/`main_before` the pure reconcile fn does
+    // not have — is built here, not inside it.
+    let develop_before = rev_parse(repo_root, &format!("refs/heads/{develop}"))?;
+    let recovery = RecoveryContext {
+        main,
+        develop,
+        tag: &tag,
+        rel_branch: &rel_branch,
+        main_before: &main_before,
+        develop_before: &develop_before,
+    };
+    let reconcile = reconcile_or_bail(
+        reconcile_develop_with_origin(repo_root, develop, &tag),
+        &recovery,
+        &format!("{develop} is unchanged (merge aborted)"),
+        "reconciling develop with origin before the back-merge",
+    )?;
+    let reconcile_detail = describe_reconcile(&reconcile);
+    green(&format!("  develop-reconcile: {reconcile_detail}"));
+    phases.push(("develop-reconcile", reconcile_detail));
+
     git_stdout(repo_root, &["checkout", "-q", develop])?;
     if let Err(why) = merge_no_ff(repo_root, main, &format!("back-merge: {tag}")) {
         abort_merge(repo_root);
         red("BACK-MERGE CONFLICT — the release is NOT pushed.");
+        // R6a: report what the reconcile actually did to develop instead of
+        // the blanket "is unchanged" — a fast-forward or reconcile merge
+        // may now sit on local develop, unpushed.
+        let develop_state = match &reconcile {
+            DevelopReconcile::InSync | DevelopReconcile::Ahead(_) => {
+                format!("{develop} is unchanged (merge aborted)")
+            }
+            DevelopReconcile::FastForwarded(sha) => {
+                format!("{develop} at {sha}: fast-forwarded to origin (merge aborted)")
+            }
+            DevelopReconcile::Merged(foreign) => format!(
+                "{develop} merged {} foreign commit(s) from origin, unpushed (merge aborted)",
+                foreign.len()
+            ),
+        };
+        // Fresh-cut-only alternative: abandoning the cut entirely must also
+        // reset develop, since the reconcile above may have moved it ahead
+        // of origin (a fast-forward or an unpushed merge commit) — finish
+        // mode never re-cuts, so it never suggests this (R3's "never
+        // --finish while the tag exists" doctrine applies here too).
+        let fresh_cut_unwind = if finish.is_none() {
+            format!(
+                "\nOr unwind a fresh cut:\n  git tag -d {tag}\n  \
+                 git branch -f {main} {main_before}\n  \
+                 git branch -f {develop} {develop_before}   \
+                 # drops an unpushed reconcile merge, keeps local-ahead commits\n  \
+                 git branch -D {rel_branch}\n  \
+                 then re-run hex release cut"
+            )
+        } else {
+            String::new()
+        };
         bail!(
             "back-merge of {main} into {develop} failed ({why}).\n\
-             State: local {main} has the release merge and tag {tag}; {develop} is \
-             unchanged (merge aborted); {rel_branch} still exists. Nothing was pushed.\n\
+             State: local {main} has the release merge and tag {tag}; {develop_state}; \
+             {rel_branch} still exists. Nothing was pushed.\n\
              Recover (v1 = operator resolves):\n  \
              1. git checkout {develop} && git merge --no-ff {main}   # resolve, commit\n  \
-             2. {RELEASE_PIPELINE_ENV}=1 git push origin {main} {develop} {tag}\n  \
-             3. git branch -d {rel_branch}"
+             2. {RELEASE_PIPELINE_ENV}=1 git push --atomic origin {main} {develop} {tag}\n  \
+             3. git branch -d {rel_branch}{fresh_cut_unwind}"
         );
     }
-    let develop_sha = rev_parse(repo_root, "HEAD")?;
+    let mut develop_sha = rev_parse(repo_root, "HEAD")?;
     phases.push((
         "back-merge",
         format!("{main} → {develop} @ {}", short_sha(&develop_sha)),
@@ -2497,56 +3036,228 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
         format!("ok — {main}, {develop}, and {tag} mutually consistent"),
     ));
 
-    // (k) Hardened pushes — every push carries HEX_RELEASE_PIPELINE=1;
-    // independent post-push ls-remote verify for both branches.
-    bold("Pushing...");
-    push_ref(repo_root, main)?;
-    verify_pushed(repo_root, main, &main_sha)?;
-    push_ref(repo_root, develop)?;
-    verify_pushed(repo_root, develop, &develop_sha)?;
+    // (k) Atomic push (KTD3): main, the tag, and develop land together or
+    // not at all — the two partial states the old sequential order allowed
+    // (main without tag; main+tag without develop) cannot occur. A
+    // rejection naming develop specifically (origin moved again between
+    // the reconcile above and this push) gets ONE retry: reconcile once
+    // more, then push once more (KTD4). Any other CONFIRMED rejection, or a
+    // second one, aborts with nothing on origin (R8). A failure origin did
+    // not confirm (spawn error, signal, connection lost after send, a
+    // client-side hook) is an UNKNOWN outcome: the ceremony falls through
+    // to the verification below and lets origin say what it holds
+    // (review #2) instead of claiming "nothing was pushed".
+    bold("Pushing (atomic)...");
     let tag_ref = format!("refs/tags/{tag}");
-    let tag_phase = match tag_push_action(&tag_sha, ls_remote_sha(repo_root, &tag_ref)?.as_deref())
-    {
-        TagPushAction::Push => {
-            push_ref(repo_root, &tag_ref)?;
-            // Independent verify for the tag too — same S6 doctrine.
-            match ls_remote_sha(repo_root, &tag_ref)?.as_deref() {
-                Some(sha) if sha == tag_sha => {}
-                other => bail!(
-                    "SHA MISMATCH after tag push: origin {tag} is {} but expected {tag_sha}",
-                    other.unwrap_or("<absent>")
-                ),
+    let develop_pushed_state = format!("{develop} carries the back-merge of {main}, unpushed");
+    let mut retried = false;
+    let (tag_action, unconfirmed, origin_before) = loop {
+        let remote_tag = ls_remote_sha(repo_root, &tag_ref)?;
+        let tag_action = tag_push_action(&tag_sha, remote_tag.as_deref());
+        if let TagPushAction::RefuseDivergent { remote_sha } = &tag_action {
+            bail!(
+                "tag {tag} on origin points to {}, not {} — refusing to overwrite a \
+                 divergent remote tag",
+                short_sha(remote_sha),
+                short_sha(&tag_sha)
+            );
+        }
+        let refspecs = atomic_refspecs(main, develop, &tag_ref, &tag_action);
+        // What origin holds right before this attempt — the baseline an
+        // unknown outcome is verified against ("nothing moved" is a claim
+        // about these, not about absence: main and develop always exist on
+        // origin).
+        let origin_before = [
+            ref_on_origin(repo_root, &format!("refs/heads/{main}")),
+            remote_tag.map_or(RefOnOrigin::Absent, RefOnOrigin::At),
+            ref_on_origin(repo_root, &format!("refs/heads/{develop}")),
+        ];
+        let stderr = match classify_push_outcome(push_atomic(repo_root, &refspecs), develop) {
+            PushOutcome::Accepted => break (tag_action, None, origin_before),
+            PushOutcome::Unknown(detail) => {
+                red(&format!(
+                    "PUSH OUTCOME UNKNOWN — git failed without a refusal from origin; \
+                     checking what origin holds...\n{detail}"
+                ));
+                break (tag_action, Some(detail), origin_before);
             }
-            format!("{tag} pushed")
-        }
-        TagPushAction::SkipAlreadyOnOrigin => {
-            green(&format!(
-                "  Tag {tag} already on origin at the same commit ✓ (idempotent skip)"
-            ));
-            format!("{tag} already on origin")
-        }
-        TagPushAction::RefuseDivergent { remote_sha } => bail!(
-            "tag {tag} on origin points to {}, not {} — refusing to overwrite a \
-             divergent remote tag",
-            short_sha(&remote_sha),
-            short_sha(&tag_sha)
-        ),
+            PushOutcome::DevelopRejected(stderr) if !retried => {
+                red(&format!(
+                    "PUSH REJECTED — origin/{develop} moved again; reconciling once more \
+                     and retrying the atomic push...\n{stderr}"
+                ));
+                let r = reconcile_or_bail(
+                    reconcile_develop_with_origin(repo_root, develop, &tag),
+                    &recovery,
+                    &format!("{develop_pushed_state} (retry merge aborted)"),
+                    "reconciling develop with origin before the atomic push retry",
+                )?;
+                let detail = describe_reconcile(&r);
+                green(&format!("  develop-reconcile (retry): {detail}"));
+                phases.push(("develop-reconcile-retry", detail));
+                develop_sha = rev_parse(repo_root, &format!("refs/heads/{develop}"))?;
+                retried = true;
+                continue;
+            }
+            PushOutcome::DevelopRejected(stderr) | PushOutcome::Rejected(stderr) => stderr,
+        };
+
+        bail!(
+            "PUSH REJECTED — nothing was pushed (atomic).\n{stderr}\n\
+             State: local {main} has the release merge and tag {tag}; \
+             {develop_pushed_state}; {rel_branch} still exists. Nothing was pushed.\n\
+             {}",
+            recovery_tail(&recovery)
+        );
     };
-    green(&format!("  Pushed {main} + {develop} — SHAs verified ✓"));
-    phases.push(("push", format!("{main} + {develop} verified; {tag_phase}")));
+
+    // Independent post-push verify (S6: a 0 exit from `git push` is not
+    // proof on its own, and a non-zero one is not proof of failure) —
+    // all three refs by ls-remote, each folded into a three-state
+    // RefOnOrigin so "could not ask" is never rendered as "absent"
+    // (review #6).
+    let main_state = ref_on_origin(repo_root, &format!("refs/heads/{main}"));
+    let tag_state = ref_on_origin(repo_root, &tag_ref);
+    let develop_state = ref_on_origin(repo_root, &format!("refs/heads/{develop}"));
+    let all_verified = main_state.is_at(&main_sha)
+        && tag_state.is_at(&tag_sha)
+        && develop_state.is_at(&develop_sha);
+
+    if !all_verified {
+        let entries = [
+            (main, &main_state, main_sha.as_str()),
+            (tag.as_str(), &tag_state, tag_sha.as_str()),
+            (develop, &develop_state, develop_sha.as_str()),
+        ];
+        let nothing_moved = entries
+            .iter()
+            .zip(origin_before.iter())
+            .all(|((_, now, _), before)| !matches!(now, RefOnOrigin::Unknown(_)) && *now == before);
+        if let (Some(detail), true) = (&unconfirmed, nothing_moved) {
+            // The unknown outcome resolved: origin confirms every ref is
+            // exactly where it was before the attempt — a verified
+            // "nothing was pushed", same local state and recovery as a
+            // confirmed rejection.
+            red("PUSH FAILED — nothing was pushed (verified against origin).");
+            bail!(
+                "PUSH FAILED — nothing was pushed (verified: origin still holds \
+                 {main}, {tag}, and {develop} exactly as before the push).\n{detail}\n\
+                 State: local {main} has the release merge and tag {tag}; \
+                 {develop_pushed_state}; {rel_branch} still exists. Nothing was pushed.\n\
+                 {}",
+                recovery_tail(&recovery)
+            );
+        }
+
+        // KTD6: origin holds some, all-but-misplaced, or unverifiable refs
+        // — the only genuinely uncertain outcome. Print exactly what origin
+        // said per ref, run the GitHub release step only if the tag is on
+        // origin AT THE EXPECTED COMMIT (review #3: a moved tag is not a
+        // releasable tag), run cleanup, print the summary, THEN bail —
+        // none of that is optional just because the ceremony is about to
+        // fail (S6).
+        red("PUSH VERIFY FAILED — publish state uncertain.");
+        let publish_state = format!(
+            "PUBLISH STATE:\n  {}\n  {}\n  {}",
+            publish_state_line(main, &main_state, &main_sha),
+            publish_state_line(&tag, &tag_state, &tag_sha),
+            publish_state_line(develop, &develop_state, &develop_sha),
+        );
+        let hint = publish_state_hint(&entries);
+        phases.push((
+            "push",
+            match &unconfirmed {
+                Some(_) => "OUTCOME UNKNOWN, VERIFY FAILED — see PUBLISH STATE below".to_string(),
+                None => "VERIFY FAILED — see PUBLISH STATE below".to_string(),
+            },
+        ));
+        let gh_phase = run_gh_release(
+            profile,
+            repo_root,
+            &tag,
+            &notes_path,
+            tag_state.is_at(&tag_sha),
+        );
+        phases.push(("gh-release", gh_phase.clone()));
+        let cleanup = run_cleanup(repo_root, &rel_branch);
+        phases.push(("cleanup", cleanup.join("; ")));
+        bold(&format!("═══ Release UNCERTAIN: {tag} ═══"));
+        print_phase_summary(&phases);
+        let unknown_note = unconfirmed
+            .as_deref()
+            .map(|d| format!("push reported failure: {d}\n"))
+            .unwrap_or_default();
+        bail!("{unknown_note}{publish_state}\n{hint}\nGitHub release: {gh_phase}");
+    }
+
+    let retry_note = match (retried, &unconfirmed) {
+        (true, _) => format!(" (atomic, 1 retry after origin/{develop} moved)"),
+        (false, Some(_)) => {
+            " (atomic; git reported failure, but origin holds all three refs)".to_string()
+        }
+        (false, None) => " (atomic)".to_string(),
+    };
+    let tag_note = match &tag_action {
+        TagPushAction::Push => format!("{tag} pushed"),
+        TagPushAction::SkipAlreadyOnOrigin => format!("{tag} already on origin"),
+        TagPushAction::RefuseDivergent { .. } => {
+            unreachable!("RefuseDivergent bails before any push")
+        }
+    };
+    green(&format!(
+        "  Pushed {main} + {develop} + {tag} — SHAs verified ✓{retry_note}"
+    ));
+    phases.push((
+        "push",
+        format!("{main}, {tag}, {develop} verified{retry_note}; {tag_note}"),
+    ));
 
     // (l) GitHub release — recoverable: every failure is a loud WARN naming
     // the backfill command; the pushes already succeeded.
-    let gh_phase = if profile.gh_release {
-        gh_release_step(repo_root, &tag, &notes_path)
-    } else {
-        "disabled by profile".to_string()
-    };
+    let gh_phase = run_gh_release(profile, repo_root, &tag, &notes_path, true);
     phases.push(("gh-release", gh_phase));
 
     // (m) Branch cleanup — best-effort, loud on failure.
+    let cleanup = run_cleanup(repo_root, &rel_branch);
+    phases.push(("cleanup", cleanup.join("; ")));
+
+    // Final summary — every phase outcome.
+    bold(&format!(
+        "═══ Release complete: {tag} ({}) ═══",
+        short_sha(&main_sha)
+    ));
+    print_phase_summary(&phases);
+    Ok(format!("{tag} released"))
+}
+
+/// Step (l), shared by the success path and the KTD6 publish-state-uncertain
+/// path: run [`gh_release_step`] only when the tag is on origin AT THE
+/// EXPECTED COMMIT — creating a GitHub release from a tag name alone would
+/// mint the tag on the default branch (KTD6), and a tag origin moved to
+/// another commit would publish a release for the wrong code (review #3).
+fn run_gh_release(
+    profile: &ReleaseProfile,
+    repo_root: &Path,
+    tag: &str,
+    notes_path: &Path,
+    tag_at_expected_commit: bool,
+) -> String {
+    if !tag_at_expected_commit {
+        return "GitHub release SKIPPED: tag not on origin at the expected commit".to_string();
+    }
+    if profile.gh_release {
+        gh_release_step(repo_root, tag, notes_path)
+    } else {
+        "disabled by profile".to_string()
+    }
+}
+
+/// Step (m), shared by the success path and the KTD6 publish-state-uncertain
+/// path: best-effort local + origin cleanup of the spent release branch,
+/// loud on failure, never fatal.
+fn run_cleanup(repo_root: &Path, rel_branch: &str) -> Vec<String> {
     let mut cleanup = Vec::new();
-    match git_stdout(repo_root, &["branch", "-d", &rel_branch]) {
+    match git_stdout(repo_root, &["branch", "-d", rel_branch]) {
         Ok(_) => cleanup.push(format!("{rel_branch} deleted locally")),
         Err(e) => {
             red(&format!(
@@ -2570,15 +3281,7 @@ fn cut_ceremony(repo_root: &Path, profile: &ReleaseProfile, opts: &CutOptions) -
             "WARN: could not check origin for {rel_branch}: {e:#}"
         )),
     }
-    phases.push(("cleanup", cleanup.join("; ")));
-
-    // Final summary — every phase outcome.
-    bold(&format!(
-        "═══ Release complete: {tag} ({}) ═══",
-        short_sha(&main_sha)
-    ));
-    print_phase_summary(&phases);
-    Ok(format!("{tag} released"))
+    cleanup
 }
 
 /// Step (f): write the new version into every profile version file, run the
@@ -4827,6 +5530,802 @@ match_dir = "boi"
                 .trim(),
             "develop"
         );
+    }
+
+    // -- U1: reconcile origin/develop before the back-merge -------------------------
+    //
+    // Black-box on purpose: every assertion goes through `cut_v`/
+    // `cut_with_profile` plus repo/origin state, never the internal
+    // `reconcile_develop_with_origin`/`DevelopReconcile` names, so these
+    // tests compile and mean the same thing before and after the fix —
+    // red is a real runtime failure, not a missing symbol.
+
+    #[test]
+    fn reconcile_incident_fast_forwards_and_completes() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "foreign.txt", "feat: foreign");
+
+        // Local develop is still exactly at the pin; the gate pushes the
+        // foreign commit to origin/develop mid-battery (R11's incident).
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        cut_v(&repo, &profile, "0.2.0").unwrap();
+
+        // Fast-forward, not a merge: no reconcile merge commit anywhere.
+        let develop_log = git_stdout(&repo, &["log", "--oneline", "develop"]).unwrap();
+        assert!(
+            !develop_log.contains("reconcile: merge"),
+            "got: {develop_log}"
+        );
+        // origin/develop carries the foreign commit and the back-merge, and
+        // descends from origin/main; the tag is on origin.
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: foreign"),
+            "got: {origin_dev_log}"
+        );
+        let origin_main = rev_parse(&origin, "refs/heads/main").unwrap();
+        let origin_dev = rev_parse(&origin, "refs/heads/develop").unwrap();
+        assert!(is_ancestor(&repo, &origin_main, &origin_dev).unwrap());
+        assert_eq!(rev_parse(&origin, "v0.2.0^{commit}").unwrap(), origin_main);
+    }
+
+    #[test]
+    fn reconcile_diverged_creates_merge_commit_and_completes() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let other = second_clone(td.path(), "other");
+
+        // One unpushed local commit becomes part of the pin.
+        git(&repo, &["checkout", "-q", "develop"]);
+        add_commit(&repo, "ours.txt", "feat: ours");
+        git(&repo, &["checkout", "-q", "main"]);
+
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "foreign.txt", "feat: foreign");
+
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        cut_v(&repo, &profile, "0.2.0").unwrap();
+
+        let develop_log = git_stdout(&repo, &["log", "--oneline", "develop"]).unwrap();
+        assert!(
+            develop_log.contains("reconcile: merge origin/develop"),
+            "got: {develop_log}"
+        );
+        assert!(develop_log.contains("feat: ours"), "got: {develop_log}");
+        assert!(develop_log.contains("feat: foreign"), "got: {develop_log}");
+    }
+
+    #[test]
+    fn reconcile_in_sync_makes_no_merge_commit() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        let develop_log = git_stdout(&repo, &["log", "--oneline", "develop"]).unwrap();
+        assert!(
+            !develop_log.contains("reconcile: merge"),
+            "got: {develop_log}"
+        );
+    }
+
+    #[test]
+    fn reconcile_ahead_publishes_local_commit_unchanged() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        git(&repo, &["checkout", "-q", "develop"]);
+        add_commit(&repo, "ours.txt", "feat: ours");
+        git(&repo, &["checkout", "-q", "main"]);
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: ours"),
+            "got: {origin_dev_log}"
+        );
+        assert!(
+            !origin_dev_log.contains("reconcile: merge"),
+            "got: {origin_dev_log}"
+        );
+    }
+
+    #[test]
+    fn reconcile_conflict_aborts_before_any_push() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+
+        // Seed conflict.txt on develop from a shared base so both sides can
+        // edit the same line.
+        git(&repo, &["checkout", "-q", "develop"]);
+        std::fs::write(repo.join("conflict.txt"), "base\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        commit(&repo, "chore: seed conflict.txt");
+        git(&repo, &["push", "-q", "origin", "develop"]);
+
+        let other = second_clone(td.path(), "other");
+
+        // Local edits the line (unpushed) — part of the pin.
+        std::fs::write(repo.join("conflict.txt"), "ours\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        commit(&repo, "feat: ours edits the line");
+        let pre_cut_develop = git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap();
+        git(&repo, &["checkout", "-q", "main"]);
+
+        // Foreign clone edits the SAME line differently, pushed mid-battery.
+        git(&other, &["checkout", "-q", "develop"]);
+        std::fs::write(other.join("conflict.txt"), "theirs\n").unwrap();
+        git(&other, &["add", "-A"]);
+        commit(&other, "feat: theirs edits the line");
+
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        let err = format!("{:#}", cut_v(&repo, &profile, "0.2.0").unwrap_err());
+        assert!(err.contains("RECONCILE CONFLICT"), "got: {err}");
+        assert!(
+            err.contains("git merge --no-ff origin/develop"),
+            "got: {err}"
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert!(ls_remote_sha(&repo, "refs/tags/v0.2.0").unwrap().is_none());
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            pre_cut_develop
+        );
+    }
+
+    #[test]
+    fn reconcile_fast_forward_then_backmerge_conflict_reports_state() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+
+        // Foreign commit edits version.txt so the LATER back-merge (main's
+        // own version.txt bump into the now-fast-forwarded develop)
+        // conflicts on the same line.
+        git(&other, &["checkout", "-q", "develop"]);
+        std::fs::write(other.join("version.txt"), "9.9.9\n").unwrap();
+        git(&other, &["add", "-A"]);
+        commit(&other, "chore: bogus version bump on develop");
+
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        let err = format!("{:#}", cut_v(&repo, &profile, "0.2.0").unwrap_err());
+        assert!(err.contains("fast-forwarded to origin"), "got: {err}");
+        // Review #1: the by-hand recovery must publish the same way the
+        // ceremony does — one atomic push — never the old sequential form.
+        assert!(err.contains("git push --atomic origin"), "got: {err}");
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert!(ls_remote_sha(&repo, "refs/tags/v0.2.0").unwrap().is_none());
+    }
+
+    #[test]
+    fn reconcile_remote_missing_develop_aborts_before_any_push() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["push", "-q", "origin", "--delete", "develop"]);
+
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+        let repo_develop_before = git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap();
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(err.contains("develop"), "got: {err}");
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            repo_develop_before
+        );
+    }
+
+    #[test]
+    fn reconcile_finish_mode_ahead_publishes_local_commit() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = finish_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        add_commit(&repo, "ours.txt", "feat: ours");
+
+        cut_with_profile(&repo, &ceremony_profile(), &finish_opts("release/0.2.0")).unwrap();
+
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: ours"),
+            "got: {origin_dev_log}"
+        );
+    }
+
+    #[test]
+    fn reconcile_runs_on_hotfix_cut_too() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "foreign.txt", "feat: foreign");
+
+        let mut profile = ceremony_profile();
+        profile.gates = vec![GateSpec {
+            name: "foreign-push".to_string(),
+            kind: GateKind::Command(format!("git -C {} push -q origin develop", other.display())),
+        }];
+
+        cut_with_profile(
+            &repo,
+            &profile,
+            &CutOptions {
+                version: Some("0.1.1".to_string()),
+                hotfix: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: foreign"),
+            "got: {origin_dev_log}"
+        );
+    }
+
+    // -- U2: atomic publish, one retry, publish-state reporting ---------------------
+    //
+    // Black-box on `cut_v`/`cut_with_profile` plus repo/origin/hook-log state,
+    // same discipline as the U1 section above — red is a real runtime
+    // failure against the sequential push code, never a missing symbol.
+
+    /// A fresh, test-owned pre-push hook directory (never the fixtures'
+    /// shared `nohooks` dir — KTD7) with `body` installed as `pre-push` and
+    /// made executable, wired onto `repo` via `core.hooksPath`.
+    fn install_pre_push_hook(repo: &Path, td: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = td.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hook = dir.join("pre-push");
+        std::fs::write(&hook, body).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(repo, &["config", "core.hooksPath", dir.to_str().unwrap()]);
+        dir
+    }
+
+    #[test]
+    fn atomic_success_path_is_one_push_carrying_all_three_refs() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let log = td.path().join("hook.log");
+        install_pre_push_hook(
+            &repo,
+            td.path(),
+            "hooks-ok",
+            &format!(
+                "#!/bin/sh\n{{ echo ---; cat; }} >> {}\nexit 0\n",
+                log.display()
+            ),
+        );
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        // One atomic invocation, carrying all three refs (R7/KTD3) — not
+        // three separate pushes.
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            1,
+            "expected exactly one push invocation, got log:\n{log_text}"
+        );
+        assert!(log_text.contains("refs/heads/main"), "got: {log_text}");
+        assert!(log_text.contains("refs/heads/develop"), "got: {log_text}");
+        assert!(log_text.contains("refs/tags/v0.2.0"), "got: {log_text}");
+
+        let main_sha = git_stdout(&repo, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            main_sha
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap()
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "v0.2.0^{commit}"]).unwrap(),
+            main_sha
+        );
+    }
+
+    #[test]
+    fn atomic_retries_once_after_a_second_race_on_develop() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "foreign.txt", "feat: foreign");
+
+        let log = td.path().join("hook.log");
+        let marker = td.path().join("hook.marker");
+        let hook_body = format!(
+            "#!/bin/sh\n{{ echo ---; cat; }} >> {log}\n\
+             if [ ! -f {marker} ]; then\n  touch {marker}\n  \
+             git -C {other} push -q origin develop\nfi\nexit 0\n",
+            log = log.display(),
+            marker = marker.display(),
+            other = other.display(),
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-race", &hook_body);
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            2,
+            "expected two push attempts (one retry), got log:\n{log_text}"
+        );
+
+        // origin/develop carries BOTH the foreign commit and the back-merge.
+        let origin_dev_log =
+            git_stdout(&origin, &["log", "--oneline", "refs/heads/develop"]).unwrap();
+        assert!(
+            origin_dev_log.contains("feat: foreign"),
+            "got: {origin_dev_log}"
+        );
+        let origin_main = rev_parse(&origin, "refs/heads/main").unwrap();
+        let origin_dev = rev_parse(&origin, "refs/heads/develop").unwrap();
+        assert!(is_ancestor(&repo, &origin_main, &origin_dev).unwrap());
+        assert_eq!(rev_parse(&origin, "v0.2.0^{commit}").unwrap(), origin_main);
+    }
+
+    #[test]
+    fn atomic_every_push_rejected_leaves_nothing_on_origin() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+        let origin_dev_before = git_stdout(&origin, &["rev-parse", "refs/heads/develop"]).unwrap();
+
+        let log = td.path().join("hook.log");
+        let hook_body = format!(
+            "#!/bin/sh\n{{ echo ---; cat; }} >> {}\necho blocked by test hook >&2\nexit 1\n",
+            log.display()
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-reject", &hook_body);
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(
+            err.to_lowercase().contains("nothing was pushed"),
+            "got: {err}"
+        );
+        assert!(err.contains("git push --atomic origin"), "got: {err}");
+        // Review #2: a hook/transport failure does not name a rejected ref,
+        // so "nothing was pushed" must be a VERIFIED claim (origin queried),
+        // not an inference from a non-zero exit.
+        assert!(err.contains("verified"), "got: {err}");
+        // Review #7: local develop already carries the back-merge here, so
+        // the state line must say so and the fresh-cut unwind must reset
+        // develop, not only main.
+        assert!(err.contains("carries the back-merge"), "got: {err}");
+        assert!(err.contains("git branch -f develop "), "got: {err}");
+
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            origin_dev_before
+        );
+        assert!(ls_remote_sha(&repo, "refs/tags/v0.2.0").unwrap().is_none());
+
+        // Every rejection is a generic hook failure, not a develop-specific
+        // one — no retry, exactly one attempt.
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            1,
+            "expected exactly one push attempt, got log:\n{log_text}"
+        );
+    }
+
+    #[test]
+    fn atomic_persistent_non_fast_forward_fails_after_two_attempts() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+
+        let origin_main_before = git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap();
+        let log = td.path().join("hook.log");
+        let counter = td.path().join("hook.counter");
+        let hook_body = format!(
+            "#!/bin/sh\n{{ echo ---; cat; }} >> {log}\n\
+             N=$(( $(cat {counter} 2>/dev/null || echo 0) + 1 ))\n\
+             echo \"$N\" > {counter}\n\
+             echo content-$N > {other}/foreign-$N.txt\n\
+             git -C {other} add -A\n\
+             git -C {other} -c user.email=test@example.com -c user.name=Test \
+             commit -q -m \"feat: foreign $N\"\n\
+             git -C {other} push -q origin develop\nexit 0\n",
+            log = log.display(),
+            counter = counter.display(),
+            other = other.display(),
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-persistent", &hook_body);
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(
+            err.to_lowercase().contains("nothing was pushed"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            origin_main_before
+        );
+        assert!(ls_remote_sha(&repo, "refs/tags/v0.2.0").unwrap().is_none());
+
+        // One initial attempt plus exactly one retry, both rejected.
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            2,
+            "expected exactly two push attempts, got log:\n{log_text}"
+        );
+    }
+
+    #[test]
+    fn atomic_tag_already_on_origin_omits_tag_from_refspecs() {
+        // Full-ceremony reproduction is structurally unreachable: within one
+        // `cut_v` run, `refuse_existing_tag` bails long before the tag is
+        // created if it already exists anywhere, the tag object that would
+        // need to pre-exist on origin does not exist until THIS run creates
+        // it, and `--atomic` guarantees a rejected attempt lands nothing —
+        // so no actor, including a retried attempt of this same run, can
+        // put the tag on origin ahead of the push that is supposed to send
+        // it. This exercises the refspec builder directly instead (KTD3's
+        // "left out of the push list" contract), the same unit the
+        // ceremony calls.
+        let tag_ref = "refs/tags/v0.2.0".to_string();
+        assert_eq!(
+            atomic_refspecs("main", "develop", &tag_ref, &TagPushAction::Push),
+            vec!["main".to_string(), tag_ref.clone(), "develop".to_string()]
+        );
+        assert_eq!(
+            atomic_refspecs(
+                "main",
+                "develop",
+                &tag_ref,
+                &TagPushAction::SkipAlreadyOnOrigin
+            ),
+            vec!["main".to_string(), "develop".to_string()]
+        );
+    }
+
+    #[test]
+    fn atomic_verify_uncertain_reports_publish_state_runs_gh_and_cleanup() {
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "scratch.txt", "chore: scratch for post-update hook");
+        // The commit object lands in origin's odb on a side ref that is
+        // never `develop` itself, so the real push below is a normal,
+        // uncontested fast-forward — the hook alone creates the mismatch.
+        git(
+            &other,
+            &[
+                "push",
+                "-q",
+                "origin",
+                "develop:refs/heads/scratch-mismatch",
+            ],
+        );
+
+        use std::os::unix::fs::PermissionsExt;
+        let hook = origin.join("hooks").join("post-update");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nfor r in \"$@\"; do\n  \
+             if [ \"$r\" = \"refs/heads/develop\" ]; then\n    \
+             git update-ref refs/heads/develop refs/heads/scratch-mismatch\n  fi\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(err.contains("PUBLISH STATE"), "got: {err}");
+        assert!(err.contains("main: on origin at"), "got: {err}");
+        assert!(err.contains("v0.2.0: on origin at"), "got: {err}");
+        assert!(err.contains("develop: on origin at"), "got: {err}");
+        // develop is PRESENT on origin (the hook moved it, not deleted it),
+        // so nothing is "missing" — the hint names the verify failure
+        // instead of a push command for an absent ref.
+        assert!(
+            err.contains("all refs on origin; only verification failed"),
+            "got: {err}"
+        );
+        assert!(err.contains("develop: on origin at"), "got: {err}");
+        assert!(err.contains("(expected "), "got: {err}");
+
+        // Cleanup still ran best-effort despite the uncertain outcome.
+        assert!(!ref_exists(&repo, "refs/heads/release/0.2.0"));
+    }
+
+    #[test]
+    fn atomic_unknown_push_outcome_after_origin_committed_verifies_and_succeeds() {
+        // Review #2 (cross-model): origin commits the atomic transaction
+        // but the client sees a failure (connection lost after send, git
+        // killed). The ceremony must not claim "nothing was pushed" from a
+        // non-zero exit alone — it checks origin, finds all three refs at
+        // the expected SHAs, and finishes as a normal success.
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let log = td.path().join("hook.log");
+        // The hook publishes the three refs itself (bypassing hooks), then
+        // fails the ceremony's own push with a transport-shaped error.
+        let hook_body = format!(
+            "#!/bin/sh\n{{ echo ---; cat; }} >> {log}\n\
+             git -C {repo} -c core.hooksPath=/dev/null push -q origin \
+             refs/heads/main refs/tags/v0.2.0 refs/heads/develop\n\
+             echo 'fatal: the remote end hung up unexpectedly (test hook)' >&2\n\
+             exit 1\n",
+            log = log.display(),
+            repo = repo.display(),
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-hangup", &hook_body);
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            1,
+            "expected exactly one push attempt (no retry on an unknown outcome), got log:\n{log_text}"
+        );
+        let main_sha = git_stdout(&repo, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            main_sha
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap()
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "v0.2.0^{commit}"]).unwrap(),
+            main_sha
+        );
+        // Cleanup ran: the release branch is gone.
+        assert!(!ref_exists(&repo, "refs/heads/release/0.2.0"));
+    }
+
+    #[test]
+    fn atomic_divergent_tag_after_push_skips_github_release() {
+        // Review #3 (cross-model): after an accepted push a server-side
+        // hook moves the tag to another commit. Verification must report
+        // the tag as divergent and the GitHub release step must be
+        // SKIPPED — a tag "present on origin" at the wrong commit is not a
+        // releasable tag.
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "scratch.txt", "chore: scratch for post-update hook");
+        git(
+            &other,
+            &["push", "-q", "origin", "develop:refs/heads/scratch-tag"],
+        );
+
+        use std::os::unix::fs::PermissionsExt;
+        let hook = origin.join("hooks").join("post-update");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nfor r in \"$@\"; do\n  \
+             if [ \"$r\" = \"refs/tags/v0.2.0\" ]; then\n    \
+             git update-ref refs/tags/v0.2.0 refs/heads/scratch-tag\n  fi\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(err.contains("PUBLISH STATE"), "got: {err}");
+        assert!(err.contains("v0.2.0: on origin at"), "got: {err}");
+        assert!(err.contains("expected"), "got: {err}");
+        assert!(err.contains("GitHub release SKIPPED"), "got: {err}");
+        // main and develop did publish.
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            git_stdout(&repo, &["rev-parse", "refs/heads/main"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn atomic_verify_error_reports_could_not_verify_not_absent() {
+        // Review #6 (correctness + cross-model): an ls-remote error during
+        // post-push verification is not evidence of absence. PUBLISH STATE
+        // must say "could not verify", and the exit hint must tell the
+        // operator to look (ls-remote), never to blindly push refs that may
+        // already be on origin.
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let origin_url = git_stdout(&repo, &["config", "remote.origin.url"]).unwrap();
+        // The push itself goes through (the transport is already open when
+        // pre-push runs); every ls-remote AFTER it fails because the hook
+        // points origin at a path that does not exist.
+        let hook_body = format!(
+            "#!/bin/sh\ncat > /dev/null\n\
+             git -C {repo} config remote.origin.url {bogus}\nexit 0\n",
+            repo = repo.display(),
+            bogus = td.path().join("nonexistent.git").display(),
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-vanish", &hook_body);
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        git(&repo, &["config", "remote.origin.url", origin_url.trim()]);
+
+        assert!(err.contains("PUBLISH STATE"), "got: {err}");
+        assert!(err.contains("main: could not verify"), "got: {err}");
+        assert!(err.contains("v0.2.0: could not verify"), "got: {err}");
+        assert!(err.contains("develop: could not verify"), "got: {err}");
+        assert!(!err.contains(": not on origin"), "got: {err}");
+        assert!(err.contains("git ls-remote origin"), "got: {err}");
+        assert!(!err.contains("git push origin"), "got: {err}");
+        assert!(err.contains("GitHub release SKIPPED"), "got: {err}");
+        // The publish actually succeeded — origin holds all three.
+        let main_sha = git_stdout(&repo, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            main_sha
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "v0.2.0^{commit}"]).unwrap(),
+            main_sha
+        );
+    }
+
+    #[test]
+    fn run_gh_release_skips_when_tag_is_not_on_origin_even_if_profile_enables_it() {
+        // Review #4: the KTD6 guard — never `gh release create` for a tag
+        // that is not on origin at the expected commit, even when the
+        // profile asks for GitHub releases (gh would mint the tag on the
+        // default branch).
+        let td = tempfile::tempdir().unwrap();
+        let mut profile = ceremony_profile();
+        profile.gh_release = true;
+        let notes = td.path().join("notes.md");
+        std::fs::write(&notes, "notes\n").unwrap();
+        let phase = run_gh_release(&profile, td.path(), "v0.0.0", &notes, false);
+        assert!(phase.starts_with("GitHub release SKIPPED"), "got: {phase}");
+    }
+
+    // -- pure classifiers: atomic push rejection / refspecs -------------------------
+
+    #[test]
+    fn atomic_develop_rejection_classifier_matches_only_develop() {
+        // Client-side preflight shape (remote's advertised state already
+        // showed the conflict before any pack was sent) — captured from a
+        // real `git push --atomic` against a local bare origin.
+        let client_side = " ! [rejected]        develop -> develop (fetch first)\n\
+             ! [rejected]        main -> main (atomic push failed)\n\
+             ! [rejected]        v9.9.9 -> v9.9.9 (atomic push failed)\n\
+             error: failed to push some refs to 'origin'\n";
+        assert!(develop_push_rejected(client_side, "develop"));
+
+        // Server-side atomic-transaction shape (the race lands AFTER
+        // negotiation, e.g. from inside a pre-push hook) — every ref gets
+        // an identical, uninformative bracket line; only the "cannot lock
+        // ref" line names the true culprit. Captured verbatim from the
+        // `atomic_retries_once_after_a_second_race_on_develop` red run.
+        let server_side = "remote: error: cannot lock ref 'refs/heads/develop': is at \
+             57540adb942e637d0814a87af9056a890c9999c7 but expected \
+             83e716b54503b5d73327cce208c59cadf2587944\n\
+             ! [remote rejected] develop -> develop (atomic transaction failed)\n\
+             ! [remote rejected] main -> main (atomic transaction failed)\n\
+             ! [remote rejected] v0.2.0 -> v0.2.0 (atomic transaction failed)\n\
+             error: failed to push some refs to 'origin'\n";
+        assert!(develop_push_rejected(server_side, "develop"));
+
+        // Client-side preflight with MAIN as the culprit: real git still
+        // prints a develop sibling line, tagged "(atomic push failed)", so
+        // a bracket-marker match alone would misfire (review #5; captured
+        // from a throwaway bare origin with git 2.54).
+        let main_rejected = " ! [rejected]        develop -> develop (atomic push failed)\n\
+             ! [rejected]        main -> main (fetch first)\n\
+             error: failed to push some refs to 'origin'\n";
+        assert!(!develop_push_rejected(main_rejected, "develop"));
+
+        let server_side_main_culprit = "remote: error: cannot lock ref 'refs/heads/main': \
+             is at aaa but expected bbb\n\
+             ! [remote rejected] develop -> develop (atomic transaction failed)\n\
+             ! [remote rejected] main -> main (atomic transaction failed)\n";
+        assert!(!develop_push_rejected(server_side_main_culprit, "develop"));
+
+        let atomic_unsupported = "error: the receiving end does not support --atomic push\n";
+        assert!(!develop_push_rejected(atomic_unsupported, "develop"));
+
+        let hook_blocked = "blocked by test hook\nerror: failed to push some refs to 'origin'\n";
+        assert!(!develop_push_rejected(hook_blocked, "develop"));
     }
 
     // -- develop sync --------------------------------------------------------------
