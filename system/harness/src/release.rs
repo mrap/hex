@@ -5599,6 +5599,9 @@ match_dir = "boi"
 
         let err = format!("{:#}", cut_v(&repo, &profile, "0.2.0").unwrap_err());
         assert!(err.contains("fast-forwarded to origin"), "got: {err}");
+        // Review #1: the by-hand recovery must publish the same way the
+        // ceremony does — one atomic push — never the old sequential form.
+        assert!(err.contains("git push --atomic origin"), "got: {err}");
         assert_eq!(
             git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
             origin_main_before
@@ -5821,6 +5824,15 @@ match_dir = "boi"
             "got: {err}"
         );
         assert!(err.contains("git push --atomic origin"), "got: {err}");
+        // Review #2: a hook/transport failure does not name a rejected ref,
+        // so "nothing was pushed" must be a VERIFIED claim (origin queried),
+        // not an inference from a non-zero exit.
+        assert!(err.contains("verified"), "got: {err}");
+        // Review #7: local develop already carries the back-merge here, so
+        // the state line must say so and the fresh-cut unwind must reset
+        // develop, not only main.
+        assert!(err.contains("carries the back-merge"), "got: {err}");
+        assert!(err.contains("git branch -f develop "), "got: {err}");
 
         assert_eq!(
             git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
@@ -5975,6 +5987,165 @@ match_dir = "boi"
         assert!(!ref_exists(&repo, "refs/heads/release/0.2.0"));
     }
 
+    #[test]
+    fn atomic_unknown_push_outcome_after_origin_committed_verifies_and_succeeds() {
+        // Review #2 (cross-model): origin commits the atomic transaction
+        // but the client sees a failure (connection lost after send, git
+        // killed). The ceremony must not claim "nothing was pushed" from a
+        // non-zero exit alone — it checks origin, finds all three refs at
+        // the expected SHAs, and finishes as a normal success.
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let log = td.path().join("hook.log");
+        // The hook publishes the three refs itself (bypassing hooks), then
+        // fails the ceremony's own push with a transport-shaped error.
+        let hook_body = format!(
+            "#!/bin/sh\n{{ echo ---; cat; }} >> {log}\n\
+             git -C {repo} -c core.hooksPath=/dev/null push -q origin \
+             refs/heads/main refs/tags/v0.2.0 refs/heads/develop\n\
+             echo 'fatal: the remote end hung up unexpectedly (test hook)' >&2\n\
+             exit 1\n",
+            log = log.display(),
+            repo = repo.display(),
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-hangup", &hook_body);
+
+        cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap();
+
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.matches("---").count(),
+            1,
+            "expected exactly one push attempt (no retry on an unknown outcome), got log:\n{log_text}"
+        );
+        let main_sha = git_stdout(&repo, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            main_sha
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/develop"]).unwrap(),
+            git_stdout(&repo, &["rev-parse", "refs/heads/develop"]).unwrap()
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "v0.2.0^{commit}"]).unwrap(),
+            main_sha
+        );
+        // Cleanup ran: the release branch is gone.
+        assert!(!ref_exists(&repo, "refs/heads/release/0.2.0"));
+    }
+
+    #[test]
+    fn atomic_divergent_tag_after_push_skips_github_release() {
+        // Review #3 (cross-model): after an accepted push a server-side
+        // hook moves the tag to another commit. Verification must report
+        // the tag as divergent and the GitHub release step must be
+        // SKIPPED — a tag "present on origin" at the wrong commit is not a
+        // releasable tag.
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let other = second_clone(td.path(), "other");
+        git(&other, &["checkout", "-q", "develop"]);
+        add_commit(&other, "scratch.txt", "chore: scratch for post-update hook");
+        git(
+            &other,
+            &["push", "-q", "origin", "develop:refs/heads/scratch-tag"],
+        );
+
+        use std::os::unix::fs::PermissionsExt;
+        let hook = origin.join("hooks").join("post-update");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nfor r in \"$@\"; do\n  \
+             if [ \"$r\" = \"refs/tags/v0.2.0\" ]; then\n    \
+             git update-ref refs/tags/v0.2.0 refs/heads/scratch-tag\n  fi\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        assert!(err.contains("PUBLISH STATE"), "got: {err}");
+        assert!(err.contains("v0.2.0: on origin at"), "got: {err}");
+        assert!(err.contains("expected"), "got: {err}");
+        assert!(err.contains("GitHub release SKIPPED"), "got: {err}");
+        // main and develop did publish.
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            git_stdout(&repo, &["rev-parse", "refs/heads/main"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn atomic_verify_error_reports_could_not_verify_not_absent() {
+        // Review #6 (correctness + cross-model): an ls-remote error during
+        // post-push verification is not evidence of absence. PUBLISH STATE
+        // must say "could not verify", and the exit hint must tell the
+        // operator to look (ls-remote), never to blindly push refs that may
+        // already be on origin.
+        let (_hex, _guard) = crate::telemetry::test_support::isolate();
+        let td = tempfile::tempdir().unwrap();
+        let repo = gitflow_fixture(td.path());
+        let origin = td.path().join("origin.git");
+        let origin_url = git_stdout(&repo, &["config", "remote.origin.url"]).unwrap();
+        // The push itself goes through (the transport is already open when
+        // pre-push runs); every ls-remote AFTER it fails because the hook
+        // points origin at a path that does not exist.
+        let hook_body = format!(
+            "#!/bin/sh\ncat > /dev/null\n\
+             git -C {repo} config remote.origin.url {bogus}\nexit 0\n",
+            repo = repo.display(),
+            bogus = td.path().join("nonexistent.git").display(),
+        );
+        install_pre_push_hook(&repo, td.path(), "hooks-vanish", &hook_body);
+
+        let err = format!(
+            "{:#}",
+            cut_v(&repo, &ceremony_profile(), "0.2.0").unwrap_err()
+        );
+        git(&repo, &["config", "remote.origin.url", origin_url.trim()]);
+
+        assert!(err.contains("PUBLISH STATE"), "got: {err}");
+        assert!(err.contains("main: could not verify"), "got: {err}");
+        assert!(err.contains("v0.2.0: could not verify"), "got: {err}");
+        assert!(err.contains("develop: could not verify"), "got: {err}");
+        assert!(!err.contains("not on origin"), "got: {err}");
+        assert!(err.contains("git ls-remote origin"), "got: {err}");
+        assert!(!err.contains("git push origin"), "got: {err}");
+        assert!(err.contains("GitHub release SKIPPED"), "got: {err}");
+        // The publish actually succeeded — origin holds all three.
+        let main_sha = git_stdout(&repo, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "refs/heads/main"]).unwrap(),
+            main_sha
+        );
+        assert_eq!(
+            git_stdout(&origin, &["rev-parse", "v0.2.0^{commit}"]).unwrap(),
+            main_sha
+        );
+    }
+
+    #[test]
+    fn run_gh_release_skips_when_tag_is_not_on_origin_even_if_profile_enables_it() {
+        // Review #4: the KTD6 guard — never `gh release create` for a tag
+        // that is not on origin at the expected commit, even when the
+        // profile asks for GitHub releases (gh would mint the tag on the
+        // default branch).
+        let td = tempfile::tempdir().unwrap();
+        let mut profile = ceremony_profile();
+        profile.gh_release = true;
+        let notes = td.path().join("notes.md");
+        std::fs::write(&notes, "notes\n").unwrap();
+        let phase = run_gh_release(&profile, td.path(), "v0.0.0", &notes, false);
+        assert!(phase.starts_with("GitHub release SKIPPED"), "got: {phase}");
+    }
+
     // -- pure classifiers: atomic push rejection / refspecs -------------------------
 
     #[test]
@@ -6002,7 +6173,12 @@ match_dir = "boi"
              error: failed to push some refs to 'origin'\n";
         assert!(develop_push_rejected(server_side, "develop"));
 
-        let main_rejected = " ! [rejected]        main -> main (fetch first)\n\
+        // Client-side preflight with MAIN as the culprit: real git still
+        // prints a develop sibling line, tagged "(atomic push failed)", so
+        // a bracket-marker match alone would misfire (review #5; captured
+        // from a throwaway bare origin with git 2.54).
+        let main_rejected = " ! [rejected]        develop -> develop (atomic push failed)\n\
+             ! [rejected]        main -> main (fetch first)\n\
              error: failed to push some refs to 'origin'\n";
         assert!(!develop_push_rejected(main_rejected, "develop"));
 
