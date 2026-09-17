@@ -6,6 +6,7 @@
 //! swappable: the seam is small, named, and grep-able.
 
 use serde_json::{json, Value};
+use std::time::Duration;
 
 /// Pure description of the state write a given event maps to.
 ///
@@ -72,8 +73,27 @@ fn call_builtin(function_id: &str, payload: Value) -> Result<Value, String> {
     call_builtin_with_timeout(function_id, payload, None)
 }
 
+/// Upper bound on how long a `call_builtin` caller waits for the SDK client
+/// to shut down after the trigger completes. In the normal paths (engine
+/// reachable, or connect refused) the connection thread exits within ~2s;
+/// the budget only fires when the engine accepts TCP but never finishes the
+/// WebSocket handshake, where the SDK's `connect_async` has no timeout.
+const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(5);
+
 /// `call_builtin` with an explicit invocation timeout (`None` = SDK default,
-/// 30s). Split out so tests can drive the unreachable-engine path quickly.
+/// 30s). `pub` so the `fd_limits` integration binary can drive the
+/// unreachable-engine path quickly; production callers use `state_*`/`emit`.
+pub fn call_builtin_with_timeout(
+    function_id: &str,
+    payload: Value,
+    timeout_ms: Option<u64>,
+) -> Result<Value, String> {
+    call_builtin_with_timeout_and_budget(function_id, payload, timeout_ms, SHUTDOWN_JOIN_BUDGET)
+}
+
+/// `call_builtin_with_timeout` with an explicit shutdown-join budget. `pub`
+/// only so the `fd_limits` integration binary can prove the bound with a
+/// sub-second budget; production always uses [`SHUTDOWN_JOIN_BUDGET`].
 ///
 /// The client is torn down on EVERY return path. `iii_sdk::register_worker`
 /// spawns a dedicated OS thread (`iii-connection`) with its own tokio runtime
@@ -85,10 +105,11 @@ fn call_builtin(function_id: &str, payload: Value) -> Result<Value, String> {
 /// storm across every worker; incident `failures-storm-...Too-many-open-
 /// files`). `shutdown()` flips `running=false` and joins the thread; the
 /// reconnect loop honors that within ~2s even when connect keeps failing.
-fn call_builtin_with_timeout(
+pub fn call_builtin_with_timeout_and_budget(
     function_id: &str,
     payload: Value,
     timeout_ms: Option<u64>,
+    _shutdown_budget: Duration,
 ) -> Result<Value, String> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("ops::call_builtin: failed to start tokio runtime: {e}"))?;
@@ -245,8 +266,6 @@ mod tests {
         }
     }
 
-    /// Live round-trip against a running engine. Run: `cargo test -p hex-harness
-    /// -- --ignored state_roundtrip_live`.
     /// Open-fd count of this process (`/dev/fd` on macOS and Linux).
     fn open_fd_count() -> usize {
         std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
@@ -307,6 +326,8 @@ mod tests {
         );
     }
 
+    /// Live round-trip against a running engine. Run: `cargo test -p hex-harness
+    /// -- --ignored state_roundtrip_live`.
     #[test]
     #[ignore]
     fn state_roundtrip_live() {
